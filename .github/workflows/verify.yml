@@ -1,0 +1,45 @@
+name: Verify Community
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  community:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out public source only
+        uses: actions/checkout@v7
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install public dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Check Community frontend
+        run: bun run check:frontend
+
+      - name: Test public Rust workspace
+        run: cargo test --workspace --locked
+
+      - name: Lint public Rust workspace
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Build Community app
+        run: bun run build

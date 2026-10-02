@@ -1,0 +1,15 @@
+{
+  "productName": "GoggleLab Community Dev",
+  "identifier": "com.sonicparke.stl-handoff.community-dev",
+  "app": {
+    "windows": [
+      {
+        "title": "GoggleLab Community Dev",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 480,
+        "minHeight": 360
+      }
+    ]
+  }
+}

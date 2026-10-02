@@ -1,0 +1,51 @@
+{
+  "name": "@gogglelab/core",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MPL-2.0",
+  "type": "module",
+  "exports": {
+    "./app": "./src/main.ts",
+    "./extensions": "./src/lib/app-extensions.ts",
+    "./ipc": "./src/lib/ipc.ts",
+    "./storage-keys": "./src/lib/storage-keys.ts",
+    "./authored-color-feature": "./src/lib/authored-color-feature.ts",
+    "./color-types": "./src/lib/color-types.ts",
+    "./cad-format": "./src/lib/cad-format.ts",
+    "./floating-panel": "./src/lib/floating-panel.ts"
+  },
+  "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "dev": "cd src-tauri && ../node_modules/.bin/tauri dev --config tauri.dev.conf.json",
+    "dev:web": "vite",
+    "dev:free": "bun run dev",
+    "build": "bun run tauri:build && bash scripts/patch-info-plist.sh target/release/bundle/macos/GoggleLab.app",
+    "build:web": "bun run typecheck && vite build",
+    "check": "bun run check:frontend && bun run build:web && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked",
+    "check:core": "bun run check",
+    "check:frontend": "bun run fmt:check && bun run lint && bun run typecheck && bun run test:core",
+    "test:core": "bun test src",
+    "fmt": "oxfmt package.json .oxlintrc.json src/main.ts src/lib src-tauri/tauri.conf.json",
+    "fmt:check": "oxfmt --check package.json .oxlintrc.json src/main.ts src/lib src-tauri/tauri.conf.json",
+    "lint": "oxlint src",
+    "tauri:build": "cd src-tauri && ../node_modules/.bin/tauri build",
+    "status": "bash scripts/status.sh",
+    "typecheck": "tsc --noEmit",
+    "test": "bun run test:core"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.3",
+    "occt-wasm": "4.3.2",
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@types/three": "0.185.4",
+    "oxfmt": "0.66.0",
+    "oxlint": "1.81.0",
+    "typescript": "5.9.3",
+    "vite": "6.3.5"
+  },
+  "packageManager": "bun@1.3.14"
+}

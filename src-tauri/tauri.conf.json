@@ -1,0 +1,73 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GoggleLab",
+  "version": "0.1.0",
+  "identifier": "com.sonicparke.stl-handoff",
+  "build": {
+    "beforeDevCommand": {
+      "script": "bun run dev:web",
+      "cwd": ".."
+    },
+    "beforeBuildCommand": {
+      "script": "bun run build:web",
+      "cwd": ".."
+    },
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "GoggleLab",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 480,
+        "minHeight": 360
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["stl"],
+        "name": "STL 3D Model",
+        "mimeType": "model/stl",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["3mf"],
+        "name": "3MF 3D Manufacturing Model",
+        "mimeType": "model/3mf",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["step", "stp"],
+        "name": "STEP CAD Model",
+        "mimeType": "model/step",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["f3d"],
+        "name": "Autodesk Fusion Design",
+        "mimeType": "application/octet-stream",
+        "role": "Viewer",
+        "rank": "Alternate"
+      }
+    ]
+  }
+}
