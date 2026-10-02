@@ -35,6 +35,9 @@ jobs:
       - name: Check Community frontend
         run: bun run check:frontend
 
+      - name: Test local Fusion bridge
+        run: python3 integrations/fusion/test_bridge.py
+
       - name: Test public Rust workspace
         run: cargo test --workspace --locked
 
