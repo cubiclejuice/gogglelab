@@ -96,6 +96,14 @@ impl SelectedRootHandle {
         }
 
         self.verify_current()?;
+        #[cfg(windows)]
+        {
+            // The held root denies delete/rename and rejects reparse points.
+            // create_dir is atomic and fails if the child already exists.
+            fs::create_dir(self.path.join(name))
+                .map_err(|e| format!("Could not create folder: {e}"))?;
+        }
+        #[cfg(not(windows))]
         create_directory_at(&self.directory, name)?;
         self.verify_current()?;
         Ok(self.path.join(name))
@@ -103,9 +111,9 @@ impl SelectedRootHandle {
 }
 
 #[cfg(unix)]
-fn root_identity(metadata: &std::fs::Metadata) -> Result<RootIdentity, String> {
+fn root_identity(file: &File) -> Result<RootIdentity, String> {
     use std::os::unix::fs::MetadataExt;
-
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
     Ok(RootIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -113,23 +121,14 @@ fn root_identity(metadata: &std::fs::Metadata) -> Result<RootIdentity, String> {
 }
 
 #[cfg(windows)]
-fn root_identity(metadata: &std::fs::Metadata) -> Result<RootIdentity, String> {
-    use std::os::windows::fs::MetadataExt;
-
-    let device = metadata
-        .volume_serial_number()
-        .ok_or_else(|| "Could not identify the selected folder volume.".to_string())?;
-    let inode = metadata
-        .file_index()
-        .ok_or_else(|| "Could not identify the selected folder.".to_string())?;
-    Ok(RootIdentity {
-        device: u64::from(device),
-        inode,
-    })
+fn root_identity(file: &File) -> Result<RootIdentity, String> {
+    let (device, inode) =
+        crate::fs_portability::windows_identity(file).map_err(|e| e.to_string())?;
+    Ok(RootIdentity { device, inode })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn root_identity(_metadata: &std::fs::Metadata) -> Result<RootIdentity, String> {
+fn root_identity(_file: &File) -> Result<RootIdentity, String> {
     Err("This platform cannot verify the selected folder identity.".into())
 }
 
@@ -145,12 +144,15 @@ fn verify_root_path(path: &Path, expected: RootIdentity) -> Result<(), String> {
     if canonical != path {
         return Err("The selected folder path changed unexpectedly.".into());
     }
-    if root_identity(&link_metadata)? != expected {
+    if root_identity(&crate::fs_portability::open_directory(path).map_err(|e| e.to_string())?)?
+        != expected
+    {
         return Err("The selected folder was replaced. Select it again and retry.".into());
     }
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn create_directory_at(directory: &File, name: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -376,10 +378,10 @@ fn canonical_root(root: &str) -> Result<(PathBuf, RootIdentity), AppError> {
 }
 
 fn selected_root_identity(root: &Path) -> Result<RootIdentity, AppError> {
-    let metadata = fs::symlink_metadata(root).map_err(|_| AppError::Watch {
+    let directory = crate::fs_portability::open_directory(root).map_err(|_| AppError::Watch {
         message: "The selected folder is no longer available.".into(),
     })?;
-    let identity = root_identity(&metadata).map_err(|message| AppError::Watch { message })?;
+    let identity = root_identity(&directory).map_err(|message| AppError::Watch { message })?;
     verify_root_path(root, identity).map_err(|message| AppError::Watch { message })?;
     Ok(identity)
 }
@@ -423,14 +425,9 @@ impl FolderWatchState {
         }
 
         verify_root_path(&selected.path, selected.identity)?;
-        let directory = File::open(&selected.path)
+        let directory = crate::fs_portability::open_directory(&selected.path)
             .map_err(|_| "The selected folder is no longer available.".to_string())?;
-        if root_identity(
-            &directory
-                .metadata()
-                .map_err(|_| "The selected folder is no longer available.".to_string())?,
-        )? != selected.identity
-        {
+        if root_identity(&directory)? != selected.identity {
             return Err("The selected folder was replaced. Select it again and retry.".into());
         }
         let root = SelectedRootHandle {
@@ -733,6 +730,7 @@ mod tests {
         assert_eq!(state.selected_root(), Some(second));
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn extraction_publishing_notifies_the_selected_root() {
         use std::io::Write;

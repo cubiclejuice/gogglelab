@@ -1,23 +1,22 @@
 import { OcctKernel } from "occt-wasm";
-import wasmUrl from "occt-wasm/dist/occt-wasm.wasm?url";
 import { convertStepMesh, type StepPreview } from "./step-mesh";
 
 type StepWorkerScope = {
   postMessage(message: StepPreview | { error: string }, transfer?: Transferable[]): void;
-  onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null;
+  onmessage: ((event: MessageEvent<{ step: ArrayBuffer; wasm: ArrayBuffer }>) => void) | null;
 };
 
 const scope = self as unknown as StepWorkerScope;
 
-scope.onmessage = async ({ data: bytes }) => {
+scope.onmessage = async ({ data: { step: bytes, wasm } }) => {
   try {
     const digestBytes = await crypto.subtle.digest("SHA-256", bytes);
     const digest = Array.from(new Uint8Array(digestBytes), (byte) =>
       byte.toString(16).padStart(2, "0"),
     ).join("");
-    const kernel = await OcctKernel.init({ wasm: wasmUrl }).catch(() => {
+    const kernel = await OcctKernel.init({ wasm }).catch(() => {
       throw new Error(
-        "The STEP engine could not start. STEP preview requires WebKit compatible with Safari 17.2 or later; check your macOS update and app installation.",
+        "The STEP engine could not start. Update the system WebView/runtime and check your CAD-engine installation. STEP requires WebAssembly SIMD, tail calls and exceptions.",
       );
     });
     const shape = kernel.importStep(bytes);

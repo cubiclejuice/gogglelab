@@ -19,8 +19,8 @@
     "dev": "cd src-tauri && ../node_modules/.bin/tauri dev --config tauri.dev.conf.json",
     "dev:web": "vite",
     "dev:free": "bun run dev",
-    "build": "bun run tauri:build && bash scripts/patch-info-plist.sh target/release/bundle/macos/GoggleLab.app",
-    "build:web": "bun run typecheck && vite build",
+    "build": "bun scripts/build-app.mjs",
+    "build:web": "bun run typecheck && bun scripts/prepare-resources.mjs && vite build",
     "check": "bun run check:frontend && bun run build:web && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked",
     "check:core": "bun run check",
     "check:frontend": "bun run fmt:check && bun run lint && bun run typecheck && bun run test:core",
@@ -31,7 +31,8 @@
     "tauri:build": "cd src-tauri && ../node_modules/.bin/tauri build",
     "status": "bash scripts/status.sh",
     "typecheck": "tsc --noEmit",
-    "test": "bun run test:core"
+    "test": "bun run test:core",
+    "build:release": "bun scripts/build-app.mjs --release"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

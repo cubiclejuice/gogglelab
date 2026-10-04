@@ -68,6 +68,10 @@
         "role": "Viewer",
         "rank": "Alternate"
       }
-    ]
+    ],
+    "resources": {
+      "../resources/cad/": "cad/",
+      "../resources/licenses/": "licenses/"
+    }
   }
 }

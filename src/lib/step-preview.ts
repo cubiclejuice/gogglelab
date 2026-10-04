@@ -1,9 +1,12 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { StepPreview } from "./step-mesh";
 
 const STEP_TIMEOUT_MS = 60_000;
 
 /** Run the CAD kernel off the UI thread and stop abandoned/long-running loads. */
-export function previewStep(bytes: ArrayBuffer, signal: AbortSignal): Promise<StepPreview> {
+export async function previewStep(bytes: ArrayBuffer, signal: AbortSignal): Promise<StepPreview> {
+  const wasm = await invoke<ArrayBuffer>("read_cad_engine");
+  if (signal.aborted) throw new DOMException("STEP load canceled", "AbortError");
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./step-worker.ts", import.meta.url), { type: "module" });
     let settled = false;
@@ -31,6 +34,6 @@ export function previewStep(bytes: ArrayBuffer, signal: AbortSignal): Promise<St
       if (cleanup()) reject(new Error("The STEP preview worker could not start."));
     };
     if (signal.aborted) onAbort();
-    else worker.postMessage(bytes, [bytes]);
+    else worker.postMessage({ step: bytes, wasm }, [bytes, wasm]);
   });
 }

@@ -1,6 +1,6 @@
 # GoggleLab Community
 
-A macOS desktop viewer for checking 3D models before printing. Built with Tauri, Rust, TypeScript and Three.js.
+A desktop viewer for checking 3D models before printing. Built with Tauri, Rust, TypeScript and Three.js.
 
 ## Community features
 
@@ -17,7 +17,8 @@ Custom preview colors are not exported into models. STEP/F3D previews do not add
 
 ## Build and develop
 
-Requires macOS 13+, stable Rust, Bun 1.3.14 and Xcode Command Line Tools.
+Requires stable Rust, Bun 1.3.14, Python 3, and platform prerequisites.
+macOS builds need Xcode Command Line Tools; Windows needs MSVC and WebView2; Linux needs WebKitGTK 4.1 development libraries.
 STEP preview requires a WebKit version supporting the bundled CAD engine (Safari 17.2+).
 
 ```sh
@@ -44,7 +45,8 @@ key custody and approved binary releases are managed separately.
 
 ## Limitations
 
-macOS only; no mesh repair, slicing, supports, CAD editing, OBJ or G-code rendering.
+See [preview release notes](docs/RELEASE-NOTES.md) for installers, platform limitations and CAD replacement.
+No mesh repair, slicing, supports, CAD editing, OBJ or G-code rendering.
 CAD previews preserve the original source and derive measurements from tessellated geometry.
 The Fusion bridge requires an installed, running Autodesk Fusion with its local add-in enabled.
 ZIP extraction rejects unsafe paths, encrypted/unsupported entries and collisions.

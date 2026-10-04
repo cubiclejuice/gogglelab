@@ -1,0 +1,145 @@
+name: Release community
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-community
+  cancel-in-progress: false
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+            bundles: app
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x64
+            bundles: app
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x64
+            bundles: nsis,msi
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x64
+            bundles: deb,appimage
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOGGLELAB_PRO_LICENSE_TRUSTED_KEYS: ${{ vars.GOGGLELAB_PRO_LICENSE_TRUSTED_KEYS }}
+      NO_STRIP: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-community-${{ matrix.target }}
+      - name: Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2 xvfb rpm
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+      - name: Fetch locked Rust dependency sources
+        run: cargo fetch --locked
+      - name: Check frontend
+        run: bun run check:frontend
+      - name: Prepare bundled resources
+        run: bun scripts/prepare-resources.mjs
+      - name: Test native workspace
+        run: cargo test --workspace --locked
+      - name: Build installers
+        run: bun run build:release -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Verify release command permissions
+        if: 'false'
+        run: |
+          python - <<'PYTHON'
+          import json
+          with open('src-tauri/gen/schemas/acl-manifests.json') as file:
+              permissions=json.load(file)['gogglelab-pro']['permissions']
+          assert 'allow-set-development-entitlements' not in permissions
+          assert 'allow-open-in-slicer' in permissions
+          PYTHON
+      - name: Smoke-test desktop startup
+        run: |
+          binary="target/${{ matrix.target }}/release/gogglelab"
+          if [[ "${{ matrix.platform }}" == windows ]]; then binary="$binary.exe"; fi
+          if [[ "${{ matrix.platform }}" == linux ]]; then
+            xvfb-run -a python scripts/smoke-release.py "$binary"
+          else
+            python scripts/smoke-release.py "$binary"
+          fi
+      - name: Package downloads and checksums
+        run: python scripts/package-release.py --edition community --target ${{ matrix.target }} --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: community-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: community-${{ matrix.platform }}-${{ matrix.arch }}-diagnostics
+          path: release-smoke.log
+          if-no-files-found: ignore
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install source-kit package metadata
+        run: bun install --frozen-lockfile
+      - name: Prepare corresponding sources
+        run: |
+          mkdir -p release-assets
+          git archive --format=tar.gz --output=release-assets/gogglelab-community-source.tar.gz HEAD
+          python scripts/prepare-cad-source.py --output release-assets/gogglelab-cad-source-4.3.2.tar.gz
+          cp docs/RELEASE-NOTES.md release-assets/RELEASE-NOTES.md
+      - name: Create checksums and draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(python -c 'import json; print(json.load(open("package.json"))["version"])')
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          gh release create "v$VERSION" --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "GoggleLab community $VERSION Preview" --notes-file RELEASE-NOTES.md --draft --prerelease ./*

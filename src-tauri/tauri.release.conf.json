@@ -1,0 +1,9 @@
+{
+  "productName": "GoggleLab Community",
+  "identifier": "com.cubiclejuice.gogglelab.community",
+  "bundle": {
+    "targets": "all",
+    "shortDescription": "3D model viewing and print inspection",
+    "category": "GraphicsAndDesign"
+  }
+}

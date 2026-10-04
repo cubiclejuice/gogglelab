@@ -39,6 +39,13 @@ fn valid_request_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+fn ensure_supported_platform() -> Result<(), AppError> {
+    if cfg!(target_os = "macos") {
+        Ok(())
+    } else {
+        Err(fusion_error("F3D conversion through Autodesk Fusion is available only on macOS. Export STEP from Fusion to view this model on Windows or Linux.", false))
+    }
+}
 fn home() -> Result<PathBuf, AppError> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -182,6 +189,7 @@ fn write_owned_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
 
 #[tauri::command]
 pub fn install_fusion_bridge() -> Result<(), AppError> {
+    ensure_supported_platform()?;
     let home = home()?;
     let app = fusion_app(&home).ok_or_else(|| {
         fusion_error(
@@ -419,6 +427,7 @@ pub async fn read_fusion_file(
     request_id: String,
     state: State<'_, FusionBridgeState>,
 ) -> Result<Response, AppError> {
+    ensure_supported_platform()?;
     if !valid_request_id(&request_id) {
         return Err(fusion_error("Invalid Fusion preview request.", false));
     }

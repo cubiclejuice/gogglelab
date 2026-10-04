@@ -29,3 +29,12 @@ output/
 __pycache__/
 *.pyc
 bench/*.stl
+
+resources/cad/
+resources/licenses/generated/
+release-assets/
+
+target-*/
+release-smoke.log
+
+!docs/RELEASE-NOTES.md

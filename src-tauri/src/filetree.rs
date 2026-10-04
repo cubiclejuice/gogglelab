@@ -453,15 +453,61 @@ fn rename_without_replacing(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn rename_without_replacing(
-    _selected: &crate::folder_watch::SelectedRootHandle,
-    _source: &Path,
-    _destination: &Path,
+    selected: &crate::folder_watch::SelectedRootHandle,
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    selected.verify_current().map_err(std::io::Error::other)?;
+    let root = selected.path();
+    if source.parent() != Some(root) || destination.parent() != Some(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Moving items into or out of nested folders is not yet supported on Linux",
+        ));
+    }
+    let source = source.strip_prefix(root).map_err(std::io::Error::other)?;
+    let destination = destination
+        .strip_prefix(root)
+        .map_err(std::io::Error::other)?;
+    let from = crate::fs_portability::linux_parent(selected.directory(), source.parent().unwrap())?;
+    let to =
+        crate::fs_portability::linux_parent(selected.directory(), destination.parent().unwrap())?;
+    selected.verify_current().map_err(std::io::Error::other)?;
+    crate::fs_portability::linux_rename_at(
+        &from,
+        Path::new(source.file_name().unwrap()),
+        &to,
+        Path::new(destination.file_name().unwrap()),
+    )
+}
+
+#[cfg(windows)]
+fn rename_without_replacing(
+    selected: &crate::folder_watch::SelectedRootHandle,
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    selected.verify_current().map_err(std::io::Error::other)?;
+    // Holding each ancestor without FILE_SHARE_DELETE prevents substitution.
+    let _source_ancestors =
+        crate::fs_portability::lock_ancestors(selected.path(), source.parent().unwrap())?;
+    let _destination_ancestors =
+        crate::fs_portability::lock_ancestors(selected.path(), destination.parent().unwrap())?;
+    selected.verify_current().map_err(std::io::Error::other)?;
+    crate::fs_portability::rename_no_replace(source, destination)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn rename_without_replacing(
+    _: &crate::folder_watch::SelectedRootHandle,
+    _: &Path,
+    _: &Path,
 ) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "moving files and folders is only supported by the macOS app",
+        "Secure moves are unavailable on this platform",
     ))
 }
 
@@ -582,6 +628,7 @@ mod tests {
             .contains("outside"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn move_rejects_symlink_source_and_destination() {
         let root = tmp("move-symlinks");
@@ -601,7 +648,7 @@ mod tests {
             .contains("Symbolic links"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn moves_unicode_file_and_folder_without_overwriting() {
         let root = tmp("move-success");
@@ -623,6 +670,21 @@ mod tests {
             std::fs::read(destination.join("folder/model.stl")).unwrap(),
             b"nested"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_nested_moves_fail_closed_without_mutation() {
+        let root = tmp("linux-nested-move");
+        let destination = root.join("destination");
+        let source = root.join("part.stl");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(&source, b"original").unwrap();
+
+        let error = move_for_test(&root, &source, &destination).unwrap_err();
+        assert!(error.contains("not yet supported on Linux"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert!(!destination.join("part.stl").exists());
     }
 
     #[test]
@@ -686,6 +748,7 @@ mod tests {
         std::fs::write(root.join("bracket-source.zip"), b"").unwrap();
         std::fs::write(root.join("cup.stl"), b"").unwrap();
         std::fs::write(outside.join("bracket-escaped.stl"), b"").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
 
         let r = search_dir(root.to_string_lossy().into(), "BRACKET".into()).unwrap();
@@ -734,10 +797,12 @@ mod tests {
         assert!(matches!(r, Err(AppError::OutsideRoot)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_out_of_root_cannot_escape() {
         let root = tmp("symroot");
         let outside = tmp("symout");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let r = list_dir(
             root.to_string_lossy().into(),

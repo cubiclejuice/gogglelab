@@ -1,9 +1,11 @@
 mod archive;
+mod cad_engine;
 mod commands;
 mod error;
 pub mod extension_api;
 mod filetree;
 mod folder_watch;
+mod fs_portability;
 mod fusion_preview;
 mod geometry_buffer;
 mod opened_urls;
@@ -39,6 +41,7 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
         .manage(OpenedUrls::default())
         .manage(settings::SettingsState::default())
         .invoke_handler(tauri::generate_handler![
+            cad_engine::read_cad_engine,
             commands::open_model,
             commands::model_geometry,
             step_preview::read_step_file,

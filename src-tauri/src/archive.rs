@@ -129,28 +129,35 @@ fn extract_zip_with_limits(
     let mut archive = ZipArchive::new(file).map_err(map_zip_open_error)?;
     let plans = preflight(&mut archive, limits)?;
 
-    let parent = source
-        .parent()
-        .ok_or_else(|| archive_error("The ZIP has no writable parent folder."))?;
-    let stem = source
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .ok_or_else(|| archive_error("The ZIP filename has no usable name."))?;
+    #[cfg(target_os = "linux")]
+    return Err(archive_error(
+        "ZIP extraction is not yet supported on Linux because it cannot safely publish files while the selected folder may move.",
+    ));
 
-    let staging_path = create_staging(parent)?;
-    let mut staging = StagingGuard {
-        path: staging_path.clone(),
-        active: true,
-    };
-    let files = extract_plans(&mut archive, &plans, &staging_path, limits)?;
-    let destination = publish_staging(parent, stem, &staging_path)?;
-    staging.active = false;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let parent = source
+            .parent()
+            .ok_or_else(|| archive_error("The ZIP has no writable parent folder."))?;
+        let stem = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .ok_or_else(|| archive_error("The ZIP filename has no usable name."))?;
+        let staging_path = create_staging(parent)?;
+        let mut staging = StagingGuard {
+            path: staging_path.clone(),
+            active: true,
+        };
+        let files = extract_plans(&mut archive, &plans, &staging_path, limits)?;
+        let destination = publish_staging(parent, stem, &staging_path)?;
+        staging.active = false;
 
-    Ok(ExtractResult {
-        destination: destination.to_string_lossy().into_owned(),
-        files,
-    })
+        Ok(ExtractResult {
+            destination: destination.to_string_lossy().into_owned(),
+            files,
+        })
+    }
 }
 
 fn canonical_directory(path: &str) -> Result<PathBuf, AppError> {
@@ -534,12 +541,31 @@ fn rename_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn rename_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
-    // Windows rename fails when the destination exists. On other Unix targets,
-    // the preceding sibling scan avoids normal collisions; protecting against
-    // a hostile concurrent ancestor mutation requires descriptor-relative APIs.
-    fs::rename(from, to)
+    let parent = crate::fs_portability::open_directory(
+        from.parent()
+            .ok_or_else(|| io::Error::other("Missing staging parent"))?,
+    )?;
+    crate::fs_portability::linux_rename_at(
+        &parent,
+        Path::new(from.file_name().unwrap()),
+        &parent,
+        Path::new(to.file_name().unwrap()),
+    )
+}
+
+#[cfg(windows)]
+fn rename_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
+    crate::fs_portability::rename_no_replace(from, to)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn rename_without_replacing(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Secure extraction unavailable on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -601,6 +627,7 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn extracts_nested_files_into_a_fresh_sibling_and_keeps_the_zip() {
         let root = TestDir::new("nested");
@@ -635,6 +662,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn existing_destination_is_untouched_and_numbered_destination_is_used() {
         let root = TestDir::new("destination-collision");
@@ -651,6 +679,53 @@ mod tests {
             fs::read(root.0.join("Models (2)/part.stl")).unwrap(),
             b"new"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_extraction_fails_closed_without_publishing() {
+        let root = TestDir::new("linux-extraction-disabled");
+        let archive = root.0.join("Models.zip");
+        write_zip(&archive, &[("part.stl", b"new")]);
+
+        let message = archive_error_message(extract_zip_core(
+            root.0.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ));
+        assert!(message.contains("not yet supported on Linux"));
+        assert!(archive.exists());
+        assert!(!root.0.join("Models").exists());
+        assert!(!fs::read_dir(&root.0).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".gogglelab-extract-")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_replaced_root_cannot_redirect_extraction() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("linux-replaced-root");
+        let archive = root.0.join("Models.zip");
+        write_zip(&archive, &[("part.stl", b"new")]);
+        let retired = root.0.with_extension("retired");
+        let replacement = root.0.with_extension("replacement");
+        fs::rename(&root.0, &retired).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        symlink(&replacement, &root.0).unwrap();
+
+        let result = extract_zip_core(
+            root.0.to_str().unwrap(),
+            retired.join("Models.zip").to_str().unwrap(),
+        );
+        assert!(result.is_err());
+        assert!(!retired.join("Models").exists());
+        assert!(!replacement.join("Models").exists());
+
+        fs::remove_file(&root.0).unwrap();
+        fs::rename(&retired, &root.0).unwrap();
+        let _ = fs::remove_dir_all(&replacement);
     }
 
     #[test]

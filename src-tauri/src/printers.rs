@@ -32,17 +32,14 @@ pub fn detect_printers() -> Vec<DetectedPrinter> {
         .into_iter()
         .map(|s| s.bundle_id)
         .collect();
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return vec![];
-    };
     let mut out = Vec::new();
     for definition in slicers::slicer_definitions() {
         if !installed.contains(definition.bundle_id) {
             continue;
         }
-        let support = home
-            .join("Library/Application Support")
-            .join(definition.support_dir);
+        let Some(support) = slicers::slicer_support_directory(definition) else {
+            continue;
+        };
         if let Some(r) = detect_in(&support, definition.config_name) {
             out.push(DetectedPrinter {
                 id: format!("{}:{}", definition.bundle_id, r.preset),
