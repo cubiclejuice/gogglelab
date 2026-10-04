@@ -30,7 +30,12 @@ sha2 = "0.10"
 stl-core = { path = "../crates/stl-core" }
 library-recovery = { path = "../crates/library-recovery" }
 notify = "8.2.0"
-trash = { version = "5.2.9", default-features = false }
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(not(windows))'.dependencies]
+trash = { version = "5.2.9", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
