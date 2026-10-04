@@ -76,6 +76,7 @@ def npm_components() -> list[Component]:
         # architecture-independent package from the same project and version.
         binary_license_packages = {
             "@esbuild/": "esbuild",
+            "@napi-rs/lzma-": "@napi-rs/lzma",
             "@oxlint/binding-": "oxlint",
             "@oxfmt/binding-": "oxfmt",
             "@rollup/rollup-": "rollup",
@@ -84,11 +85,21 @@ def npm_components() -> list[Component]:
         for prefix, canonical_name in binary_license_packages.items():
             if name.startswith(prefix) and not files:
                 candidates = package_roots.get((canonical_name, version), [])
-                if not candidates:
+                # @napi-rs/lzma 1.5.1 and its native packages all declare MIT,
+                # but the canonical and platform npm tarballs omit the text.
+                # Keep this fallback exact-versioned so a future release with
+                # different terms fails closed instead of inheriting stale text.
+                exact_text_fallbacks = {
+                    ("@napi-rs/lzma", "1.5.1", "MIT"): (TRACKED_LICENSES / "MIT.txt",),
+                }
+                if candidates:
+                    files = package_license_files(sorted(candidates, key=str)[0])
+                if not files:
+                    files = exact_text_fallbacks.get((canonical_name, version, license_expression), ())
+                if not files:
                     raise RuntimeError(
-                        f"npm binary package {name}@{version} has no exact installed canonical package {canonical_name}@{version}"
+                        f"npm binary package {name}@{version} has no license text from exact canonical package {canonical_name}@{version}"
                     )
-                files = package_license_files(sorted(candidates, key=str)[0])
                 break
         if name == "occt-wasm":
             files = (
@@ -197,7 +208,7 @@ def main() -> int:
     lines = [
         "# GoggleLab third-party notices",
         "",
-        "This distribution includes the components below. Each component retains its own license.",
+        "This release was built using the dependencies below. Some are build tools or platform-specific; each distributed component retains its own license.",
         "The referenced files under `texts/` contain the complete license and notice text found in",
         "the exact installed package used to build this release.",
         "",
