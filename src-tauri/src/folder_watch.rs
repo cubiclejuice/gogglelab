@@ -647,7 +647,8 @@ mod tests {
     #[test]
     fn canonical_root_normalizes_paths_and_rejects_files() {
         let root = temp("canonical");
-        let normalized = canonical_root(&format!("{}/.", root.display())).unwrap();
+        let dotted = root.join(".");
+        let normalized = canonical_root(&dotted.to_string_lossy()).unwrap();
         assert_eq!(normalized.0, root);
         let file = root.join("file.stl");
         fs::write(&file, b"mesh").unwrap();
