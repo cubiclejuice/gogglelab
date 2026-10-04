@@ -1,6 +1,11 @@
 name: Release community
 on:
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Windows diagnostic build only; never publishes a release
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -12,27 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            platform: macos
-            arch: arm64
-            bundles: app
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            platform: macos
-            arch: x64
-            bundles: app
-          - runner: windows-2022
-            target: x86_64-pc-windows-msvc
-            platform: windows
-            arch: x64
-            bundles: nsis,msi
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            platform: linux
-            arch: x64
-            bundles: deb,appimage
+        include: ${{ fromJSON(inputs.windows_only && '[{"runner":"windows-2022","target":"x86_64-pc-windows-msvc","platform":"windows","arch":"x64","bundles":"nsis,msi"}]' || '[{"runner":"macos-15","target":"aarch64-apple-darwin","platform":"macos","arch":"arm64","bundles":"app"},{"runner":"macos-15-intel","target":"x86_64-apple-darwin","platform":"macos","arch":"x64","bundles":"app"},{"runner":"windows-2022","target":"x86_64-pc-windows-msvc","platform":"windows","arch":"x64","bundles":"nsis,msi"},{"runner":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","platform":"linux","arch":"x64","bundles":"deb,appimage"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
@@ -113,6 +98,7 @@ jobs:
           path: release-smoke.log
           if-no-files-found: ignore
   release:
+    if: ${{ !inputs.windows_only }}
     needs: build
     runs-on: ubuntu-22.04
     permissions:
