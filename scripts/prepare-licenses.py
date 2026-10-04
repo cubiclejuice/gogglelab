@@ -120,6 +120,7 @@ def cargo_components() -> list[Component]:
         ["cargo", "metadata", "--locked", "--format-version", "1"],
         cwd=PROJECT,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         check=True,
     )
