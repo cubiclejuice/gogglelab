@@ -59,7 +59,7 @@ jobs:
       - name: Prepare bundled resources
         run: bun scripts/prepare-resources.mjs
       - name: Test native workspace
-        run: cargo test --workspace --locked
+        run: python scripts/test-native.py
       - name: Diagnose Windows loader failures
         if: failure() && matrix.platform == 'windows'
         run: python scripts/diagnose-windows.py
