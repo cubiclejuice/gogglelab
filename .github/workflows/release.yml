@@ -75,6 +75,9 @@ jobs:
         run: bun scripts/prepare-resources.mjs
       - name: Test native workspace
         run: cargo test --workspace --locked
+      - name: Diagnose Windows loader failures
+        if: failure() && matrix.platform == 'windows'
+        run: python scripts/diagnose-windows.py
       - name: Build installers
         run: bun run build:release -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
       - name: Verify release command permissions
