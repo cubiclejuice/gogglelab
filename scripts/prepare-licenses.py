@@ -41,34 +41,54 @@ def npm_components() -> list[Component]:
     modules = PROJECT / "node_modules"
     if not modules.is_dir():
         raise RuntimeError("node_modules is missing; run bun install --frozen-lockfile first")
-    found: list[Component] = []
+    manifests: list[tuple[Path, dict]] = []
     for manifest in modules.rglob("package.json"):
         relative = manifest.relative_to(modules)
         tail = relative.parts[relative.parts.index("node_modules") + 1 :] if "node_modules" in relative.parts else relative.parts
         if not (len(tail) == 2 or (len(tail) == 3 and tail[0].startswith("@"))):
             continue
         data = json.loads(manifest.read_text(encoding="utf-8"))
+        manifests.append((manifest, data))
+
+    package_roots: dict[tuple[str, str], list[Path]] = {}
+    for manifest, data in manifests:
+        name, version = data.get("name"), data.get("version")
+        if isinstance(name, str) and isinstance(version, str):
+            package_roots.setdefault((name, version), []).append(manifest.parent)
+
+    found: list[Component] = []
+    emitted: set[tuple[str, str]] = set()
+    for manifest, data in manifests:
         name = data.get("name")
         version = data.get("version")
         license_expression = data.get("license")
         if not all(isinstance(value, str) and value for value in (name, version, license_expression)):
             raise RuntimeError(f"incomplete npm license metadata: {manifest}")
+        identity = (name, version)
+        if identity in emitted:
+            continue
+        emitted.add(identity)
         repository = data.get("repository", "")
         if isinstance(repository, dict):
             repository = repository.get("url", "")
         files = package_license_files(manifest.parent)
         # Platform-specific binary packages omit texts that are shipped in their
         # architecture-independent package from the same project and version.
-        binary_license_roots = {
-            "@esbuild/": modules / "esbuild",
-            "@oxlint/binding-": modules / "oxlint",
-            "@oxfmt/binding-": modules / "oxfmt",
-            "@rollup/rollup-": modules / "rollup",
-            "@tauri-apps/cli-": modules / "@tauri-apps" / "cli",
+        binary_license_packages = {
+            "@esbuild/": "esbuild",
+            "@oxlint/binding-": "oxlint",
+            "@oxfmt/binding-": "oxfmt",
+            "@rollup/rollup-": "rollup",
+            "@tauri-apps/cli-": "@tauri-apps/cli",
         }
-        for prefix, license_root in binary_license_roots.items():
+        for prefix, canonical_name in binary_license_packages.items():
             if name.startswith(prefix) and not files:
-                files = package_license_files(license_root)
+                candidates = package_roots.get((canonical_name, version), [])
+                if not candidates:
+                    raise RuntimeError(
+                        f"npm binary package {name}@{version} has no exact installed canonical package {canonical_name}@{version}"
+                    )
+                files = package_license_files(sorted(candidates, key=str)[0])
                 break
         if name == "occt-wasm":
             files = (
