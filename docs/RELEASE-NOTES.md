@@ -28,6 +28,22 @@ Apple builds are currently ad-hoc signed and not notarized. Windows installers a
 currently unsigned. A draft may be used for private verification, but these limitations
 must remain visible if the release is published as a preview.
 
+## Upgrading from the 0.1.0 Pro preview
+
+- Windows: keep the same installer family when possible: MSI to MSI or NSIS setup to NSIS
+  setup. Release-candidate checks exercise the legacy MSI upgrade identity and the legacy
+  NSIS uninstall registry identity. The old-MSI-to-new-NSIS display-name match is verified
+  against the pinned installer template, but not installed unattended because the upstream
+  migration opens the MSI uninstaller UI. Old NSIS to new MSI is not a supported migration
+  path.
+- Linux Debian package: installing the new `goggle-lab` package replaces the old
+  `goggle-lab-pro` package while retaining the `gogglelab-pro` executable name.
+- macOS ZIP: quit GoggleLab Pro, keep the existing `GoggleLab Pro.app` as a temporary backup,
+  and copy the new `GoggleLab.app` into Applications manually. Open the new app and verify
+  its Library and activation data before removing the old app. Both builds use the same
+  application identifier, so do not run them at the same time or delete application data
+  during the switch.
+
 ## Licensing
 
 Activation is offline after installation. Enter the purchase email exactly for the part
