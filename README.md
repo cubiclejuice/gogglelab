@@ -1,6 +1,11 @@
-# GoggleLab Community
+# GoggleLab public core
 
 A desktop viewer for checking 3D models before printing. Built with Tauri, Rust, TypeScript and Three.js.
+
+Download the official app from [GoggleLab releases](https://github.com/cubiclejuice/gogglelab/releases).
+The official download starts Free and unlocks Pro offline with a purchase email and signed
+license key. It is assembled privately with this public core; builds from this repository
+contain the Community features listed below. Private Pro source stays in its separate repository.
 
 ## Community features
 
