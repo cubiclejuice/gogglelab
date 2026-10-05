@@ -38,6 +38,9 @@ jobs:
       - name: Test local Fusion bridge
         run: python3 integrations/fusion/test_bridge.py
 
+      - name: Prepare frontend and bundled CAD/license resources
+        run: bun run build:web
+
       - name: Test public Rust workspace
         run: cargo test --workspace --locked
 
