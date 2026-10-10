@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-10
-Status: approved product direction and informed MPL-2.0 source transfer; phase 1 implementation in progress.
+Status: phase 1 implemented and locally validated; native screenshot verification unavailable. Full parity phases 2–6 remain planned.
 
 ## Decision
 
@@ -118,14 +118,26 @@ The user explicitly approved moving the existing private library and slicer-hand
 - Informed source transfer approved; resumed implementation on codex/free-library-handoff in both repositories.
 - Skill repository updates skipped: both installed skill source repositories contain unrelated local modifications; preserving them and using the already-read installed instructions.
 
-## Phase 1 validation (in progress)
+## Phase 1 validation
 
 - Public native workspace tests and clippy passed; existing unrelated compiler/clippy warnings remain.
 - Public frontend formatting/lint/typecheck and 51 tests passed; production web build passed.
-- Pro frontend checks and 43 tests passed; final checks against the updated core pin remain required.
+- Pro frontend checks and 44 tests passed against the updated core pin; final production web build passed.
 - Focused native handoff tests (6) and generation/extension tests (5) passed using injected launch closures.
 - Real schema-v1 STL blob/revision/folder/tag fixture and license-free reopen tests passed with identity, bytes and schema retained.
 - Browser Library fixture passed import callback, metadata search, folder filtering, model-open callback and restored focus; at 480px viewport the dialog is 448px wide without horizontal overflow.
 - Independent backend/wiring review found no blocking issue. Review-driven fixes cover symlink escapes, stale import status and cyclic legacy folder rendering.
 - Existing missing/empty database initialization and orphan-blob crash cleanup remain follow-ups for phase 4; no new migration behavior was introduced.
-- Local standalone packaging, unified-app pin/build/install and native visual verification remain in progress. No external release is authorized.
+- Standalone Community and unified macOS app packaging passed. Unified app signature verified and installed at /Applications/GoggleLab.app. No external release is authorized.
+
+### Final local result
+
+- Community implementation checkpoint: 731e723. Pro consumes the public core; duplicate private Library/handoff handlers, state, implementation and permissions were removed.
+- Pro native workspace tests and clippy passed. A stale acceptance example was updated to test still-paid colorway admission. Existing compatibility claims remain parseable and legacy handoff admission is test-only.
+- Lockfiles changed only for the library workspace/dependency move; no unrelated dependency upgrade retained.
+- Full unified-app browser check with a deliberately unavailable license service passed: Unlock Pro stays visible, Library lists/imports via public commands, and Customize colors remains Pro. Synthetic native responses were used; no real user model or license data was changed by this check.
+- Previous installed bundle preserved at /Users/bradmcalister/Documents/DEV/gogglelab/output/app-backups/GoggleLab-before-free-library-20261010.app.
+- Installed unified executable SHA-256: 1adbe7fd65e75ae68c68ec4ce084e256272bc7503a466ce59fa6f6530820efa0.
+- Installed process launched successfully; a native stack sample confirmed AppKit and WebKit event-loop activity. Computer-use returned cgWindowNotFound for both GoggleLab and Finder, so native window appearance/interactions were not verified. Browser UI checks do not substitute for that native check.
+- Windows/Linux runtime verification, full parity phases 2–6, native real-slicer launch verification and publication are outstanding. Local handoff tests use injected launch closures rather than starting a user's slicer.
+- Both repositories keep local codex/free-library-handoff work; nothing pushed. Unrelated Pro payment/runner planning files preserved.
