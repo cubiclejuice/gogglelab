@@ -8,6 +8,8 @@ mod folder_watch;
 mod fs_portability;
 mod fusion_preview;
 mod geometry_buffer;
+mod handoff;
+mod library_commands;
 mod opened_urls;
 mod printers;
 mod recovery;
@@ -51,6 +53,15 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             cli_arg_path,
             opened_urls::opened_urls,
             slicers::detect_slicers,
+            handoff::open_in_slicer,
+            library_commands::library_list_folders,
+            library_commands::library_list_models,
+            library_commands::library_create_folder,
+            library_commands::library_rename_folder,
+            library_commands::library_move_folder,
+            library_commands::library_delete_folder,
+            library_commands::library_import_file,
+            library_commands::library_open_model,
             settings::get_default_slicer,
             settings::set_default_slicer,
             settings::get_settings,
@@ -74,6 +85,8 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             trash::move_tree_file_to_trash,
         ])
         .setup(|app| {
+            let library_root = app.path().app_data_dir()?.join("library");
+            app.manage(library_commands::LibraryState::new(library_root));
             let loaded = settings::load(app.handle());
             app.set_theme(loaded.appearance_mode.native_theme());
             *app.state::<settings::SettingsState>().0.lock().unwrap() = loaded;

@@ -1,3 +1,10 @@
+# Unreleased: Free library and slicer handoff
+
+Basic managed Library import/search/browsing and original STL/3MF slicer handoff are
+Community features and work without Pro activation in the unified app. Existing official-app
+Library storage, model IDs and schema remain unchanged. Colorways and palette access remain Pro.
+This is the first [Free parity milestone](FREE-PRINTVENTORY-PARITY-PLAN.md), not full Printventory parity.
+
 # GoggleLab 0.1.1
 
 GoggleLab now ships through one public download channel. The official app is built from the

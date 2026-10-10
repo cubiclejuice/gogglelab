@@ -1,49 +1,23 @@
 import { expect, test } from "bun:test";
 import { isLibraryRequestCurrent } from "./library-load-guard";
 
-const request = { generation: 12, entitlementRevision: 4 };
+const request = { generation: 12 };
 
-test("a Library response is current only while its viewer and license revisions still match", () => {
+test("a Library response is current only while its request and viewer generations match", () => {
   expect(
     isLibraryRequestCurrent(request, request, {
       generation: 12,
-      entitlementRevision: 4,
-      entitled: true,
     }),
   ).toBe(true);
   expect(
     isLibraryRequestCurrent(request, null, {
       generation: 12,
-      entitlementRevision: 4,
-      entitled: true,
     }),
   ).toBe(false);
-  expect(
-    isLibraryRequestCurrent(
-      request,
-      { generation: 13, entitlementRevision: 4 },
-      { generation: 13, entitlementRevision: 4, entitled: true },
-    ),
-  ).toBe(false);
+  expect(isLibraryRequestCurrent(request, { generation: 13 }, { generation: 13 })).toBe(false);
   expect(
     isLibraryRequestCurrent(request, request, {
       generation: 13,
-      entitlementRevision: 4,
-      entitled: true,
-    }),
-  ).toBe(false);
-  expect(
-    isLibraryRequestCurrent(request, request, {
-      generation: 12,
-      entitlementRevision: 6,
-      entitled: true,
-    }),
-  ).toBe(false);
-  expect(
-    isLibraryRequestCurrent(request, request, {
-      generation: 12,
-      entitlementRevision: 4,
-      entitled: false,
     }),
   ).toBe(false);
 });

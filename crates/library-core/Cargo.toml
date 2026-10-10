@@ -1,0 +1,13 @@
+[package]
+license = "MPL-2.0"
+name = "library-core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+stl-core = { path = "../stl-core" }
+thiserror = "2"
+uuid = { version = "1.26", features = ["v4"] }

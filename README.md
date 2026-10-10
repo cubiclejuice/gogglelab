@@ -13,12 +13,15 @@ contain the Community features listed below. Private Pro source stays in its sep
 - STEP/STP tessellated previews; F3D viewing through the optional local Autodesk Fusion bridge.
 - Multi-plate selection and overview, embedded/authored 3MF colors, and appearance controls.
 - Folder browsing, search, watching, ZIP extraction, drag/drop moves and confirmed Trash actions.
-- Installed slicer discovery and printer-profile detection for inspection.
+- Installed slicer discovery, printer-profile detection, and handoff of the loaded original STL/3MF.
+- Managed Library import, folder catalog, search and model opening without a license.
 - Read-only recovery of existing Library data and raw saved colorway records.
 
-Community does not contain managed Library, editable/saved colorway or slicer-launch implementations.
+Community owns managed Library and basic slicer handoff. Editable/saved colorways and slicer palette access remain Pro.
 The official app composes this core with private Pro source and unlocks paid functionality through signed entitlements.
 Custom preview colors are not exported into models. STEP/F3D previews do not add slicer handoff.
+
+See the [Free parity plan](docs/FREE-PRINTVENTORY-PARITY-PLAN.md) for the remaining Printventory capabilities; this first migration does not claim full parity.
 
 ## Build and develop
 

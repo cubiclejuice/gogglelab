@@ -1,4 +1,4 @@
-export type HandoffAvailability = "hidden" | "locked" | "ready";
+export type HandoffAvailability = "hidden" | "ready";
 
 import { isCadPreview } from "./cad-format";
 
@@ -7,7 +7,6 @@ export interface HandoffAvailabilityInput {
   hasSlicer: boolean;
   hasModel: boolean;
   format: "binary" | "ascii" | "3mf" | "step" | "f3d" | null;
-  entitled: boolean;
 }
 
 export function handoffAvailability(input: HandoffAvailabilityInput): HandoffAvailability {
@@ -20,5 +19,5 @@ export function handoffAvailability(input: HandoffAvailabilityInput): HandoffAva
   ) {
     return "hidden";
   }
-  return input.entitled ? "ready" : "locked";
+  return "ready";
 }

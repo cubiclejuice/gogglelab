@@ -371,6 +371,10 @@ export function setDefaultSlicer(slicerId: string): Promise<void> {
   return invoke("set_default_slicer", { slicerId });
 }
 
+export function openInSlicer(generation: number, slicerId: string): Promise<void> {
+  return invoke("open_in_slicer", { generation, slicerId });
+}
+
 export function openModel(path: string, generation: number): Promise<ModelSummary> {
   return invoke("open_model", { path, generation });
 }
@@ -441,6 +445,32 @@ export interface LibraryModel {
   created_at: string;
   updated_at: string;
   tags: string[];
+}
+
+export function libraryListFolders(): Promise<LibraryFolder[]> {
+  return invoke("library_list_folders");
+}
+
+export function libraryListModels(query?: string): Promise<LibraryModel[]> {
+  return invoke("library_list_models", {
+    folderId: null,
+    query: query ?? null,
+  });
+}
+
+export function libraryImportFile(
+  sourcePath: string,
+  folderId = "root",
+): Promise<{ model: LibraryModel; reused_blob: boolean }> {
+  return invoke("library_import_file", {
+    sourcePath,
+    folderId,
+    displayName: null,
+  });
+}
+
+export function libraryOpenModel(modelId: string, generation: number): Promise<ModelSummary> {
+  return invoke("library_open_model", { modelId, generation });
 }
 
 export interface RecoveryManifest {

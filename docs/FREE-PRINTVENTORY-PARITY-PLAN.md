@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-10
-Status: approved product direction; phase 1 implementation started but blocked on source-publication approval.
+Status: approved product direction and informed MPL-2.0 source transfer; phase 1 implementation in progress.
 
 ## Decision
 
@@ -56,9 +56,7 @@ Move existing implementations and wire them into the public core; preserve behav
 
 ### Source and license gate
 
-The existing private library crate manifest says LicenseRef-Proprietary. Automatic approval review rejected copying it into the public MPL-2.0 repository as a sensitive source disclosure and requires informed user approval. User must explicitly authorize making the selected library and slicer implementations public under Community's MPL-2.0 license. No push/publication is authorized by that approval alone.
-
-An untracked draft src-tauri/src/handoff.rs was created before the rejection. It is unwired, untested and uncommitted. Further transfers are stopped pending approval. No library source has moved. No installed app or live data has been changed.
+The user explicitly approved moving the existing private library and slicer-handoff source into public Community under MPL-2.0 on 2026-10-10, after disclosure of the proprietary-source boundary. Licensing and colorways remain private. This resolves the automatic approval review source-transfer gate. No push/publication is authorized by this approval alone.
 
 ### Ordered implementation
 
@@ -98,7 +96,7 @@ An untracked draft src-tauri/src/handoff.rs was created before the rejection. It
 
 | Finding | Severity | Evidence | Disposition / owner |
 | --- | --- | --- | --- |
-| Private source transfer needs informed approval | Blocking | Automatic approval review; private library crate license manifest | Await user approval; coordinator stops transfer |
+| Private source transfer needs informed approval | Resolved | Explicit informed user approval on 2026-10-10 | Selected library and handoff source authorized under MPL-2.0; no push |
 | Free cannot depend on Pro library initialization | High | Pro library commands use LicenseState::admit_feature | Phase 1 native migration; native worker/coordinator |
 | Entitlement updates could relock Free UI | High | Pro frontend supplies gated LibraryService and handoff entitlements | Phase 1 shared frontend + transition tests; frontend worker |
 | Removing a license gate must not remove launch guards | High | with_original_source generation/current-model locks and allowlisted discovery | Retain and test; handoff worker |
@@ -116,3 +114,18 @@ An untracked draft src-tauri/src/handoff.rs was created before the rejection. It
 - Existing Pro untracked payment/runner planning files preserved.
 - Source transfer blocked before integration. No code completion, test success, packaging or installation claims.
 - Skill-update/build/release steps remain unexecuted while the source gate is blocked. No checkpoint commit yet; only planning and the unwired handoff draft are present.
+
+- Informed source transfer approved; resumed implementation on codex/free-library-handoff in both repositories.
+- Skill repository updates skipped: both installed skill source repositories contain unrelated local modifications; preserving them and using the already-read installed instructions.
+
+## Phase 1 validation (in progress)
+
+- Public native workspace tests and clippy passed; existing unrelated compiler/clippy warnings remain.
+- Public frontend formatting/lint/typecheck and 51 tests passed; production web build passed.
+- Pro frontend checks and 43 tests passed; final checks against the updated core pin remain required.
+- Focused native handoff tests (6) and generation/extension tests (5) passed using injected launch closures.
+- Real schema-v1 STL blob/revision/folder/tag fixture and license-free reopen tests passed with identity, bytes and schema retained.
+- Browser Library fixture passed import callback, metadata search, folder filtering, model-open callback and restored focus; at 480px viewport the dialog is 448px wide without horizontal overflow.
+- Independent backend/wiring review found no blocking issue. Review-driven fixes cover symlink escapes, stale import status and cyclic legacy folder rendering.
+- Existing missing/empty database initialization and orphan-blob crash cleanup remain follow-ups for phase 4; no new migration behavior was introduced.
+- Local standalone packaging, unified-app pin/build/install and native visual verification remain in progress. No external release is authorized.

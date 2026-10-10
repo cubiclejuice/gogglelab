@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/stl-core", "crates/library-recovery", "src-tauri"]
+members = ["crates/stl-core", "crates/library-recovery", "crates/library-core", "src-tauri"]
 
 [workspace.package]
 edition = "2021"

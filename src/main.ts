@@ -16,6 +16,11 @@ import {
   detectSlicers,
   getDefaultSlicer,
   setDefaultSlicer,
+  openInSlicer,
+  libraryListFolders,
+  libraryListModels,
+  libraryImportFile,
+  libraryOpenModel,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -47,6 +52,9 @@ import type { AppExtensions } from "./lib/app-extensions";
 import { mountRecoveryControl } from "./lib/recovery";
 import { isLibraryRequestCurrent, type LibraryRequestToken } from "./lib/library-load-guard";
 import { handoffAvailability } from "./lib/handoff-availability";
+import { withCoreEntitlements } from "./lib/core-entitlements";
+import { LibraryPanel } from "./lib/library";
+import { LibraryOperationGuard } from "./lib/library-operation";
 import "./styles.css";
 
 export function startApp(extensions: AppExtensions): void {
@@ -74,14 +82,14 @@ export function startApp(extensions: AppExtensions): void {
     },
     { once: true },
   );
-  const libraryPanel = extensions.createLibraryPanel?.(app) ?? null;
-  const libraryService = extensions.library;
-  let activeEntitlements = extensions.currentEntitlements?.() ?? {
-    library: false,
-    colorways: false,
-    slicerHandoff: false,
-    revision: 0,
+  const libraryPanel = new LibraryPanel(app);
+  const libraryService = {
+    listFolders: libraryListFolders,
+    listModels: libraryListModels,
+    importFile: libraryImportFile,
+    openModel: libraryOpenModel,
   };
+  let activeEntitlements = withCoreEntitlements(extensions.currentEntitlements?.());
   const main = document.createElement("div");
   main.className = "main";
   app.appendChild(main);
@@ -222,7 +230,6 @@ export function startApp(extensions: AppExtensions): void {
   const plateControls = new PlateControls();
   const colorFeature = extensions.createColorFeature();
   colorFeature.setEntitlements?.(activeEntitlements);
-  libraryPanel?.setLocked?.(!activeEntitlements.library);
   let colorwayModeRevision = 0;
   viewportWrap.append(plateControls.root, plateControls.warning, colorFeature.root);
   colorFeature.onChange = () => viewport.setColorway(colorFeature.mode, colorFeature.resolveColor);
@@ -303,17 +310,15 @@ export function startApp(extensions: AppExtensions): void {
   mountRecoveryControl(app, (control) => tree.addFooterControl(control));
   extensions.mountLicenseControl?.(app, (control) => tree.addFooterControl(control));
 
-  if (libraryPanel) {
-    const libraryButton = document.createElement("button");
-    libraryButton.className = "btn";
-    libraryButton.textContent = "Library";
-    libraryButton.setAttribute("aria-label", "Open managed library");
-    libraryButton.addEventListener("click", () => {
-      libraryPanel.show(libraryButton);
-      void refreshLibrary();
-    });
-    tree.addFooterControl(libraryButton);
-  }
+  const libraryButton = document.createElement("button");
+  libraryButton.className = "btn";
+  libraryButton.textContent = "Library";
+  libraryButton.setAttribute("aria-label", "Open managed library");
+  libraryButton.addEventListener("click", () => {
+    libraryPanel.show(libraryButton);
+    void refreshLibrary();
+  });
+  tree.addFooterControl(libraryButton);
 
   function refreshSettingsPanel() {
     if (!settingsPanel.isOpen) return;
@@ -458,16 +463,12 @@ export function startApp(extensions: AppExtensions): void {
   function updateHandoffButton() {
     const active = slicers.find((s) => s.id === activeSlicerId);
     const availability = handoffAvailability({
-      hasAction: typeof extensions.requestHandoff === "function",
+      hasAction: true,
       hasSlicer: active !== undefined,
       hasModel: loadedGeneration !== null,
       format: loadedFormat,
-      entitled: activeEntitlements.slicerHandoff,
     });
-    hud.setHandoff(
-      availability === "hidden" ? null : active!.display_name,
-      availability === "locked",
-    );
+    hud.setHandoff(availability === "hidden" ? null : active!.display_name);
   }
 
   /** Window title: "bracket_v3.stl — GoggleLab" while a file is open. */
@@ -567,21 +568,16 @@ export function startApp(extensions: AppExtensions): void {
   async function handoff() {
     const active = slicers.find((s) => s.id === activeSlicerId);
     const availability = handoffAvailability({
-      hasAction: typeof extensions.requestHandoff === "function",
+      hasAction: true,
       hasSlicer: active !== undefined,
       hasModel: loadedGeneration !== null,
       format: loadedFormat,
-      entitled: activeEntitlements.slicerHandoff,
     });
     if (availability === "hidden") return;
-    if (availability === "locked") {
-      extensions.onHandoffLocked?.();
-      return;
-    }
     const generation = loadedGeneration!;
     const slicerId = activeSlicerId!;
     try {
-      await extensions.requestHandoff!(generation, slicerId);
+      await openInSlicer(generation, slicerId);
     } catch (e) {
       if (isAppError(e) && e.kind !== "Superseded") {
         setOverlay({ kind: "error", text: describeError(e) });
@@ -631,6 +627,8 @@ export function startApp(extensions: AppExtensions): void {
   let pendingLibraryLoad: LibraryRequestToken | null = null;
   let libraryRefreshSequence = 0;
   let activeLibraryRefresh: LibraryRequestToken | null = null;
+  const libraryOperations = new LibraryOperationGuard();
+  let libraryImportInFlight = false;
   let progressTimer: number | undefined;
   let stepController: AbortController | null = null;
 
@@ -644,26 +642,6 @@ export function startApp(extensions: AppExtensions): void {
       window.clearTimeout(progressTimer);
       progressTimer = undefined;
     }
-  }
-
-  function invalidatePendingLibraryLoad() {
-    const pending = pendingLibraryLoad;
-    if (!pending || pending.generation !== generation) return;
-    pendingLibraryLoad = null;
-    const gen = ++generation;
-    stepController?.abort();
-    stepController = null;
-    loadingSourcePath = null;
-    loadedSourcePath = null;
-    loadedGeneration = null;
-    loadedFormat = null;
-    plateSession.reset(gen);
-    colorFeature.reset(gen);
-    clearProgressTimer();
-    hud.hide();
-    setWindowTitle(null);
-    updateHandoffButton();
-    setOverlay({ kind: "hint", text: "Library access changed while the model was loading." });
   }
 
   function scheduleProgress(text: string, gen: number) {
@@ -821,16 +799,8 @@ export function startApp(extensions: AppExtensions): void {
   }
 
   async function loadLibraryModel(modelId: string) {
-    if (
-      !libraryPanel ||
-      !libraryService ||
-      !activeEntitlements.library ||
-      !libraryService.isEnabled()
-    )
-      return;
     const gen = ++generation;
-    const entitlementRevision = activeEntitlements.revision;
-    const request: LibraryRequestToken = { generation: gen, entitlementRevision };
+    const request: LibraryRequestToken = { generation: gen };
     pendingLibraryLoad = request;
     stepController?.abort();
     stepController = null;
@@ -848,8 +818,6 @@ export function startApp(extensions: AppExtensions): void {
       if (
         !isLibraryRequestCurrent(request, pendingLibraryLoad, {
           generation,
-          entitlementRevision: activeEntitlements.revision,
-          entitled: activeEntitlements.library && libraryService.isEnabled(),
         })
       ) {
         return;
@@ -873,21 +841,11 @@ export function startApp(extensions: AppExtensions): void {
     }
   }
 
-  async function refreshLibrary() {
-    if (!libraryPanel || !libraryService) return;
+  async function refreshLibrary(owner = libraryOperations.begin()) {
     const request: LibraryRequestToken = {
       generation: ++libraryRefreshSequence,
-      entitlementRevision: activeEntitlements.revision,
     };
     activeLibraryRefresh = request;
-    if (!activeEntitlements.library || !libraryService.isEnabled()) {
-      libraryPanel.setLocked?.(true);
-      libraryPanel.setStatus(
-        "Import a valid Pro license to use the managed Library. Your existing data stays on this device.",
-      );
-      return;
-    }
-    libraryPanel.setLocked?.(false);
     try {
       const [folders, models] = await Promise.all([
         libraryService.listFolders(),
@@ -896,122 +854,98 @@ export function startApp(extensions: AppExtensions): void {
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
           generation: libraryRefreshSequence,
-          entitlementRevision: activeEntitlements.revision,
-          entitled: activeEntitlements.library && libraryService.isEnabled(),
         })
       ) {
         return;
       }
       libraryPanel.render(folders, models);
-      libraryPanel.setStatus("Managed copies are stored locally and survive source-file changes.");
+      if (libraryOperations.isCurrent(owner)) {
+        libraryPanel.setStatus(
+          "Managed copies are stored locally and survive source-file changes.",
+        );
+      }
     } catch (e) {
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
           generation: libraryRefreshSequence,
-          entitlementRevision: activeEntitlements.revision,
-          entitled: activeEntitlements.library && libraryService.isEnabled(),
         })
       ) {
         return;
       }
-      libraryPanel.setStatus(isAppError(e) ? describeError(e) : String(e));
+      if (libraryOperations.isCurrent(owner)) {
+        libraryPanel.setStatus(isAppError(e) ? describeError(e) : String(e));
+      }
     } finally {
       if (activeLibraryRefresh === request) activeLibraryRefresh = null;
     }
   }
 
   async function importIntoLibrary() {
-    if (!libraryPanel || !libraryService || !libraryService.isEnabled()) return;
-    const entitlementRevision = activeEntitlements.revision;
-    if (!activeEntitlements.library) return;
-    const selected = await openDialog({
-      multiple: true,
-      filters: [{ name: "3D models", extensions: ["stl", "3mf"] }],
-    });
-    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-    if (
-      paths.length === 0 ||
-      entitlementRevision !== activeEntitlements.revision ||
-      !activeEntitlements.library ||
-      !libraryService.isEnabled()
-    ) {
-      return;
-    }
-    libraryPanel.setStatus(`Importing ${paths.length} model${paths.length === 1 ? "" : "s"}…`);
-    let imported = 0;
-    const failures: string[] = [];
-    for (const path of paths) {
-      if (
-        entitlementRevision !== activeEntitlements.revision ||
-        !activeEntitlements.library ||
-        !libraryService.isEnabled()
-      ) {
-        return;
+    if (libraryImportInFlight) return;
+    libraryImportInFlight = true;
+    libraryPanel.setImportBusy(true);
+    const owner = libraryOperations.begin();
+    try {
+      const selected = await openDialog({
+        multiple: true,
+        filters: [{ name: "3D models", extensions: ["stl", "3mf"] }],
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      if (paths.length === 0) return;
+      if (libraryOperations.isCurrent(owner)) {
+        libraryPanel.setStatus(`Importing ${paths.length} model${paths.length === 1 ? "" : "s"}…`);
       }
-      try {
-        await libraryService.importFile(path);
-        imported += 1;
-      } catch (e) {
-        const filename = path.split("/").pop() ?? path;
-        const detail = isAppError(e) ? describeError(e) : String(e);
-        failures.push(`${filename}: ${detail}`);
+      let imported = 0;
+      const failures: string[] = [];
+      for (const path of paths) {
+        try {
+          await libraryService.importFile(path);
+          imported += 1;
+        } catch (e) {
+          const filename = path.split("/").pop() ?? path;
+          const detail = isAppError(e) ? describeError(e) : String(e);
+          failures.push(`${filename}: ${detail}`);
+        }
       }
+      await refreshLibrary(owner);
+      if (libraryOperations.isCurrent(owner)) {
+        const summary = `${imported} imported · ${failures.length} failed`;
+        libraryPanel.setStatus(
+          failures.length ? `${summary}\n${failures.join("\n")}` : `${summary}.`,
+        );
+      }
+    } finally {
+      libraryImportInFlight = false;
+      libraryPanel.setImportBusy(false);
     }
-    await refreshLibrary();
-    if (
-      entitlementRevision !== activeEntitlements.revision ||
-      !activeEntitlements.library ||
-      !libraryService.isEnabled()
-    ) {
-      return;
-    }
-    const summary = `${imported} imported · ${failures.length} failed`;
-    libraryPanel.setStatus(failures.length ? `${summary}\n${failures.join("\n")}` : `${summary}.`);
   }
 
-  if (libraryPanel) {
-    libraryPanel.onImport = () => void importIntoLibrary();
-    libraryPanel.onOpenModel = (modelId) => {
-      libraryPanel.hide();
-      void loadLibraryModel(modelId);
-    };
-  }
+  libraryPanel.onImport = () => void importIntoLibrary();
+  libraryPanel.onOpenModel = (modelId) => {
+    libraryPanel.hide();
+    void loadLibraryModel(modelId);
+  };
 
   const unsubscribeEntitlements =
     extensions.subscribeEntitlements?.((entitlements) => {
-      const pending = pendingLibraryLoad;
-      activeEntitlements = entitlements;
+      activeEntitlements = withCoreEntitlements(entitlements);
       updateHandoffButton();
       colorwayPaletteRevision += 1;
-      colorFeature.setEntitlements?.(entitlements);
-      if (!entitlements.library) activeLibraryRefresh = null;
-      if (
-        pending &&
-        (!entitlements.library || pending.entitlementRevision !== entitlements.revision)
-      ) {
-        invalidatePendingLibraryLoad();
-      }
-      libraryPanel?.setLocked?.(!entitlements.library);
+      colorFeature.setEntitlements?.(activeEntitlements);
       if (entitlements.colorways) void refreshColorwayPalette();
-      if (entitlements.library) void refreshLibrary();
-      else if (libraryPanel) {
-        libraryPanel.setStatus(
-          "Import a valid Pro license to use the managed Library. Your existing data stays on this device.",
-        );
-      }
     }) ?? (() => {});
   window.addEventListener("beforeunload", unsubscribeEntitlements, { once: true });
   type TopmostOverlay = "none" | "settings" | "library" | "coldStart";
 
   function topmostOverlay(): TopmostOverlay {
     if (settingsPanel.isOpen) return "settings";
-    if (libraryPanel?.isOpen) return "library";
+    if (libraryPanel.isOpen) return "library";
     if (folderModal.open) return "coldStart";
     return "none";
   }
   function closeTopmostOverlay(overlayName: Exclude<TopmostOverlay, "none">) {
     if (overlayName === "settings") settingsPanel.hide();
-    else if (overlayName === "library") libraryPanel?.hide();
+    else if (overlayName === "library") libraryPanel.hide();
     else hideFolderModal();
   }
 

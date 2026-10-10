@@ -29,6 +29,7 @@ serde_json = "1"
 sha2 = "0.10"
 stl-core = { path = "../crates/stl-core" }
 library-recovery = { path = "../crates/library-recovery" }
+library-core = { path = "../crates/library-core" }
 notify = "8.2.0"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

@@ -1184,6 +1184,7 @@ dependencies = [
 name = "gogglelab"
 version = "0.1.0"
 dependencies = [
+ "library-core",
  "library-recovery",
  "notify",
  "plist",
@@ -1832,6 +1833,18 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
+]
+
+[[package]]
+name = "library-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "sha2",
+ "stl-core",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
