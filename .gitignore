@@ -38,3 +38,5 @@ target-*/
 release-smoke.log
 
 !docs/RELEASE-NOTES.md
+
+!docs/FREE-PRINTVENTORY-PARITY-PLAN.md
