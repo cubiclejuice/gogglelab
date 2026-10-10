@@ -445,6 +445,36 @@ export interface LibraryModel {
   created_at: string;
   updated_at: string;
   tags: string[];
+  /** Managed entries are durable app-owned copies. Indexed entries remain at their source path. */
+  source_kind?: "managed" | "indexed";
+  source_path?: string | null;
+  source_root_id?: string | null;
+  source_missing?: boolean;
+  /** Native index fingerprint in epoch nanoseconds; legacy catalogs may contain epoch seconds. */
+  source_modified_at?: number | null;
+  thumbnail_path?: string | null;
+}
+
+export interface IndexRoot {
+  id: string;
+  path: string;
+  enabled: boolean;
+  last_scanned_at: string | null;
+  scan_interval_minutes: number;
+  max_file_bytes: number;
+}
+
+export interface LibraryScanStatus {
+  running: boolean;
+  cancelling: boolean;
+  currentRootId: string | null;
+  rootsTotal: number;
+  rootsCompleted: number;
+  filesVisited: number;
+  filesIndexed: number;
+  errors: string[];
+  startedAt: string | null;
+  finishedAt: string | null;
 }
 
 export function libraryListFolders(): Promise<LibraryFolder[]> {
@@ -471,6 +501,47 @@ export function libraryImportFile(
 
 export function libraryOpenModel(modelId: string, generation: number): Promise<ModelSummary> {
   return invoke("library_open_model", { modelId, generation });
+}
+
+export function libraryListRoots(): Promise<IndexRoot[]> {
+  return invoke("library_list_roots");
+}
+
+export function libraryAddRoot(path: string): Promise<IndexRoot> {
+  return invoke("library_add_root", { path });
+}
+
+export function libraryUpdateRoot(root: IndexRoot): Promise<IndexRoot> {
+  return invoke("library_update_root", {
+    rootId: root.id,
+    enabled: root.enabled,
+    scanIntervalMinutes: root.scan_interval_minutes,
+    maxFileBytes: root.max_file_bytes,
+  });
+}
+
+export function libraryRemoveRoot(rootId: string): Promise<void> {
+  return invoke("library_remove_root", { rootId });
+}
+
+export function libraryStartScan(rootId: string | null = null): Promise<void> {
+  return invoke("library_start_scan", { rootId });
+}
+
+export function libraryScanStatus(): Promise<LibraryScanStatus> {
+  return invoke("library_scan_status");
+}
+
+export function libraryCancelScan(): Promise<void> {
+  return invoke("library_cancel_scan");
+}
+
+export function libraryGetThumbnail(modelId: string, regenerate = false): Promise<string | null> {
+  return invoke("library_get_thumbnail", { modelId, regenerate });
+}
+
+export function libraryPurgeThumbnails(): Promise<void> {
+  return invoke("library_purge_thumbnails");
 }
 
 export interface RecoveryManifest {

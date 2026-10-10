@@ -10,6 +10,8 @@ mod fusion_preview;
 mod geometry_buffer;
 mod handoff;
 mod library_commands;
+mod library_scan;
+mod library_thumbnail;
 mod opened_urls;
 mod printers;
 mod recovery;
@@ -62,6 +64,15 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             library_commands::library_delete_folder,
             library_commands::library_import_file,
             library_commands::library_open_model,
+            library_commands::library_list_roots,
+            library_commands::library_add_root,
+            library_commands::library_update_root,
+            library_commands::library_remove_root,
+            library_commands::library_start_scan,
+            library_commands::library_scan_status,
+            library_commands::library_cancel_scan,
+            library_commands::library_get_thumbnail,
+            library_commands::library_purge_thumbnails,
             settings::get_default_slicer,
             settings::set_default_slicer,
             settings::get_settings,
@@ -87,6 +98,7 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
         .setup(|app| {
             let library_root = app.path().app_data_dir()?.join("library");
             app.manage(library_commands::LibraryState::new(library_root));
+            library_scan::start_background_scanner(app.handle().clone());
             let loaded = settings::load(app.handle());
             app.set_theme(loaded.appearance_mode.native_theme());
             *app.state::<settings::SettingsState>().0.lock().unwrap() = loaded;

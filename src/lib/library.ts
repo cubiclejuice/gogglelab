@@ -1,6 +1,22 @@
-import type { LibraryFolder, LibraryModel } from "./ipc";
+import type { IndexRoot, LibraryFolder, LibraryModel, LibraryScanStatus } from "./ipc";
 
-function formatBytes(bytes: number): string {
+export type LibrarySort = "name" | "size" | "date";
+export type LibrarySourceFilter = "all" | "managed" | "indexed";
+export type LibraryStatusFilter = "all" | "available" | "missing";
+
+export interface LibraryViewOptions {
+  query: string;
+  folderId: string | null;
+  rootId: string | null;
+  source: LibrarySourceFilter;
+  status: LibraryStatusFilter;
+  sort: LibrarySort;
+}
+
+const PAGE_SIZE = 36;
+const THUMBNAIL_CONCURRENCY = 4;
+
+export function formatLibraryBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -29,20 +45,193 @@ export function libraryFolderDepths(folders: LibraryFolder[]): Map<string, numbe
   return depths;
 }
 
+function modelSource(model: LibraryModel): "managed" | "indexed" {
+  return model.source_kind ?? "managed";
+}
+
+export function normalizeLibraryTimestamp(value: number | string | null | undefined): number {
+  if (value === null || value === undefined || value === "") return 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    if (numeric > 1_000_000_000_000_000) return numeric / 1_000_000;
+    return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  }
+  return typeof value === "string" ? Date.parse(value) || 0 : 0;
+}
+
+function modelDate(model: LibraryModel): number {
+  return normalizeLibraryTimestamp(model.source_modified_at ?? model.updated_at);
+}
+
+export function filterAndSortLibraryModels(
+  models: LibraryModel[],
+  options: LibraryViewOptions,
+): LibraryModel[] {
+  const query = options.query.trim().toLocaleLowerCase();
+  return models
+    .filter((model) => {
+      if (options.folderId && model.folder_id !== options.folderId) return false;
+      if (options.rootId && model.source_root_id !== options.rootId) return false;
+      if (options.source !== "all" && modelSource(model) !== options.source) return false;
+      if (options.status === "missing" && !model.source_missing) return false;
+      if (options.status === "available" && model.source_missing) return false;
+      if (!query) return true;
+      return [
+        model.display_name,
+        model.original_name ?? "",
+        model.description,
+        model.source_path ?? "",
+        model.format ?? "",
+        ...model.tags,
+      ]
+        .join(" ")
+        .toLocaleLowerCase()
+        .includes(query);
+    })
+    .sort((a, b) => {
+      if (options.sort === "size") {
+        return b.bytes - a.bytes || a.display_name.localeCompare(b.display_name);
+      }
+      if (options.sort === "date") {
+        return modelDate(b) - modelDate(a) || a.display_name.localeCompare(b.display_name);
+      }
+      return a.display_name.localeCompare(b.display_name, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
+    });
+}
+
+export function scanStatusMessage(status: LibraryScanStatus): string {
+  if (status.running) {
+    const action = status.cancelling ? "Stopping scan" : "Scanning";
+    const roots = status.rootsTotal
+      ? ` · ${status.rootsCompleted}/${status.rootsTotal} folders`
+      : "";
+    return `${action}${roots} · ${status.filesVisited.toLocaleString()} checked · ${status.filesIndexed.toLocaleString()} indexed`;
+  }
+  if (!status.finishedAt) return "Ready to scan indexed folders.";
+  const errors = status.errors.length
+    ? ` · ${status.errors.length} issue${status.errors.length === 1 ? "" : "s"}`
+    : "";
+  return `Scan finished · ${status.filesIndexed.toLocaleString()} indexed${errors}`;
+}
+
+export function canOpenLibraryModel(model: LibraryModel): boolean {
+  return !model.source_missing;
+}
+
+export function didLibraryScanComplete(
+  wasRunning: boolean,
+  status: Pick<LibraryScanStatus, "running">,
+): boolean {
+  return wasRunning && !status.running;
+}
+
+export function thumbnailCacheInvalidations(
+  previous: LibraryModel[],
+  next: LibraryModel[],
+): string[] {
+  const nextById = new Map(next.map((model) => [model.id, model]));
+  const invalidations: string[] = [];
+  for (const model of previous) {
+    const replacement = nextById.get(model.id);
+    if (
+      !replacement ||
+      model.content_hash !== replacement.content_hash ||
+      model.thumbnail_path !== replacement.thumbnail_path ||
+      Boolean(model.source_missing) !== Boolean(replacement.source_missing)
+    ) {
+      invalidations.push(model.id);
+    }
+  }
+  return invalidations;
+}
+
+function libraryErrorMessage(error: unknown): string {
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return String(error);
+}
+
+/** Guards async thumbnail writes when a card is recycled or regenerated. */
+export class ThumbnailRequestGuard {
+  private readonly revisions = new Map<string, number>();
+
+  begin(modelId: string): number {
+    const next = (this.revisions.get(modelId) ?? 0) + 1;
+    this.revisions.set(modelId, next);
+    return next;
+  }
+
+  isCurrent(modelId: string, revision: number): boolean {
+    return this.revisions.get(modelId) === revision;
+  }
+
+  invalidate(modelId: string): void {
+    this.begin(modelId);
+  }
+}
+
 export class LibraryPanel {
   private readonly root: HTMLDialogElement;
-  private readonly folders: HTMLElement;
-  private readonly list: HTMLElement;
   private readonly status: HTMLElement;
+  private readonly scanStatus: HTMLElement;
   private readonly searchInput: HTMLInputElement;
+  private readonly navigation: HTMLElement;
+  private readonly gallery: HTMLElement;
+  private readonly resultCount: HTMLElement;
+  private readonly sortSelect: HTMLSelectElement;
+  private readonly sourceSelect: HTMLSelectElement;
+  private readonly statusSelect: HTMLSelectElement;
+  private readonly scanButton: HTMLButtonElement;
+  private readonly cancelScanButton: HTMLButtonElement;
+  private readonly importButton: HTMLButtonElement;
+  private readonly addRootButton: HTMLButtonElement;
+  private readonly purgeButton: HTMLButtonElement;
   private invoker: HTMLElement | null = null;
   private allFolders: LibraryFolder[] = [];
   private allModels: LibraryModel[] = [];
+  private allRoots: IndexRoot[] = [];
   private activeFolderId: string | null = null;
-  private importButton: HTMLButtonElement;
+  private activeRootId: string | null = null;
+  private page = 1;
+  private renderRevision = 0;
+  private scanWasRunning = false;
+  private pollTimer: number | undefined;
+  private scanPollRevision = 0;
+  private scanPollInFlight = false;
+  private observer: IntersectionObserver | null = null;
+  private readonly thumbnailCache = new Map<string, string | null>();
+  private readonly thumbnailGuard = new ThumbnailRequestGuard();
+  private readonly thumbnailQueue: Array<() => Promise<void>> = [];
+  private thumbnailWorkers = 0;
 
   onImport: () => void = () => {};
   onOpenModel: (modelId: string) => void = () => {};
+  onAddRoot: () => Promise<void> = async () => {};
+  onUpdateRoot: (root: IndexRoot) => Promise<void> = async () => {};
+  onRemoveRoot: (rootId: string) => Promise<void> = async () => {};
+  onStartScan: (rootId: string | null) => Promise<void> = async () => {};
+  onCancelScan: () => Promise<void> = async () => {};
+  onPollScanStatus: () => Promise<LibraryScanStatus> = async () => ({
+    running: false,
+    cancelling: false,
+    currentRootId: null,
+    rootsTotal: 0,
+    rootsCompleted: 0,
+    filesVisited: 0,
+    filesIndexed: 0,
+    errors: [],
+    startedAt: null,
+    finishedAt: null,
+  });
+  onScanCompleted: () => void = () => {};
+  onGetThumbnail: (modelId: string, regenerate: boolean) => Promise<string | null> = async () =>
+    null;
+  onPurgeThumbnails: () => Promise<void> = async () => {};
 
   constructor(container: HTMLElement) {
     this.root = document.createElement("dialog");
@@ -56,44 +245,112 @@ export class LibraryPanel {
       this.hide();
     });
 
-    const header = document.createElement("div");
+    const shell = document.createElement("section");
+    shell.className = "library-shell";
+    const header = document.createElement("header");
     header.className = "library-header";
+    const heading = document.createElement("div");
+    const eyebrow = document.createElement("div");
+    eyebrow.className = "library-eyebrow";
+    eyebrow.textContent = "Model catalog";
     const title = document.createElement("h2");
     title.id = "library-title";
     title.className = "library-title";
     title.textContent = "Library";
+    const subtitle = document.createElement("p");
+    subtitle.className = "library-subtitle";
+    subtitle.textContent =
+      "Managed imports are saved copies. Indexed folders stay in place and are read-only.";
+    heading.append(eyebrow, title, subtitle);
+
     const actions = document.createElement("div");
     actions.className = "library-actions";
-    this.importButton = document.createElement("button");
-    this.importButton.type = "button";
-    this.importButton.className = "btn primary";
-    this.importButton.textContent = "Import models…";
-    this.importButton.addEventListener("click", () => this.onImport());
-    const closeButton = document.createElement("button");
-    closeButton.type = "button";
-    closeButton.className = "btn";
-    closeButton.textContent = "Close";
-    closeButton.addEventListener("click", () => this.hide());
-    actions.append(this.importButton, closeButton);
-    header.append(title, actions);
+    this.importButton = this.actionButton("Import copies…", "primary", () => this.onImport());
+    this.addRootButton = this.actionButton(
+      "Index folder…",
+      "",
+      () => void this.runAction(this.onAddRoot),
+    );
+    const closeButton = this.actionButton("Close", "", () => this.hide());
+    actions.append(this.importButton, this.addRootButton, closeButton);
+    header.append(heading, actions);
 
     this.status = document.createElement("div");
     this.status.className = "library-status hint";
     this.status.setAttribute("role", "status");
     this.status.setAttribute("aria-live", "polite");
 
+    const toolbar = document.createElement("div");
+    toolbar.className = "library-toolbar";
     this.searchInput = document.createElement("input");
     this.searchInput.type = "search";
     this.searchInput.className = "library-search";
-    this.searchInput.placeholder = "Search library";
-    this.searchInput.setAttribute("aria-label", "Search library");
-    this.searchInput.addEventListener("input", () => this.renderContent());
+    this.searchInput.placeholder = "Search names, paths, formats, and tags";
+    this.searchInput.setAttribute("aria-label", "Search model catalog");
+    this.searchInput.addEventListener("input", () => this.resetAndRender());
+    this.sourceSelect = this.selectControl("Source", [
+      ["all", "All sources"],
+      ["managed", "Managed copies"],
+      ["indexed", "Indexed folders"],
+    ]);
+    this.statusSelect = this.selectControl("Availability", [
+      ["all", "Any status"],
+      ["available", "Available"],
+      ["missing", "Missing source"],
+    ]);
+    this.sortSelect = this.selectControl("Sort", [
+      ["name", "Name"],
+      ["date", "Newest"],
+      ["size", "Largest"],
+    ]);
+    toolbar.append(this.searchInput, this.sourceSelect, this.statusSelect, this.sortSelect);
 
-    this.folders = document.createElement("div");
-    this.folders.className = "library-folders";
-    this.list = document.createElement("div");
-    this.list.className = "library-list";
-    this.root.append(header, this.status, this.searchInput, this.folders, this.list);
+    const body = document.createElement("div");
+    body.className = "library-body";
+    this.navigation = document.createElement("aside");
+    this.navigation.className = "library-navigation";
+    this.navigation.setAttribute("aria-label", "Library sources and folders");
+    const content = document.createElement("main");
+    content.className = "library-content";
+    const contentHeader = document.createElement("div");
+    contentHeader.className = "library-content-header";
+    this.resultCount = document.createElement("div");
+    this.resultCount.className = "library-result-count";
+    const thumbnailActions = document.createElement("div");
+    thumbnailActions.className = "library-thumbnail-actions";
+    this.purgeButton = this.actionButton("Clear previews", "", () => void this.purgeThumbnails());
+    thumbnailActions.append(this.purgeButton);
+    contentHeader.append(this.resultCount, thumbnailActions);
+    this.gallery = document.createElement("div");
+    this.gallery.className = "library-gallery";
+    this.gallery.setAttribute("aria-live", "polite");
+    content.append(contentHeader, this.gallery);
+    body.append(this.navigation, content);
+
+    const scanBar = document.createElement("footer");
+    scanBar.className = "library-scan-bar";
+    this.scanStatus = document.createElement("div");
+    this.scanStatus.className = "library-scan-status";
+    this.scanStatus.setAttribute("role", "status");
+    this.scanButton = this.actionButton(
+      "Scan enabled folders",
+      "",
+      () =>
+        void this.runAction(async () => {
+          await this.onStartScan(null);
+          await this.pollScanStatus();
+        }),
+    );
+    this.cancelScanButton = this.actionButton(
+      "Cancel scan",
+      "",
+      () => void this.runAction(this.onCancelScan),
+    );
+    this.cancelScanButton.hidden = true;
+    scanBar.append(this.scanStatus, this.scanButton, this.cancelScanButton);
+
+    shell.append(header, this.status, toolbar, body, scanBar);
+    this.root.append(shell);
     container.appendChild(this.root);
   }
 
@@ -105,13 +362,22 @@ export class LibraryPanel {
     const active = invoker ?? document.activeElement;
     this.invoker = active instanceof HTMLElement ? active : null;
     if (!this.root.open) this.root.showModal();
+    this.startPolling();
+    window.setTimeout(() => this.searchInput.focus(), 0);
   }
 
   hide(): void {
+    this.stopPolling();
+    this.observer?.disconnect();
     if (this.root.open) this.root.close();
     const invoker = this.invoker;
     this.invoker = null;
     invoker?.focus();
+  }
+
+  dispose(): void {
+    this.stopPolling();
+    this.observer?.disconnect();
   }
 
   setStatus(message: string): void {
@@ -123,72 +389,429 @@ export class LibraryPanel {
     this.importButton.setAttribute("aria-disabled", String(busy));
   }
 
-  render(folders: LibraryFolder[], models: LibraryModel[]): void {
+  render(folders: LibraryFolder[], models: LibraryModel[], roots: IndexRoot[] = []): void {
+    for (const modelId of thumbnailCacheInvalidations(this.allModels, models)) {
+      this.thumbnailCache.delete(modelId);
+      this.thumbnailGuard.invalidate(modelId);
+    }
     this.allFolders = folders;
     this.allModels = models;
+    this.allRoots = roots;
     if (this.activeFolderId && !folders.some((folder) => folder.id === this.activeFolderId)) {
       this.activeFolderId = null;
+    }
+    if (this.activeRootId && !roots.some((root) => root.id === this.activeRootId)) {
+      this.activeRootId = null;
     }
     this.renderContent();
   }
 
+  setScanStatus(value: LibraryScanStatus): void {
+    this.scanStatus.textContent = scanStatusMessage(value);
+    this.scanButton.disabled = value.running;
+    this.cancelScanButton.hidden = !value.running;
+    this.cancelScanButton.disabled = value.cancelling;
+    if (value.errors.length) this.scanStatus.title = value.errors.join("\n");
+    else this.scanStatus.removeAttribute("title");
+    if (didLibraryScanComplete(this.scanWasRunning, value)) this.onScanCompleted();
+    this.scanWasRunning = value.running;
+  }
+
+  private actionButton(label: string, variant: string, action: () => void): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `btn${variant ? ` ${variant}` : ""}`;
+    button.textContent = label;
+    button.addEventListener("click", action);
+    return button;
+  }
+
+  private selectControl(label: string, options: Array<[string, string]>): HTMLSelectElement {
+    const select = document.createElement("select");
+    select.className = "library-select";
+    select.setAttribute("aria-label", label);
+    for (const [value, text] of options) select.add(new Option(text, value));
+    select.addEventListener("change", () => this.resetAndRender());
+    return select;
+  }
+
+  private resetAndRender(): void {
+    this.page = 1;
+    this.renderContent();
+  }
+
   private renderContent(): void {
-    const depths = libraryFolderDepths(this.allFolders);
-
-    this.folders.replaceChildren();
-    const folderHeading = document.createElement("div");
-    folderHeading.className = "library-section-label";
-    folderHeading.textContent = "Folders";
-    this.folders.appendChild(folderHeading);
-    for (const folder of this.allFolders) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "library-folder-row";
-      row.style.setProperty("--folder-depth", String(depths.get(folder.id) ?? 0));
-      row.setAttribute("aria-pressed", String(this.activeFolderId === folder.id));
-      row.textContent = `${folder.name} · ${folder.model_count}`;
-      row.addEventListener("click", () => {
-        this.activeFolderId = this.activeFolderId === folder.id ? null : folder.id;
-        this.renderContent();
-      });
-      this.folders.appendChild(row);
-    }
-
-    const query = this.searchInput.value.trim().toLocaleLowerCase();
-    const models = this.allModels.filter((model) => {
-      if (this.activeFolderId && model.folder_id !== this.activeFolderId) return false;
-      if (!query) return true;
-      return [model.display_name, model.original_name ?? "", model.description, ...model.tags]
-        .join(" ")
-        .toLocaleLowerCase()
-        .includes(query);
+    this.renderRevision += 1;
+    this.observer?.disconnect();
+    this.renderNavigation();
+    const models = filterAndSortLibraryModels(this.allModels, {
+      query: this.searchInput.value,
+      folderId: this.activeFolderId,
+      rootId: this.activeRootId,
+      source: this.sourceSelect.value as LibrarySourceFilter,
+      status: this.statusSelect.value as LibraryStatusFilter,
+      sort: this.sortSelect.value as LibrarySort,
     });
-    this.list.replaceChildren();
-    const modelHeading = document.createElement("div");
-    modelHeading.className = "library-section-label";
-    modelHeading.textContent = `${models.length} model${models.length === 1 ? "" : "s"}`;
-    this.list.appendChild(modelHeading);
-    if (models.length === 0) {
+    this.resultCount.textContent = `${models.length.toLocaleString()} model${models.length === 1 ? "" : "s"}`;
+    this.gallery.replaceChildren();
+    if (!models.length) {
       const empty = document.createElement("div");
-      empty.className = "library-empty hint";
-      empty.textContent =
-        query || this.activeFolderId ? "No matching models." : "Your managed library is empty.";
-      this.list.appendChild(empty);
+      empty.className = "library-empty";
+      empty.innerHTML =
+        "<strong>No models found</strong><span>Adjust the filters, import copies, or index a folder.</span>";
+      this.gallery.append(empty);
       return;
     }
-    for (const model of models) {
-      const button = document.createElement("button");
-      button.className = "library-model";
-      button.type = "button";
-      button.addEventListener("click", () => this.onOpenModel(model.id));
-      const name = document.createElement("span");
-      name.className = "library-model-name";
-      name.textContent = model.display_name;
-      const meta = document.createElement("span");
-      meta.className = "library-model-meta";
-      meta.textContent = `${model.original_name ?? "No source"} · ${formatBytes(model.bytes)}`;
-      button.append(name, meta);
-      this.list.appendChild(button);
+    const shown = models.slice(0, this.page * PAGE_SIZE);
+    this.observer =
+      typeof IntersectionObserver === "undefined"
+        ? null
+        : new IntersectionObserver(
+            (entries) => {
+              for (const entry of entries) {
+                if (!entry.isIntersecting) continue;
+                this.observer?.unobserve(entry.target);
+                const card = entry.target as HTMLElement;
+                void this.requestThumbnail(card.dataset.modelId ?? "", card, false);
+              }
+            },
+            { root: this.gallery, rootMargin: "160px" },
+          );
+    for (const model of shown) this.gallery.append(this.modelCard(model));
+    if (shown.length < models.length) {
+      const more = this.actionButton(
+        `Show ${Math.min(PAGE_SIZE, models.length - shown.length)} more`,
+        "",
+        () => {
+          this.page += 1;
+          this.renderContent();
+        },
+      );
+      more.classList.add("library-load-more");
+      this.gallery.append(more);
+    }
+  }
+
+  private renderNavigation(): void {
+    this.navigation.replaceChildren();
+    const sources = document.createElement("section");
+    const sourceHeading = document.createElement("h3");
+    sourceHeading.className = "library-section-label";
+    sourceHeading.textContent = "Sources";
+    sources.append(
+      sourceHeading,
+      this.filterButton("All models", this.activeRootId === null, () => {
+        this.activeRootId = null;
+        this.resetAndRender();
+      }),
+    );
+    for (const root of this.allRoots) sources.append(this.rootCard(root));
+    if (!this.allRoots.length) {
+      const hint = document.createElement("p");
+      hint.className = "library-nav-hint";
+      hint.textContent = "Index a folder to catalog models without copying them.";
+      sources.append(hint);
+    }
+
+    const folders = document.createElement("section");
+    const folderHeading = document.createElement("h3");
+    folderHeading.className = "library-section-label";
+    folderHeading.textContent = "Collections";
+    folders.append(
+      folderHeading,
+      this.filterButton("All collections", this.activeFolderId === null, () => {
+        this.activeFolderId = null;
+        this.resetAndRender();
+      }),
+    );
+    const depths = libraryFolderDepths(this.allFolders);
+    for (const folder of this.allFolders) {
+      const button = this.filterButton(
+        `${folder.name} · ${folder.model_count}`,
+        this.activeFolderId === folder.id,
+        () => {
+          this.activeFolderId = this.activeFolderId === folder.id ? null : folder.id;
+          this.resetAndRender();
+        },
+      );
+      button.style.setProperty("--folder-depth", String(depths.get(folder.id) ?? 0));
+      button.classList.add("library-folder-row");
+      folders.append(button);
+    }
+    this.navigation.append(sources, folders);
+  }
+
+  private filterButton(label: string, selected: boolean, action: () => void): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "library-filter-button";
+    button.setAttribute("aria-pressed", String(selected));
+    button.textContent = label;
+    button.addEventListener("click", action);
+    return button;
+  }
+
+  private rootCard(root: IndexRoot): HTMLElement {
+    const card = document.createElement("article");
+    card.className = "library-root-card";
+    const row = document.createElement("div");
+    row.className = "library-root-heading";
+    const select = this.filterButton(
+      root.path.split(/[\\/]/).pop() || root.path,
+      this.activeRootId === root.id,
+      () => {
+        this.activeRootId = this.activeRootId === root.id ? null : root.id;
+        this.resetAndRender();
+      },
+    );
+    select.title = root.path;
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.checked = root.enabled;
+    enabled.setAttribute("aria-label", `Enable scanning ${root.path}`);
+    row.append(select, enabled);
+    const path = document.createElement("div");
+    path.className = "library-root-path";
+    path.textContent = root.path;
+    const config = document.createElement("div");
+    config.className = "library-root-config";
+    const [intervalField, interval] = this.numberField(
+      "Minutes",
+      root.scan_interval_minutes,
+      1,
+      1440,
+    );
+    const [maxMbField, maxMb] = this.numberField(
+      "Max MB",
+      Math.max(1, Math.round(root.max_file_bytes / 1048576)),
+      1,
+      100,
+    );
+    const save = this.actionButton(
+      "Save",
+      "",
+      () =>
+        void this.runAction(() =>
+          this.onUpdateRoot({
+            ...root,
+            enabled: enabled.checked,
+            scan_interval_minutes: Number(interval.value),
+            max_file_bytes: Number(maxMb.value) * 1048576,
+          }),
+        ),
+    );
+    const scan = this.actionButton(
+      "Scan",
+      "",
+      () => void this.runAction(() => this.onStartScan(root.id)),
+    );
+    const remove = this.actionButton("Remove", "danger", () => {
+      if (
+        !window.confirm(
+          `Remove “${root.path}” and its indexed entries from the catalog?\n\nIts catalog metadata will be removed. The source folder and files will not be deleted.`,
+        )
+      ) {
+        return;
+      }
+      void this.runAction(() => this.onRemoveRoot(root.id));
+    });
+    config.append(intervalField, maxMbField, save, scan, remove);
+    const last = document.createElement("div");
+    last.className = "library-root-last";
+    const lastScanned = normalizeLibraryTimestamp(root.last_scanned_at);
+    last.textContent = lastScanned
+      ? `Scanned ${new Date(lastScanned).toLocaleString()}`
+      : "Not scanned yet";
+    card.append(row, path, config, last);
+    return card;
+  }
+
+  private numberField(
+    label: string,
+    value: number,
+    min: number,
+    max: number,
+  ): [HTMLLabelElement, HTMLInputElement] {
+    const field = document.createElement("label");
+    field.className = "library-number-field";
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = "library-number";
+    input.value = String(value);
+    input.min = String(min);
+    input.max = String(max);
+    input.setAttribute("aria-label", label);
+    input.title = label;
+    field.append(caption, input);
+    return [field, input];
+  }
+
+  private modelCard(model: LibraryModel): HTMLElement {
+    const article = document.createElement("article");
+    article.className = "library-model";
+    article.dataset.modelId = model.id;
+    if (model.source_missing) article.classList.add("is-missing");
+    const preview = document.createElement("div");
+    preview.className = "library-model-preview";
+    preview.setAttribute("aria-hidden", "true");
+    preview.textContent = (model.format ?? "3D").toLocaleUpperCase();
+    const cached = this.thumbnailCache.get(model.id);
+    if (cached) this.installThumbnail(preview, cached);
+    else if (this.thumbnailCache.has(model.id)) preview.classList.add("is-unavailable");
+    else if (this.observer) this.observer.observe(article);
+    else queueMicrotask(() => void this.requestThumbnail(model.id, article, false));
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "library-model-open";
+    open.disabled = !canOpenLibraryModel(model);
+    open.setAttribute(
+      "aria-label",
+      model.source_missing ? `${model.display_name}, source missing` : `Open ${model.display_name}`,
+    );
+    open.addEventListener("click", () => this.onOpenModel(model.id));
+    const name = document.createElement("strong");
+    name.className = "library-model-name";
+    name.textContent = model.display_name;
+    const meta = document.createElement("span");
+    meta.className = "library-model-meta";
+    meta.textContent = `${formatLibraryBytes(model.bytes)} · ${model.format?.toUpperCase() ?? "MODEL"}`;
+    const source = document.createElement("span");
+    source.className = "library-model-source";
+    source.textContent = model.source_missing
+      ? "Source missing — unavailable"
+      : modelSource(model) === "indexed"
+        ? "Indexed · read-only source"
+        : "Managed copy";
+    const sourceRoot = this.allRoots.find((root) => root.id === model.source_root_id);
+    source.title =
+      sourceRoot && model.source_path
+        ? `${sourceRoot.path.replace(/[\\/]$/, "")}/${model.source_path}`
+        : (model.source_path ?? model.original_name ?? "");
+    open.append(name, meta, source);
+    const regenerate = this.actionButton("Refresh preview", "library-regenerate", () => {
+      this.thumbnailCache.delete(model.id);
+      void this.requestThumbnail(model.id, article, true);
+    });
+    regenerate.setAttribute("aria-label", `Regenerate preview for ${model.display_name}`);
+    article.append(preview, open, regenerate);
+    return article;
+  }
+
+  private async requestThumbnail(
+    modelId: string,
+    card: HTMLElement,
+    regenerate: boolean,
+  ): Promise<void> {
+    if (!modelId || !card.isConnected) return;
+    const requestRevision = this.thumbnailGuard.begin(modelId);
+    const renderRevision = this.renderRevision;
+    const preview = card.querySelector<HTMLElement>(".library-model-preview");
+    preview?.classList.add("is-loading");
+    this.thumbnailQueue.push(async () => {
+      if (renderRevision !== this.renderRevision || !card.isConnected) return;
+      try {
+        const dataUri = await this.onGetThumbnail(modelId, regenerate);
+        if (
+          !this.thumbnailGuard.isCurrent(modelId, requestRevision) ||
+          renderRevision !== this.renderRevision ||
+          !card.isConnected
+        ) {
+          return;
+        }
+        this.thumbnailCache.set(modelId, dataUri);
+        if (preview && dataUri) this.installThumbnail(preview, dataUri);
+        else preview?.classList.add("is-unavailable");
+      } catch (error) {
+        const isCurrent =
+          this.thumbnailGuard.isCurrent(modelId, requestRevision) &&
+          renderRevision === this.renderRevision &&
+          card.isConnected;
+        if (isCurrent) {
+          preview?.classList.add("is-unavailable");
+        }
+        if (regenerate && isCurrent) {
+          this.setStatus(`Could not regenerate preview: ${libraryErrorMessage(error)}`);
+        }
+      } finally {
+        preview?.classList.remove("is-loading");
+      }
+    });
+    this.drainThumbnailQueue();
+  }
+
+  private drainThumbnailQueue(): void {
+    while (this.thumbnailWorkers < THUMBNAIL_CONCURRENCY) {
+      const job = this.thumbnailQueue.shift();
+      if (!job) return;
+      this.thumbnailWorkers += 1;
+      void job().finally(() => {
+        this.thumbnailWorkers -= 1;
+        this.drainThumbnailQueue();
+      });
+    }
+  }
+
+  private installThumbnail(preview: HTMLElement, dataUri: string): void {
+    const image = document.createElement("img");
+    image.src = dataUri;
+    image.alt = "";
+    preview.replaceChildren(image);
+    preview.classList.remove("is-unavailable", "is-loading");
+  }
+
+  private async purgeThumbnails(): Promise<void> {
+    this.purgeButton.disabled = true;
+    try {
+      await this.onPurgeThumbnails();
+      this.thumbnailCache.clear();
+      for (const model of this.allModels) this.thumbnailGuard.invalidate(model.id);
+      this.setStatus(
+        "Generated previews cleared. They will be recreated as models become visible.",
+      );
+      this.renderContent();
+    } catch (error) {
+      this.setStatus(`Could not clear previews: ${libraryErrorMessage(error)}`);
+    } finally {
+      this.purgeButton.disabled = false;
+    }
+  }
+
+  private async runAction(action: () => Promise<void>): Promise<void> {
+    try {
+      await action();
+    } catch (error) {
+      this.setStatus(libraryErrorMessage(error));
+    }
+  }
+
+  private startPolling(): void {
+    this.stopPolling();
+    void this.pollScanStatus();
+    this.pollTimer = window.setInterval(() => void this.pollScanStatus(), 1000);
+  }
+
+  private stopPolling(): void {
+    if (this.pollTimer !== undefined) window.clearInterval(this.pollTimer);
+    this.pollTimer = undefined;
+    this.scanPollRevision += 1;
+  }
+
+  private async pollScanStatus(): Promise<void> {
+    if (!this.root.open || this.scanPollInFlight) return;
+    const revision = ++this.scanPollRevision;
+    this.scanPollInFlight = true;
+    try {
+      const status = await this.onPollScanStatus();
+      if (this.root.open && revision === this.scanPollRevision) this.setScanStatus(status);
+    } catch (error) {
+      if (this.root.open && revision === this.scanPollRevision) {
+        this.scanStatus.textContent = `Scan status unavailable: ${libraryErrorMessage(error)}`;
+      }
+    } finally {
+      this.scanPollInFlight = false;
     }
   }
 }

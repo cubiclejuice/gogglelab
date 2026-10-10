@@ -1,3 +1,12 @@
+# Unreleased: in-place catalog and thumbnails
+
+Free now supports multiple indexed folders, startup/periodic scans, cancellation, size
+limits, persistent geometry thumbnails, source/status filters, and name/size/date sorting.
+Indexing never moves or writes source files. Missing files retain catalog metadata; a unique
+rename retains its identity. Schema-v1 catalogs are backed up consistently before the
+additive schema-v2 migration. Recovery exports retain managed assets and indexed references.
+Source folder backups remain necessary for indexed originals.
+
 # Unreleased: Free library and slicer handoff
 
 Basic managed Library import/search/browsing and original STL/3MF slicer handoff are

@@ -24,6 +24,8 @@ pub enum LibraryError {
     RootFolderMutation,
     #[error("model not found: {0}")]
     ModelNotFound(String),
+    #[error("index root not found: {0}")]
+    IndexRootNotFound(String),
     #[error("source file changed while it was being imported")]
     SourceChanged,
     #[error("unsupported library format: {0}")]

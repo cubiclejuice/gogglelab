@@ -21,6 +21,15 @@ import {
   libraryListModels,
   libraryImportFile,
   libraryOpenModel,
+  libraryListRoots,
+  libraryAddRoot,
+  libraryUpdateRoot,
+  libraryRemoveRoot,
+  libraryStartScan,
+  libraryScanStatus,
+  libraryCancelScan,
+  libraryGetThumbnail,
+  libraryPurgeThumbnails,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -78,6 +87,7 @@ export function startApp(extensions: AppExtensions): void {
       viewport.dispose();
       plateControls.dispose();
       colorFeature.dispose();
+      libraryPanel.dispose();
       extensions.dispose?.();
     },
     { once: true },
@@ -88,6 +98,15 @@ export function startApp(extensions: AppExtensions): void {
     listModels: libraryListModels,
     importFile: libraryImportFile,
     openModel: libraryOpenModel,
+    listRoots: libraryListRoots,
+    addRoot: libraryAddRoot,
+    updateRoot: libraryUpdateRoot,
+    removeRoot: libraryRemoveRoot,
+    startScan: libraryStartScan,
+    scanStatus: libraryScanStatus,
+    cancelScan: libraryCancelScan,
+    getThumbnail: libraryGetThumbnail,
+    purgeThumbnails: libraryPurgeThumbnails,
   };
   let activeEntitlements = withCoreEntitlements(extensions.currentEntitlements?.());
   const main = document.createElement("div");
@@ -847,9 +866,10 @@ export function startApp(extensions: AppExtensions): void {
     };
     activeLibraryRefresh = request;
     try {
-      const [folders, models] = await Promise.all([
+      const [folders, models, roots] = await Promise.all([
         libraryService.listFolders(),
         libraryService.listModels(),
+        libraryService.listRoots(),
       ]);
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
@@ -858,7 +878,7 @@ export function startApp(extensions: AppExtensions): void {
       ) {
         return;
       }
-      libraryPanel.render(folders, models);
+      libraryPanel.render(folders, models, roots);
       if (libraryOperations.isCurrent(owner)) {
         libraryPanel.setStatus(
           "Managed copies are stored locally and survive source-file changes.",
@@ -925,6 +945,38 @@ export function startApp(extensions: AppExtensions): void {
     libraryPanel.hide();
     void loadLibraryModel(modelId);
   };
+  libraryPanel.onAddRoot = async () => {
+    const path = await openDialog({ directory: true, multiple: false });
+    if (typeof path !== "string") return;
+    const root = await libraryService.addRoot(path);
+    await refreshLibrary();
+    libraryPanel.setStatus(`Indexed source added. Files remain read-only in ${root.path}.`);
+    await libraryService.startScan(root.id);
+  };
+  libraryPanel.onUpdateRoot = async (root) => {
+    await libraryService.updateRoot(root);
+    await refreshLibrary();
+    libraryPanel.setStatus("Source settings saved.");
+  };
+  libraryPanel.onRemoveRoot = async (rootId) => {
+    await libraryService.removeRoot(rootId);
+    await refreshLibrary();
+    libraryPanel.setStatus(
+      "Source and its indexed entries removed from the catalog. No source files were deleted.",
+    );
+  };
+  libraryPanel.onStartScan = async (rootId) => {
+    await libraryService.startScan(rootId);
+    libraryPanel.setStatus(rootId ? "Folder scan started." : "Scan started for enabled folders.");
+  };
+  libraryPanel.onCancelScan = async () => {
+    await libraryService.cancelScan();
+    libraryPanel.setStatus("Stopping the active scan…");
+  };
+  libraryPanel.onPollScanStatus = libraryService.scanStatus;
+  libraryPanel.onScanCompleted = () => void refreshLibrary();
+  libraryPanel.onGetThumbnail = libraryService.getThumbnail;
+  libraryPanel.onPurgeThumbnails = libraryService.purgeThumbnails;
 
   const unsubscribeEntitlements =
     extensions.subscribeEntitlements?.((entitlements) => {

@@ -284,3 +284,90 @@ fn live_wal_reader_uses_committed_snapshot_without_changing_database() {
     );
     writer.execute_batch("ROLLBACK").unwrap();
 }
+
+#[test]
+fn schema_v2_recovery_preserves_indexed_references_without_accessing_source_roots() {
+    let (tmp, root) = fixture();
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE thumbnails ADD source_content_hash TEXT;
+         ALTER TABLE models ADD source_kind TEXT NOT NULL DEFAULT 'managed';
+         ALTER TABLE models ADD source_path TEXT;
+         ALTER TABLE models ADD source_root_id TEXT;
+         ALTER TABLE models ADD source_missing INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE models ADD source_modified_at INTEGER;
+         CREATE TABLE index_roots (id TEXT PRIMARY KEY, path TEXT, enabled INTEGER,
+           last_scanned_at TEXT, scan_interval_minutes INTEGER, max_file_bytes INTEGER);
+         CREATE TABLE indexed_model_data (model_id TEXT PRIMARY KEY, content_hash TEXT,
+           original_name TEXT, format TEXT, bytes INTEGER);
+         INSERT INTO index_roots VALUES ('source-1','/unavailable/qa-models',1,NULL,60,52428800);
+         INSERT INTO models (id,display_name,description,folder_id,current_revision_id,
+           metadata_version,deleted_at,created_at,updated_at,source_kind,source_path,
+           source_root_id,source_missing,source_modified_at)
+           VALUES ('indexed-1','Indexed gear','keep this','root',NULL,1,NULL,'1','2',
+           'indexed','parts/gear.stl','source-1',1,100);
+         PRAGMA user_version=2;",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO indexed_model_data VALUES ('indexed-1',?1,'gear.stl','stl-binary',134)",
+        [sha(b"external model")],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE thumbnails SET source_content_hash=?1",
+        [sha(ORIGINAL)],
+    )
+    .unwrap();
+    drop(conn);
+    let before = fs::read(root.join("library.sqlite3")).unwrap();
+    let manifest = inspect_library(&root).unwrap();
+    assert_eq!(manifest.library_schema_version, 2);
+    assert_eq!(manifest.index_roots.len(), 1);
+    let managed = manifest.models.iter().find(|m| m.id == "model-1").unwrap();
+    assert_eq!(managed.thumbnails[0].asset.sha256, sha(THUMBNAIL));
+    assert_eq!(
+        managed.thumbnails[0].source_content_hash.as_deref(),
+        Some(sha(ORIGINAL).as_str())
+    );
+    let indexed = manifest
+        .models
+        .iter()
+        .find(|m| m.id == "indexed-1")
+        .unwrap();
+    let source = indexed.indexed_source.as_ref().unwrap();
+    assert_eq!(source.relative_path, "parts/gear.stl");
+    assert_eq!(source.root_id, "source-1");
+    assert!(source.missing);
+    assert_eq!(source.bytes, 134);
+    let exported = export_library_zip(&root, &[], &tmp.path().join("v2.zip")).unwrap();
+    assert_eq!(exported.models.len(), 2);
+    assert_eq!(fs::read(root.join("library.sqlite3")).unwrap(), before);
+}
+
+#[test]
+fn schema_v2_recovery_rejects_unknown_source_kind_and_out_of_range_root() {
+    let (_tmp, root) = fixture();
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE models ADD source_kind TEXT NOT NULL DEFAULT 'managed';
+         ALTER TABLE models ADD source_path TEXT;
+         ALTER TABLE models ADD source_root_id TEXT;
+         ALTER TABLE models ADD source_missing INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE models ADD source_modified_at INTEGER;
+         ALTER TABLE thumbnails ADD source_content_hash TEXT;
+         CREATE TABLE index_roots(id TEXT PRIMARY KEY,path TEXT,enabled INTEGER,last_scanned_at TEXT,scan_interval_minutes INTEGER,max_file_bytes INTEGER);
+         CREATE TABLE indexed_model_data(model_id TEXT PRIMARY KEY,content_hash TEXT,original_name TEXT,format TEXT,bytes INTEGER);
+         PRAGMA user_version=2;
+         UPDATE models SET source_kind='unexpected';"
+    ).unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute("UPDATE models SET source_kind='managed'", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO index_roots VALUES ('invalid','/qa/models',1,NULL,60,104857601)",
+        [],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+}

@@ -1,6 +1,6 @@
 # Library and saved colorway recovery format, version 1
 
-This is the public recovery contract for existing GoggleLab Library data. The recovery reader is independent of the writable Library implementation. It reads `app_data_dir/library/library.sqlite3` with SQLite's read-only flag, in a read transaction, and never initializes a missing database or runs a migration. It accepts `PRAGMA user_version = 1` only. An unknown or incomplete schema is an error; the reader leaves the source intact.
+This is the public recovery contract for existing GoggleLab Library data. The recovery reader is independent of the writable Library implementation. It reads `app_data_dir/library/library.sqlite3` with SQLite's read-only flag, in a read transaction, and never initializes a missing database or runs a migration. It accepts schema versions 1 and 2 without migrating. An unknown or incomplete schema is an error; the reader leaves the source intact.
 
 The v1 reader requires the existing `libraries`, `folders`, `blobs`, `models`, `revisions`, `tags`, `model_tags`, `manuals`, `thumbnails`, and `jobs` tables and their v1 columns. `folders` preserve `id`, `name`, and `parent_id`. Each model preserves its ID, `library:<model_id>` source identity, display name, description, folder ID, current revision ID, metadata version, deletion time, and creation/update times. Every revision is joined by `revisions.model_id` and `revisions.blob_hash = blobs.hash`; it preserves revision ID, model ID, blob hash, original name, format, creation time, byte count, and the managed blob path. Tag IDs/names and model-tag links remain explicit. Referenced manuals and thumbnails retain their paths and hashes; thumbnails also retain their IDs and `is_custom` state. Unreferenced staging, trash, jobs, and blobs are not exported.
 
@@ -26,3 +26,17 @@ Managed paths must use forward slashes, start with their designated `originals/`
 Saved colorways live under the webview localStorage key `gogglelab.colorways.v1`. The Free recovery interface reads that raw value in the same app/webview identity and passes it to the native `recovery_export_colorways` command. The command writes the received UTF-8 string bytes to a new user-chosen file, with an 8 MiB limit. It neither parses nor normalizes the string, so malformed JSON remains exportable. It never calls `setItem` or otherwise changes localStorage. A missing key has no raw value to export.
 
 Future Pro schema changes must retain v1 recovery compatibility or ship a public, compatible reader adapter in the same release. Older readers reject unknown versions without writing to the source.
+
+## Indexed source references in schema 2
+
+The manifest keeps version 1 with additive optional fields. Schema-1 exports retain their
+original structure. Schema-2 inspection/export includes index_roots (canonical source
+locations and scan settings) and each indexed model's indexed_source (root ID, relative
+path, missing status, modified time, hash, name, format and byte count). Indexed originals
+stay in their existing source folders; the recovery ZIP preserves references and metadata
+rather than reading/copying external originals. Use a separate source-folder backup for
+those files. Managed original/manual/thumbnail assets retain the existing byte verification.
+
+Generated thumbnail content_hash remains the PNG byte hash. The optional
+source_content_hash records which model geometry produced it. Custom thumbnails retain
+their original ownership and are excluded from the generated-cache purge.

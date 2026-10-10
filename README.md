@@ -15,6 +15,8 @@ contain the Community features listed below. Private Pro source stays in its sep
 - Folder browsing, search, watching, ZIP extraction, drag/drop moves and confirmed Trash actions.
 - Installed slicer discovery, printer-profile detection, and handoff of the loaded original STL/3MF.
 - Managed Library import, folder catalog, search and model opening without a license.
+- Multiple indexed folders with startup/periodic scans, cancellation and configurable size limits.
+- Cached STL/3MF thumbnail gallery with source/status filters, search, sorting and preview regeneration.
 - Read-only recovery of existing Library data and raw saved colorway records.
 
 Community owns managed Library and basic slicer handoff. Editable/saved colorways and slicer palette access remain Pro.

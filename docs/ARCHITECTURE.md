@@ -18,3 +18,10 @@ Library identities and raw saved colorway records.
 
 The selected Library and handoff implementations moved from private Pro to public MPL-2.0
 with explicit owner approval on 2026-10-10. See [Free parity plan](FREE-PRINTVENTORY-PARITY-PLAN.md).
+
+Phase 2 adds additive schema-v2 indexed references with a pre-migration SQLite snapshot
+backup. Originals remain in place. A bounded background scanner reconciles complete scans;
+failed/cancelled scans do not infer missing data. Indexed sources are validated against
+immutable canonical roots at use. Thumbnail rendering runs in bounded blocking tasks and
+stores deterministic PNGs keyed by source hash and renderer version. The read-only recovery
+reader accepts schemas 1 and 2 and preserves indexed references without reading originals.

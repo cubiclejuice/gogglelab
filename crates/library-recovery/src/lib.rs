@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 
 pub const MANIFEST_VERSION: u32 = 1;
-pub const LIBRARY_SCHEMA_VERSION: u32 = 1;
+pub const LIBRARY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_COLORWAY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -79,6 +79,8 @@ pub struct RecoveryManifest {
     pub tags: Vec<RecoveryTag>,
     pub model_tags: Vec<RecoveryModelTag>,
     pub models: Vec<RecoveryModel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_roots: Vec<RecoveryIndexRoot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +117,30 @@ pub struct RecoveryModel {
     pub revisions: Vec<RecoveryRevision>,
     pub manual: Option<RecoveryAsset>,
     pub thumbnails: Vec<RecoveryThumbnail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_source: Option<RecoveryIndexedSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryIndexRoot {
+    pub id: String,
+    pub path: String,
+    pub enabled: bool,
+    pub last_scanned_at: Option<String>,
+    pub scan_interval_minutes: u32,
+    pub max_file_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryIndexedSource {
+    pub root_id: String,
+    pub relative_path: String,
+    pub missing: bool,
+    pub modified_at: Option<u64>,
+    pub content_hash: String,
+    pub original_name: String,
+    pub format: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +159,8 @@ pub struct RecoveryThumbnail {
     pub id: String,
     pub model_id: String,
     pub is_custom: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_content_hash: Option<String>,
     pub asset: RecoveryAsset,
 }
 
@@ -465,6 +493,7 @@ fn managed_file(root: &Path, relative: &str, kind: &str) -> Result<PathBuf, Reco
 
 fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
     validate_schema(conn)?;
+    let schema_version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let (library_id, library_name, library_created_at) = conn
         .query_row(
             "SELECT id, name, created_at FROM libraries WHERE id = 'local'",
@@ -520,6 +549,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 revisions: Vec::new(),
                 manual: None,
                 thumbnails: Vec::new(),
+                indexed_source: None,
             })
         },
     )?;
@@ -528,6 +558,103 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         .enumerate()
         .map(|(position, model)| (model.id.clone(), position))
         .collect();
+
+    let index_roots = if schema_version >= 2 {
+        let invalid_sources: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM models WHERE source_kind IS NULL OR source_kind NOT IN ('managed','indexed')",
+            [],|row|row.get(0))?;
+        let invalid_links: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM indexed_model_data d LEFT JOIN models m ON m.id=d.model_id
+             WHERE m.id IS NULL OR m.source_kind IS NULL OR m.source_kind!='indexed'",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid_sources != 0 || invalid_links != 0 {
+            return Err(invalid(
+                "Indexed source kinds or metadata links are invalid",
+            ));
+        }
+
+        let roots = collect_rows(conn,
+            "SELECT id,path,enabled,last_scanned_at,scan_interval_minutes,max_file_bytes FROM index_roots ORDER BY id",
+            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,row.get::<_, i64>(4)?,row.get::<_, i64>(5)?)))?;
+        let mut result = Vec::new();
+        for (id, path, enabled, last_scanned_at, interval, limit) in roots {
+            if !Path::new(&path).is_absolute()
+                || !(0..=1).contains(&enabled)
+                || !(1..=1440).contains(&interval)
+                || limit <= 0
+                || limit > 100 * 1024 * 1024
+            {
+                return Err(invalid("An indexed root has invalid configuration"));
+            }
+            result.push(RecoveryIndexRoot {
+                id,
+                path,
+                enabled: enabled == 1,
+                last_scanned_at,
+                scan_interval_minutes: interval as u32,
+                max_file_bytes: limit as u64,
+            });
+        }
+        let root_ids: BTreeSet<_> = result.iter().map(|root| root.id.as_str()).collect();
+        let sources = collect_rows(conn,
+            "SELECT m.id,m.source_root_id,m.source_path,m.source_missing,m.source_modified_at,
+              d.content_hash,d.original_name,d.format,d.bytes FROM models m
+              LEFT JOIN indexed_model_data d ON d.model_id=m.id WHERE m.source_kind='indexed' ORDER BY m.id",
+            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,row.get::<_, Option<i64>>(4)?,row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,row.get::<_, String>(7)?,row.get::<_, i64>(8)?)))?;
+        for (
+            model_id,
+            root_id,
+            relative_path,
+            missing,
+            modified_at,
+            content_hash,
+            original_name,
+            format,
+            bytes,
+        ) in sources
+        {
+            let relative = Path::new(&relative_path);
+            if !root_ids.contains(root_id.as_str())
+                || relative.is_absolute()
+                || relative_path.contains('\\')
+                || relative_path.contains(' ')
+                || relative_path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                || relative
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_)))
+                || !(0..=1).contains(&missing)
+                || modified_at.is_some_and(|value| value < 0)
+                || bytes < 0
+                || content_hash.len() != 64
+                || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(invalid("An indexed model has invalid source metadata"));
+            }
+            let position = index
+                .get(&model_id)
+                .ok_or_else(|| invalid("Unknown indexed model"))?;
+            models[*position].indexed_source = Some(RecoveryIndexedSource {
+                root_id,
+                relative_path,
+                missing: missing == 1,
+                modified_at: modified_at.map(|v| v as u64),
+                content_hash,
+                original_name,
+                format,
+                bytes: bytes as u64,
+            });
+        }
+        result
+    } else {
+        Vec::new()
+    };
 
     let revisions = collect_rows(
         conn,
@@ -597,8 +724,11 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
     }
     let thumbnails = collect_rows(
         conn,
-        "SELECT id, model_id, relative_path, content_hash, is_custom
-         FROM thumbnails ORDER BY model_id, id",
+        if schema_version >= 2 {
+            "SELECT id,model_id,relative_path,content_hash,is_custom,source_content_hash FROM thumbnails ORDER BY model_id,id"
+        } else {
+            "SELECT id,model_id,relative_path,content_hash,is_custom,NULL FROM thumbnails ORDER BY model_id,id"
+        },
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -606,13 +736,19 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         },
     )?;
-    for (id, model_id, path, hash, is_custom) in thumbnails {
+    for (id, model_id, path, hash, is_custom, source_content_hash) in thumbnails {
         let model = index
             .get(&model_id)
             .ok_or_else(|| invalid("A thumbnail references an unknown model"))?;
+        if source_content_hash.as_ref().is_some_and(|hash| {
+            hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(invalid("A thumbnail has invalid source provenance"));
+        }
         if is_custom != 0 && is_custom != 1 {
             return Err(invalid("A thumbnail has invalid custom state"));
         }
@@ -620,6 +756,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             id,
             model_id,
             is_custom: is_custom == 1,
+            source_content_hash,
             asset: RecoveryAsset {
                 original_relative_path: path,
                 exported_path: None,
@@ -663,7 +800,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
     }
     Ok(RecoveryManifest {
         manifest_version: MANIFEST_VERSION,
-        library_schema_version: LIBRARY_SCHEMA_VERSION,
+        library_schema_version: schema_version,
         library_id,
         library_name,
         library_created_at,
@@ -671,6 +808,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         tags,
         model_tags,
         models,
+        index_roots,
     })
 }
 
@@ -710,9 +848,9 @@ fn collect_rows<T>(
 
 fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != LIBRARY_SCHEMA_VERSION as i64 {
+    if !(1..=LIBRARY_SCHEMA_VERSION as i64).contains(&version) {
         return Err(invalid(format!(
-            "Unsupported Library schema version {version}; recovery supports version 1"
+            "Unsupported Library schema version {version}; recovery supports versions 1 and 2"
         )));
     }
     const TABLES: &[(&str, &[&str])] = &[
@@ -771,7 +909,56 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
             ],
         ),
     ];
-    for (table, required) in TABLES {
+    let mut tables = TABLES.to_vec();
+    if version == 2 {
+        tables.extend_from_slice(&[
+            (
+                "index_roots",
+                &[
+                    "id",
+                    "path",
+                    "enabled",
+                    "last_scanned_at",
+                    "scan_interval_minutes",
+                    "max_file_bytes",
+                ],
+            ),
+            (
+                "indexed_model_data",
+                &[
+                    "model_id",
+                    "content_hash",
+                    "original_name",
+                    "format",
+                    "bytes",
+                ],
+            ),
+        ]);
+        let mut stmt = conn.prepare("PRAGMA table_info(models)")?;
+        let columns: BTreeSet<String> = stmt
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<_, _>>()?;
+        for column in [
+            "source_kind",
+            "source_path",
+            "source_root_id",
+            "source_missing",
+            "source_modified_at",
+        ] {
+            if !columns.contains(column) {
+                return Err(invalid("Indexed model columns are missing"));
+            }
+        }
+        let source_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(length(source_path)+length(source_root_id)),0) FROM models",
+            [],
+            |row| row.get(0),
+        )?;
+        if source_bytes > MAX_METADATA_BYTES {
+            return Err(invalid("Indexed metadata exceeds recovery limit"));
+        }
+    }
+    for (table, required) in &tables {
         let found_type: Option<String> = conn
             .query_row(
                 "SELECT type FROM sqlite_master WHERE name = ?1",
@@ -799,7 +986,7 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
         return Err(invalid("Library has too many models for recovery"));
     }
     let mut metadata_bytes = 0i64;
-    for (table, columns) in TABLES.iter().filter(|(table, _)| *table != "jobs") {
+    for (table, columns) in tables.iter().filter(|(table, _)| *table != "jobs") {
         let terms = columns
             .iter()
             .map(|column| format!("COALESCE(length(CAST({column} AS BLOB)), 0)"))
