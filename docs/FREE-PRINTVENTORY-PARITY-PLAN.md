@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-10
-Status: phase 1 implemented and locally validated; native screenshot verification unavailable. Full parity phases 2–6 remain planned.
+Status: phases 1–2 implemented and locally built/verified; phase 3 in progress. Native window capture and cross-platform release verification remain outstanding.
 
 ## Decision
 
@@ -141,3 +141,21 @@ The user explicitly approved moving the existing private library and slicer-hand
 - Installed process launched successfully; a native stack sample confirmed AppKit and WebKit event-loop activity. Computer-use returned cgWindowNotFound for both GoggleLab and Finder, so native window appearance/interactions were not verified. Browser UI checks do not substitute for that native check.
 - Windows/Linux runtime verification, full parity phases 2–6, native real-slicer launch verification and publication are outstanding. Local handoff tests use injected launch closures rather than starting a user's slicer.
 - Both repositories keep local codex/free-library-handoff work; nothing pushed. Unrelated Pro payment/runner planning files preserved.
+
+## Phase 2 local completion
+
+- Community commits bf140e8 / 0e806b0 implement in-place roots, safe reconciliation,
+  cached thumbnails, view modes, bulk generation, configurable rendering and scanning.
+- Community frontend: 61 tests; storage: 21; focused native: 23; recovery: 12;
+  full workspace/default clippy and standalone/unified macOS builds passed.
+- Unified workspace checkpoint c997102 pins 0e806b0 with only necessary png/base64
+  dependency edges; no dependency-version upgrade.
+- Browser catalog verification includes all controls, view modes, cache invalidation,
+  source settings/dates, full thumbnail containment, desktop/480px rendering and zero errors.
+- Installed unified phase-2 executable SHA256:
+  4d5a6c573a91dfec51127742f75deae06e996c56a209e415eaf9b63a7cfa4e74.
+- App is running. Previous bundle: output/app-backups/GoggleLab-before-phase2-20261010.app.
+- Native capture was retried and still returns cgWindowNotFound. Actual native window
+  appearance is not asserted. Windows/Linux runtime validation remains a release gate.
+- Remaining phases 3–6 retain their full scope, plus pinned-guide file-management,
+  archive indexing, thumbnail-image formats and browser-extension discovery requirements.

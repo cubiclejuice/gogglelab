@@ -1,7 +1,7 @@
 # Phase 2: in-place indexing and thumbnail catalog
 
 Date: 2026-10-10
-Status: full phase 2 Community implementation, browser verification and build passed; final unified-app gate in progress. All functionality belongs to Community/Free.
+Status: phase 2 local gates passed; Community/unified builds verified, installed and running. Native window capture remains unavailable. All functionality belongs to Community/Free.
 
 ## Outcome
 Register multiple local or mounted-network model roots and browse a persistent thumbnail catalog without copying, moving or writing originals. Managed imports continue to work. UI exposes scan status/cancellation, periodic scan settings, configurable file limits, name/size/date sorting, global search, source/folder/missing filters and thumbnail regenerate/purge.
@@ -85,3 +85,9 @@ before deleting registry rows or files; malformed metadata must never delete an 
 - Expanded browser QA passed all view modes, details, bulk false/true job calls, persisted settings callback, root timestamps, content-change thumbnail refetch, and 480px header/settings/view controls within bounds. Console errors: zero.
 - Independent storage/native reviews reconciled; no open high/medium implementation finding.
 - Unchanged external validation limitation: native window capture unavailable; Windows/Linux runtime and publication remain outside local validation.
+
+Unified frontend/native tests, clippy, packaging and signature verification passed against
+0e806b0. Installed at /Applications/GoggleLab.app and process verified running. Previous
+phase-1 app retained under output/app-backups/GoggleLab-before-phase2-20261010.app.
+Native CUA capture retried, still cgWindowNotFound; browser visual evidence and isolated
+native fixtures remain the available validation. No push or release.
