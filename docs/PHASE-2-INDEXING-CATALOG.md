@@ -1,7 +1,7 @@
 # Phase 2: in-place indexing and thumbnail catalog
 
 Date: 2026-10-10
-Status: implementation and Community validation complete; unified build/install gate in progress. All functionality belongs to Community/Free.
+Status: full phase 2 Community implementation, browser verification and build passed; final unified-app gate in progress. All functionality belongs to Community/Free.
 
 ## Outcome
 Register multiple local or mounted-network model roots and browse a persistent thumbnail catalog without copying, moving or writing originals. Managed imports continue to work. UI exposes scan status/cancellation, periodic scan settings, configurable file limits, name/size/date sorting, global search, source/folder/missing filters and thumbnail regenerate/purge.
@@ -59,3 +59,29 @@ Upstream phase-2 baseline pinned: Printventory f551c4601c03072362b426c652b5dd37e
 - Review fixes: current-scan-only rename matching, offline cache use, source/hash races, bounded file/PNG reads, source-change UI cache invalidation, ns timestamp normalization and intrinsic grid sizing.
 - Recovery exports indexed metadata/references only; original source-folder backup belongs to phase 4's explicit backup options.
 - Standalone Community packaging passed; final UI repackaging and unified core pin/native checks/package/install remain underway.
+
+## Pinned-guide completeness audit
+
+The pinned GUIDE additionally requires List/Preview/Detailed views, generate-missing
+previews, regenerate-all previews, thumbnail size/concurrency settings and background color.
+These are included in phase 2 before advancing. Catalog settings persist locally (128/256/512px,
+#RRGGBB background, 1–2 concurrent renders, scan batch 16–256); supported choices are honored.
+Bulk generation uses cancellable background jobs and shares the scan-progress lifecycle.
+Settings changes invalidate generated previews while retaining custom ones.
+
+The guide's ZIP indexing/bundles belong to phase 3; file reveal/delete and all-data purge
+belong to phase 4; AI/Spoolman and remote/MCP/extension remain phases 5/6. Generated-cache
+orphans from content/configuration changes must be cleaned during phase 4 maintenance.
+New review finding: cache purge must validate thumbnails namespace and symlink ancestry
+before deleting registry rows or files; malformed metadata must never delete an original.
+
+## Expanded catalog final gate
+
+- Free List/Previews/Details layouts, missing-preview generation/full regeneration, automatic post-scan previews, persistent size/background/concurrency/batch controls implemented.
+- Final storage tests: 21 passed. Persisted values fail closed; purge validates all targets before registry deletion, protects originals/symlink escapes/custom-shared files, and atomically preserves render provenance.
+- Final native focused tests: 23 passed; full workspace tests and clippy passed. Render-source/configuration races, PNG bounds, thumbnail job cancellation and native deletion revalidation covered.
+- Read-only recovery: 12 passed, including optional catalog settings and separate PNG/source hashes.
+- Final frontend: 61 passed; format/lint/typecheck/web production build and standalone macOS packaging passed.
+- Expanded browser QA passed all view modes, details, bulk false/true job calls, persisted settings callback, root timestamps, content-change thumbnail refetch, and 480px header/settings/view controls within bounds. Console errors: zero.
+- Independent storage/native reviews reconciled; no open high/medium implementation finding.
+- Unchanged external validation limitation: native window capture unavailable; Windows/Linux runtime and publication remain outside local validation.

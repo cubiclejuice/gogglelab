@@ -40,3 +40,5 @@ those files. Managed original/manual/thumbnail assets retain the existing byte v
 Generated thumbnail content_hash remains the PNG byte hash. The optional
 source_content_hash records which model geometry produced it. Custom thumbnails retain
 their original ownership and are excluded from the generated-cache purge.
+
+Schema-2 exports also retain optional catalog_settings (preview size/background, bounded render concurrency, and scan batch size). Older schema-2 catalogs without that singleton remain readable.

@@ -1,12 +1,48 @@
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::collections::VecDeque;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 
 use crate::extension_api::{AppError, AppState, ModelSummary};
-use library_core::{Folder, ImportResult, IndexRoot, LibraryDb, LibraryError, Model};
+use library_core::{
+    CatalogSettings, Folder, ImportResult, IndexRoot, LibraryDb, LibraryError, Model,
+};
 
 use crate::library_scan::{LibraryScanStatus, ScanControl};
 
-static THUMBNAIL_RENDER_LOCK: Mutex<()> = Mutex::new(());
+static THUMBNAIL_RENDER_LIMITER: LazyLock<RenderLimiter> = LazyLock::new(RenderLimiter::new);
+
+struct RenderLimiter {
+    active: Mutex<usize>,
+    available: Condvar,
+}
+
+struct RenderPermit<'a>(&'a RenderLimiter);
+
+impl RenderLimiter {
+    fn new() -> Self {
+        Self {
+            active: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, limit: usize) -> RenderPermit<'_> {
+        let mut active = self.active.lock().unwrap();
+        while *active >= limit.max(1) {
+            active = self.available.wait(active).unwrap();
+        }
+        *active += 1;
+        RenderPermit(self)
+    }
+}
+
+impl Drop for RenderPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap();
+        *active = active.saturating_sub(1);
+        self.0.available.notify_one();
+    }
+}
 
 #[derive(Clone)]
 pub struct LibraryState {
@@ -153,6 +189,25 @@ pub fn library_list_roots(
 }
 
 #[tauri::command]
+pub fn library_get_catalog_settings(
+    state: tauri::State<'_, LibraryState>,
+) -> Result<CatalogSettings, AppError> {
+    with_db(&state, |db| {
+        db.get_catalog_settings().map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_set_catalog_settings(
+    state: tauri::State<'_, LibraryState>,
+    settings: CatalogSettings,
+) -> Result<CatalogSettings, AppError> {
+    with_db(&state, |db| {
+        db.update_catalog_settings(&settings).map_err(library_error)
+    })
+}
+
+#[tauri::command]
 pub fn library_add_root(
     state: tauri::State<'_, LibraryState>,
     path: String,
@@ -227,6 +282,107 @@ pub fn library_cancel_scan(state: tauri::State<'_, LibraryState>) {
     state.scan_control().cancel();
 }
 
+const MAX_THUMBNAIL_JOB_MODELS: usize = 200_000;
+
+#[tauri::command]
+pub fn library_start_thumbnail_job(
+    state: tauri::State<'_, LibraryState>,
+    regenerate: bool,
+) -> Result<(), AppError> {
+    let state = state.inner().clone();
+    let model_ids = thumbnail_job_models(&state, None)?;
+    if !state.scan_control().try_begin(0, "thumbnails") {
+        return Err(AppError::Library {
+            message: "A library scan or thumbnail job is already running".into(),
+        });
+    }
+    state.scan_control().set_thumbnail_progress(model_ids.len());
+    let worker_state = state.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("gogglelab-thumbnail-job".into())
+        .spawn(move || {
+            render_thumbnail_models(&worker_state, model_ids, regenerate);
+            worker_state.scan_control().finish();
+        })
+    {
+        let message = error.to_string();
+        state.scan_control().failed_to_spawn(message.clone());
+        return Err(AppError::Library { message });
+    }
+    Ok(())
+}
+
+fn thumbnail_job_models(
+    state: &LibraryState,
+    root_id: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    let models = with_db(state, |db| {
+        db.list_models(None, None).map_err(library_error)
+    })?;
+    if models.len() > MAX_THUMBNAIL_JOB_MODELS {
+        return Err(AppError::Library {
+            message: format!(
+                "Thumbnail job exceeds the safety limit of {MAX_THUMBNAIL_JOB_MODELS} models"
+            ),
+        });
+    }
+    Ok(models
+        .into_iter()
+        .filter(|model| {
+            !model.source_missing
+                && model.content_hash.is_some()
+                && root_id.is_none_or(|id| model.source_root_id.as_deref() == Some(id))
+        })
+        .map(|model| model.id)
+        .collect())
+}
+
+pub(crate) fn render_thumbnails_for_root(state: &LibraryState, root_id: &str) {
+    let model_ids = match thumbnail_job_models(state, Some(root_id)) {
+        Ok(model_ids) => model_ids,
+        Err(error) => {
+            state
+                .scan_control()
+                .error(format!("Thumbnail job: {error:?}"));
+            return;
+        }
+    };
+    state.scan_control().set_job_kind("thumbnails");
+    state.scan_control().set_thumbnail_progress(model_ids.len());
+    render_thumbnail_models(state, model_ids, false);
+    state.scan_control().set_job_kind("scan");
+}
+
+fn render_thumbnail_models(state: &LibraryState, model_ids: Vec<String>, regenerate: bool) {
+    let concurrency = with_db(state, |db| {
+        db.get_catalog_settings()
+            .map(|settings| settings.thumbnail_concurrency.clamp(1, 2) as usize)
+            .map_err(library_error)
+    })
+    .unwrap_or(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from(model_ids)));
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency {
+            let queue = Arc::clone(&queue);
+            let state = state.clone();
+            scope.spawn(move || loop {
+                if state.scan_control().cancelled() {
+                    break;
+                }
+                let Some(model_id) = queue.lock().unwrap().pop_front() else {
+                    break;
+                };
+                if let Err(error) = get_thumbnail(&state, &model_id, regenerate) {
+                    state
+                        .scan_control()
+                        .error(format!("Thumbnail {model_id}: {error:?}"));
+                }
+                state.scan_control().thumbnail_completed();
+            });
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn library_get_thumbnail(
     state: tauri::State<'_, LibraryState>,
@@ -243,7 +399,7 @@ pub async fn library_get_thumbnail(
     })?
 }
 
-fn get_thumbnail(
+pub(crate) fn get_thumbnail(
     state: &LibraryState,
     model_id: &str,
     regenerate: bool,
@@ -253,7 +409,12 @@ fn get_thumbnail(
             return Ok(Some(cached));
         }
     }
-    let _render_guard = THUMBNAIL_RENDER_LOCK.lock().unwrap();
+    let render_concurrency = with_db(state, |db| {
+        db.get_catalog_settings()
+            .map(|settings| settings.thumbnail_concurrency.min(2) as usize)
+            .map_err(library_error)
+    })?;
+    let _render_permit = THUMBNAIL_RENDER_LIMITER.acquire(render_concurrency);
     if !regenerate {
         if let Ok(Some(cached)) = with_db(state, |db| cached_thumbnail(db, model_id)) {
             return Ok(Some(cached));
@@ -275,9 +436,10 @@ fn get_thumbnail(
             content_hash,
             model.bytes,
             db.root().to_path_buf(),
+            db.get_catalog_settings().map_err(library_error)?,
         )))
     })?;
-    let Some((source_path, content_hash, source_bytes, library_root)) = source else {
+    let Some((source_path, content_hash, source_bytes, library_root, settings)) = source else {
         return Ok(None);
     };
     let thumbnail = crate::library_thumbnail::ensure_thumbnail(
@@ -285,43 +447,84 @@ fn get_thumbnail(
         &source_path,
         &content_hash,
         source_bytes,
+        &settings,
         regenerate,
     )
     .map_err(|message| AppError::Library { message })?;
     with_db(state, |db| {
-        let current_hash = db
-            .get_model(model_id)
-            .map_err(library_error)?
-            .and_then(|model| model.content_hash)
-            .ok_or_else(|| AppError::Library {
-                message: "Model source changed while rendering its thumbnail".into(),
-            })?;
-        if current_hash != content_hash {
-            return Err(AppError::Library {
-                message: "Model source changed while rendering its thumbnail".into(),
-            });
-        }
-        db.set_thumbnail_for_source(
-            model_id,
-            &content_hash,
-            &thumbnail.png_hash,
-            &thumbnail.relative_path,
-        )
-        .map_err(library_error)
+        persist_generated_thumbnail(db, model_id, &content_hash, &settings, &thumbnail)
     })?;
     crate::library_thumbnail::png_data_uri(&library_root.join(thumbnail.relative_path))
         .map(Some)
         .map_err(|message| AppError::Library { message })
 }
 
+fn persist_generated_thumbnail(
+    db: &LibraryDb,
+    model_id: &str,
+    content_hash: &str,
+    settings: &CatalogSettings,
+    thumbnail: &crate::library_thumbnail::ThumbnailArtifact,
+) -> Result<(), AppError> {
+    let current_hash = db
+        .get_model(model_id)
+        .map_err(library_error)?
+        .and_then(|model| model.content_hash)
+        .ok_or_else(|| AppError::Library {
+            message: "Model source changed while rendering its thumbnail".into(),
+        })?;
+    if current_hash != content_hash {
+        return Err(AppError::Library {
+            message: "Model source changed while rendering its thumbnail".into(),
+        });
+    }
+    let current_settings = db.get_catalog_settings().map_err(library_error)?;
+    if current_settings.thumbnail_size != settings.thumbnail_size
+        || current_settings.thumbnail_background != settings.thumbnail_background
+    {
+        return Err(AppError::Library {
+            message: "Thumbnail settings changed while rendering".into(),
+        });
+    }
+    db.set_thumbnail_for_source_and_settings(
+        model_id,
+        content_hash,
+        settings,
+        &thumbnail.png_hash,
+        &thumbnail.relative_path,
+    )
+    .map_err(library_error)
+}
+
 fn cached_thumbnail(db: &LibraryDb, model_id: &str) -> Result<Option<String>, AppError> {
-    let Some((path, png_hash)) = db
-        .thumbnail_for_model_with_hash(model_id)
+    let Some(entry) = db
+        .thumbnail_cache_entry_for_model(model_id)
         .map_err(library_error)?
     else {
         return Ok(None);
     };
-    crate::library_thumbnail::png_data_uri_with_hash(&path, &png_hash)
+    if !entry.is_custom {
+        let model_hash = db
+            .get_model(model_id)
+            .map_err(library_error)?
+            .and_then(|model| model.content_hash)
+            .ok_or_else(|| AppError::Library {
+                message: "Generated thumbnail has no model source hash".into(),
+            })?;
+        let settings = db.get_catalog_settings().map_err(library_error)?;
+        let expected = db
+            .root()
+            .join(crate::library_thumbnail::thumbnail_relative_path(
+                &model_hash,
+                &settings,
+            ))
+            .canonicalize()
+            .map_err(|error| crate::error::map_io_error(&error))?;
+        if entry.path != expected {
+            return Ok(None);
+        }
+    }
+    crate::library_thumbnail::png_data_uri_with_hash(&entry.path, &entry.png_hash)
         .map(Some)
         .map_err(|message| AppError::Library { message })
 }
@@ -340,10 +543,78 @@ pub async fn library_purge_thumbnails(
 
 fn purge_thumbnails(state: &LibraryState) -> Result<u64, AppError> {
     let paths = with_db(state, |db| db.purge_thumbnails().map_err(library_error))?;
+    remove_thumbnail_paths(&state.inner.root, paths)
+}
+
+fn remove_thumbnail_paths(library_root: &Path, paths: Vec<PathBuf>) -> Result<u64, AppError> {
+    let canonical_library = library_root
+        .canonicalize()
+        .map_err(|error| crate::error::map_io_error(&error))?;
+    let thumbnail_root = library_root
+        .join("thumbnails")
+        .canonicalize()
+        .map_err(|error| crate::error::map_io_error(&error))?;
+    if thumbnail_root != canonical_library.join("thumbnails") {
+        return Err(AppError::Library {
+            message: "Thumbnail directory identity changed".into(),
+        });
+    }
     let mut removed = 0_u64;
     for path in paths {
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed += 1,
+        if !path.starts_with(&thumbnail_root) || path.parent().is_none() {
+            return Err(AppError::Library {
+                message: "Refused to purge a path outside the thumbnail directory".into(),
+            });
+        }
+        let relative = path
+            .strip_prefix(&thumbnail_root)
+            .map_err(|_| AppError::Library {
+                message: "Refused to purge a malformed thumbnail path".into(),
+            })?;
+        let components = relative.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(AppError::Library {
+                message: "Refused to purge a malformed thumbnail path".into(),
+            });
+        }
+        let mut ancestor = thumbnail_root.clone();
+        for component in &components[..components.len() - 1] {
+            let Component::Normal(component) = component else {
+                unreachable!("components were validated");
+            };
+            ancestor.push(component);
+            let metadata = std::fs::symlink_metadata(&ancestor)
+                .map_err(|error| crate::error::map_io_error(&error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(AppError::Library {
+                    message: "Refused to purge through a symlinked thumbnail directory".into(),
+                });
+            }
+        }
+        let parent = path
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .map_err(|error| crate::error::map_io_error(&error))?;
+        if !parent.starts_with(&thumbnail_root) {
+            return Err(AppError::Library {
+                message: "Refused to purge through a symlinked thumbnail directory".into(),
+            });
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(AppError::Library {
+                    message: "Refused to purge a non-regular thumbnail".into(),
+                });
+            }
+            Ok(_) => {
+                std::fs::remove_file(&path).map_err(|error| crate::error::map_io_error(&error))?;
+                removed += 1;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(crate::error::map_io_error(&error)),
         }
@@ -453,7 +724,10 @@ mod access_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_thumbnail, library_source_identity, open_library};
+    use super::{
+        cached_thumbnail, library_source_identity, open_library, persist_generated_thumbnail,
+        remove_thumbnail_paths, render_thumbnail_models, LibraryState,
+    };
     use library_core::ScannedModel;
     use sha2::{Digest, Sha256};
     use std::path::{Path, PathBuf};
@@ -551,6 +825,7 @@ mod tests {
             &source,
             &source_hash,
             bytes.len() as u64,
+            &db.get_catalog_settings().unwrap(),
             false,
         )
         .unwrap();
@@ -566,5 +841,189 @@ mod tests {
         let data_uri = cached_thumbnail(&db, &model_id).unwrap().unwrap();
         assert!(data_uri.starts_with("data:image/png;base64,"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_thumbnail_render_generates_all_and_honors_cancellation_without_source_writes() {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gogglelab-library-bulk-{}-{nonce}",
+            std::process::id()
+        ));
+        let source_root = std::env::temp_dir().join(format!(
+            "gogglelab-library-bulk-source-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&source_root);
+        std::fs::create_dir_all(&source_root).unwrap();
+        let mut bytes = vec![0_u8; 84];
+        bytes[80..84].copy_from_slice(&0_u32.to_le_bytes());
+        let sources = [source_root.join("one.stl"), source_root.join("two.stl")];
+        for source in &sources {
+            std::fs::write(source, &bytes).unwrap();
+        }
+        let before = sources
+            .iter()
+            .map(|source| std::fs::metadata(source).unwrap().modified().unwrap())
+            .collect::<Vec<_>>();
+        let state = LibraryState::new(root.clone());
+        let model_ids = state
+            .with_db(|db| {
+                sources
+                    .iter()
+                    .map(|source| {
+                        db.import_file(source, None, None)
+                            .map(|result| result.model.id)
+                            .map_err(super::library_error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(state.scan_control().try_begin(0, "thumbnails"));
+        state.scan_control().set_thumbnail_progress(model_ids.len());
+        render_thumbnail_models(&state, model_ids.clone(), false);
+        assert_eq!(state.scan_control().status().thumbnails_completed, 2);
+        state
+            .with_db(|db| {
+                for model_id in &model_ids {
+                    assert!(db.thumbnail_for_model(model_id).unwrap().is_some());
+                }
+                Ok(())
+            })
+            .unwrap();
+        state.scan_control().finish();
+        assert_eq!(
+            state.scan_control().status().job_kind.as_deref(),
+            Some("thumbnails")
+        );
+
+        let cached = state
+            .with_db(|db| {
+                Ok(db
+                    .thumbnail_for_model(&model_ids[0])
+                    .map_err(super::library_error)?
+                    .unwrap())
+            })
+            .unwrap();
+        std::fs::write(&cached, b"corrupt cache").unwrap();
+        assert!(state.scan_control().try_begin(0, "thumbnails"));
+        state.scan_control().set_thumbnail_progress(1);
+        render_thumbnail_models(&state, vec![model_ids[0].clone()], true);
+        assert_eq!(state.scan_control().status().thumbnails_completed, 1);
+        assert!(crate::library_thumbnail::png_data_uri(&cached).is_ok());
+        state.scan_control().finish();
+
+        assert!(state.scan_control().try_begin(0, "thumbnails"));
+        state.scan_control().set_thumbnail_progress(model_ids.len());
+        state.scan_control().cancel();
+        render_thumbnail_models(&state, model_ids, true);
+        assert_eq!(state.scan_control().status().thumbnails_completed, 0);
+        assert_eq!(
+            before,
+            sources
+                .iter()
+                .map(|source| std::fs::metadata(source).unwrap().modified().unwrap())
+                .collect::<Vec<_>>()
+        );
+        state.scan_control().finish();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn native_purge_guard_refuses_paths_outside_thumbnail_directory() {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gogglelab-library-purge-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("thumbnails")).unwrap();
+        let outside = root.join("originals-do-not-delete.stl");
+        std::fs::write(&outside, b"preserve").unwrap();
+        assert!(remove_thumbnail_paths(&root, vec![outside.clone()]).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+        let thumbnail = root.join("thumbnails/generated.png");
+        std::fs::write(&thumbnail, b"generated").unwrap();
+        assert_eq!(
+            remove_thumbnail_paths(&root, vec![thumbnail.canonicalize().unwrap()]).unwrap(),
+            1
+        );
+        assert!(!thumbnail.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_purge_guard_rejects_swapped_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gogglelab-library-purge-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        let thumbnails = root.join("thumbnails");
+        let original_dir = thumbnails.join("original");
+        let replacement_dir = thumbnails.join("replacement");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        std::fs::create_dir_all(&replacement_dir).unwrap();
+        let original = original_dir.join("generated.png");
+        std::fs::write(&original, b"original").unwrap();
+        let stored_path = original.canonicalize().unwrap();
+        std::fs::remove_file(&original).unwrap();
+        std::fs::remove_dir(&original_dir).unwrap();
+        let replacement = replacement_dir.join("generated.png");
+        std::fs::write(&replacement, b"preserve").unwrap();
+        symlink(&replacement_dir, &original_dir).unwrap();
+
+        assert!(remove_thumbnail_paths(&root, vec![stored_path]).is_err());
+        assert_eq!(std::fs::read(&replacement).unwrap(), b"preserve");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_render_is_not_published_after_appearance_settings_change() {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gogglelab-library-settings-race-{}-{nonce}",
+            std::process::id()
+        ));
+        let source_root = std::env::temp_dir().join(format!(
+            "gogglelab-library-settings-race-source-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("model.stl");
+        let mut bytes = vec![0_u8; 84];
+        bytes[80..84].copy_from_slice(&0_u32.to_le_bytes());
+        std::fs::write(&source, &bytes).unwrap();
+        let db = open_library(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        let original_settings = db.get_catalog_settings().unwrap();
+        let thumbnail = crate::library_thumbnail::ensure_thumbnail(
+            &root,
+            &source,
+            model.content_hash.as_deref().unwrap(),
+            bytes.len() as u64,
+            &original_settings,
+            false,
+        )
+        .unwrap();
+        let mut changed = original_settings.clone();
+        changed.thumbnail_background = "#FFFFFF".into();
+        db.update_catalog_settings(&changed).unwrap();
+
+        assert!(persist_generated_thumbnail(
+            &db,
+            &model.id,
+            model.content_hash.as_deref().unwrap(),
+            &original_settings,
+            &thumbnail,
+        )
+        .is_err());
+        assert!(db.thumbnail_for_model(&model.id).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(source_root);
     }
 }

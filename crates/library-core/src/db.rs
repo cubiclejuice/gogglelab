@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,8 @@ use uuid::Uuid;
 
 use crate::error::{io, LibraryError};
 use crate::models::{
-    Folder, ImportResult, IndexRoot, IndexedSourceMetadata, Model, ScanReconcile, ScannedModel,
+    CatalogSettings, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, Model, ScanReconcile,
+    ScannedModel, ThumbnailCacheEntry,
 };
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 2;
@@ -19,6 +21,7 @@ pub const MAX_SCAN_INTERVAL_MINUTES: u32 = 1_440;
 pub const MAX_INDEXED_FILE_BYTES: u64 = stl_core::limits::MAX_FILE_BYTES;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_CACHED_THUMBNAIL_BYTES: u64 = 4 * 1024 * 1024;
 
 pub struct LibraryDb {
     conn: Connection,
@@ -57,6 +60,7 @@ impl LibraryDb {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V1_TO_V2)?;
         }
+        conn.execute_batch(ENSURE_CATALOG_SETTINGS)?;
         Ok(Self { conn, root })
     }
 
@@ -352,6 +356,56 @@ impl LibraryDb {
         )?;
         let rows = stmt.query_map([], index_root_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_catalog_settings(&self) -> Result<CatalogSettings, LibraryError> {
+        let (thumbnail_size, thumbnail_background, thumbnail_concurrency, scan_batch_size): (
+            i64,
+            String,
+            i64,
+            i64,
+        ) = self.conn.query_row(
+            "SELECT thumbnail_size, thumbnail_background, thumbnail_concurrency,
+                        scan_batch_size FROM catalog_settings WHERE id = 'local'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let corrupt = || LibraryError::InvalidInput("catalog settings row is corrupt".into());
+        let settings = CatalogSettings {
+            thumbnail_size: u32::try_from(thumbnail_size).map_err(|_| corrupt())?,
+            thumbnail_background,
+            thumbnail_concurrency: u32::try_from(thumbnail_concurrency).map_err(|_| corrupt())?,
+            scan_batch_size: u32::try_from(scan_batch_size).map_err(|_| corrupt())?,
+        };
+        validate_catalog_settings(&settings)?;
+        Ok(settings)
+    }
+
+    pub fn update_catalog_settings(
+        &self,
+        settings: &CatalogSettings,
+    ) -> Result<CatalogSettings, LibraryError> {
+        validate_catalog_settings(settings)?;
+        let current = self.get_catalog_settings()?;
+        let appearance_changed = current.thumbnail_size != settings.thumbnail_size
+            || current.thumbnail_background != settings.thumbnail_background;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE catalog_settings SET thumbnail_size = ?1, thumbnail_background = ?2,
+                    thumbnail_concurrency = ?3, scan_batch_size = ?4
+             WHERE id = 'local'",
+            params![
+                i64::from(settings.thumbnail_size),
+                settings.thumbnail_background,
+                i64::from(settings.thumbnail_concurrency),
+                i64::from(settings.scan_batch_size)
+            ],
+        )?;
+        if appearance_changed {
+            tx.execute("DELETE FROM thumbnails WHERE is_custom = 0", [])?;
+        }
+        tx.commit()?;
+        self.get_catalog_settings()
     }
 
     pub fn update_index_root(&self, root: &IndexRoot) -> Result<IndexRoot, LibraryError> {
@@ -756,6 +810,41 @@ impl LibraryDb {
         content_hash: &str,
         thumbnail_relative_path: &Path,
     ) -> Result<(), LibraryError> {
+        self.set_thumbnail_for_source_with_expected_settings(
+            model_id,
+            source_content_hash,
+            None,
+            content_hash,
+            thumbnail_relative_path,
+        )
+    }
+
+    pub fn set_thumbnail_for_source_and_settings(
+        &self,
+        model_id: &str,
+        source_content_hash: &str,
+        expected_settings: &CatalogSettings,
+        content_hash: &str,
+        thumbnail_relative_path: &Path,
+    ) -> Result<(), LibraryError> {
+        validate_catalog_settings(expected_settings)?;
+        self.set_thumbnail_for_source_with_expected_settings(
+            model_id,
+            source_content_hash,
+            Some(expected_settings),
+            content_hash,
+            thumbnail_relative_path,
+        )
+    }
+
+    fn set_thumbnail_for_source_with_expected_settings(
+        &self,
+        model_id: &str,
+        source_content_hash: &str,
+        expected_settings: Option<&CatalogSettings>,
+        content_hash: &str,
+        thumbnail_relative_path: &Path,
+    ) -> Result<(), LibraryError> {
         let relative = validated_relative_path(thumbnail_relative_path)?;
         if Path::new(&relative).components().next()
             != Some(Component::Normal("thumbnails".as_ref()))
@@ -767,16 +856,38 @@ impl LibraryDb {
         resolve_under_root(&self.root, Path::new(&relative))?;
         validate_hash(content_hash)?;
         validate_hash(source_content_hash)?;
-        let model = self
-            .get_model(model_id)?
-            .ok_or_else(|| LibraryError::ModelNotFound(model_id.to_owned()))?;
-        let current_source_hash = model
-            .content_hash
-            .ok_or_else(|| LibraryError::InvalidInput("model has no source content hash".into()))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let current_source_hash: Option<String> = tx
+            .query_row(
+                "SELECT COALESCE(r.blob_hash, d.content_hash)
+                 FROM models m
+                 LEFT JOIN revisions r ON r.id = m.current_revision_id
+                 LEFT JOIN indexed_model_data d ON d.model_id = m.id
+                 WHERE m.id = ?1",
+                params![model_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current_source_hash =
+            current_source_hash.ok_or_else(|| LibraryError::ModelNotFound(model_id.to_owned()))?;
         if current_source_hash != source_content_hash {
             return Err(LibraryError::SourceChanged);
         }
-        let tx = self.conn.unchecked_transaction()?;
+        if let Some(expected) = expected_settings {
+            let current: (i64, String) = tx.query_row(
+                "SELECT thumbnail_size, thumbnail_background
+                 FROM catalog_settings WHERE id = 'local'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if current.0 != i64::from(expected.thumbnail_size)
+                || current.1 != expected.thumbnail_background
+            {
+                return Err(LibraryError::InvalidInput(
+                    "catalog thumbnail settings changed while rendering".into(),
+                ));
+            }
+        }
         tx.execute(
             "DELETE FROM thumbnails WHERE model_id = ?1 AND is_custom = 0",
             params![model_id],
@@ -807,10 +918,19 @@ impl LibraryDb {
         &self,
         model_id: &str,
     ) -> Result<Option<(PathBuf, String)>, LibraryError> {
-        let thumbnail: Option<(String, String)> = self
+        Ok(self
+            .thumbnail_cache_entry_for_model(model_id)?
+            .map(|entry| (entry.path, entry.png_hash)))
+    }
+
+    pub fn thumbnail_cache_entry_for_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<ThumbnailCacheEntry>, LibraryError> {
+        let thumbnail: Option<(String, String, bool)> = self
             .conn
             .query_row(
-                "SELECT t.relative_path, t.content_hash FROM thumbnails t
+                "SELECT t.relative_path, t.content_hash, t.is_custom FROM thumbnails t
                  LEFT JOIN revisions r ON r.id = (SELECT current_revision_id FROM models WHERE id = ?1)
                  LEFT JOIN indexed_model_data d ON d.model_id = ?1
                  WHERE t.model_id = ?1
@@ -818,13 +938,18 @@ impl LibraryDb {
                         OR t.source_content_hash = COALESCE(r.blob_hash, d.content_hash))
                  ORDER BY t.is_custom DESC, t.id LIMIT 1",
                 params![model_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         thumbnail
-            .map(|(path, content_hash)| {
-                resolve_under_root(&self.root, Path::new(&path))
-                    .map(|absolute| (absolute, content_hash))
+            .map(|(path, png_hash, is_custom)| {
+                resolve_under_root(&self.root, Path::new(&path)).map(|absolute| {
+                    ThumbnailCacheEntry {
+                        path: absolute,
+                        png_hash,
+                        is_custom,
+                    }
+                })
             })
             .transpose()
     }
@@ -845,7 +970,7 @@ impl LibraryDb {
             "t.is_custom = 0"
         };
         let sql = format!(
-            "SELECT t.id, t.relative_path FROM thumbnails t
+            "SELECT t.id, t.relative_path, t.content_hash FROM thumbnails t
              JOIN models m ON m.id = t.model_id
              LEFT JOIN revisions r ON r.id = m.current_revision_id
              LEFT JOIN indexed_model_data d ON d.model_id = m.id
@@ -855,19 +980,39 @@ impl LibraryDb {
         {
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?;
             records.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
+        let preserved_paths = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT relative_path FROM thumbnails WHERE is_custom = 1")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<HashSet<_>, _>>()?
+        };
+        let validated_paths = records
+            .iter()
+            .map(|(_, path, hash)| {
+                validated_thumbnail_cache_path(&self.root, Path::new(path), hash)
+                    .map(|absolute| (path, absolute))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let tx = self.conn.unchecked_transaction()?;
-        for (id, _) in &records {
+        for (id, _, _) in &records {
             tx.execute("DELETE FROM thumbnails WHERE id = ?1", params![id])?;
         }
         tx.commit()?;
-        records
+        Ok(validated_paths
             .into_iter()
-            .map(|(_, path)| managed_relative_path(&self.root, Path::new(&path)))
-            .collect()
+            .filter_map(|(relative, absolute)| {
+                (!preserved_paths.contains(relative)).then_some(absolute)
+            })
+            .collect())
     }
 
     fn get_index_root(&self, id: &str) -> Result<Option<IndexRoot>, LibraryError> {
@@ -974,6 +1119,18 @@ const MODEL_SELECT: &str = "SELECT m.id, m.display_name, m.description, m.folder
 const SCHEMA: &str = r#"
 CREATE TABLE libraries (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
 INSERT INTO libraries (id, name, created_at) VALUES ('local', 'Local Library', '1970-01-01T00:00:00Z');
+CREATE TABLE catalog_settings (
+    id TEXT PRIMARY KEY CHECK(id = 'local'),
+    thumbnail_size INTEGER NOT NULL CHECK(thumbnail_size IN (128, 256, 512)),
+    thumbnail_background TEXT NOT NULL CHECK(
+        length(thumbnail_background) = 7
+        AND substr(thumbnail_background, 1, 1) = '#'
+        AND substr(thumbnail_background, 2) NOT GLOB '*[^0-9A-Fa-f]*'
+    ),
+    thumbnail_concurrency INTEGER NOT NULL CHECK(thumbnail_concurrency BETWEEN 1 AND 2),
+    scan_batch_size INTEGER NOT NULL CHECK(scan_batch_size BETWEEN 16 AND 256)
+);
+INSERT INTO catalog_settings VALUES ('local', 256, '#12171F', 2, 128);
 CREATE TABLE folders (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -1054,6 +1211,18 @@ ALTER TABLE models ADD COLUMN source_missing INTEGER NOT NULL DEFAULT 0
 ALTER TABLE models ADD COLUMN source_modified_at INTEGER;
 ALTER TABLE thumbnails ADD COLUMN source_content_hash TEXT;
 CREATE INDEX thumbnails_model_idx ON thumbnails(model_id, is_custom);
+CREATE TABLE catalog_settings (
+    id TEXT PRIMARY KEY CHECK(id = 'local'),
+    thumbnail_size INTEGER NOT NULL CHECK(thumbnail_size IN (128, 256, 512)),
+    thumbnail_background TEXT NOT NULL CHECK(
+        length(thumbnail_background) = 7
+        AND substr(thumbnail_background, 1, 1) = '#'
+        AND substr(thumbnail_background, 2) NOT GLOB '*[^0-9A-Fa-f]*'
+    ),
+    thumbnail_concurrency INTEGER NOT NULL CHECK(thumbnail_concurrency BETWEEN 1 AND 2),
+    scan_batch_size INTEGER NOT NULL CHECK(scan_batch_size BETWEEN 16 AND 256)
+);
+INSERT INTO catalog_settings VALUES ('local', 256, '#12171F', 2, 128);
 CREATE TABLE index_roots (
     id TEXT PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
@@ -1074,6 +1243,23 @@ CREATE UNIQUE INDEX indexed_model_source_idx ON models(source_root_id, source_pa
     WHERE source_kind = 'indexed';
 PRAGMA user_version = 2;
 COMMIT;
+"#;
+
+const ENSURE_CATALOG_SETTINGS: &str = r#"
+CREATE TABLE IF NOT EXISTS catalog_settings (
+    id TEXT PRIMARY KEY CHECK(id = 'local'),
+    thumbnail_size INTEGER NOT NULL CHECK(thumbnail_size IN (128, 256, 512)),
+    thumbnail_background TEXT NOT NULL CHECK(
+        length(thumbnail_background) = 7
+        AND substr(thumbnail_background, 1, 1) = '#'
+        AND substr(thumbnail_background, 2) NOT GLOB '*[^0-9A-Fa-f]*'
+    ),
+    thumbnail_concurrency INTEGER NOT NULL CHECK(thumbnail_concurrency BETWEEN 1 AND 2),
+    scan_batch_size INTEGER NOT NULL CHECK(scan_batch_size BETWEEN 16 AND 256)
+);
+INSERT OR IGNORE INTO catalog_settings
+    (id, thumbnail_size, thumbnail_background, thumbnail_concurrency, scan_batch_size)
+VALUES ('local', 256, '#12171F', 2, 128);
 "#;
 
 fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
@@ -1101,14 +1287,47 @@ fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
 }
 
 fn index_root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRoot> {
+    let enabled: i64 = row.get(2)?;
+    let scan_interval: i64 = row.get(4)?;
+    let max_file_bytes: i64 = row.get(5)?;
+    let scan_interval_minutes = u32::try_from(scan_interval)
+        .map_err(|_| invalid_persisted_integer(4, "scan interval is outside u32"))?;
+    let max_file_bytes = u64::try_from(max_file_bytes)
+        .map_err(|_| invalid_persisted_integer(5, "maximum file size is negative"))?;
+    if !(0..=1).contains(&enabled) {
+        return Err(invalid_persisted_integer(2, "enabled must be zero or one"));
+    }
+    if !(MIN_SCAN_INTERVAL_MINUTES..=MAX_SCAN_INTERVAL_MINUTES).contains(&scan_interval_minutes) {
+        return Err(invalid_persisted_integer(
+            4,
+            "scan interval is outside the supported range",
+        ));
+    }
+    if max_file_bytes == 0 || max_file_bytes > MAX_INDEXED_FILE_BYTES {
+        return Err(invalid_persisted_integer(
+            5,
+            "maximum file size is outside the supported range",
+        ));
+    }
     Ok(IndexRoot {
         id: row.get(0)?,
         path: PathBuf::from(row.get::<_, String>(1)?),
-        enabled: row.get(2)?,
+        enabled: enabled == 1,
         last_scanned_at: row.get(3)?,
-        scan_interval_minutes: row.get::<_, i64>(4)? as u32,
-        max_file_bytes: row.get::<_, i64>(5)? as u64,
+        scan_interval_minutes,
+        max_file_bytes,
     })
+}
+
+fn invalid_persisted_integer(index: usize, message: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Integer,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message.to_owned(),
+        )),
+    )
 }
 
 fn clean_name(value: &str, kind: &str) -> Result<String, LibraryError> {
@@ -1208,9 +1427,83 @@ fn resolve_under_root(root: &Path, relative: &Path) -> Result<PathBuf, LibraryEr
     Ok(canonical_candidate)
 }
 
-fn managed_relative_path(root: &Path, relative: &Path) -> Result<PathBuf, LibraryError> {
+fn validated_thumbnail_cache_path(
+    root: &Path,
+    relative: &Path,
+    expected_hash: &str,
+) -> Result<PathBuf, LibraryError> {
     let relative = validated_relative_path(relative)?;
-    Ok(root.join(relative))
+    validate_hash(expected_hash)?;
+    let components = Path::new(&relative).components().collect::<Vec<_>>();
+    if components.len() < 2 || components[0] != Component::Normal("thumbnails".as_ref()) {
+        return Err(LibraryError::InvalidInput(
+            "generated thumbnail path is outside the thumbnails directory".into(),
+        ));
+    }
+    let canonical_root = root.canonicalize().map_err(|error| io(root, error))?;
+    if canonical_root != root {
+        return Err(LibraryError::InvalidInput(
+            "library root identity changed".into(),
+        ));
+    }
+    let mut current = canonical_root.clone();
+    let mut missing = false;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(LibraryError::InvalidInput(
+                "generated thumbnail path is unsafe".into(),
+            ));
+        };
+        current.push(component);
+        if missing {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(LibraryError::InvalidInput(
+                        "generated thumbnail path contains a symlink".into(),
+                    ));
+                }
+                let is_leaf = index + 1 == components.len();
+                if (is_leaf && !metadata.is_file()) || (!is_leaf && !metadata.is_dir()) {
+                    return Err(LibraryError::InvalidInput(
+                        "generated thumbnail path has an unexpected file type".into(),
+                    ));
+                }
+                if is_leaf {
+                    if metadata.len() > MAX_CACHED_THUMBNAIL_BYTES {
+                        return Err(LibraryError::InvalidInput(
+                            "generated thumbnail exceeds the cache size limit".into(),
+                        ));
+                    }
+                    let mut file =
+                        std::fs::File::open(&current).map_err(|error| io(&current, error))?;
+                    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                    file.by_ref()
+                        .take(MAX_CACHED_THUMBNAIL_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| io(&current, error))?;
+                    if bytes.len() as u64 > MAX_CACHED_THUMBNAIL_BYTES
+                        || !bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+                        || hex_digest(&bytes) != expected_hash
+                    {
+                        return Err(LibraryError::InvalidInput(
+                            "generated thumbnail does not match its catalog hash".into(),
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(error) => return Err(io(&current, error)),
+        }
+    }
+    if !current.starts_with(&canonical_root) {
+        return Err(LibraryError::InvalidInput(
+            "generated thumbnail path escapes the library root".into(),
+        ));
+    }
+    Ok(current)
 }
 
 fn validate_hash(hash: &str) -> Result<(), LibraryError> {
@@ -1235,6 +1528,34 @@ fn validate_root_limits(
         return Err(LibraryError::InvalidInput(format!(
             "maximum file size must be between 1 and {MAX_INDEXED_FILE_BYTES} bytes"
         )));
+    }
+    Ok(())
+}
+
+fn validate_catalog_settings(settings: &CatalogSettings) -> Result<(), LibraryError> {
+    if !matches!(settings.thumbnail_size, 128 | 256 | 512) {
+        return Err(LibraryError::InvalidInput(
+            "thumbnail size must be 128, 256, or 512 pixels".into(),
+        ));
+    }
+    let background = settings.thumbnail_background.as_bytes();
+    if background.len() != 7
+        || background[0] != b'#'
+        || !background[1..].iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(LibraryError::InvalidInput(
+            "thumbnail background must be a #RRGGBB color".into(),
+        ));
+    }
+    if !(1..=2).contains(&settings.thumbnail_concurrency) {
+        return Err(LibraryError::InvalidInput(
+            "thumbnail concurrency must be between 1 and 2".into(),
+        ));
+    }
+    if !(16..=256).contains(&settings.scan_batch_size) {
+        return Err(LibraryError::InvalidInput(
+            "scan batch size must be between 16 and 256".into(),
+        ));
     }
     Ok(())
 }
@@ -1273,6 +1594,10 @@ mod tests {
         format!("{byte:02x}").repeat(32)
     }
 
+    fn png_fixture() -> Vec<u8> {
+        b"\x89PNG\r\n\x1a\nthumbnail fixture".to_vec()
+    }
+
     fn stl_fixture() -> Vec<u8> {
         let mut bytes = vec![0; 80];
         bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -1303,6 +1628,194 @@ mod tests {
         );
         assert_eq!(reopened.list_folders().unwrap().len(), 2);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_settings_persist_and_existing_schema_v2_gets_defaults() {
+        let root = temp_root("catalog-settings");
+        let db = LibraryDb::open(&root).unwrap();
+        assert_eq!(
+            db.get_catalog_settings().unwrap(),
+            CatalogSettings::default()
+        );
+        let updated = CatalogSettings {
+            thumbnail_size: 512,
+            thumbnail_background: "#A1B2C3".into(),
+            thumbnail_concurrency: 1,
+            scan_batch_size: 256,
+        };
+        assert_eq!(db.update_catalog_settings(&updated).unwrap(), updated);
+        drop(db);
+        assert_eq!(
+            LibraryDb::open(&root)
+                .unwrap()
+                .get_catalog_settings()
+                .unwrap(),
+            updated
+        );
+
+        let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+        conn.execute("DROP TABLE catalog_settings", []).unwrap();
+        drop(conn);
+        assert_eq!(
+            LibraryDb::open(&root)
+                .unwrap()
+                .get_catalog_settings()
+                .unwrap(),
+            CatalogSettings::default()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_settings_reject_out_of_range_values_without_persisting() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let original = db.get_catalog_settings().unwrap();
+        for invalid in [
+            CatalogSettings {
+                thumbnail_size: 300,
+                ..original.clone()
+            },
+            CatalogSettings {
+                thumbnail_background: "12171F".into(),
+                ..original.clone()
+            },
+            CatalogSettings {
+                thumbnail_concurrency: 3,
+                ..original.clone()
+            },
+            CatalogSettings {
+                scan_batch_size: 15,
+                ..original.clone()
+            },
+        ] {
+            assert!(matches!(
+                db.update_catalog_settings(&invalid),
+                Err(LibraryError::InvalidInput(_))
+            ));
+            assert_eq!(db.get_catalog_settings().unwrap(), original);
+        }
+
+        db.conn
+            .execute_batch(
+                "DROP TABLE catalog_settings;
+                 CREATE TABLE catalog_settings (
+                   id TEXT PRIMARY KEY,
+                   thumbnail_size INTEGER NOT NULL,
+                   thumbnail_background TEXT NOT NULL,
+                   thumbnail_concurrency INTEGER NOT NULL,
+                   scan_batch_size INTEGER NOT NULL
+                 );
+                 INSERT INTO catalog_settings VALUES
+                   ('local', 4294967552, '#12171F', 4294967297, 128);",
+            )
+            .unwrap();
+        assert!(matches!(
+            db.get_catalog_settings(),
+            Err(LibraryError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn thumbnail_appearance_settings_invalidate_generated_rows_and_preserve_custom() {
+        let root = temp_root("catalog-settings-thumbnails");
+        let source_dir = temp_root("catalog-settings-thumbnails-source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("part.stl");
+        fs::write(&source, stl_fixture()).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        fs::write(root.join("thumbnails/generated.png"), b"generated").unwrap();
+        fs::write(root.join("thumbnails/custom.png"), b"custom").unwrap();
+        db.set_thumbnail(&model.id, &hash(9), Path::new("thumbnails/generated.png"))
+            .unwrap();
+        db.conn.execute("INSERT INTO thumbnails (id, model_id, relative_path, content_hash, is_custom) VALUES ('settings-custom', ?1, 'thumbnails/custom.png', 'custom-hash', 1)", params![model.id]).unwrap();
+
+        let mut settings = db.get_catalog_settings().unwrap();
+        settings.thumbnail_concurrency = 1;
+        settings.scan_batch_size = 64;
+        db.update_catalog_settings(&settings).unwrap();
+        let generated_before_appearance_change: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE is_custom = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generated_before_appearance_change, 1);
+        settings.thumbnail_size = 512;
+        db.update_catalog_settings(&settings).unwrap();
+        let generated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE is_custom = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let custom: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE is_custom = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generated, 0);
+        assert_eq!(custom, 1);
+        assert!(db.thumbnail_for_model(&model.id).unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[test]
+    fn thumbnail_commit_rejects_stale_appearance_settings_atomically() {
+        let root = temp_root("thumbnail-settings-race");
+        let source_dir = temp_root("thumbnail-settings-race-source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("part.stl");
+        fs::write(&source, stl_fixture()).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        let png = png_fixture();
+        let png_hash = hex_digest(&png);
+        let relative = Path::new("thumbnails/settings-race.png");
+        fs::write(db.root().join(relative), png).unwrap();
+        let stale = db.get_catalog_settings().unwrap();
+        let mut current = stale.clone();
+        current.thumbnail_background = "#223344".into();
+        db.update_catalog_settings(&current).unwrap();
+
+        assert!(matches!(
+            db.set_thumbnail_for_source_and_settings(
+                &model.id,
+                model.content_hash.as_deref().unwrap(),
+                &stale,
+                &png_hash,
+                relative,
+            ),
+            Err(LibraryError::InvalidInput(_))
+        ));
+        let generated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE is_custom = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generated, 0);
+        db.set_thumbnail_for_source_and_settings(
+            &model.id,
+            model.content_hash.as_deref().unwrap(),
+            &current,
+            &png_hash,
+            relative,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(source_dir);
     }
 
     #[test]
@@ -1535,12 +2048,14 @@ mod tests {
         );
 
         let thumbnail_relative = PathBuf::from("thumbnails/unique.png");
-        fs::write(library_root.join(&thumbnail_relative), b"thumbnail").unwrap();
+        let thumbnail_bytes = png_fixture();
+        let thumbnail_hash = hex_digest(&thumbnail_bytes);
+        fs::write(library_root.join(&thumbnail_relative), &thumbnail_bytes).unwrap();
         assert!(matches!(
-            db.set_thumbnail_for_source(&unique.id, &hash(8), &hash(9), &thumbnail_relative),
+            db.set_thumbnail_for_source(&unique.id, &hash(8), &thumbnail_hash, &thumbnail_relative),
             Err(LibraryError::SourceChanged)
         ));
-        db.set_thumbnail_for_source(&unique.id, &hash(1), &hash(9), &thumbnail_relative)
+        db.set_thumbnail_for_source(&unique.id, &hash(1), &thumbnail_hash, &thumbnail_relative)
             .unwrap();
         let (thumbnail, png_hash) = db
             .thumbnail_for_model_with_hash(&unique.id)
@@ -1553,7 +2068,7 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        assert_eq!(png_hash, hash(9));
+        assert_eq!(png_hash, thumbnail_hash);
         fs::write(source_root.join("renamed.stl"), b"unique-v2").unwrap();
         let changed = ScannedModel {
             relative_path: "renamed.stl".into(),
@@ -1634,6 +2149,45 @@ mod tests {
             db.complete_scan(&root.id, &[], "cancelled"),
             Err(LibraryError::IndexRootNotFound(_))
         ));
+        let _ = fs::remove_dir_all(library_root);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn persisted_index_root_values_are_checked_before_scanner_use() {
+        let library_root = temp_root("corrupt-root-settings-library");
+        let source_root = temp_root("corrupt-root-settings-source");
+        fs::create_dir_all(&source_root).unwrap();
+        let db = LibraryDb::open(&library_root).unwrap();
+        let root = db.add_index_root(&source_root, 60, 1024).unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE index_roots SET max_file_bytes = ?1 WHERE id = ?2",
+                params![MAX_INDEXED_FILE_BYTES as i64 + 1, root.id],
+            )
+            .unwrap();
+        assert!(db.list_index_roots().is_err());
+
+        db.conn
+            .execute(
+                "UPDATE index_roots SET max_file_bytes = 1024, scan_interval_minutes = 4294967356
+                 WHERE id = ?1",
+                params![root.id],
+            )
+            .unwrap();
+        assert!(db.list_index_roots().is_err());
+
+        db.conn
+            .execute(
+                "UPDATE index_roots SET scan_interval_minutes = 60, enabled = 2 WHERE id = ?1",
+                params![root.id],
+            )
+            .unwrap();
+        assert!(db.list_index_roots().is_err());
         let _ = fs::remove_dir_all(library_root);
         let _ = fs::remove_dir_all(source_root);
     }
@@ -1872,10 +2426,16 @@ mod tests {
         fs::write(&source, stl_fixture()).unwrap();
         let db = LibraryDb::open(&root).unwrap();
         let model = db.import_file(&source, None, None).unwrap().model;
-        fs::write(root.join("thumbnails/generated.png"), b"generated").unwrap();
+        let generated_bytes = png_fixture();
+        let generated_hash = hex_digest(&generated_bytes);
+        fs::write(root.join("thumbnails/generated.png"), &generated_bytes).unwrap();
         fs::write(root.join("thumbnails/custom.png"), b"custom").unwrap();
-        db.set_thumbnail(&model.id, &hash(9), Path::new("thumbnails/generated.png"))
-            .unwrap();
+        db.set_thumbnail(
+            &model.id,
+            &generated_hash,
+            Path::new("thumbnails/generated.png"),
+        )
+        .unwrap();
         db.conn.execute("INSERT INTO thumbnails (id, model_id, relative_path, content_hash, is_custom) VALUES ('custom', ?1, 'thumbnails/custom.png', 'custom-hash', 1)", params![model.id]).unwrap();
         let purged = db.purge_thumbnails().unwrap();
         assert_eq!(
@@ -1891,6 +2451,157 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[test]
+    fn purge_removes_generated_row_but_preserves_file_shared_with_custom_row() {
+        let root = temp_root("purge-shared-custom");
+        let source_dir = temp_root("purge-shared-custom-source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("part.stl");
+        fs::write(&source, stl_fixture()).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        let thumbnail_bytes = png_fixture();
+        let thumbnail_hash = hex_digest(&thumbnail_bytes);
+        let relative = "thumbnails/shared.png";
+        let absolute = db.root().join(relative);
+        fs::write(&absolute, &thumbnail_bytes).unwrap();
+        db.set_thumbnail(&model.id, &thumbnail_hash, Path::new(relative))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO thumbnails
+                 (id, model_id, relative_path, content_hash, is_custom)
+                 VALUES ('shared-custom', ?1, ?2, ?3, 1)",
+                params![model.id, relative, thumbnail_hash],
+            )
+            .unwrap();
+
+        let preferred = db
+            .thumbnail_cache_entry_for_model(&model.id)
+            .unwrap()
+            .unwrap();
+        assert!(preferred.is_custom);
+        assert_eq!(preferred.png_hash, thumbnail_hash);
+
+        let physical_deletes = db.purge_thumbnails().unwrap();
+        for path in physical_deletes {
+            fs::remove_file(path).unwrap();
+        }
+        assert!(absolute.is_file());
+        let generated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE is_custom = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let custom: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE id = 'shared-custom'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generated, 0);
+        assert_eq!(custom, 1);
+        assert!(db.thumbnail_for_model(&model.id).unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[test]
+    fn purge_refuses_wrong_namespace_before_deleting_rows_or_originals() {
+        let root = temp_root("purge-wrong-namespace");
+        let source_dir = temp_root("purge-wrong-namespace-source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("part.stl");
+        let source_bytes = stl_fixture();
+        fs::write(&source, &source_bytes).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        let original_relative = model.storage_path.clone().unwrap();
+        let original_path = db.root().join(&original_relative);
+        let before = fs::read(&original_path).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO thumbnails
+                 (id, model_id, relative_path, content_hash, is_custom, source_content_hash)
+                 VALUES ('malicious-original', ?1, ?2, ?3, 0, ?4)",
+                params![
+                    model.id,
+                    original_relative,
+                    hex_digest(&source_bytes),
+                    model.content_hash
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            db.purge_thumbnails(),
+            Err(LibraryError::InvalidInput(_))
+        ));
+        assert_eq!(fs::read(&original_path).unwrap(), before);
+        let retained: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE id = 'malicious-original'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_refuses_symlinked_thumbnail_ancestor_and_retains_outside_file_and_row() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("purge-symlink-ancestor");
+        let source_dir = temp_root("purge-symlink-ancestor-source");
+        let outside = temp_root("purge-symlink-ancestor-outside");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let source = source_dir.join("part.stl");
+        fs::write(&source, stl_fixture()).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        let outside_bytes = png_fixture();
+        let outside_path = outside.join("outside.png");
+        fs::write(&outside_path, &outside_bytes).unwrap();
+        symlink(&outside, db.root().join("thumbnails/link")).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO thumbnails
+                 (id, model_id, relative_path, content_hash, is_custom, source_content_hash)
+                 VALUES ('malicious-symlink', ?1, 'thumbnails/link/outside.png', ?2, 0, ?3)",
+                params![model.id, hex_digest(&outside_bytes), model.content_hash],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            db.purge_thumbnails(),
+            Err(LibraryError::InvalidInput(_))
+        ));
+        assert_eq!(fs::read(&outside_path).unwrap(), outside_bytes);
+        let retained: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM thumbnails WHERE id = 'malicious-symlink'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]

@@ -314,6 +314,8 @@ fn schema_v2_recovery_preserves_indexed_references_without_accessing_source_root
         [sha(b"external model")],
     )
     .unwrap();
+    conn.execute_batch("CREATE TABLE catalog_settings(id TEXT PRIMARY KEY,thumbnail_size INTEGER,thumbnail_background TEXT,thumbnail_concurrency INTEGER,scan_batch_size INTEGER);
+        INSERT INTO catalog_settings VALUES ('local',512,'#112233',1,32);").unwrap();
     conn.execute(
         "UPDATE thumbnails SET source_content_hash=?1",
         [sha(ORIGINAL)],
@@ -324,6 +326,18 @@ fn schema_v2_recovery_preserves_indexed_references_without_accessing_source_root
     let manifest = inspect_library(&root).unwrap();
     assert_eq!(manifest.library_schema_version, 2);
     assert_eq!(manifest.index_roots.len(), 1);
+    assert_eq!(
+        manifest.catalog_settings.as_ref().unwrap().thumbnail_size,
+        512
+    );
+    assert_eq!(
+        manifest
+            .catalog_settings
+            .as_ref()
+            .unwrap()
+            .thumbnail_background,
+        "#112233"
+    );
     let managed = manifest.models.iter().find(|m| m.id == "model-1").unwrap();
     assert_eq!(managed.thumbnails[0].asset.sha256, sha(THUMBNAIL));
     assert_eq!(

@@ -30,6 +30,9 @@ import {
   libraryCancelScan,
   libraryGetThumbnail,
   libraryPurgeThumbnails,
+  libraryStartThumbnailJob,
+  libraryGetCatalogSettings,
+  librarySetCatalogSettings,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -107,6 +110,9 @@ export function startApp(extensions: AppExtensions): void {
     cancelScan: libraryCancelScan,
     getThumbnail: libraryGetThumbnail,
     purgeThumbnails: libraryPurgeThumbnails,
+    startThumbnailJob: libraryStartThumbnailJob,
+    getCatalogSettings: libraryGetCatalogSettings,
+    setCatalogSettings: librarySetCatalogSettings,
   };
   let activeEntitlements = withCoreEntitlements(extensions.currentEntitlements?.());
   const main = document.createElement("div");
@@ -866,10 +872,11 @@ export function startApp(extensions: AppExtensions): void {
     };
     activeLibraryRefresh = request;
     try {
-      const [folders, models, roots] = await Promise.all([
+      const [folders, models, roots, catalogSettings] = await Promise.all([
         libraryService.listFolders(),
         libraryService.listModels(),
         libraryService.listRoots(),
+        libraryService.getCatalogSettings(),
       ]);
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
@@ -878,7 +885,7 @@ export function startApp(extensions: AppExtensions): void {
       ) {
         return;
       }
-      libraryPanel.render(folders, models, roots);
+      libraryPanel.render(folders, models, roots, catalogSettings);
       if (libraryOperations.isCurrent(owner)) {
         libraryPanel.setStatus(
           "Managed copies are stored locally and survive source-file changes.",
@@ -977,6 +984,13 @@ export function startApp(extensions: AppExtensions): void {
   libraryPanel.onScanCompleted = () => void refreshLibrary();
   libraryPanel.onGetThumbnail = libraryService.getThumbnail;
   libraryPanel.onPurgeThumbnails = libraryService.purgeThumbnails;
+  libraryPanel.onStartThumbnailJob = libraryService.startThumbnailJob;
+  libraryPanel.onSaveCatalogSettings = async (settings) => {
+    const saved = await libraryService.setCatalogSettings(settings);
+    libraryPanel.clearThumbnailCache();
+    await refreshLibrary();
+    return saved;
+  };
 
   const unsubscribeEntitlements =
     extensions.subscribeEntitlements?.((entitlements) => {

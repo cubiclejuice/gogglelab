@@ -59,6 +59,32 @@ pub struct IndexedSourceMetadata {
     pub content_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogSettings {
+    pub thumbnail_size: u32,
+    pub thumbnail_background: String,
+    pub thumbnail_concurrency: u32,
+    pub scan_batch_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThumbnailCacheEntry {
+    pub path: PathBuf,
+    pub png_hash: String,
+    pub is_custom: bool,
+}
+
+impl Default for CatalogSettings {
+    fn default() -> Self {
+        Self {
+            thumbnail_size: 256,
+            thumbnail_background: "#12171F".into(),
+            thumbnail_concurrency: 2,
+            scan_batch_size: 128,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanReconcile {
     pub seen: usize,

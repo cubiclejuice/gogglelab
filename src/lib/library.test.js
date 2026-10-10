@@ -3,8 +3,11 @@ import {
   canOpenLibraryModel,
   didLibraryScanComplete,
   filterAndSortLibraryModels,
+  LIBRARY_CATALOG_TIER,
+  LIBRARY_VIEW_MODES,
   libraryFolderDepths,
   normalizeLibraryTimestamp,
+  normalizeCatalogSettings,
   scanStatusMessage,
   ThumbnailRequestGuard,
   thumbnailCacheInvalidations,
@@ -86,6 +89,27 @@ test("catalog search spans roots and source/status filters compose", () => {
   expect(
     filterAndSortLibraryModels(models, view({ status: "missing" })).map((item) => item.id),
   ).toEqual(["missing"]);
+});
+
+test("all catalog view modes and settings remain in the Free feature tier", () => {
+  expect(LIBRARY_CATALOG_TIER).toBe("free");
+  expect(LIBRARY_VIEW_MODES).toEqual(["list", "preview", "detailed"]);
+});
+
+test("catalog settings normalize supported render and scan bounds before saving", () => {
+  expect(
+    normalizeCatalogSettings({
+      thumbnail_size: 512,
+      thumbnail_background: "#abcdef",
+      thumbnail_concurrency: 9,
+      scan_batch_size: 3,
+    }),
+  ).toEqual({
+    thumbnail_size: 512,
+    thumbnail_background: "#ABCDEF",
+    thumbnail_concurrency: 2,
+    scan_batch_size: 16,
+  });
 });
 
 test("catalog sorts by natural name, descending size, and descending date", () => {
@@ -175,6 +199,9 @@ test("scan state copy distinguishes idle, running, cancelling, and completed", (
     errors: [],
     startedAt: null,
     finishedAt: null,
+    jobKind: null,
+    thumbnailsTotal: 0,
+    thumbnailsCompleted: 0,
   };
   expect(scanStatusMessage(idle)).toBe("Ready to scan indexed folders.");
   expect(
@@ -190,6 +217,24 @@ test("scan state copy distinguishes idle, running, cancelling, and completed", (
   expect(scanStatusMessage({ ...idle, running: true, cancelling: true })).toContain(
     "Stopping scan",
   );
+  expect(
+    scanStatusMessage({
+      ...idle,
+      running: true,
+      jobKind: "thumbnails",
+      thumbnailsTotal: 20,
+      thumbnailsCompleted: 7,
+    }),
+  ).toBe("Generating previews · 7/20 complete");
+  expect(
+    scanStatusMessage({
+      ...idle,
+      jobKind: "thumbnails",
+      thumbnailsTotal: 20,
+      thumbnailsCompleted: 20,
+      finishedAt: "now",
+    }),
+  ).toBe("Preview generation finished · 20/20 complete");
   expect(
     scanStatusMessage({ ...idle, filesIndexed: 3, errors: ["unreadable"], finishedAt: "now" }),
   ).toBe("Scan finished · 3 indexed · 1 issue");

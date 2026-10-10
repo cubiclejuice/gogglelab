@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use library_core::CatalogSettings;
 use sha2::{Digest, Sha256};
 use stl_core::ParsedStl;
 
-const SIZE: usize = 256;
 const RENDER_VERSION: u32 = 1;
 const MAX_RENDER_TRIANGLES: usize = 200_000;
-const MAX_RASTER_SAMPLES: usize = 8_000_000;
-const MAX_CACHED_PNG_BYTES: u64 = 2 * 1024 * 1024;
+const BASE_MAX_RASTER_SAMPLES: usize = 8_000_000;
+const MAX_CACHED_PNG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PNG_DIMENSION: u32 = 1024;
 const MAX_DECODED_PNG_BYTES: usize = 4 * 1024 * 1024;
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -22,8 +22,15 @@ pub struct ThumbnailArtifact {
     pub png_hash: String,
 }
 
-pub fn thumbnail_relative_path(content_hash: &str) -> PathBuf {
-    PathBuf::from("thumbnails").join(format!("{content_hash}-isometric-v{RENDER_VERSION}.png"))
+pub fn thumbnail_relative_path(content_hash: &str, settings: &CatalogSettings) -> PathBuf {
+    let background = settings
+        .thumbnail_background
+        .trim_start_matches('#')
+        .to_ascii_lowercase();
+    PathBuf::from("thumbnails").join(format!(
+        "{content_hash}-isometric-v{RENDER_VERSION}-{}-{background}.png",
+        settings.thumbnail_size
+    ))
 }
 
 pub fn ensure_thumbnail(
@@ -31,9 +38,10 @@ pub fn ensure_thumbnail(
     source_path: &Path,
     content_hash: &str,
     expected_source_bytes: u64,
+    settings: &CatalogSettings,
     regenerate: bool,
 ) -> Result<ThumbnailArtifact, String> {
-    let relative = thumbnail_relative_path(content_hash);
+    let relative = thumbnail_relative_path(content_hash, settings);
     let output = library_root.join(&relative);
     if !regenerate {
         match fs::symlink_metadata(&output) {
@@ -72,7 +80,7 @@ pub fn ensure_thumbnail(
         return Err("Model source changed since it was indexed".into());
     }
     let parsed = stl_core::parse_model(&bytes).map_err(|error| error.to_string())?;
-    let png = render_png(&parsed)?;
+    let png = render_png(&parsed, settings)?;
     let parent = output
         .parent()
         .ok_or_else(|| "Thumbnail output has no parent directory".to_string())?;
@@ -163,12 +171,18 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn render_png(model: &ParsedStl) -> Result<Vec<u8>, String> {
-    let mut rgba = vec![0_u8; SIZE * SIZE * 4];
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&[18, 23, 31, 255]);
+fn render_png(model: &ParsedStl, settings: &CatalogSettings) -> Result<Vec<u8>, String> {
+    let size = usize::try_from(settings.thumbnail_size)
+        .map_err(|_| "Thumbnail size is invalid".to_string())?;
+    if !matches!(size, 128 | 256 | 512) {
+        return Err("Thumbnail size is invalid".into());
     }
-    let mut depth = vec![f32::NEG_INFINITY; SIZE * SIZE];
+    let background = parse_background(&settings.thumbnail_background)?;
+    let mut rgba = vec![0_u8; size * size * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[background[0], background[1], background[2], 255]);
+    }
+    let mut depth = vec![f32::NEG_INFINITY; size * size];
 
     if model.positions.len() >= 9 {
         let (min_x, max_x, min_y, max_y) = bounds(
@@ -179,12 +193,17 @@ fn render_png(model: &ParsedStl) -> Result<Vec<u8>, String> {
         );
         let width = (max_x - min_x).max(f32::EPSILON);
         let height = (max_y - min_y).max(f32::EPSILON);
-        let scale = ((SIZE as f32 - 28.0) / width).min((SIZE as f32 - 28.0) / height);
-        let offset_x = (SIZE as f32 - width * scale) * 0.5 - min_x * scale;
-        let offset_y = (SIZE as f32 - height * scale) * 0.5 + max_y * scale;
+        let margin = (size as f32 * 0.055).max(7.0);
+        let scale =
+            ((size as f32 - margin * 2.0) / width).min((size as f32 - margin * 2.0) / height);
+        let offset_x = (size as f32 - width * scale) * 0.5 - min_x * scale;
+        let offset_y = (size as f32 - height * scale) * 0.5 + max_y * scale;
         let triangle_count = model.positions.len() / 9;
         let stride = triangle_count.div_ceil(MAX_RENDER_TRIANGLES).max(1);
-        let mut raster_budget = MAX_RASTER_SAMPLES;
+        let mut raster_budget = BASE_MAX_RASTER_SAMPLES
+            .saturating_mul(size * size)
+            .checked_div(256 * 256)
+            .unwrap_or(BASE_MAX_RASTER_SAMPLES);
 
         for triangle in (0..triangle_count).step_by(stride) {
             let first = triangle * 9;
@@ -210,7 +229,14 @@ fn render_png(model: &ParsedStl) -> Result<Vec<u8>, String> {
             ];
             let source = &model.positions[first..first + 9];
             let shade = triangle_shade(source);
-            if !rasterize(vertices, shade, &mut depth, &mut rgba, &mut raster_budget) {
+            if !rasterize(
+                vertices,
+                shade,
+                size,
+                &mut depth,
+                &mut rgba,
+                &mut raster_budget,
+            ) {
                 break;
             }
         }
@@ -218,7 +244,7 @@ fn render_png(model: &ParsedStl) -> Result<Vec<u8>, String> {
 
     let mut output = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut output, SIZE as u32, SIZE as u32);
+        let mut encoder = png::Encoder::new(&mut output, size as u32, size as u32);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
@@ -284,6 +310,7 @@ fn triangle_shade(p: &[f32]) -> u8 {
 fn rasterize(
     vertices: [[f32; 3]; 3],
     shade: u8,
+    size: usize,
     depth: &mut [f32],
     rgba: &mut [u8],
     budget: &mut usize,
@@ -293,25 +320,25 @@ fn rasterize(
         .map(|point| point[0].floor() as i32)
         .min()
         .unwrap_or(0)
-        .clamp(0, SIZE as i32 - 1);
+        .clamp(0, size as i32 - 1);
     let max_x = vertices
         .iter()
         .map(|point| point[0].ceil() as i32)
         .max()
         .unwrap_or(0)
-        .clamp(0, SIZE as i32 - 1);
+        .clamp(0, size as i32 - 1);
     let min_y = vertices
         .iter()
         .map(|point| point[1].floor() as i32)
         .min()
         .unwrap_or(0)
-        .clamp(0, SIZE as i32 - 1);
+        .clamp(0, size as i32 - 1);
     let max_y = vertices
         .iter()
         .map(|point| point[1].ceil() as i32)
         .max()
         .unwrap_or(0)
-        .clamp(0, SIZE as i32 - 1);
+        .clamp(0, size as i32 - 1);
     let area = edge(vertices[0], vertices[1], vertices[2][0], vertices[2][1]);
     if area.abs() < f32::EPSILON {
         return true;
@@ -331,7 +358,7 @@ fn rasterize(
             let w2 = 1.0 - w0 - w1;
             if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                 let z = w0 * vertices[0][2] + w1 * vertices[1][2] + w2 * vertices[2][2];
-                let index = y as usize * SIZE + x as usize;
+                let index = y as usize * size + x as usize;
                 if z > depth[index] {
                     depth[index] = z;
                     let pixel = &mut rgba[index * 4..index * 4 + 4];
@@ -341,6 +368,17 @@ fn rasterize(
         }
     }
     true
+}
+
+fn parse_background(value: &str) -> Result<[u8; 3], String> {
+    if value.len() != 7 || !value.starts_with('#') {
+        return Err("Thumbnail background must be #RRGGBB".into());
+    }
+    let parse = |range| {
+        u8::from_str_radix(&value[range], 16)
+            .map_err(|_| "Thumbnail background must be #RRGGBB".to_string())
+    };
+    Ok([parse(1..3)?, parse(3..5)?, parse(5..7)?])
 }
 
 fn edge(a: [f32; 3], b: [f32; 3], x: f32, y: f32) -> f32 {
@@ -363,6 +401,15 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn settings() -> CatalogSettings {
+        CatalogSettings {
+            thumbnail_size: 256,
+            thumbnail_background: "#12171F".into(),
+            thumbnail_concurrency: 2,
+            scan_batch_size: 128,
+        }
+    }
+
     fn one_triangle() -> ParsedStl {
         ParsedStl {
             format: StlFormat::Binary,
@@ -374,7 +421,7 @@ mod tests {
 
     #[test]
     fn renders_real_png_with_non_background_pixels() {
-        let png = render_png(&one_triangle()).unwrap();
+        let png = render_png(&one_triangle(), &settings()).unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(png.len() > 500);
         let decoder = png::Decoder::new(Cursor::new(&png));
@@ -446,6 +493,7 @@ mod tests {
             &source,
             &source_hash,
             source_bytes.len() as u64,
+            &settings(),
             false,
         )
         .unwrap();
@@ -455,6 +503,7 @@ mod tests {
             &source,
             &source_hash,
             source_bytes.len() as u64,
+            &settings(),
             false,
         )
         .unwrap();
@@ -474,7 +523,7 @@ mod tests {
         let source_bytes = binary_triangle();
         fs::write(&source, &source_bytes).unwrap();
         let source_hash = hex_digest(&source_bytes);
-        let cached = root.join(thumbnail_relative_path(&source_hash));
+        let cached = root.join(thumbnail_relative_path(&source_hash, &settings()));
         fs::write(&cached, b"\x89PNG\r\n\x1a\ntruncated").unwrap();
         assert!(png_data_uri(&cached).is_err());
 
@@ -483,6 +532,7 @@ mod tests {
             &source,
             &source_hash,
             source_bytes.len() as u64,
+            &settings(),
             false,
         )
         .unwrap();
@@ -519,6 +569,35 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn cache_key_and_pixels_include_thumbnail_configuration() {
+        let default = settings();
+        let mut configured = default.clone();
+        configured.thumbnail_size = 128;
+        configured.thumbnail_background = "#FF0000".into();
+        assert_ne!(
+            thumbnail_relative_path("abc", &default),
+            thumbnail_relative_path("abc", &configured)
+        );
+
+        let png = render_png(
+            &ParsedStl {
+                format: StlFormat::Binary,
+                triangle_count: 0,
+                positions: Vec::new(),
+                stored_normals: Vec::new(),
+            },
+            &configured,
+        )
+        .unwrap();
+        let decoder = png::Decoder::new(Cursor::new(png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (128, 128));
+        assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn cached_thumbnail_symlink_is_rejected() {
@@ -529,13 +608,14 @@ mod tests {
         let source_bytes = binary_triangle();
         fs::write(&source, &source_bytes).unwrap();
         let source_hash = hex_digest(&source_bytes);
-        let cached = root.join(thumbnail_relative_path(&source_hash));
+        let cached = root.join(thumbnail_relative_path(&source_hash, &settings()));
         symlink(&source, cached).unwrap();
         assert!(ensure_thumbnail(
             &root,
             &source,
             &source_hash,
             source_bytes.len() as u64,
+            &settings(),
             false,
         )
         .unwrap_err()
@@ -548,7 +628,7 @@ mod tests {
         let parsed = stl_core::parse_model(&three_mf_cube()).unwrap();
         assert_eq!(parsed.format, StlFormat::ThreeMf);
         assert_eq!(parsed.triangle_count, 12);
-        let png = render_png(&parsed).unwrap();
+        let png = render_png(&parsed, &settings()).unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         if let Some(path) = std::env::var_os("GOGGLELAB_THUMBNAIL_QA_OUTPUT") {
             let path = PathBuf::from(path);

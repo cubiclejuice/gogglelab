@@ -475,6 +475,16 @@ export interface LibraryScanStatus {
   errors: string[];
   startedAt: string | null;
   finishedAt: string | null;
+  jobKind: "scan" | "thumbnails" | null;
+  thumbnailsTotal: number;
+  thumbnailsCompleted: number;
+}
+
+export interface CatalogSettings {
+  thumbnail_size: 128 | 256 | 512;
+  thumbnail_background: string;
+  thumbnail_concurrency: number;
+  scan_batch_size: number;
 }
 
 export function libraryListFolders(): Promise<LibraryFolder[]> {
@@ -542,6 +552,18 @@ export function libraryGetThumbnail(modelId: string, regenerate = false): Promis
 
 export function libraryPurgeThumbnails(): Promise<void> {
   return invoke("library_purge_thumbnails");
+}
+
+export function libraryStartThumbnailJob(regenerate: boolean): Promise<void> {
+  return invoke("library_start_thumbnail_job", { regenerate });
+}
+
+export function libraryGetCatalogSettings(): Promise<CatalogSettings> {
+  return invoke("library_get_catalog_settings");
+}
+
+export function librarySetCatalogSettings(settings: CatalogSettings): Promise<CatalogSettings> {
+  return invoke("library_set_catalog_settings", { settings });
 }
 
 export interface RecoveryManifest {

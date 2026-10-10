@@ -15,7 +15,6 @@ use crate::extension_api::AppError;
 use crate::library_commands::{LibraryState, LibraryStateInner};
 
 const MAX_SCAN_FILES: usize = 250_000;
-const ENTRY_BATCH_SIZE: usize = 128;
 const MAX_REPORTED_ERRORS: usize = 100;
 const BACKGROUND_POLL: Duration = Duration::from_secs(30);
 
@@ -24,11 +23,14 @@ const BACKGROUND_POLL: Duration = Duration::from_secs(30);
 pub struct LibraryScanStatus {
     pub running: bool,
     pub cancelling: bool,
+    pub job_kind: Option<String>,
     pub current_root_id: Option<String>,
     pub roots_total: usize,
     pub roots_completed: usize,
     pub files_visited: usize,
     pub files_indexed: usize,
+    pub thumbnails_total: usize,
+    pub thumbnails_completed: usize,
     pub errors: Vec<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -52,13 +54,14 @@ impl ScanControl {
     }
 
     pub(crate) fn cancel(&self) {
-        if self.status.lock().unwrap().running {
+        let mut status = self.status.lock().unwrap();
+        if status.running {
             self.cancel.store(true, Ordering::Release);
-            self.status.lock().unwrap().cancelling = true;
+            status.cancelling = true;
         }
     }
 
-    fn try_begin(&self, roots_total: usize) -> bool {
+    pub(crate) fn try_begin(&self, roots_total: usize, job_kind: &str) -> bool {
         let mut status = self.status.lock().unwrap();
         if status.running {
             return false;
@@ -66,6 +69,7 @@ impl ScanControl {
         self.cancel.store(false, Ordering::Release);
         *status = LibraryScanStatus {
             running: true,
+            job_kind: Some(job_kind.into()),
             roots_total,
             started_at: Some(timestamp()),
             ..LibraryScanStatus::default()
@@ -73,7 +77,7 @@ impl ScanControl {
         true
     }
 
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         let mut status = self.status.lock().unwrap();
         status.running = false;
         status.cancelling = false;
@@ -81,12 +85,12 @@ impl ScanControl {
         status.finished_at = Some(timestamp());
     }
 
-    fn failed_to_spawn(&self, message: String) {
+    pub(crate) fn failed_to_spawn(&self, message: String) {
         self.error(message);
         self.finish();
     }
 
-    fn error(&self, message: String) {
+    pub(crate) fn error(&self, message: String) {
         let mut status = self.status.lock().unwrap();
         if status.errors.len() < MAX_REPORTED_ERRORS {
             status.errors.push(message);
@@ -95,6 +99,24 @@ impl ScanControl {
                 .errors
                 .push("Additional scan errors were omitted".into());
         }
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_job_kind(&self, kind: &str) {
+        self.status.lock().unwrap().job_kind = Some(kind.into());
+    }
+
+    pub(crate) fn set_thumbnail_progress(&self, total: usize) {
+        let mut status = self.status.lock().unwrap();
+        status.thumbnails_total = total;
+        status.thumbnails_completed = 0;
+    }
+
+    pub(crate) fn thumbnail_completed(&self) {
+        self.status.lock().unwrap().thumbnails_completed += 1;
     }
 }
 
@@ -195,7 +217,7 @@ fn start_scan(
     if root_id.is_some() && roots.is_empty() {
         return Err("Index root was not found or is disabled".into());
     }
-    if !state.scan_control().try_begin(roots.len()) {
+    if !state.scan_control().try_begin(roots.len(), "scan") {
         return Err("A library scan is already running".into());
     }
     let scanner_state = state.clone();
@@ -241,8 +263,15 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
     }
 
     let mut stack = vec![canonical_root.clone()];
+    let batch_size = state
+        .with_db(|db| {
+            db.get_catalog_settings()
+                .map(|settings| settings.scan_batch_size.clamp(16, 256) as usize)
+                .map_err(super::library_commands::library_error)
+        })
+        .map_err(app_error_text)?;
     let mut seen = Vec::<PathBuf>::new();
-    let mut batch = Vec::<ScannedModel>::with_capacity(ENTRY_BATCH_SIZE);
+    let mut batch = Vec::<ScannedModel>::with_capacity(batch_size);
     let mut reconciled = ScanReconcile::default();
     let mut complete = true;
 
@@ -360,7 +389,7 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
                         .error(format!("{}: {error}", path.display()));
                 }
             }
-            if batch.len() == ENTRY_BATCH_SIZE {
+            if batch.len() == batch_size {
                 let result = flush_batch(state, &root.id, &mut batch)?;
                 add_reconcile(&mut reconciled, &result);
             }
@@ -384,6 +413,9 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
             })
             .map_err(app_error_text)?;
         add_reconcile(&mut reconciled, &result);
+        if !state.scan_control().cancelled() {
+            crate::library_commands::render_thumbnails_for_root(state, &root.id);
+        }
     }
     Ok(reconciled)
 }
@@ -570,6 +602,18 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_an_idle_completed_job_does_not_leave_cancelling_set() {
+        let control = ScanControl::new();
+        assert!(control.try_begin(0, "thumbnails"));
+        control.finish();
+        control.cancel();
+        let status = control.status();
+        assert!(!status.running);
+        assert!(!status.cancelling);
+        assert_eq!(status.job_kind.as_deref(), Some("thumbnails"));
+    }
+
+    #[test]
     fn cancelled_scan_does_not_mark_sources_missing_but_completed_scan_does() {
         let catalog = temp_root("cancel-catalog");
         let source = temp_root("cancel-source");
@@ -637,14 +681,13 @@ mod tests {
             })
             .unwrap();
         scan_root(&state, &root).unwrap();
-        let original_hash = state
+        let (original_hash, original_thumbnail) = state
             .with_db(|db| {
-                Ok(db
+                let model = db
                     .list_models(None, None)
-                    .map_err(super::super::library_commands::library_error)?[0]
-                    .content_hash
-                    .clone()
-                    .unwrap())
+                    .map_err(super::super::library_commands::library_error)?
+                    .remove(0);
+                Ok((model.content_hash.unwrap(), model.thumbnail_path.unwrap()))
             })
             .unwrap();
 
@@ -653,17 +696,17 @@ mod tests {
         thread::sleep(Duration::from_millis(2));
         fs::write(&path, changed).unwrap();
         scan_root(&state, &root).unwrap();
-        let changed_hash = state
+        let (changed_hash, changed_thumbnail) = state
             .with_db(|db| {
-                Ok(db
+                let model = db
                     .list_models(None, None)
-                    .map_err(super::super::library_commands::library_error)?[0]
-                    .content_hash
-                    .clone()
-                    .unwrap())
+                    .map_err(super::super::library_commands::library_error)?
+                    .remove(0);
+                Ok((model.content_hash.unwrap(), model.thumbnail_path.unwrap()))
             })
             .unwrap();
         assert_ne!(original_hash, changed_hash);
+        assert_ne!(original_thumbnail, changed_thumbnail);
         let _ = fs::remove_dir_all(catalog);
         let _ = fs::remove_dir_all(source);
     }

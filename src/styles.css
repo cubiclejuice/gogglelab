@@ -984,7 +984,7 @@ dialog::backdrop {
   height: min(820px, calc(100vh - 24px));
   margin: auto;
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
   overflow: hidden;
   border: 1px solid var(--hairline);
   border-radius: 8px;
@@ -1157,7 +1157,20 @@ dialog::backdrop {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
   border-bottom: 1px solid var(--hairline);
+}
+.library-view-switcher,
+.library-thumbnail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.library-view-switcher .btn[aria-pressed="true"] {
+  background: var(--seg-on);
+  border-color: var(--seg-on);
+  color: var(--seg-on-text);
 }
 .library-result-count {
   font-weight: 600;
@@ -1251,6 +1264,9 @@ dialog::backdrop {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.library-model-details {
+  display: none;
+}
 .library-model-source {
   color: var(--accent);
   font-size: var(--font-sm);
@@ -1270,6 +1286,48 @@ dialog::backdrop {
 .library-load-more {
   min-height: 42px;
   grid-column: 1 / -1;
+}
+.library-gallery[data-view="list"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.library-gallery[data-view="list"] .library-model {
+  min-height: 72px;
+  grid-template-columns: 72px minmax(0, 1fr);
+  grid-template-rows: minmax(72px, auto);
+}
+.library-gallery[data-view="list"] .library-model-preview {
+  height: 100%;
+  border-right: 1px solid var(--hairline);
+  border-bottom: 0;
+}
+.library-gallery[data-view="list"] .library-model-open {
+  padding: var(--space-2) 100px var(--space-2) var(--space-3);
+}
+.library-gallery[data-view="list"] .library-regenerate {
+  bottom: 50%;
+  transform: translateY(50%);
+}
+.library-gallery[data-view="detailed"] {
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+.library-gallery[data-view="detailed"] .library-model {
+  min-height: 320px;
+  grid-template-rows: 180px auto;
+}
+.library-gallery[data-view="detailed"] .library-model-details {
+  margin-top: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: var(--font-sm);
+  white-space: normal;
+}
+.library-model-path {
+  overflow: hidden;
+  font-family: var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .library-empty {
   min-height: 180px;
@@ -1292,6 +1350,42 @@ dialog::backdrop {
   gap: var(--space-2);
   border-top: 1px solid var(--hairline);
   background: var(--strip);
+}
+.library-catalog-settings {
+  padding: var(--space-2) var(--space-5);
+  border-top: 1px solid var(--hairline);
+  background: var(--sheet);
+}
+.library-catalog-settings summary {
+  width: max-content;
+  color: var(--dim);
+  font-size: var(--font-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+.library-settings-fields {
+  margin-top: var(--space-2);
+  display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 1fr)) auto;
+  align-items: end;
+  gap: var(--space-2);
+}
+.library-setting-field {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  color: var(--muted);
+  font-size: 9px;
+}
+.library-setting-field > *:last-child {
+  width: 100%;
+}
+.library-color-input {
+  height: 28px;
+  padding: 2px;
+  border: 1px solid var(--button-border);
+  border-radius: 4px;
+  background: var(--button);
 }
 .library-scan-status {
   min-width: 0;
@@ -1344,6 +1438,13 @@ dialog::backdrop {
     border-bottom: 1px solid var(--hairline);
   }
   .library-gallery {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .library-gallery[data-view="list"],
+  .library-gallery[data-view="detailed"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .library-settings-fields {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

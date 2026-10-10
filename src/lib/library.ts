@@ -1,8 +1,24 @@
-import type { IndexRoot, LibraryFolder, LibraryModel, LibraryScanStatus } from "./ipc";
+import type {
+  CatalogSettings,
+  IndexRoot,
+  LibraryFolder,
+  LibraryModel,
+  LibraryScanStatus,
+} from "./ipc";
 
 export type LibrarySort = "name" | "size" | "date";
 export type LibrarySourceFilter = "all" | "managed" | "indexed";
 export type LibraryStatusFilter = "all" | "available" | "missing";
+export type LibraryViewMode = "list" | "preview" | "detailed";
+export const LIBRARY_CATALOG_TIER = "free" as const;
+export const LIBRARY_VIEW_MODES: readonly LibraryViewMode[] = ["list", "preview", "detailed"];
+
+const DEFAULT_CATALOG_SETTINGS: CatalogSettings = {
+  thumbnail_size: 256,
+  thumbnail_background: "#12171F",
+  thumbnail_concurrency: 2,
+  scan_batch_size: 128,
+};
 
 export interface LibraryViewOptions {
   query: string;
@@ -104,17 +120,44 @@ export function filterAndSortLibraryModels(
 
 export function scanStatusMessage(status: LibraryScanStatus): string {
   if (status.running) {
+    if (status.jobKind === "thumbnails") {
+      const action = status.cancelling ? "Stopping preview generation" : "Generating previews";
+      return `${action} · ${status.thumbnailsCompleted.toLocaleString()}/${status.thumbnailsTotal.toLocaleString()} complete`;
+    }
     const action = status.cancelling ? "Stopping scan" : "Scanning";
     const roots = status.rootsTotal
       ? ` · ${status.rootsCompleted}/${status.rootsTotal} folders`
       : "";
     return `${action}${roots} · ${status.filesVisited.toLocaleString()} checked · ${status.filesIndexed.toLocaleString()} indexed`;
   }
+  if (status.jobKind === "thumbnails" && status.finishedAt) {
+    return `Preview generation finished · ${status.thumbnailsCompleted.toLocaleString()}/${status.thumbnailsTotal.toLocaleString()} complete`;
+  }
   if (!status.finishedAt) return "Ready to scan indexed folders.";
   const errors = status.errors.length
     ? ` · ${status.errors.length} issue${status.errors.length === 1 ? "" : "s"}`
     : "";
   return `Scan finished · ${status.filesIndexed.toLocaleString()} indexed${errors}`;
+}
+
+export function normalizeCatalogSettings(settings: CatalogSettings): CatalogSettings {
+  const thumbnailSize = [128, 256, 512].includes(settings.thumbnail_size)
+    ? settings.thumbnail_size
+    : 256;
+  const concurrency = Number.isFinite(settings.thumbnail_concurrency)
+    ? Math.round(settings.thumbnail_concurrency)
+    : DEFAULT_CATALOG_SETTINGS.thumbnail_concurrency;
+  const batchSize = Number.isFinite(settings.scan_batch_size)
+    ? Math.round(settings.scan_batch_size)
+    : DEFAULT_CATALOG_SETTINGS.scan_batch_size;
+  return {
+    thumbnail_size: thumbnailSize as 128 | 256 | 512,
+    thumbnail_background: /^#[0-9a-f]{6}$/i.test(settings.thumbnail_background)
+      ? settings.thumbnail_background.toUpperCase()
+      : DEFAULT_CATALOG_SETTINGS.thumbnail_background,
+    thumbnail_concurrency: Math.min(2, Math.max(1, concurrency)),
+    scan_batch_size: Math.min(256, Math.max(16, batchSize)),
+  };
 }
 
 export function canOpenLibraryModel(model: LibraryModel): boolean {
@@ -191,12 +234,21 @@ export class LibraryPanel {
   private readonly importButton: HTMLButtonElement;
   private readonly addRootButton: HTMLButtonElement;
   private readonly purgeButton: HTMLButtonElement;
+  private readonly generateMissingButton: HTMLButtonElement;
+  private readonly regenerateAllButton: HTMLButtonElement;
+  private readonly viewButtons = new Map<LibraryViewMode, HTMLButtonElement>();
+  private readonly thumbnailSizeSelect: HTMLSelectElement;
+  private readonly thumbnailBackgroundInput: HTMLInputElement;
+  private readonly thumbnailConcurrencyInput: HTMLInputElement;
+  private readonly scanBatchSizeInput: HTMLInputElement;
   private invoker: HTMLElement | null = null;
   private allFolders: LibraryFolder[] = [];
   private allModels: LibraryModel[] = [];
   private allRoots: IndexRoot[] = [];
   private activeFolderId: string | null = null;
   private activeRootId: string | null = null;
+  private viewMode: LibraryViewMode = "preview";
+  private catalogSettings = DEFAULT_CATALOG_SETTINGS;
   private page = 1;
   private renderRevision = 0;
   private scanWasRunning = false;
@@ -227,11 +279,18 @@ export class LibraryPanel {
     errors: [],
     startedAt: null,
     finishedAt: null,
+    jobKind: null,
+    thumbnailsTotal: 0,
+    thumbnailsCompleted: 0,
   });
   onScanCompleted: () => void = () => {};
   onGetThumbnail: (modelId: string, regenerate: boolean) => Promise<string | null> = async () =>
     null;
   onPurgeThumbnails: () => Promise<void> = async () => {};
+  onStartThumbnailJob: (regenerate: boolean) => Promise<void> = async () => {};
+  onSaveCatalogSettings: (settings: CatalogSettings) => Promise<CatalogSettings> = async (
+    settings,
+  ) => settings;
 
   constructor(container: HTMLElement) {
     this.root = document.createElement("dialog");
@@ -316,16 +375,82 @@ export class LibraryPanel {
     contentHeader.className = "library-content-header";
     this.resultCount = document.createElement("div");
     this.resultCount.className = "library-result-count";
+    const viewSwitcher = document.createElement("div");
+    viewSwitcher.className = "library-view-switcher";
+    viewSwitcher.setAttribute("role", "group");
+    viewSwitcher.setAttribute("aria-label", "Catalog view");
+    for (const [mode, label] of [
+      ["list", "List"],
+      ["preview", "Previews"],
+      ["detailed", "Details"],
+    ] as Array<[LibraryViewMode, string]>) {
+      const button = this.actionButton(label, "", () => {
+        this.viewMode = mode;
+        this.page = 1;
+        this.renderContent();
+      });
+      button.setAttribute("aria-pressed", String(mode === this.viewMode));
+      this.viewButtons.set(mode, button);
+      viewSwitcher.append(button);
+    }
     const thumbnailActions = document.createElement("div");
     thumbnailActions.className = "library-thumbnail-actions";
+    this.generateMissingButton = this.actionButton(
+      "Generate missing",
+      "",
+      () => void this.startThumbnailJob(false),
+    );
+    this.regenerateAllButton = this.actionButton(
+      "Regenerate all",
+      "",
+      () => void this.startThumbnailJob(true),
+    );
     this.purgeButton = this.actionButton("Clear previews", "", () => void this.purgeThumbnails());
-    thumbnailActions.append(this.purgeButton);
-    contentHeader.append(this.resultCount, thumbnailActions);
+    thumbnailActions.append(this.generateMissingButton, this.regenerateAllButton, this.purgeButton);
+    contentHeader.append(this.resultCount, viewSwitcher, thumbnailActions);
     this.gallery = document.createElement("div");
     this.gallery.className = "library-gallery";
     this.gallery.setAttribute("aria-live", "polite");
     content.append(contentHeader, this.gallery);
     body.append(this.navigation, content);
+
+    const catalogSettings = document.createElement("details");
+    catalogSettings.className = "library-catalog-settings";
+    const settingsSummary = document.createElement("summary");
+    settingsSummary.textContent = "Catalog settings";
+    const settingsFields = document.createElement("div");
+    settingsFields.className = "library-settings-fields";
+    this.thumbnailSizeSelect = document.createElement("select");
+    this.thumbnailSizeSelect.className = "library-select";
+    this.thumbnailSizeSelect.setAttribute("aria-label", "Preview size");
+    for (const size of [128, 256, 512]) {
+      this.thumbnailSizeSelect.add(new Option(`${size} px`, String(size)));
+    }
+    this.thumbnailBackgroundInput = document.createElement("input");
+    this.thumbnailBackgroundInput.type = "color";
+    this.thumbnailBackgroundInput.className = "library-color-input";
+    this.thumbnailBackgroundInput.setAttribute("aria-label", "Preview background");
+    this.thumbnailConcurrencyInput = document.createElement("input");
+    this.thumbnailConcurrencyInput.type = "number";
+    this.thumbnailConcurrencyInput.className = "library-number";
+    this.thumbnailConcurrencyInput.min = "1";
+    this.thumbnailConcurrencyInput.max = "2";
+    this.thumbnailConcurrencyInput.setAttribute("aria-label", "Preview concurrency");
+    this.scanBatchSizeInput = document.createElement("input");
+    this.scanBatchSizeInput.type = "number";
+    this.scanBatchSizeInput.className = "library-number";
+    this.scanBatchSizeInput.min = "16";
+    this.scanBatchSizeInput.max = "256";
+    this.scanBatchSizeInput.step = "16";
+    this.scanBatchSizeInput.setAttribute("aria-label", "Scan batch size");
+    settingsFields.append(
+      this.settingField("Preview size", this.thumbnailSizeSelect),
+      this.settingField("Background", this.thumbnailBackgroundInput),
+      this.settingField("Preview workers", this.thumbnailConcurrencyInput),
+      this.settingField("Scan batch", this.scanBatchSizeInput),
+      this.actionButton("Save settings", "", () => void this.saveCatalogSettings()),
+    );
+    catalogSettings.append(settingsSummary, settingsFields);
 
     const scanBar = document.createElement("footer");
     scanBar.className = "library-scan-bar";
@@ -349,7 +474,7 @@ export class LibraryPanel {
     this.cancelScanButton.hidden = true;
     scanBar.append(this.scanStatus, this.scanButton, this.cancelScanButton);
 
-    shell.append(header, this.status, toolbar, body, scanBar);
+    shell.append(header, this.status, toolbar, body, catalogSettings, scanBar);
     this.root.append(shell);
     container.appendChild(this.root);
   }
@@ -389,7 +514,12 @@ export class LibraryPanel {
     this.importButton.setAttribute("aria-disabled", String(busy));
   }
 
-  render(folders: LibraryFolder[], models: LibraryModel[], roots: IndexRoot[] = []): void {
+  render(
+    folders: LibraryFolder[],
+    models: LibraryModel[],
+    roots: IndexRoot[] = [],
+    settings: CatalogSettings = this.catalogSettings,
+  ): void {
     for (const modelId of thumbnailCacheInvalidations(this.allModels, models)) {
       this.thumbnailCache.delete(modelId);
       this.thumbnailGuard.invalidate(modelId);
@@ -397,6 +527,7 @@ export class LibraryPanel {
     this.allFolders = folders;
     this.allModels = models;
     this.allRoots = roots;
+    this.setCatalogSettings(settings);
     if (this.activeFolderId && !folders.some((folder) => folder.id === this.activeFolderId)) {
       this.activeFolderId = null;
     }
@@ -409,12 +540,21 @@ export class LibraryPanel {
   setScanStatus(value: LibraryScanStatus): void {
     this.scanStatus.textContent = scanStatusMessage(value);
     this.scanButton.disabled = value.running;
+    this.generateMissingButton.disabled = value.running;
+    this.regenerateAllButton.disabled = value.running;
     this.cancelScanButton.hidden = !value.running;
     this.cancelScanButton.disabled = value.cancelling;
+    this.cancelScanButton.textContent =
+      value.jobKind === "thumbnails" ? "Cancel previews" : "Cancel scan";
     if (value.errors.length) this.scanStatus.title = value.errors.join("\n");
     else this.scanStatus.removeAttribute("title");
     if (didLibraryScanComplete(this.scanWasRunning, value)) this.onScanCompleted();
     this.scanWasRunning = value.running;
+  }
+
+  clearThumbnailCache(): void {
+    this.thumbnailCache.clear();
+    for (const model of this.allModels) this.thumbnailGuard.invalidate(model.id);
   }
 
   private actionButton(label: string, variant: string, action: () => void): HTMLButtonElement {
@@ -435,6 +575,58 @@ export class LibraryPanel {
     return select;
   }
 
+  private settingField(label: string, control: HTMLElement): HTMLLabelElement {
+    const field = document.createElement("label");
+    field.className = "library-setting-field";
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    field.append(caption, control);
+    return field;
+  }
+
+  private setCatalogSettings(settings: CatalogSettings): void {
+    this.catalogSettings = normalizeCatalogSettings(settings);
+    this.thumbnailSizeSelect.value = String(this.catalogSettings.thumbnail_size);
+    this.thumbnailBackgroundInput.value = this.catalogSettings.thumbnail_background;
+    this.thumbnailConcurrencyInput.value = String(this.catalogSettings.thumbnail_concurrency);
+    this.scanBatchSizeInput.value = String(this.catalogSettings.scan_batch_size);
+  }
+
+  private async saveCatalogSettings(): Promise<void> {
+    const settings = normalizeCatalogSettings({
+      thumbnail_size: Number(this.thumbnailSizeSelect.value) as 128 | 256 | 512,
+      thumbnail_background: this.thumbnailBackgroundInput.value,
+      thumbnail_concurrency: Number(this.thumbnailConcurrencyInput.value),
+      scan_batch_size: Number(this.scanBatchSizeInput.value),
+    });
+    try {
+      this.setCatalogSettings(await this.onSaveCatalogSettings(settings));
+      this.clearThumbnailCache();
+      this.setStatus("Catalog settings saved. Previews will use the new render settings.");
+      this.renderContent();
+    } catch (error) {
+      this.setStatus(`Could not save catalog settings: ${libraryErrorMessage(error)}`);
+    }
+  }
+
+  private async startThumbnailJob(regenerate: boolean): Promise<void> {
+    await this.runAction(async () => {
+      this.generateMissingButton.disabled = true;
+      this.regenerateAllButton.disabled = true;
+      try {
+        await this.onStartThumbnailJob(regenerate);
+        this.setStatus(
+          regenerate ? "Regenerating every catalog preview…" : "Generating missing previews…",
+        );
+        await this.pollScanStatus();
+      } catch (error) {
+        this.generateMissingButton.disabled = false;
+        this.regenerateAllButton.disabled = false;
+        throw error;
+      }
+    });
+  }
+
   private resetAndRender(): void {
     this.page = 1;
     this.renderContent();
@@ -443,6 +635,10 @@ export class LibraryPanel {
   private renderContent(): void {
     this.renderRevision += 1;
     this.observer?.disconnect();
+    this.gallery.dataset.view = this.viewMode;
+    for (const [mode, button] of this.viewButtons) {
+      button.setAttribute("aria-pressed", String(mode === this.viewMode));
+    }
     this.renderNavigation();
     const models = filterAndSortLibraryModels(this.allModels, {
       query: this.searchInput.value,
@@ -690,7 +886,22 @@ export class LibraryPanel {
       sourceRoot && model.source_path
         ? `${sourceRoot.path.replace(/[\\/]$/, "")}/${model.source_path}`
         : (model.source_path ?? model.original_name ?? "");
-    open.append(name, meta, source);
+    const details = document.createElement("span");
+    details.className = "library-model-details";
+    const description = document.createElement("span");
+    description.textContent = model.description || "No description";
+    const path = document.createElement("span");
+    path.className = "library-model-path";
+    path.textContent = source.title || "No source path";
+    const updated = document.createElement("span");
+    const updatedAt = normalizeLibraryTimestamp(model.source_modified_at ?? model.updated_at);
+    updated.textContent = updatedAt
+      ? `Updated ${new Date(updatedAt).toLocaleString()}`
+      : "Update time unavailable";
+    const tags = document.createElement("span");
+    tags.textContent = model.tags.length ? `Tags: ${model.tags.join(", ")}` : "No tags";
+    details.append(description, path, updated, tags);
+    open.append(name, meta, source, details);
     const regenerate = this.actionButton("Refresh preview", "library-regenerate", () => {
       this.thumbnailCache.delete(model.id);
       void this.requestThumbnail(model.id, article, true);

@@ -81,6 +81,8 @@ pub struct RecoveryManifest {
     pub models: Vec<RecoveryModel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub index_roots: Vec<RecoveryIndexRoot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_settings: Option<RecoveryCatalogSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +121,14 @@ pub struct RecoveryModel {
     pub thumbnails: Vec<RecoveryThumbnail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_source: Option<RecoveryIndexedSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryCatalogSettings {
+    pub thumbnail_size: u32,
+    pub thumbnail_background: String,
+    pub thumbnail_concurrency: u32,
+    pub scan_batch_size: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +666,44 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         Vec::new()
     };
 
+    let catalog_settings = if schema_version >= 2 {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_settings')",
+            [],|row|row.get(0))?;
+        if exists {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM catalog_settings", [], |row| {
+                    row.get(0)
+                })?;
+            if count != 1 {
+                return Err(invalid("Catalog settings singleton is invalid"));
+            }
+            let (size,background,workers,batch): (i64,String,i64,i64) = conn.query_row(
+                "SELECT thumbnail_size,thumbnail_background,thumbnail_concurrency,scan_batch_size FROM catalog_settings WHERE id='local'",
+                [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            let color = background.as_bytes();
+            if ![128, 256, 512].contains(&size)
+                || !(1..=2).contains(&workers)
+                || !(16..=256).contains(&batch)
+                || color.len() != 7
+                || color[0] != b'#'
+                || !color[1..].iter().all(u8::is_ascii_hexdigit)
+            {
+                return Err(invalid("Catalog settings values are invalid"));
+            }
+            Some(RecoveryCatalogSettings {
+                thumbnail_size: size as u32,
+                thumbnail_background: background,
+                thumbnail_concurrency: workers as u32,
+                scan_batch_size: batch as u32,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let revisions = collect_rows(
         conn,
         "SELECT r.id, r.model_id, r.blob_hash, r.original_name, r.format, r.bytes, r.created_at,
@@ -809,6 +857,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         model_tags,
         models,
         index_roots,
+        catalog_settings,
     })
 }
 
