@@ -71,7 +71,8 @@
     ],
     "resources": {
       "../resources/cad/": "cad/",
-      "../resources/licenses/": "licenses/"
+      "../resources/licenses/": "licenses/",
+      "../dist-browser/": "server-web/"
     }
   }
 }

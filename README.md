@@ -77,4 +77,4 @@ Credentials last only for the app session; saving configuration makes no provide
 Review each model, accept or reject, and choose append, replace or category-aware merge.
 Current requests share a normalized preview, display name and assigned tag names.
 Categories remain local and are validated before applying; provider costs are separate
-from GoggleLab Free. Optional category-vocabulary sharing awaits explicit authorization.
+from GoggleLab Free. Category sharing defaults to local. A user can opt in to sharing category labels with the configured provider when generating suggestions.

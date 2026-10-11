@@ -10,16 +10,17 @@ use uuid::Uuid;
 
 use crate::error::{io, LibraryError};
 use crate::models::{
-    CatalogSettings, DuplicateGroup, Filament, FilamentInput, FilamentOrigin, FilamentResourceKind,
+    CaptureDownloadRecord, CaptureReceipt, CaptureReceiptInput, CaptureSummary, CatalogSettings,
+    DuplicateGroup, Filament, FilamentInput, FilamentOrigin, FilamentResourceKind,
     FilamentSyncSummary, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, MetadataPatch,
-    Model, ModelFilamentAssignment, ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome,
-    PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource, ReviewedTagStrategy,
-    ReviewedTagTarget, ScanReconcile, ScannedModel, SourceRef, SpoolmanFilamentRecord,
-    SpoolmanSource, SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry, VersionedModelUpdate,
-    VersionedTarget,
+    Model, ModelFilamentAssignment, ModelGroupFilter, ModelMetadata, ModelPageQuery, ModelSort,
+    PrintAttempt, PrintAttemptInput, PrintOutcome, PrintStatus, RemovalResult, RemovedModel,
+    ResolvedModelSource, ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel,
+    SortDirection, SourceRef, SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag,
+    TagMode, ThumbnailCacheEntry, ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 pub const ROOT_FOLDER_ID: &str = "root";
 pub const MIN_SCAN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_SCAN_INTERVAL_MINUTES: u32 = 1_440;
@@ -114,13 +115,19 @@ impl LibraryDb {
             conn.execute_batch(MIGRATE_V1_TO_V2)?;
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
+            conn.execute_batch(MIGRATE_V4_TO_V5)?;
         } else if version == 2 {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
+            conn.execute_batch(MIGRATE_V4_TO_V5)?;
         } else if version == 3 {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
+            conn.execute_batch(MIGRATE_V4_TO_V5)?;
+        } else if version == 4 {
+            create_migration_backup(&conn, &root, version)?;
+            conn.execute_batch(MIGRATE_V4_TO_V5)?;
         }
         conn.execute_batch(ENSURE_CATALOG_SETTINGS)?;
         Ok(Self { conn, root })
@@ -128,6 +135,10 @@ impl LibraryDb {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn total_changes(&self) -> u64 {
+        self.conn.total_changes()
     }
 
     pub fn create_model(
@@ -193,6 +204,116 @@ impl LibraryDb {
             model.filament_ids = filaments.remove(&model.id).unwrap_or_default();
         }
         Ok(models)
+    }
+
+    pub fn list_models_page(
+        &self,
+        query: &ModelPageQuery,
+        after_sort_value: Option<&str>,
+        after_id: Option<&str>,
+        limit: u16,
+    ) -> Result<(Vec<Model>, bool), LibraryError> {
+        if limit == 0 || limit > 500 || after_sort_value.is_some() != after_id.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "model page request is invalid".into(),
+            ));
+        }
+        let search = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let print_status = query.print_status.as_ref().map(|status| match status {
+            PrintStatus::Unprinted => "unprinted",
+            PrintStatus::Want => "want",
+            PrintStatus::Queued => "queued",
+            PrintStatus::Printing => "printing",
+            PrintStatus::Printed => "printed",
+            PrintStatus::Failed => "failed",
+        });
+        let group = query.group.map(|group| match group {
+            ModelGroupFilter::Standalone => 1_i64,
+            ModelGroupFilter::Bundle => 2,
+            ModelGroupFilter::Archive => 3,
+        });
+        let (sort_expression, cursor_expression) = match query.sort {
+            ModelSort::Name => ("lower(m.display_name)", "?16"),
+            ModelSort::Size => ("m.bytes", "CAST(?16 AS INTEGER)"),
+            ModelSort::Date => ("m.created_at", "?16"),
+        };
+        let comparison = match query.direction {
+            SortDirection::Asc => ">",
+            SortDirection::Desc => "<",
+        };
+        let direction = match query.direction {
+            SortDirection::Asc => "ASC",
+            SortDirection::Desc => "DESC",
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "{MODEL_SELECT} WHERE m.deleted_at IS NULL
+             AND (?1 IS NULL OR m.folder_id=?1)
+             AND (?2 IS NULL OR lower(m.display_name) LIKE '%' || lower(?2) || '%'
+                  OR EXISTS (SELECT 1 FROM model_tags mt JOIN tags t ON t.id=mt.tag_id
+                             WHERE mt.model_id=m.id AND lower(t.name) LIKE '%' || lower(?2) || '%'))
+             AND (?3 IS NULL OR EXISTS (SELECT 1 FROM model_tags mt
+                                         WHERE mt.model_id=m.id AND mt.tag_id=?3))
+             AND (?4 IS NULL OR EXISTS (SELECT 1 FROM model_tags mt JOIN tags t ON t.id=mt.tag_id
+                                         WHERE mt.model_id=m.id AND t.category=?4))
+             AND (?5 IS NULL OR m.designer=?5)
+             AND (?6 IS NULL OR m.model_license=?6)
+             AND (?7 IS NULL OR m.print_status=?7)
+             AND (?8 IS NULL OR (?8=1 AND m.print_count>0) OR (?8=0 AND m.print_count=0))
+             AND (?9 IS NULL OR m.bundle_id=?9)
+             AND (?10 IS NULL OR m.source_root_id=?10)
+             AND (?11 IS NULL OR EXISTS (SELECT 1 FROM model_filaments mf
+                                          WHERE mf.model_id=m.id AND mf.filament_id=?11))
+             AND (?12 IS NULL OR m.source_missing=?12)
+             AND (?13=0 OR (COALESCE(r.blob_hash,d.content_hash) IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM models duplicate
+                  LEFT JOIN revisions duplicate_revision ON duplicate_revision.id=duplicate.current_revision_id
+                  LEFT JOIN indexed_model_data duplicate_data ON duplicate_data.model_id=duplicate.id
+                  WHERE duplicate.deleted_at IS NULL AND duplicate.id!=m.id
+                  AND COALESCE(duplicate_revision.blob_hash,duplicate_data.content_hash)
+                      =COALESCE(r.blob_hash,d.content_hash))))
+             AND (?14 IS NULL OR m.source_kind=?14)
+             AND (?15 IS NULL OR (?15=1 AND m.bundle_id IS NULL AND m.source_archive_member IS NULL)
+                  OR (?15=2 AND m.bundle_id IS NOT NULL)
+                  OR (?15=3 AND m.source_archive_member IS NOT NULL))
+             AND (?16 IS NULL OR {sort_expression}{comparison}{cursor_expression}
+                  OR ({sort_expression}={cursor_expression} AND m.id{comparison}?17))
+             ORDER BY {sort_expression} {direction},m.id {direction} LIMIT ?18"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                query.folder_id.as_deref(),
+                search,
+                query.tag_id.as_deref(),
+                query.category.as_deref(),
+                query.designer.as_deref(),
+                query.model_license.as_deref(),
+                print_status,
+                query.ever_printed.map(i64::from),
+                query.bundle_id.as_deref(),
+                query.root_id.as_deref(),
+                query.filament_id.as_deref(),
+                query.source_missing.map(i64::from),
+                i64::from(query.duplicates_only),
+                query.source_kind.as_deref(),
+                group,
+                after_sort_value,
+                after_id,
+                i64::from(limit) + 1
+            ],
+            model_from_row,
+        )?;
+        let mut models = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = models.len() > usize::from(limit);
+        models.truncate(usize::from(limit));
+        for model in &mut models {
+            model.tags = self.tags_for(&model.id)?;
+            model.filament_ids = self.filament_ids_for_model(&model.id)?;
+        }
+        Ok((models, has_more))
     }
 
     pub fn list_bundle_models(&self, bundle_id: &str) -> Result<Vec<Model>, LibraryError> {
@@ -778,7 +899,18 @@ impl LibraryDb {
             ],
         )?;
         if appearance_changed {
+            let mut affected = Vec::new();
+            {
+                let mut stmt =
+                    tx.prepare("SELECT DISTINCT model_id FROM thumbnails WHERE is_custom=0")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                affected.extend(rows.collect::<Result<Vec<_>, _>>()?);
+            }
             tx.execute("DELETE FROM thumbnails WHERE is_custom = 0", [])?;
+            for model_id in affected {
+                compact_thumbnail_ordinals(&tx, &model_id)?;
+                select_thumbnail_fallback(&tx, &model_id)?;
+            }
         }
         tx.commit()?;
         self.get_catalog_settings()
@@ -1502,7 +1634,16 @@ impl LibraryDb {
             "DELETE FROM thumbnails WHERE model_id=?1 AND is_custom=1",
             params![model_id],
         )?;
-        tx.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash) VALUES(?1,?2,?3,?4,1,NULL)",params![new_id("custom-thumbnail"),model_id,relative,png_hash])?;
+        tx.execute(
+            "UPDATE thumbnails SET is_active=0 WHERE model_id=?1",
+            params![model_id],
+        )?;
+        let ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal)+1,0) FROM thumbnails WHERE model_id=?1",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        tx.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash,ordinal,is_active) VALUES(?1,?2,?3,?4,1,NULL,?5,1)",params![new_id("custom-thumbnail"),model_id,relative,png_hash,ordinal])?;
         tx.execute(
             "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
             params![timestamp(), model_id],
@@ -1542,6 +1683,7 @@ impl LibraryDb {
             "DELETE FROM thumbnails WHERE model_id=?1 AND is_custom=1",
             params![model_id],
         )?;
+        select_thumbnail_fallback(&tx, model_id)?;
         tx.execute(
             "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
             params![timestamp(), model_id],
@@ -1549,6 +1691,164 @@ impl LibraryDb {
         tx.commit()?;
         self.get_model(model_id)?
             .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    pub fn list_thumbnail_gallery(
+        &self,
+        model_id: &str,
+    ) -> Result<Vec<ThumbnailGalleryItem>, LibraryError> {
+        self.ensure_model(model_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id,t.model_id,t.relative_path,t.content_hash,t.source_content_hash,
+                    t.is_custom,t.ordinal,t.is_active
+             FROM thumbnails t JOIN models m ON m.id=t.model_id
+             LEFT JOIN revisions r ON r.id=m.current_revision_id
+             LEFT JOIN indexed_model_data d ON d.model_id=m.id
+             WHERE t.model_id=?1
+               AND (t.is_custom=1 OR t.source_content_hash IS NULL
+                    OR t.source_content_hash=COALESCE(r.blob_hash,d.content_hash))
+             ORDER BY t.ordinal,t.id",
+        )?;
+        let rows = stmt.query_map(params![model_id], thumbnail_gallery_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn add_custom_thumbnail(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        png_hash: &str,
+        thumbnail_relative_path: &Path,
+    ) -> Result<(Model, ThumbnailGalleryItem), LibraryError> {
+        let relative =
+            validate_thumbnail_record_path(&self.root, thumbnail_relative_path, png_hash)?;
+        let tx = self.conn.unchecked_transaction()?;
+        validate_active_model_version(&tx, model_id, expected_version)?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM thumbnails WHERE model_id=?1",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        if count >= 12 {
+            return Err(LibraryError::InvalidInput(
+                "thumbnail gallery is limited to 12 images".into(),
+            ));
+        }
+        let ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal)+1,0) FROM thumbnails WHERE model_id=?1",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "UPDATE thumbnails SET is_active=0 WHERE model_id=?1",
+            params![model_id],
+        )?;
+        let id = new_id("custom-thumbnail");
+        tx.execute(
+            "INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,
+             source_content_hash,ordinal,is_active) VALUES(?1,?2,?3,?4,1,NULL,?5,1)",
+            params![id, model_id, relative, png_hash, ordinal],
+        )?;
+        tx.execute(
+            "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+            params![timestamp(), model_id],
+        )?;
+        tx.commit()?;
+        let model = self
+            .get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))?;
+        let item = self
+            .list_thumbnail_gallery(model_id)?
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or_else(|| LibraryError::InvalidInput("thumbnail gallery item missing".into()))?;
+        Ok((model, item))
+    }
+
+    pub fn set_active_thumbnail(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        thumbnail_id: &str,
+    ) -> Result<Model, LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        validate_active_model_version(&tx, model_id, expected_version)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thumbnails t JOIN models m ON m.id=t.model_id
+             LEFT JOIN revisions r ON r.id=m.current_revision_id
+             LEFT JOIN indexed_model_data d ON d.model_id=m.id
+             WHERE t.id=?1 AND t.model_id=?2
+               AND (t.is_custom=1 OR t.source_content_hash IS NULL
+                    OR t.source_content_hash=COALESCE(r.blob_hash,d.content_hash)))",
+            params![thumbnail_id, model_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(LibraryError::InvalidInput(
+                "thumbnail gallery item not found".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE thumbnails SET is_active=0 WHERE model_id=?1",
+            params![model_id],
+        )?;
+        tx.execute(
+            "UPDATE thumbnails SET is_active=1 WHERE id=?1 AND model_id=?2",
+            params![thumbnail_id, model_id],
+        )?;
+        tx.execute(
+            "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+            params![timestamp(), model_id],
+        )?;
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    pub fn delete_thumbnail_gallery_item(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        thumbnail_id: &str,
+    ) -> Result<(Model, PathBuf), LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        validate_active_model_version(&tx, model_id, expected_version)?;
+        let item: Option<(String, String, bool)> = tx
+            .query_row(
+                "SELECT relative_path,content_hash,is_active FROM thumbnails
+                 WHERE id=?1 AND model_id=?2",
+                params![thumbnail_id, model_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((relative_path, content_hash, active)) = item else {
+            return Err(LibraryError::InvalidInput(
+                "thumbnail gallery item not found".into(),
+            ));
+        };
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM thumbnails WHERE model_id=?1",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        if active || count <= 1 {
+            return Err(LibraryError::InvalidInput(
+                "active or last thumbnail cannot be deleted".into(),
+            ));
+        }
+        let absolute =
+            validated_thumbnail_cache_path(&self.root, Path::new(&relative_path), &content_hash)?;
+        tx.execute("DELETE FROM thumbnails WHERE id=?1", params![thumbnail_id])?;
+        compact_thumbnail_ordinals(&tx, model_id)?;
+        tx.execute(
+            "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+            params![timestamp(), model_id],
+        )?;
+        tx.commit()?;
+        let model = self
+            .get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))?;
+        Ok((model, absolute))
     }
 
     fn set_thumbnail_for_source_with_expected_settings(
@@ -1606,16 +1906,28 @@ impl LibraryDb {
             "DELETE FROM thumbnails WHERE model_id = ?1 AND is_custom = 0",
             params![model_id],
         )?;
+        let ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal)+1,0) FROM thumbnails WHERE model_id=?1",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        let has_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thumbnails WHERE model_id=?1 AND is_active=1)",
+            params![model_id],
+            |row| row.get(0),
+        )?;
         tx.execute(
             "INSERT INTO thumbnails
-             (id, model_id, relative_path, content_hash, is_custom, source_content_hash)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+             (id, model_id, relative_path, content_hash, is_custom, source_content_hash,ordinal,is_active)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5,?6,?7)",
             params![
                 new_id("thumbnail"),
                 model_id,
                 relative,
                 content_hash,
-                source_content_hash
+                source_content_hash,
+                ordinal,
+                !has_active
             ],
         )?;
         tx.commit()?;
@@ -1724,7 +2036,7 @@ impl LibraryDb {
             "t.is_custom = 0"
         };
         let sql = format!(
-            "SELECT t.id, t.relative_path, t.content_hash FROM thumbnails t
+            "SELECT t.id, t.model_id, t.relative_path, t.content_hash FROM thumbnails t
              JOIN models m ON m.id = t.model_id
              LEFT JOIN revisions r ON r.id = m.current_revision_id
              LEFT JOIN indexed_model_data d ON d.model_id = m.id
@@ -1738,6 +2050,7 @@ impl LibraryDb {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             records.extend(rows.collect::<Result<Vec<_>, _>>()?);
@@ -1751,14 +2064,21 @@ impl LibraryDb {
         };
         let validated_paths = records
             .iter()
-            .map(|(_, path, hash)| {
+            .map(|(_, _, path, hash)| {
                 validated_thumbnail_cache_path(&self.root, Path::new(path), hash)
                     .map(|absolute| (path, absolute))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let tx = self.conn.unchecked_transaction()?;
-        for (id, _, _) in &records {
+        let affected = records
+            .iter()
+            .map(|(_, model_id, _, _)| model_id.clone())
+            .collect::<BTreeSet<_>>();
+        for (id, _, _, _) in &records {
             tx.execute("DELETE FROM thumbnails WHERE id = ?1", params![id])?;
+        }
+        for model_id in affected {
+            select_thumbnail_fallback(&tx, &model_id)?;
         }
         tx.commit()?;
         Ok(validated_paths
@@ -2143,6 +2463,277 @@ impl LibraryDb {
         recompute_print_summary(&tx, &model_id)?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn create_or_get_capture_receipt(
+        &self,
+        input: &CaptureReceiptInput,
+    ) -> Result<CaptureReceipt, LibraryError> {
+        validate_capture_receipt(input)?;
+        if let Some(existing_hash) = self
+            .conn
+            .query_row(
+                "SELECT payload_hash FROM capture_items WHERE item_id=?1",
+                params![input.item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if existing_hash != input.payload_hash {
+                return Err(LibraryError::InvalidInput(
+                    "capture item ID conflicts with a different payload".into(),
+                ));
+            }
+            return self
+                .get_capture_receipt(&input.item_id)?
+                .ok_or_else(|| LibraryError::InvalidInput("capture receipt is missing".into()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for download in &input.downloads {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capture_downloads WHERE capture_id=?1)",
+                params![download.capture_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Err(LibraryError::InvalidInput(
+                    "capture download ID is already owned by another item".into(),
+                ));
+            }
+        }
+        let parent_model_id = if let Some(parent) = &input.page.parent_external_id {
+            tx.query_row(
+                "SELECT page_model_id FROM capture_items WHERE item_id=?1",
+                params![parent],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .ok_or_else(|| LibraryError::InvalidInput("capture parent item is unknown".into()))?
+            .into()
+        } else {
+            None
+        };
+        let model_id = new_id("bookmark");
+        let now = timestamp();
+        tx.execute(
+            "INSERT INTO models(id,display_name,description,folder_id,metadata_version,
+             created_at,updated_at,source_kind,source_missing,designer,source_url,notes,
+             model_license,parent_model_id,catalog_kind)
+             VALUES(?1,?2,'','root',1,?3,?3,'managed',0,?4,?5,?6,?7,?8,'bookmark')",
+            params![
+                model_id,
+                input.page.title.trim(),
+                now,
+                clean_optional(input.page.designer.as_deref(), 200)?,
+                input.page.url.trim(),
+                clean_optional(input.page.notes.as_deref(), 20_000)?,
+                clean_optional(input.page.model_license.as_deref(), 200)?,
+                parent_model_id
+            ],
+        )?;
+        let status = if input.downloads.is_empty() {
+            "imported"
+        } else {
+            "partial"
+        };
+        tx.execute(
+            "INSERT INTO capture_items(item_id,payload_hash,status,page_model_id,created_at,
+             received_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?6)",
+            params![
+                input.item_id,
+                input.payload_hash,
+                status,
+                model_id,
+                input.created_at,
+                now
+            ],
+        )?;
+        for (ordinal, download) in input.downloads.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO capture_downloads(capture_id,item_id,ordinal,file_name,expected_hash,
+                 expected_bytes,status) VALUES(?1,?2,?3,?4,?5,?6,'needs_file')",
+                params![
+                    download.capture_id,
+                    input.item_id,
+                    ordinal as i64,
+                    download.file_name,
+                    download.sha256,
+                    download.bytes.map(|value| value as i64)
+                ],
+            )?;
+        }
+        tx.commit()?;
+        self.get_capture_receipt(&input.item_id)?
+            .ok_or_else(|| LibraryError::InvalidInput("capture receipt is missing".into()))
+    }
+
+    pub fn get_capture_receipt(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<CaptureReceipt>, LibraryError> {
+        let item: Option<(String, String, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT item_id,payload_hash,status,page_model_id FROM capture_items WHERE item_id=?1",
+                params![item_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )
+            .optional()?;
+        let Some((item_id, payload_hash, status, page_model_id)) = item else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT d.capture_id,d.status,d.model_id,d.error_code,m.deleted_at
+             FROM capture_downloads d LEFT JOIN models m ON m.id=d.model_id
+             WHERE d.item_id=?1 ORDER BY d.ordinal,d.capture_id",
+        )?;
+        let rows = stmt.query_map(params![item_id], |row| {
+            let status: String = row.get(1)?;
+            let deleted_at: Option<String> = row.get(4)?;
+            Ok(CaptureDownloadRecord {
+                capture_id: row.get(0)?,
+                status: if status == "imported" && deleted_at.is_some() {
+                    "imported_removed".into()
+                } else {
+                    status
+                },
+                model_id: row.get(2)?,
+                error_code: row.get(3)?,
+            })
+        })?;
+        Ok(Some(CaptureReceipt {
+            item_id,
+            payload_hash,
+            status,
+            page_model_id,
+            downloads: rows.collect::<Result<Vec<_>, _>>()?,
+        }))
+    }
+
+    pub fn list_capture_summaries_page(
+        &self,
+        after_created_at: Option<&str>,
+        after_item_id: Option<&str>,
+        limit: u16,
+    ) -> Result<(Vec<CaptureSummary>, bool), LibraryError> {
+        if limit == 0 || limit > 500 || after_created_at.is_some() != after_item_id.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "capture page cursor or limit is invalid".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT ci.item_id,ci.created_at,ci.status,ci.page_model_id,
+                    COALESCE(m.display_name,''),COALESCE(m.source_url,''),
+                    COUNT(cd.capture_id),
+                    COALESCE(SUM(cd.status='failed'),0),
+                    COALESCE(SUM(cd.status='needs_file'),0)
+             FROM capture_items ci
+             LEFT JOIN models m ON m.id=ci.page_model_id
+             LEFT JOIN capture_downloads cd ON cd.item_id=ci.item_id
+             WHERE ?1 IS NULL OR ci.created_at < ?1
+                OR (ci.created_at = ?1 AND ci.item_id < ?2)
+             GROUP BY ci.item_id,ci.created_at,ci.status,ci.page_model_id,
+                      m.display_name,m.source_url
+             ORDER BY ci.created_at DESC,ci.item_id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![after_created_at, after_item_id, i64::from(limit) + 1],
+            |row| {
+                Ok(CaptureSummary {
+                    item_id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    status: row.get(2)?,
+                    page_model_id: row.get(3)?,
+                    title: row.get(4)?,
+                    url: row.get(5)?,
+                    download_count: row.get::<_, i64>(6)? as u64,
+                    failed_count: row.get::<_, i64>(7)? as u64,
+                    needs_file_count: row.get::<_, i64>(8)? as u64,
+                })
+            },
+        )?;
+        let mut summaries = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = summaries.len() > usize::from(limit);
+        summaries.truncate(usize::from(limit));
+        Ok((summaries, has_more))
+    }
+
+    pub fn update_capture_download_result(
+        &self,
+        item_id: &str,
+        capture_id: &str,
+        model_id: Option<&str>,
+        error_code: Option<&str>,
+    ) -> Result<CaptureReceipt, LibraryError> {
+        if model_id.is_some() == error_code.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "capture result must be either imported or failed".into(),
+            ));
+        }
+        if let Some(code) = error_code {
+            validate_plain_capture_id(code, "capture error code")?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(model_id) = model_id {
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM models WHERE id=?1 AND deleted_at IS NULL)",
+                params![model_id],
+                |row| row.get(0),
+            )?;
+            if !active {
+                return Err(LibraryError::ModelNotFound(model_id.into()));
+            }
+        }
+        let changed = tx.execute(
+            "UPDATE capture_downloads SET status=?1,model_id=?2,error_code=?3
+             WHERE item_id=?4 AND capture_id=?5 AND status!='imported'",
+            params![
+                if model_id.is_some() {
+                    "imported"
+                } else {
+                    "failed"
+                },
+                model_id,
+                error_code,
+                item_id,
+                capture_id
+            ],
+        )?;
+        if changed == 0 {
+            let existing: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT model_id FROM capture_downloads WHERE item_id=?1 AND capture_id=?2",
+                    params![item_id, capture_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.flatten().as_deref() != model_id {
+                return Err(LibraryError::InvalidInput(
+                    "capture result conflicts with an existing import".into(),
+                ));
+            }
+        }
+        let (remaining, failed): (i64, i64) = tx.query_row(
+            "SELECT SUM(status!='imported'),SUM(status='failed') FROM capture_downloads WHERE item_id=?1",
+            params![item_id],
+            |row| Ok((row.get::<_,Option<i64>>(0)?.unwrap_or(0),row.get::<_,Option<i64>>(1)?.unwrap_or(0))),
+        )?;
+        let item_status = if remaining == 0 {
+            "imported"
+        } else if failed > 0 {
+            "failed"
+        } else {
+            "partial"
+        };
+        tx.execute(
+            "UPDATE capture_items SET status=?1,updated_at=?2 WHERE item_id=?3",
+            params![item_status, timestamp(), item_id],
+        )?;
+        tx.commit()?;
+        self.get_capture_receipt(item_id)?
+            .ok_or_else(|| LibraryError::InvalidInput("capture receipt is missing".into()))
     }
 
     pub fn create_filament(&self, input: &FilamentInput) -> Result<Filament, LibraryError> {
@@ -2694,10 +3285,10 @@ const MODEL_SELECT: &str = "SELECT m.id, m.display_name, m.description, m.folder
              WHERE t.model_id = m.id
                AND (t.is_custom = 1 OR t.source_content_hash IS NULL
                     OR t.source_content_hash = COALESCE(r.blob_hash, d.content_hash))
-             ORDER BY t.is_custom DESC, t.id LIMIT 1),
+             ORDER BY t.is_active DESC, t.is_custom DESC, t.ordinal, t.id LIMIT 1),
             m.designer, m.source_url, m.notes, m.model_license, m.print_status,
             m.parent_model_id, m.last_printed_at, m.print_count, m.bundle_id,
-            m.source_archive_member
+            m.source_archive_member,m.catalog_kind
      FROM models m
      LEFT JOIN revisions r ON r.id = m.current_revision_id
      LEFT JOIN blobs b ON b.hash = r.blob_hash
@@ -2755,7 +3346,8 @@ CREATE TABLE models (
     print_status TEXT NOT NULL DEFAULT 'unprinted',
     parent_model_id TEXT,
     last_printed_at TEXT, print_count INTEGER NOT NULL DEFAULT 0,
-    bundle_id TEXT
+    bundle_id TEXT,
+    catalog_kind TEXT NOT NULL DEFAULT 'file' CHECK(catalog_kind IN ('file','bookmark'))
 );
 CREATE INDEX models_folder_idx ON models(folder_id, deleted_at, created_at, id);
 CREATE TABLE revisions (
@@ -2775,8 +3367,9 @@ CREATE TABLE model_tags (
     PRIMARY KEY(model_id, tag_id)
 );
 CREATE TABLE manuals (model_id TEXT PRIMARY KEY REFERENCES models(id) ON DELETE CASCADE, relative_path TEXT NOT NULL, content_hash TEXT NOT NULL);
-CREATE TABLE thumbnails (id TEXT PRIMARY KEY, model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE, relative_path TEXT NOT NULL, content_hash TEXT NOT NULL, is_custom INTEGER NOT NULL DEFAULT 0, source_content_hash TEXT);
-CREATE INDEX thumbnails_model_idx ON thumbnails(model_id, is_custom);
+CREATE TABLE thumbnails (id TEXT PRIMARY KEY, model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE, relative_path TEXT NOT NULL, content_hash TEXT NOT NULL, is_custom INTEGER NOT NULL DEFAULT 0, source_content_hash TEXT, ordinal INTEGER NOT NULL DEFAULT 0 CHECK(ordinal >= 0), is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0,1)));
+CREATE INDEX thumbnails_model_idx ON thumbnails(model_id, is_active DESC, ordinal, id);
+CREATE UNIQUE INDEX thumbnails_active_model_idx ON thumbnails(model_id) WHERE is_active=1;
 CREATE TABLE jobs (id TEXT PRIMARY KEY, model_id TEXT REFERENCES models(id) ON DELETE CASCADE, kind TEXT NOT NULL, status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE index_roots (
     id TEXT PRIMARY KEY,
@@ -2834,6 +3427,29 @@ CREATE TABLE model_filaments (
     PRIMARY KEY(model_id,filament_id), UNIQUE(model_id,ordinal)
 );
 CREATE INDEX model_filaments_filament_idx ON model_filaments(filament_id,model_id);
+CREATE TABLE capture_items (
+    item_id TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('imported','partial','failed')),
+    page_model_id TEXT REFERENCES models(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error_code TEXT
+);
+CREATE TABLE capture_downloads (
+    capture_id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES capture_items(item_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    file_name TEXT NOT NULL,
+    expected_hash TEXT,
+    expected_bytes INTEGER CHECK(expected_bytes IS NULL OR expected_bytes >= 0),
+    status TEXT NOT NULL CHECK(status IN ('needs_file','imported','failed')),
+    model_id TEXT REFERENCES models(id) ON DELETE RESTRICT,
+    error_code TEXT,
+    UNIQUE(item_id,ordinal)
+);
+CREATE INDEX capture_downloads_item_idx ON capture_downloads(item_id,ordinal);
 "#;
 
 const MIGRATE_V1_TO_V2: &str = r#"
@@ -2945,6 +3561,49 @@ PRAGMA user_version=4;
 COMMIT;
 "#;
 
+const MIGRATE_V4_TO_V5: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE models ADD COLUMN catalog_kind TEXT NOT NULL DEFAULT 'file'
+    CHECK(catalog_kind IN ('file','bookmark'));
+ALTER TABLE thumbnails ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0 CHECK(ordinal >= 0);
+ALTER TABLE thumbnails ADD COLUMN is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0,1));
+UPDATE thumbnails AS target
+SET ordinal=(SELECT COUNT(*) FROM thumbnails prior
+             WHERE prior.model_id=target.model_id AND prior.id < target.id);
+UPDATE thumbnails SET is_active=1
+WHERE id=(SELECT candidate.id FROM thumbnails candidate
+          WHERE candidate.model_id=thumbnails.model_id
+          ORDER BY candidate.is_custom DESC,candidate.id LIMIT 1);
+DROP INDEX IF EXISTS thumbnails_model_idx;
+CREATE INDEX thumbnails_model_idx ON thumbnails(model_id,is_active DESC,ordinal,id);
+CREATE UNIQUE INDEX thumbnails_active_model_idx ON thumbnails(model_id) WHERE is_active=1;
+CREATE TABLE capture_items (
+    item_id TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('imported','partial','failed')),
+    page_model_id TEXT REFERENCES models(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error_code TEXT
+);
+CREATE TABLE capture_downloads (
+    capture_id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES capture_items(item_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    file_name TEXT NOT NULL,
+    expected_hash TEXT,
+    expected_bytes INTEGER CHECK(expected_bytes IS NULL OR expected_bytes >= 0),
+    status TEXT NOT NULL CHECK(status IN ('needs_file','imported','failed')),
+    model_id TEXT REFERENCES models(id) ON DELETE RESTRICT,
+    error_code TEXT,
+    UNIQUE(item_id,ordinal)
+);
+CREATE INDEX capture_downloads_item_idx ON capture_downloads(item_id,ordinal);
+PRAGMA user_version=5;
+COMMIT;
+"#;
+
 const ENSURE_CATALOG_SETTINGS: &str = r#"
 CREATE TABLE IF NOT EXISTS catalog_settings (
     id TEXT PRIMARY KEY CHECK(id = 'local'),
@@ -2996,6 +3655,7 @@ fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
         },
         bundle_id: row.get(26)?,
         source_archive_member: row.get(27)?,
+        catalog_kind: row.get(28)?,
     })
 }
 
@@ -3038,6 +3698,26 @@ fn spoolman_source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Spoolma
         id: row.get(0)?,
         base_url: row.get(1)?,
         last_synced_at: row.get(2)?,
+    })
+}
+
+fn thumbnail_gallery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThumbnailGalleryItem> {
+    let ordinal = row.get::<_, i64>(6)?;
+    let is_custom = row.get::<_, i64>(5)?;
+    let is_active = row.get::<_, i64>(7)?;
+    if ordinal < 0 || !matches!(is_custom, 0 | 1) || !matches!(is_active, 0 | 1) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(ThumbnailGalleryItem {
+        id: row.get(0)?,
+        model_id: row.get(1)?,
+        relative_path: row.get(2)?,
+        content_hash: row.get(3)?,
+        source_content_hash: row.get(4)?,
+        is_custom: is_custom == 1,
+        ordinal: u16::try_from(ordinal)
+            .map_err(|_| invalid_persisted_integer(6, "thumbnail ordinal exceeds u16"))?,
+        is_active: is_active == 1,
     })
 }
 
@@ -3343,6 +4023,140 @@ fn validate_hash(hash: &str) -> Result<(), LibraryError> {
         ));
     }
     Ok(())
+}
+
+fn validate_capture_receipt(input: &CaptureReceiptInput) -> Result<(), LibraryError> {
+    validate_plain_capture_id(&input.item_id, "capture item ID")?;
+    validate_hash(&input.payload_hash)?;
+    normalize_rfc3339(&input.created_at)?;
+    let url = input.page.url.trim();
+    if url.len() > 2048
+        || !(url.starts_with("http://") || url.starts_with("https://"))
+        || url.chars().any(char::is_control)
+    {
+        return Err(LibraryError::InvalidInput(
+            "capture page URL is invalid".into(),
+        ));
+    }
+    let title = input.page.title.trim();
+    if title.is_empty() || title.len() > 512 || title.chars().any(char::is_control) {
+        return Err(LibraryError::InvalidInput(
+            "capture page title is invalid".into(),
+        ));
+    }
+    clean_optional(input.page.designer.as_deref(), 200)?;
+    clean_optional(input.page.model_license.as_deref(), 200)?;
+    clean_optional(input.page.notes.as_deref(), 20_000)?;
+    if let Some(parent) = &input.page.parent_external_id {
+        validate_plain_capture_id(parent, "capture parent ID")?;
+    }
+    if input.downloads.len() > 128 {
+        return Err(LibraryError::InvalidInput(
+            "capture item has too many downloads".into(),
+        ));
+    }
+    let mut ids = HashSet::new();
+    for download in &input.downloads {
+        validate_plain_capture_id(&download.capture_id, "capture download ID")?;
+        if !ids.insert(&download.capture_id) {
+            return Err(LibraryError::InvalidInput(
+                "capture item repeats a download ID".into(),
+            ));
+        }
+        if download.file_name.is_empty()
+            || download.file_name.len() > 255
+            || download.file_name.contains(['/', '\\', '\0'])
+            || Path::new(&download.file_name).file_name() != Some(download.file_name.as_ref())
+        {
+            return Err(LibraryError::InvalidInput(
+                "capture download filename is invalid".into(),
+            ));
+        }
+        if let Some(hash) = &download.sha256 {
+            validate_hash(hash)?;
+        }
+        if download
+            .bytes
+            .is_some_and(|bytes| bytes == 0 || bytes > MAX_INDEXED_FILE_BYTES)
+        {
+            return Err(LibraryError::InvalidInput(
+                "capture download byte count is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_plain_capture_id(value: &str, label: &str) -> Result<(), LibraryError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
+    {
+        return Err(LibraryError::InvalidInput(format!("{label} is invalid")));
+    }
+    Ok(())
+}
+
+fn select_thumbnail_fallback(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+) -> Result<(), LibraryError> {
+    let has_active: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM thumbnails WHERE model_id=?1 AND is_active=1)",
+        params![model_id],
+        |row| row.get(0),
+    )?;
+    if !has_active {
+        let fallback: Option<String> = tx
+            .query_row(
+                "SELECT id FROM thumbnails WHERE model_id=?1
+                 ORDER BY is_custom DESC,ordinal,id LIMIT 1",
+                params![model_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = fallback {
+            tx.execute("UPDATE thumbnails SET is_active=1 WHERE id=?1", params![id])?;
+        }
+    }
+    Ok(())
+}
+
+fn compact_thumbnail_ordinals(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+) -> Result<(), LibraryError> {
+    let mut ids = Vec::new();
+    {
+        let mut stmt =
+            tx.prepare("SELECT id FROM thumbnails WHERE model_id=?1 ORDER BY ordinal,id")?;
+        let rows = stmt.query_map(params![model_id], |row| row.get::<_, String>(0))?;
+        ids.extend(rows.collect::<Result<Vec<_>, _>>()?);
+    }
+    for (ordinal, id) in ids.into_iter().enumerate() {
+        tx.execute(
+            "UPDATE thumbnails SET ordinal=?1 WHERE id=?2",
+            params![ordinal as i64, id],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_thumbnail_record_path(
+    root: &Path,
+    thumbnail_relative_path: &Path,
+    png_hash: &str,
+) -> Result<String, LibraryError> {
+    let relative = validated_relative_path(thumbnail_relative_path)?;
+    if Path::new(&relative).components().next() != Some(Component::Normal("thumbnails".as_ref())) {
+        return Err(LibraryError::InvalidInput(
+            "custom thumbnail must be stored under thumbnails".into(),
+        ));
+    }
+    validated_thumbnail_cache_path(root, Path::new(&relative), png_hash)?;
+    Ok(relative)
 }
 
 fn validate_root_limits(
@@ -4412,6 +5226,102 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.metadata.notes, None);
         assert_eq!(cleared.description, "");
+    }
+
+    #[test]
+    fn paged_catalog_filters_are_applied_before_keyset_limits() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let a = db.create_model("Alpha", None).unwrap();
+        let b = db.create_model("Beta", None).unwrap();
+        let c = db.create_model("Gamma", None).unwrap();
+        let tag = db.create_tag("Mechanical", Some("Type")).unwrap();
+        let a = db
+            .update_model_metadata(
+                &a.id,
+                a.metadata_version,
+                &MetadataPatch {
+                    designer: Some("Designer".into()),
+                    model_license: Some("CC0".into()),
+                    print_status: Some(PrintStatus::Printed),
+                    tags: Some(vec![tag.id.clone()]),
+                    tag_mode: Some(TagMode::Replace),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        let filament = db
+            .create_filament(&FilamentInput {
+                brand: "Example".into(),
+                material: "PLA".into(),
+                color: "#123456".into(),
+                name: "Catalog filter".into(),
+                notes: String::new(),
+            })
+            .unwrap();
+        db.set_model_filaments(
+            &a.id,
+            a.metadata_version,
+            std::slice::from_ref(&filament.id),
+        )
+        .unwrap();
+        db.create_print_attempt(
+            &a.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-11T12:00:00Z".into(),
+                quantity: 1,
+                notes: String::new(),
+                filament_ids: vec![filament.id.clone()],
+                outcome: PrintOutcome::Printed,
+            },
+        )
+        .unwrap();
+        let bundle_id = db.create_bundle(&[b.id.clone(), c.id.clone()]).unwrap();
+
+        for query in [
+            ModelPageQuery {
+                category: Some("Type".into()),
+                ..ModelPageQuery::default()
+            },
+            ModelPageQuery {
+                designer: Some("Designer".into()),
+                ..ModelPageQuery::default()
+            },
+            ModelPageQuery {
+                model_license: Some("CC0".into()),
+                ..ModelPageQuery::default()
+            },
+            ModelPageQuery {
+                ever_printed: Some(true),
+                ..ModelPageQuery::default()
+            },
+            ModelPageQuery {
+                filament_id: Some(filament.id.clone()),
+                ..ModelPageQuery::default()
+            },
+            ModelPageQuery {
+                group: Some(ModelGroupFilter::Standalone),
+                ..ModelPageQuery::default()
+            },
+        ] {
+            let (models, more) = db.list_models_page(&query, None, None, 1).unwrap();
+            assert!(!more);
+            assert_eq!(models[0].id, a.id);
+        }
+        let (bundled, more) = db
+            .list_models_page(
+                &ModelPageQuery {
+                    bundle_id: Some(bundle_id),
+                    sort: ModelSort::Name,
+                    direction: SortDirection::Desc,
+                    ..ModelPageQuery::default()
+                },
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        assert!(more);
+        assert_eq!(bundled[0].display_name, "Gamma");
     }
 
     #[test]
@@ -5741,7 +6651,13 @@ mod tests {
         let conn = Connection::open(root.join("library.sqlite3")).unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute_batch(
-            "DROP TABLE model_filaments; DROP TABLE filaments; DROP TABLE filament_sources;
+            "DROP TABLE capture_downloads; DROP TABLE capture_items;
+             DROP INDEX thumbnails_active_model_idx; DROP INDEX thumbnails_model_idx;
+             ALTER TABLE thumbnails DROP COLUMN is_active;
+             ALTER TABLE thumbnails DROP COLUMN ordinal;
+             CREATE INDEX thumbnails_model_idx ON thumbnails(model_id,is_custom);
+             ALTER TABLE models DROP COLUMN catalog_kind;
+             DROP TABLE model_filaments; DROP TABLE filaments; DROP TABLE filament_sources;
              PRAGMA user_version=3;",
         )
         .unwrap();
@@ -5752,7 +6668,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let backup = root.join("library.sqlite3.schema-v3.backup");
         assert!(backup.is_file());
         let backup_conn = Connection::open(backup).unwrap();
@@ -5760,6 +6676,184 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(backup_version, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v4_migration_backs_up_and_seeds_gallery_selection() {
+        let root = temp_root("schema-v4-gallery");
+        fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "DROP TABLE capture_downloads; DROP TABLE capture_items;
+             DROP INDEX thumbnails_active_model_idx; DROP INDEX thumbnails_model_idx;
+             ALTER TABLE thumbnails DROP COLUMN is_active;
+             ALTER TABLE thumbnails DROP COLUMN ordinal;
+             CREATE INDEX thumbnails_model_idx ON thumbnails(model_id,is_custom);
+             ALTER TABLE models DROP COLUMN catalog_kind;
+             INSERT INTO models(id,display_name,description,folder_id,metadata_version,created_at,updated_at)
+               VALUES('gallery-model','Gallery','', 'root',1,'1','1');
+             INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash)
+               VALUES('generated','gallery-model','thumbnails/generated.png','aa',0,NULL),
+                     ('custom','gallery-model','thumbnails/custom.png','bb',1,NULL);
+             PRAGMA user_version=4;",
+        )
+        .unwrap();
+        drop(conn);
+        let db = LibraryDb::open(&root).unwrap();
+        let gallery = db.list_thumbnail_gallery("gallery-model").unwrap();
+        assert_eq!(gallery.len(), 2);
+        assert_eq!(gallery.iter().filter(|item| item.is_active).count(), 1);
+        assert!(
+            gallery
+                .iter()
+                .find(|item| item.id == "custom")
+                .unwrap()
+                .is_active
+        );
+        assert_eq!(
+            db.get_model("gallery-model").unwrap().unwrap().catalog_kind,
+            "file"
+        );
+        let backup = root.join("library.sqlite3.schema-v4.backup");
+        assert!(backup.is_file());
+        let version: i64 = Connection::open(backup)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gallery_and_capture_receipts_are_versioned_bounded_and_idempotent() {
+        use crate::models::{CaptureDownloadInput, CapturePageInput};
+
+        let root = temp_root("gallery-capture");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("Gallery", None).unwrap();
+        let png = png_fixture();
+        let png_hash = hex_digest(&png);
+        let first_path = PathBuf::from("thumbnails/first.png");
+        let second_path = PathBuf::from("thumbnails/second.png");
+        fs::write(root.join(&first_path), &png).unwrap();
+        fs::write(root.join(&second_path), &png).unwrap();
+        let (model, first) = db
+            .add_custom_thumbnail(&model.id, model.metadata_version, &png_hash, &first_path)
+            .unwrap();
+        let (model, second) = db
+            .add_custom_thumbnail(&model.id, model.metadata_version, &png_hash, &second_path)
+            .unwrap();
+        assert!(second.is_active);
+        let gallery = db.list_thumbnail_gallery(&model.id).unwrap();
+        assert_eq!(gallery.len(), 2);
+        assert!(
+            !gallery
+                .iter()
+                .find(|item| item.id == first.id)
+                .unwrap()
+                .is_active
+        );
+        let model = db
+            .set_active_thumbnail(&model.id, model.metadata_version, &first.id)
+            .unwrap();
+        assert!(db
+            .delete_thumbnail_gallery_item(&model.id, model.metadata_version, &first.id)
+            .is_err());
+        let (model, deleted_path) = db
+            .delete_thumbnail_gallery_item(&model.id, model.metadata_version, &second.id)
+            .unwrap();
+        assert_eq!(
+            deleted_path,
+            root.canonicalize().unwrap().join(&second_path)
+        );
+        assert_eq!(db.list_thumbnail_gallery(&model.id).unwrap().len(), 1);
+
+        let receipt = CaptureReceiptInput {
+            item_id: "item-1".into(),
+            payload_hash: hash(7),
+            created_at: "2026-10-11T00:00:00Z".into(),
+            page: CapturePageInput {
+                url: "https://example.test/model".into(),
+                title: "Captured / Bookmark".into(),
+                designer: Some("Designer".into()),
+                model_license: Some("CC0".into()),
+                notes: Some("Captured while offline".into()),
+                parent_external_id: None,
+            },
+            downloads: vec![
+                CaptureDownloadInput {
+                    capture_id: "download-1".into(),
+                    file_name: "part.stl".into(),
+                    sha256: Some(hash(8)),
+                    bytes: Some(84),
+                },
+                CaptureDownloadInput {
+                    capture_id: "download-2".into(),
+                    file_name: "other.3mf".into(),
+                    sha256: None,
+                    bytes: None,
+                },
+            ],
+        };
+        let created = db.create_or_get_capture_receipt(&receipt).unwrap();
+        let bookmark_id = created.page_model_id.clone().unwrap();
+        let bookmark = db.get_model(&bookmark_id).unwrap().unwrap();
+        assert_eq!(bookmark.catalog_kind, "bookmark");
+        assert!(bookmark.content_hash.is_none());
+        assert_eq!(created.status, "partial");
+        assert_eq!(
+            db.create_or_get_capture_receipt(&receipt)
+                .unwrap()
+                .page_model_id,
+            Some(bookmark_id.clone())
+        );
+        let mut conflicting = receipt.clone();
+        conflicting.payload_hash = hash(9);
+        assert!(db.create_or_get_capture_receipt(&conflicting).is_err());
+        let mut second_receipt = receipt.clone();
+        second_receipt.item_id = "item-2".into();
+        second_receipt.payload_hash = hash(10);
+        second_receipt.created_at = "2026-10-11T00:00:01Z".into();
+        for (index, download) in second_receipt.downloads.iter_mut().enumerate() {
+            download.capture_id = format!("item-2-download-{index}");
+        }
+        db.create_or_get_capture_receipt(&second_receipt).unwrap();
+        let (first_page, more) = db.list_capture_summaries_page(None, None, 1).unwrap();
+        assert!(more);
+        assert_eq!(first_page[0].item_id, "item-2");
+        assert_eq!(first_page[0].download_count, 2);
+        let (second_page, more) = db
+            .list_capture_summaries_page(
+                Some(&first_page[0].created_at),
+                Some(&first_page[0].item_id),
+                1,
+            )
+            .unwrap();
+        assert!(!more);
+        assert_eq!(second_page[0].item_id, "item-1");
+        let imported = db.create_model("Imported part", None).unwrap();
+        let receipt = db
+            .update_capture_download_result("item-1", "download-1", Some(&imported.id), None)
+            .unwrap();
+        assert_eq!(receipt.status, "partial");
+        let receipt = db
+            .update_capture_download_result("item-1", "download-2", None, Some("needs_upload"))
+            .unwrap();
+        assert_eq!(receipt.status, "failed");
+        let other = db.create_model("Other part", None).unwrap();
+        let receipt = db
+            .update_capture_download_result("item-1", "download-2", Some(&other.id), None)
+            .unwrap();
+        assert_eq!(receipt.status, "imported");
+        db.remove_models_recoverably(&[VersionedTarget {
+            model_id: imported.id.clone(),
+            expected_version: imported.metadata_version,
+        }])
+        .unwrap();
+        let receipt = db.get_capture_receipt("item-1").unwrap().unwrap();
+        assert_eq!(receipt.downloads[0].status, "imported_removed");
         let _ = fs::remove_dir_all(root);
     }
 

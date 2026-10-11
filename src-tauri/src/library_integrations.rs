@@ -1,310 +1,33 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use library_core::{
     FilamentSyncSummary, Model, ReviewedTag, ReviewedTagStrategy, ReviewedTagTarget,
     SpoolmanFilamentRecord, SpoolmanSpoolRecord, VersionedTarget,
 };
 use library_integrations::{
-    pull_spoolman, suggest_tags, validate_provider_config, validate_spoolman_config, EndpointScope,
-    ProviderConfig, ProviderKind, SpoolmanConfig, StructuredOutputMode, SuggestedTag,
-    SuggestionInput,
+    pull_spoolman, suggest_tags, validate_spoolman_config, ProviderConfig, SpoolmanConfig,
+    SuggestedTag, SuggestionInput, SuggestionTagContext,
 };
-use serde::{Deserialize, Serialize};
+use library_runtime::integration_state::{
+    public_provider, settings_from_inner, stored_provider, validate_identifier, IntegrationInner,
+    IntegrationJobKind, SessionSecret, StoredReview, StoredSpoolman, MAX_PROVIDERS, MAX_REVIEWS,
+    MAX_REVIEW_TARGETS, REVIEW_TTL,
+};
+
+#[cfg(test)]
+use library_integrations::{CategorySharing, EndpointScope, ProviderKind, StructuredOutputMode};
+pub use library_runtime::integration_state::{
+    AiExistingTag, AiProviderPublicConfig, AiReviewAction, AiReviewDecision, AiReviewStrategy,
+    AiSuggestion, AiSuggestionBatch, AiSuggestionFailure, AiSuggestionTarget, CredentialUpdate,
+    IntegrationSettings, IntegrationState, SpoolmanPullResult,
+};
 use sha2::{Digest, Sha256};
 use tauri::State;
-use zeroize::Zeroizing;
 
 use crate::extension_api::AppError;
 use crate::library_commands::{get_thumbnail, library_error, LibraryState};
-
-const SETTINGS_VERSION: u32 = 1;
-const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
-const MAX_PROVIDERS: usize = 16;
-const MAX_REVIEW_TARGETS: usize = 50;
-const MAX_REVIEWS: usize = 16;
-const REVIEW_TTL: Duration = Duration::from_secs(15 * 60);
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AiProviderPublicConfig {
-    pub id: String,
-    pub label: String,
-    pub kind: ProviderKind,
-    pub base_url: Option<String>,
-    pub endpoint_scope: EndpointScope,
-    pub model: String,
-    pub credential_storage: String,
-    pub has_credential: bool,
-    pub max_tags: u8,
-    pub detail: String,
-    pub category_mode: String,
-    pub concurrency: u8,
-    pub timeout_seconds: u16,
-    pub structured_output: StructuredOutputMode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct IntegrationSettings {
-    pub spoolman: Option<SpoolmanConfig>,
-    pub ai_providers: Vec<AiProviderPublicConfig>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpoolmanPullResult {
-    pub filaments_received: usize,
-    pub spools_received: usize,
-    pub filaments_upserted: usize,
-    pub spools_upserted: usize,
-    pub removed_locally: usize,
-    pub last_successful_pull_at: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialUpdate {
-    pub action: String,
-    pub secret: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiSuggestion {
-    pub suggestion_id: String,
-    pub name: String,
-    pub category: Option<String>,
-    pub confidence: Option<f32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiSuggestionTarget {
-    pub model_id: String,
-    pub expected_version: u64,
-    pub display_name: String,
-    pub existing_tags: Vec<AiExistingTag>,
-    pub suggestions: Vec<AiSuggestion>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiExistingTag {
-    pub name: String,
-    pub category: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiSuggestionFailure {
-    pub model_id: String,
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiSuggestionBatch {
-    pub review_token: String,
-    pub provider_id: String,
-    pub model: String,
-    pub targets: Vec<AiSuggestionTarget>,
-    pub failures: Vec<AiSuggestionFailure>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiReviewDecision {
-    pub model_id: String,
-    pub action: AiReviewAction,
-    pub accepted_suggestion_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AiReviewAction {
-    Accept,
-    Reject,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AiReviewStrategy {
-    Append,
-    Replace,
-    Merge,
-}
-
-#[derive(Clone)]
-pub struct IntegrationState {
-    shared: Arc<IntegrationShared>,
-}
-
-struct IntegrationShared {
-    settings_path: PathBuf,
-    inner: Mutex<IntegrationInner>,
-}
-
-struct IntegrationInner {
-    spoolman: Option<StoredSpoolman>,
-    providers: Vec<StoredProvider>,
-    credentials: HashMap<String, SessionSecret>,
-    reviews: VecDeque<StoredReview>,
-    epoch: u64,
-    sequence: u64,
-    ai_request_active: bool,
-    spoolman_pull_active: bool,
-}
-
-#[derive(Clone, Copy)]
-enum IntegrationJobKind {
-    Ai,
-    Spoolman,
-}
-
-struct IntegrationJobGuard {
-    state: IntegrationState,
-    kind: IntegrationJobKind,
-}
-
-impl Drop for IntegrationJobGuard {
-    fn drop(&mut self) {
-        let mut inner = self.state.shared.inner.lock().unwrap();
-        match self.kind {
-            IntegrationJobKind::Ai => inner.ai_request_active = false,
-            IntegrationJobKind::Spoolman => inner.spoolman_pull_active = false,
-        }
-    }
-}
-
-struct SessionSecret(Zeroizing<String>);
-
-impl SessionSecret {
-    fn new(value: String) -> Result<Self, String> {
-        if value.is_empty() || value.len() > 16 * 1024 || value.bytes().any(|byte| byte == 0) {
-            return Err("Session credential is invalid".into());
-        }
-        Ok(Self(Zeroizing::new(value)))
-    }
-
-    fn temporary_copy(&self) -> Zeroizing<String> {
-        Zeroizing::new(self.0.to_string())
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredSpoolman {
-    source_id: String,
-    config: SpoolmanConfig,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredProvider {
-    id: String,
-    label: String,
-    config: ProviderConfig,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SettingsFile {
-    version: u32,
-    spoolman: Option<StoredSpoolman>,
-    providers: Vec<StoredProvider>,
-}
-
-struct StoredReview {
-    token: String,
-    epoch: u64,
-    library_generation: u64,
-    created_at: SystemTime,
-    category_mode: String,
-    known_tags: HashMap<String, Option<String>>,
-    targets: Vec<AiSuggestionTarget>,
-    applying: bool,
-}
-
-impl IntegrationState {
-    pub fn load(settings_path: PathBuf) -> Result<Self, String> {
-        let persisted = load_settings(&settings_path)?;
-        for provider in &persisted.providers {
-            validate_stored_provider(provider)?;
-        }
-        if persisted.providers.len() > MAX_PROVIDERS {
-            return Err("Integration settings contain too many providers".into());
-        }
-        if let Some(spoolman) = &persisted.spoolman {
-            validate_spoolman_config(&spoolman.config)?;
-            validate_identifier(&spoolman.source_id, "Spoolman source")?;
-        }
-        Ok(Self {
-            shared: Arc::new(IntegrationShared {
-                settings_path,
-                inner: Mutex::new(IntegrationInner {
-                    spoolman: persisted.spoolman,
-                    providers: persisted.providers,
-                    credentials: HashMap::new(),
-                    reviews: VecDeque::new(),
-                    epoch: 1,
-                    sequence: 0,
-                    ai_request_active: false,
-                    spoolman_pull_active: false,
-                }),
-            }),
-        })
-    }
-
-    fn settings(&self) -> IntegrationSettings {
-        let inner = self.shared.inner.lock().unwrap();
-        settings_from_inner(&inner)
-    }
-
-    fn persist_values(
-        &self,
-        spoolman: Option<StoredSpoolman>,
-        providers: &[StoredProvider],
-    ) -> Result<(), String> {
-        persist_settings(
-            &self.shared.settings_path,
-            &SettingsFile {
-                version: SETTINGS_VERSION,
-                spoolman,
-                providers: providers.to_vec(),
-            },
-        )
-    }
-
-    fn invalidate_locked(inner: &mut IntegrationInner) {
-        inner.epoch = inner.epoch.wrapping_add(1).max(1);
-        inner.reviews.clear();
-    }
-
-    fn begin_job(&self, kind: IntegrationJobKind) -> Result<IntegrationJobGuard, AppError> {
-        let mut inner = self.shared.inner.lock().unwrap();
-        let active = match kind {
-            IntegrationJobKind::Ai => &mut inner.ai_request_active,
-            IntegrationJobKind::Spoolman => &mut inner.spoolman_pull_active,
-        };
-        if *active {
-            return Err(integration_error(match kind {
-                IntegrationJobKind::Ai => "An AI suggestion request is already running",
-                IntegrationJobKind::Spoolman => "A Spoolman pull is already running",
-            }));
-        }
-        *active = true;
-        Ok(IntegrationJobGuard {
-            state: self.clone(),
-            kind,
-        })
-    }
-}
 
 #[tauri::command]
 pub fn integration_get_settings(state: State<'_, IntegrationState>) -> IntegrationSettings {
@@ -349,7 +72,9 @@ pub async fn spoolman_pull(
 ) -> Result<SpoolmanPullResult, AppError> {
     let state = state.inner().clone();
     let library = library.inner().clone();
-    let admission = state.begin_job(IntegrationJobKind::Spoolman)?;
+    let admission = state
+        .begin_job(IntegrationJobKind::Spoolman)
+        .map_err(integration_error)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _admission = admission;
         spoolman_pull_impl(&state, &library)
@@ -535,7 +260,9 @@ pub async fn ai_suggest_tags(
 ) -> Result<AiSuggestionBatch, AppError> {
     let state = state.inner().clone();
     let library = library.inner().clone();
-    let admission = state.begin_job(IntegrationJobKind::Ai)?;
+    let admission = state
+        .begin_job(IntegrationJobKind::Ai)
+        .map_err(integration_error)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _admission = admission;
         ai_suggest_tags_impl(&state, &library, provider_id, targets)
@@ -581,6 +308,8 @@ fn ai_suggest_tags_impl(
         .values()
         .filter_map(Clone::clone)
         .collect::<HashSet<_>>();
+    let mut existing_categories = allowed_categories.iter().cloned().collect::<Vec<_>>();
+    existing_categories.sort();
     for target in &targets {
         let model = library.with_db(|db| db.get_model(&target.model_id).map_err(library_error))?;
         let Some(model) = model else {
@@ -591,7 +320,7 @@ fn ai_suggest_tags_impl(
         }
         match get_thumbnail(library, &model.id, false) {
             Ok(Some(preview_data_url)) => {
-                let existing_tags = model
+                let existing_tags: Vec<AiExistingTag> = model
                     .tags
                     .iter()
                     .map(|name| AiExistingTag {
@@ -624,6 +353,7 @@ fn ai_suggest_tags_impl(
             let credential = credential.as_ref().map(|value| value.as_str());
             let allowed_categories = &allowed_categories;
             let taxonomy = &taxonomy;
+            let existing_categories = &existing_categories;
             scope.spawn(move || loop {
                 let Some((target, model, existing_tags, preview_data_url)) =
                     queue.lock().unwrap().pop_front()
@@ -634,6 +364,14 @@ fn ai_suggest_tags_impl(
                     model_id: model.id.clone(),
                     display_name: model.display_name.clone(),
                     existing_tags: model.tags.clone(),
+                    assigned_tags: existing_tags
+                        .iter()
+                        .map(|tag| SuggestionTagContext {
+                            name: tag.name.clone(),
+                            category: tag.category.clone(),
+                        })
+                        .collect(),
+                    existing_categories: existing_categories.clone(),
                     preview_data_url,
                 };
                 let result =
@@ -714,6 +452,7 @@ fn ai_suggest_tags_impl(
         review_token: token,
         provider_id,
         model: provider.config.model,
+        category_sharing: provider.config.category_sharing,
         targets: review_targets,
         failures,
     })
@@ -844,96 +583,6 @@ pub fn ai_discard_tag_review(
         .position(|review| review.token == review_token)
         .ok_or_else(|| integration_error("AI review token is expired, replayed, or unknown"))?;
     inner.reviews.remove(index);
-    Ok(())
-}
-
-fn settings_from_inner(inner: &IntegrationInner) -> IntegrationSettings {
-    IntegrationSettings {
-        spoolman: inner.spoolman.as_ref().map(|value| value.config.clone()),
-        ai_providers: inner
-            .providers
-            .iter()
-            .map(|provider| public_provider(provider, inner.credentials.contains_key(&provider.id)))
-            .collect(),
-    }
-}
-
-fn public_provider(provider: &StoredProvider, has_credential: bool) -> AiProviderPublicConfig {
-    AiProviderPublicConfig {
-        id: provider.id.clone(),
-        label: provider.label.clone(),
-        kind: provider.config.kind,
-        base_url: Some(provider.config.base_url.clone()),
-        endpoint_scope: provider.config.endpoint_scope,
-        model: provider.config.model.clone(),
-        credential_storage: if has_credential { "session" } else { "none" }.into(),
-        has_credential,
-        max_tags: provider.config.max_tags,
-        detail: provider.config.detail.clone(),
-        category_mode: provider.config.category_mode.clone(),
-        concurrency: provider.config.concurrency,
-        timeout_seconds: provider.config.timeout_seconds,
-        structured_output: provider.config.structured_output,
-    }
-}
-
-fn stored_provider(config: &AiProviderPublicConfig) -> Result<StoredProvider, String> {
-    validate_identifier(&config.id, "Provider")?;
-    if config.label.trim().is_empty()
-        || config.label.len() > 120
-        || config.label.chars().any(char::is_control)
-        || !matches!(config.credential_storage.as_str(), "none" | "session")
-    {
-        return Err("AI provider display configuration is invalid".into());
-    }
-    let base_url = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| match config.kind {
-            ProviderKind::Anthropic => "https://api.anthropic.com/".into(),
-            ProviderKind::Gemini => "https://generativelanguage.googleapis.com/".into(),
-            ProviderKind::OpenaiCompatible => String::new(),
-        });
-    let stored = StoredProvider {
-        id: config.id.clone(),
-        label: config.label.trim().to_owned(),
-        config: ProviderConfig {
-            kind: config.kind,
-            base_url,
-            endpoint_scope: config.endpoint_scope,
-            model: config.model.clone(),
-            max_tags: config.max_tags,
-            detail: config.detail.clone(),
-            category_mode: config.category_mode.clone(),
-            concurrency: config.concurrency,
-            timeout_seconds: config.timeout_seconds,
-            structured_output: config.structured_output,
-        },
-    };
-    validate_stored_provider(&stored)?;
-    Ok(stored)
-}
-
-fn validate_stored_provider(provider: &StoredProvider) -> Result<(), String> {
-    validate_identifier(&provider.id, "Provider")?;
-    if provider.label.is_empty()
-        || provider.label.len() > 120
-        || provider.label.chars().any(char::is_control)
-    {
-        return Err("AI provider label is invalid".into());
-    }
-    validate_provider_config(&provider.config)
-}
-
-fn validate_identifier(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(format!("{label} identifier is invalid"));
-    }
     Ok(())
 }
 
@@ -1123,114 +772,6 @@ fn now_rfc3339() -> Result<String, String> {
         .map_err(|_| "Current time could not be formatted".into())
 }
 
-fn load_settings(path: &Path) -> Result<SettingsFile, String> {
-    validate_config_ancestors(path)?;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SettingsFile {
-                version: SETTINGS_VERSION,
-                spoolman: None,
-                providers: Vec::new(),
-            });
-        }
-        Err(_) => return Err("Integration settings could not be inspected".into()),
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_SETTINGS_BYTES
-    {
-        return Err("Integration settings file is unsafe or oversized".into());
-    }
-    let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|_| "Integration settings could not be opened")?
-        .take(MAX_SETTINGS_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "Integration settings could not be read")?;
-    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
-        return Err("Integration settings file is oversized".into());
-    }
-    let settings: SettingsFile =
-        serde_json::from_slice(&bytes).map_err(|_| "Integration settings are malformed")?;
-    if settings.version != SETTINGS_VERSION {
-        return Err("Integration settings version is unsupported".into());
-    }
-    Ok(settings)
-}
-
-fn persist_settings(path: &Path, settings: &SettingsFile) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(settings)
-        .map_err(|_| "Integration settings could not be encoded")?;
-    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
-        return Err("Integration settings exceed their size limit".into());
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Integration settings path has no parent".to_string())?;
-    validate_config_ancestors(path)?;
-    fs::create_dir_all(parent)
-        .map_err(|_| "Integration settings directory could not be created")?;
-    validate_config_ancestors(path)?;
-    if fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        return Err("Integration settings file is unsafe".into());
-    }
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|_| "Integration settings temporary file could not be created")?;
-    let result = (|| {
-        file.write_all(&bytes)
-            .map_err(|_| "Integration settings could not be written".to_string())?;
-        file.sync_all()
-            .map_err(|_| "Integration settings could not be synchronized".to_string())?;
-        validate_config_ancestors(path)?;
-        if fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
-        {
-            return Err("Integration settings file became unsafe".into());
-        }
-        fs::rename(&temporary, path)
-            .map_err(|_| "Integration settings could not be published".to_string())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn validate_config_ancestors(path: &Path) -> Result<(), String> {
-    if !path.is_absolute() {
-        return Err("Integration settings path must be absolute".into());
-    }
-    let mut ancestors = path.ancestors().skip(1).collect::<Vec<_>>();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err("Integration settings directory ancestry is unsafe".into());
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("Integration settings directory could not be inspected".into()),
-        }
-    }
-    Ok(())
-}
-
 fn integration_error(message: impl Into<String>) -> AppError {
     AppError::Library {
         message: message.into(),
@@ -1241,6 +782,8 @@ fn integration_error(message: impl Into<String>) -> AppError {
 mod tests {
     use super::*;
     use library_core::{MetadataPatch, TagMode};
+    use std::fs;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
@@ -1262,6 +805,7 @@ mod tests {
             concurrency: 1,
             timeout_seconds: 30,
             structured_output: StructuredOutputMode::PlainJson,
+            category_sharing: CategorySharing::Local,
         }
     }
 

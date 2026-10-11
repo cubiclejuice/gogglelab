@@ -34,6 +34,10 @@ library-recovery = { path = "../crates/library-recovery" }
 library-core = { path = "../crates/library-core" }
 library-backup = { path = "../crates/library-backup" }
 library-integrations = { path = "../crates/library-integrations" }
+library-protocol = { path = "../crates/library-protocol" }
+library-runtime = { path = "../crates/library-runtime" }
+library-server = { path = "../crates/library-server" }
+tokio = { version = "1.53.1", features = ["net", "sync"] }
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 quick-xml = "0.41"
 notify = "8.2.0"

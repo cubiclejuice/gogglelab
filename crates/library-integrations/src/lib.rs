@@ -74,6 +74,21 @@ pub enum StructuredOutputMode {
     PlainJson,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CategorySharing {
+    #[default]
+    Local,
+    Provider,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionTagContext {
+    pub name: String,
+    pub category: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
@@ -87,6 +102,8 @@ pub struct ProviderConfig {
     pub concurrency: u8,
     pub timeout_seconds: u16,
     pub structured_output: StructuredOutputMode,
+    #[serde(default)]
+    pub category_sharing: CategorySharing,
 }
 
 #[derive(Clone, Serialize)]
@@ -95,6 +112,8 @@ pub struct SuggestionInput {
     pub model_id: String,
     pub display_name: String,
     pub existing_tags: Vec<String>,
+    pub assigned_tags: Vec<SuggestionTagContext>,
+    pub existing_categories: Vec<String>,
     pub preview_data_url: String,
 }
 
@@ -223,6 +242,30 @@ fn validate_suggestion_input(input: &SuggestionInput) -> Result<(), String> {
             .existing_tags
             .iter()
             .any(|tag| tag.is_empty() || tag.len() > 376)
+        || input.assigned_tags.len() != input.existing_tags.len()
+        || input
+            .assigned_tags
+            .iter()
+            .zip(&input.existing_tags)
+            .any(|(tag, name)| {
+                tag.name != *name
+                    || tag.name.is_empty()
+                    || tag.name.len() > 256
+                    || tag.name.chars().any(char::is_control)
+                    || tag.category.as_ref().is_some_and(|category| {
+                        category.is_empty()
+                            || category.len() > 120
+                            || category.chars().any(char::is_control)
+                    })
+            })
+        || input.existing_categories.len() > 200
+        || input.existing_categories.iter().any(|category| {
+            category.is_empty() || category.len() > 120 || category.chars().any(char::is_control)
+        })
+        || input
+            .existing_categories
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
         || input.preview_data_url.len() > 6 * 1024 * 1024
         || !input.preview_data_url.starts_with("data:image/png;base64,")
     {
@@ -533,7 +576,16 @@ fn provider_request(
     );
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    let metadata = json!({"displayName":input.display_name,"existingTags":input.existing_tags});
+    let metadata = match config.category_sharing {
+        CategorySharing::Local => {
+            json!({"displayName":input.display_name,"existingTags":input.existing_tags})
+        }
+        CategorySharing::Provider => json!({
+            "displayName":input.display_name,
+            "existingTags":input.assigned_tags,
+            "existingCategories":input.existing_categories
+        }),
+    };
     match config.kind {
         ProviderKind::OpenaiCompatible => {
             if let Some(key) = api_key {
@@ -881,6 +933,7 @@ mod tests {
             concurrency: 1,
             timeout_seconds: 30,
             structured_output: StructuredOutputMode::JsonSchema,
+            category_sharing: CategorySharing::Local,
         };
         assert!(validate_provider_config(&config).is_ok());
         for invalid in [
@@ -911,11 +964,14 @@ mod tests {
             concurrency: 1,
             timeout_seconds: 30,
             structured_output: StructuredOutputMode::JsonSchema,
+            category_sharing: CategorySharing::Local,
         };
         let input = SuggestionInput {
             model_id: "m".into(),
             display_name: "part".into(),
             existing_tags: vec![],
+            assigned_tags: vec![],
+            existing_categories: vec![],
             preview_data_url: "data:image/png;base64,AA==".into(),
         };
         let (path, headers, body) =
@@ -931,6 +987,8 @@ mod tests {
             model_id: "m".into(),
             display_name: "part".into(),
             existing_tags: vec![],
+            assigned_tags: vec![],
+            existing_categories: vec![],
             preview_data_url: "data:image/png;base64,AA==".into(),
         };
         for (mode, expected) in [
@@ -949,6 +1007,7 @@ mod tests {
                 concurrency: 1,
                 timeout_seconds: 30,
                 structured_output: mode,
+                category_sharing: CategorySharing::Local,
             };
             let (_, _, body) = provider_request(&config, None, &input).unwrap();
             assert_eq!(
@@ -965,6 +1024,8 @@ mod tests {
             model_id: "m".into(),
             display_name: "part".into(),
             existing_tags: vec![],
+            assigned_tags: vec![],
+            existing_categories: vec![],
             preview_data_url: "data:image/png;base64,AA==".into(),
         };
         let anthropic = ProviderConfig {
@@ -978,6 +1039,7 @@ mod tests {
             concurrency: 1,
             timeout_seconds: 30,
             structured_output: StructuredOutputMode::PlainJson,
+            category_sharing: CategorySharing::Local,
         };
         let (_, _, body) = provider_request(&anthropic, Some("key"), &input).unwrap();
         assert!(body["system"]
@@ -995,10 +1057,45 @@ mod tests {
             concurrency: 1,
             timeout_seconds: 30,
             structured_output: StructuredOutputMode::JsonSchema,
+            category_sharing: CategorySharing::Local,
         };
         let (_, _, body) = provider_request(&gemini, Some("key"), &input).unwrap();
         assert!(body
             .pointer("/generationConfig/responseJsonSchema")
             .is_some());
+    }
+
+    #[test]
+    fn category_sharing_defaults_local_and_only_provider_mode_discloses_categories() {
+        let legacy = json!({
+            "kind":"openaiCompatible","baseUrl":"http://127.0.0.1:11434/v1/",
+            "endpointScope":"local","model":"vision","maxTags":5,"detail":"brief",
+            "categoryMode":"existingOnly","concurrency":1,"timeoutSeconds":30,
+            "structuredOutput":"plainJson"
+        });
+        let mut config: ProviderConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(config.category_sharing, CategorySharing::Local);
+        let input = SuggestionInput {
+            model_id: "m".into(),
+            display_name: "part".into(),
+            existing_tags: vec!["gear".into()],
+            assigned_tags: vec![SuggestionTagContext {
+                name: "gear".into(),
+                category: Some("type".into()),
+            }],
+            existing_categories: vec!["type".into()],
+            preview_data_url: "data:image/png;base64,AA==".into(),
+        };
+        let (_, _, local_body) = provider_request(&config, None, &input).unwrap();
+        let local = local_body.to_string();
+        assert!(local.contains("gear"));
+        assert!(!local.contains("existingCategories"));
+        assert!(!local.contains("\\\"category\\\":\\\"type\\\""));
+
+        config.category_sharing = CategorySharing::Provider;
+        let (_, _, provider_body) = provider_request(&config, None, &input).unwrap();
+        let provider = provider_body.to_string();
+        assert!(provider.contains("existingCategories"));
+        assert!(provider.contains("\\\"category\\\":\\\"type\\\""));
     }
 }

@@ -79,6 +79,10 @@ import {
   aiSuggestTags,
   aiApplyTagReview,
   aiDiscardTagReview,
+  libraryServerStart,
+  libraryServerStop,
+  libraryServerStatus,
+  libraryServerRevealAccessKey,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -120,6 +124,8 @@ import { removalTargets } from "./lib/library-management";
 import { LibraryFilamentDialog } from "./lib/library-filament-dialog";
 import { LibraryAiDialog } from "./lib/library-ai-dialog";
 import { filamentAssignmentBatch } from "./lib/library-filaments";
+import { pathContainsOpenDialog } from "./lib/dialog-escape";
+import { LibraryServerSettingsSection } from "./lib/library-server-settings";
 import "./styles.css";
 
 export function startApp(extensions: AppExtensions): void {
@@ -411,6 +417,14 @@ export function startApp(extensions: AppExtensions): void {
   // HUD picker / handoff button would apply it.
   const settingsPanel = new SettingsPanel(main);
   settingsPanel.addExtensionSection(extensions.createSettingsSection?.() ?? null);
+  const libraryServerSettings = new LibraryServerSettingsSection({
+    status: libraryServerStatus,
+    start: () => libraryServerStart(),
+    stop: libraryServerStop,
+    revealAccessKey: libraryServerRevealAccessKey,
+  });
+  settingsPanel.addExtensionSection(libraryServerSettings.element);
+  settingsPanel.onHide = () => libraryServerSettings.clearSensitive();
   let defaultFolder: string | null = null;
   let displayUnits: "mm" | "in" = "mm";
   let appearanceMode: AppearanceMode = "system";
@@ -466,6 +480,7 @@ export function startApp(extensions: AppExtensions): void {
   }
 
   function openSettings(invoker?: HTMLElement) {
+    void libraryServerSettings.refresh();
     settingsPanel.show(
       {
         defaultFolder,
@@ -1398,6 +1413,7 @@ export function startApp(extensions: AppExtensions): void {
     const modal = topmostOverlay();
     if (modal !== "none") {
       if (e.key === "Escape") {
+        if (pathContainsOpenDialog(e.composedPath())) return;
         e.preventDefault();
         closeTopmostOverlay(modal);
       }

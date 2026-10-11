@@ -195,8 +195,12 @@ The user explicitly approved moving the existing private library and slicer-hand
   native checks and both app builds pass. Both dependency audits are clean.
 - Installed SHA25650e778a4e3668a90bd09a8b868be611140819251457baed559530af517bd5328,
   process observed; previous app preserved. Native capture remains unavailable.
-- AI categories stay local; optional category metadata egress was rejected by
-  automatic approval review and awaits explicit authorization. Names-only requests
-  and local category rules preserve Free functionality; no provider calls occurred.
+- AI category sharing is now a user-controlled local/provider setting, local by
+  default, following the owner's October11 decision. Provider sharing occurs only
+  on explicit generation; no provider calls occurred during development.
 - Phase6 proceeds with this same sharing boundary and the reviewed engine/transport/
   capture contract. All functionality remains Free; no publication/live exposure.
+
+### Phase6 implementation checkpoint scope
+
+Shared protocol/runtime, schema5 gallery/capture recovery, authenticated HTTP/MCP mutations, browser metadata/filaments/history and MV3 capture are built and locally verified. Optional server settings remain off by default. Headless source roots stay operator-controlled and read-only unless explicitly granted. See [Phase6 contract](PHASE-6-SERVER-MCP-CAPTURE.md) and [installation guide](SERVER-INSTALL.md). Scans/jobs, viewer/bundle downloads, management/backup/restore, AI/Spoolman and 3MF transports still require completion and their gates; full Phase6 and final app installation are not claimed yet.

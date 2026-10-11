@@ -1,7 +1,42 @@
-import type { AiSuggestionBatch, Filament, LibraryModel, VersionedModelTarget } from "./ipc";
+import type {
+  AiProviderPublicConfig,
+  AiSuggestionBatch,
+  Filament,
+  LibraryModel,
+  VersionedModelTarget,
+} from "./ipc";
 
-export const AI_DISCLOSURE =
-  "The selected provider receives a normalized preview image, display name, and existing tag names. Tag categories stay local. File paths, notes, source URLs, print history, and image provenance are not shared.";
+export const AI_DISCLOSURE = aiDisclosure("local");
+
+export function normalizeCategorySharing(
+  value: AiProviderPublicConfig["categorySharing"] | undefined,
+): "local" | "provider" {
+  return value === "provider" ? "provider" : "local";
+}
+
+export function aiDisclosure(mode: "local" | "provider"): string {
+  const shared =
+    mode === "provider"
+      ? "a normalized preview image, display name, assigned tag name/category pairs, and a bounded list of existing category names"
+      : "a normalized preview image, display name, and assigned tag names; categories stay local";
+  return `Only after you click Generate, the configured provider receives ${shared}. File paths, notes, source URLs, print history, filaments, other models' tags, and image provenance are not shared.`;
+}
+
+export function providerReviewConfigKey(
+  config: Pick<
+    AiProviderPublicConfig,
+    "id" | "model" | "detail" | "categoryMode" | "structuredOutput" | "categorySharing"
+  >,
+): string {
+  return JSON.stringify([
+    config.id,
+    config.model,
+    config.detail,
+    config.categoryMode,
+    config.structuredOutput,
+    normalizeCategorySharing(config.categorySharing),
+  ]);
+}
 
 export function filamentLabel(filament: Filament): string {
   const identity =

@@ -1,6 +1,6 @@
 # Proposed AI category sharing
 Date: 2026-10-11
-Status: awaiting explicit owner approval; current provider requests send tag names only.
+Status: owner authorized an opt-in setting; local is the default (2026-10-11).
 
 ## Concrete proposed behavior
 Only after a user selects models and clicks Generate suggestions:
@@ -37,3 +37,14 @@ Generate action, not unattended calls, real test calls, spending or publication.
 Extend strict provider input bounds and mock request fixtures to check the exact
 fields and absence of paths/notes/history/secrets. Update the visible disclosure
 to match the approved payload. Run native/frontend gates and both app builds.
+
+## Owner decision
+After the explanation of exact fields, configured provider and explicit Generate
+action, the user instructed: "make this a setting the user can choose. Local is default".
+Implement categorySharing=local|provider, default local in new/older settings.
+Local sends names only; provider opt-in sends assigned name/category pairs and
+bounded relevant category vocabulary after explicit generation. Changing the flag
+invalidates in-flight reviews. Keep it distinct from the AI endpoint scope so
+"local categories" cannot imply that the selected AI itself runs locally.
+This resolves the prior source-egress gate for this conditional product feature.
+No real provider calls, account actions, charges or unattended sharing are authorized.

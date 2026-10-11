@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 
 pub const MANIFEST_VERSION: u32 = 1;
-pub const LIBRARY_SCHEMA_VERSION: u32 = 4;
+pub const LIBRARY_SCHEMA_VERSION: u32 = 5;
 pub const MAX_COLORWAY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -89,6 +89,18 @@ fn invalid_external_id(value: &str) -> bool {
         || value.chars().any(char::is_control)
 }
 
+fn invalid_capture_id(value: &str) -> bool {
+    value.is_empty()
+        || value.len() > 128
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
+}
+
+fn invalid_sha256(value: &str) -> bool {
+    value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryManifest {
     pub manifest_version: u32,
@@ -110,6 +122,8 @@ pub struct RecoveryManifest {
     pub filament_sources: Vec<RecoveryFilamentSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filaments: Vec<RecoveryFilament>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captures: Vec<RecoveryCaptureItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +170,8 @@ pub struct RecoveryModel {
     pub print_attempts: Vec<RecoveryPrintAttempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filament_ids: Vec<String>,
+    #[serde(default = "default_catalog_kind", skip_serializing_if = "is_file_kind")]
+    pub catalog_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +239,31 @@ pub struct RecoveryFilament {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryCaptureItem {
+    pub item_id: String,
+    pub payload_hash: String,
+    pub status: String,
+    pub page_model_id: Option<String>,
+    pub created_at: String,
+    pub received_at: String,
+    pub updated_at: String,
+    pub error_code: Option<String>,
+    pub downloads: Vec<RecoveryCaptureDownload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryCaptureDownload {
+    pub capture_id: String,
+    pub ordinal: u32,
+    pub file_name: String,
+    pub expected_hash: Option<String>,
+    pub expected_bytes: Option<u64>,
+    pub status: String,
+    pub model_id: Option<String>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryCatalogSettings {
     pub thumbnail_size: u32,
     pub thumbnail_background: String,
@@ -280,7 +321,23 @@ pub struct RecoveryThumbnail {
     pub is_custom: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub ordinal: u16,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_active: bool,
     pub asset: RecoveryAsset,
+}
+
+fn default_catalog_kind() -> String {
+    "file".into()
+}
+
+fn is_file_kind(value: &String) -> bool {
+    value == "file"
+}
+
+fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +478,30 @@ fn select_models(manifest: &mut RecoveryManifest, ids: &[String]) -> Result<(), 
         })
         .collect();
     let mut selected: BTreeSet<String> = ids.iter().cloned().collect();
+    loop {
+        let mut changed = false;
+        for capture in &manifest.captures {
+            let capture_models = capture
+                .page_model_id
+                .iter()
+                .chain(
+                    capture
+                        .downloads
+                        .iter()
+                        .filter_map(|download| download.model_id.as_ref()),
+                )
+                .cloned()
+                .collect::<Vec<_>>();
+            if capture_models.iter().any(|id| selected.contains(id)) {
+                for id in capture_models {
+                    changed |= selected.insert(id);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut pending = selected.iter().cloned().collect::<Vec<_>>();
     while let Some(id) = pending.pop() {
         if let Some(Some(parent)) = by_id.get(&id) {
@@ -430,6 +511,17 @@ fn select_models(manifest: &mut RecoveryManifest, ids: &[String]) -> Result<(), 
         }
     }
     manifest.models.retain(|model| selected.contains(&model.id));
+    manifest.captures.retain(|capture| {
+        capture
+            .page_model_id
+            .as_ref()
+            .is_some_and(|id| selected.contains(id))
+            || capture
+                .downloads
+                .iter()
+                .filter_map(|download| download.model_id.as_ref())
+                .any(|id| selected.contains(id))
+    });
     manifest
         .model_tags
         .retain(|link| selected.contains(&link.model_id));
@@ -754,8 +846,13 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
     )?;
     let mut models: Vec<RecoveryModel> = collect_rows(
         conn,
-        "SELECT id, display_name, description, folder_id, current_revision_id, metadata_version,
-                deleted_at, created_at, updated_at FROM models ORDER BY id",
+        if schema_version >= 5 {
+            "SELECT id, display_name, description, folder_id, current_revision_id, metadata_version,
+                    deleted_at, created_at, updated_at,catalog_kind FROM models ORDER BY id"
+        } else {
+            "SELECT id, display_name, description, folder_id, current_revision_id, metadata_version,
+                    deleted_at, created_at, updated_at,'file' FROM models ORDER BY id"
+        },
         |row| {
             let id: String = row.get(0)?;
             Ok(RecoveryModel {
@@ -776,6 +873,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 organization: None,
                 print_attempts: Vec::new(),
                 filament_ids: Vec::new(),
+                catalog_kind: row.get(9)?,
             })
         },
     )?;
@@ -1130,6 +1228,112 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         (Vec::new(), Vec::new())
     };
 
+    let captures = if schema_version >= 5 {
+        let items = collect_rows(
+            conn,
+            "SELECT item_id,payload_hash,status,page_model_id,created_at,received_at,updated_at,error_code
+             FROM capture_items ORDER BY item_id",
+            |row| {
+                Ok(RecoveryCaptureItem {
+                    item_id: row.get(0)?,
+                    payload_hash: row.get(1)?,
+                    status: row.get(2)?,
+                    page_model_id: row.get(3)?,
+                    created_at: row.get(4)?,
+                    received_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    error_code: row.get(7)?,
+                    downloads: Vec::new(),
+                })
+            },
+        )?;
+        let mut by_item = items
+            .into_iter()
+            .map(|item| (item.item_id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        for item in by_item.values() {
+            if invalid_capture_id(&item.item_id)
+                || invalid_sha256(&item.payload_hash)
+                || !matches!(item.status.as_str(), "imported" | "partial" | "failed")
+                || !valid_rfc3339(&item.created_at)
+                || item
+                    .page_model_id
+                    .as_deref()
+                    .is_none_or(|id| !index.contains_key(id))
+                || item.error_code.as_deref().is_some_and(invalid_capture_id)
+            {
+                return Err(invalid("Capture item metadata is invalid"));
+            }
+            let page = &models[*index.get(item.page_model_id.as_ref().unwrap()).unwrap()];
+            if page.catalog_kind != "bookmark" {
+                return Err(invalid("Capture page does not reference a bookmark"));
+            }
+        }
+        let downloads = collect_rows(
+            conn,
+            "SELECT capture_id,item_id,ordinal,file_name,expected_hash,expected_bytes,status,model_id,error_code
+             FROM capture_downloads ORDER BY item_id,ordinal,capture_id",
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )?;
+        for (
+            capture_id,
+            item_id,
+            ordinal,
+            file_name,
+            expected_hash,
+            expected_bytes,
+            status,
+            model_id,
+            error_code,
+        ) in downloads
+        {
+            let item = by_item
+                .get_mut(&item_id)
+                .ok_or_else(|| invalid("Capture download references an unknown item"))?;
+            if invalid_capture_id(&capture_id)
+                || ordinal != item.downloads.len() as i64
+                || file_name.is_empty()
+                || file_name.len() > 255
+                || file_name.contains(['/', '\\', '\0'])
+                || expected_hash.as_deref().is_some_and(invalid_sha256)
+                || expected_bytes.is_some_and(|bytes| bytes <= 0 || bytes > 100 * 1024 * 1024)
+                || !matches!(status.as_str(), "needs_file" | "imported" | "failed")
+                || model_id
+                    .as_deref()
+                    .is_some_and(|id| !index.contains_key(id))
+                || (status == "imported") != model_id.is_some()
+                || error_code.as_deref().is_some_and(invalid_capture_id)
+            {
+                return Err(invalid("Capture download metadata is invalid"));
+            }
+            item.downloads.push(RecoveryCaptureDownload {
+                capture_id,
+                ordinal: ordinal as u32,
+                file_name,
+                expected_hash,
+                expected_bytes: expected_bytes.map(|bytes| bytes as u64),
+                status,
+                model_id,
+                error_code,
+            });
+        }
+        by_item.into_values().collect()
+    } else {
+        Vec::new()
+    };
+
     let index_roots = if schema_version >= 2 {
         let invalid_sources: i64 = conn.query_row(
             "SELECT COUNT(*) FROM models WHERE source_kind IS NULL OR source_kind NOT IN ('managed','indexed')",
@@ -1376,10 +1580,12 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
     }
     let thumbnails = collect_rows(
         conn,
-        if schema_version >= 2 {
-            "SELECT id,model_id,relative_path,content_hash,is_custom,source_content_hash FROM thumbnails ORDER BY model_id,id"
+        if schema_version >= 5 {
+            "SELECT id,model_id,relative_path,content_hash,is_custom,source_content_hash,ordinal,is_active FROM thumbnails ORDER BY model_id,ordinal,id"
+        } else if schema_version >= 2 {
+            "SELECT id,model_id,relative_path,content_hash,is_custom,source_content_hash,0,0 FROM thumbnails ORDER BY model_id,id"
         } else {
-            "SELECT id,model_id,relative_path,content_hash,is_custom,NULL FROM thumbnails ORDER BY model_id,id"
+            "SELECT id,model_id,relative_path,content_hash,is_custom,NULL,0,0 FROM thumbnails ORDER BY model_id,id"
         },
         |row| {
             Ok((
@@ -1389,10 +1595,15 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         },
     )?;
-    for (id, model_id, path, hash, is_custom, source_content_hash) in thumbnails {
+    let mut gallery_positions = BTreeMap::<String, usize>::new();
+    let mut gallery_active = BTreeSet::<String>::new();
+    for (id, model_id, path, hash, is_custom, source_content_hash, ordinal, is_active) in thumbnails
+    {
         let model = index
             .get(&model_id)
             .ok_or_else(|| invalid("A thumbnail references an unknown model"))?;
@@ -1401,14 +1612,25 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         }) {
             return Err(invalid("A thumbnail has invalid source provenance"));
         }
-        if is_custom != 0 && is_custom != 1 {
-            return Err(invalid("A thumbnail has invalid custom state"));
+        if !matches!(is_custom, 0 | 1)
+            || !matches!(is_active, 0 | 1)
+            || ordinal < 0
+            || (schema_version >= 5
+                && ordinal as usize != *gallery_positions.entry(model_id.clone()).or_default())
+            || (is_active == 1 && !gallery_active.insert(model_id.clone()))
+        {
+            return Err(invalid("A thumbnail has invalid gallery state"));
         }
+        *gallery_positions.entry(model_id.clone()).or_default() += 1;
+        let ordinal = u16::try_from(ordinal)
+            .map_err(|_| invalid("Thumbnail ordinal exceeds recovery limit"))?;
         models[*model].thumbnails.push(RecoveryThumbnail {
             id,
             model_id,
             is_custom: is_custom == 1,
             source_content_hash,
+            ordinal,
+            is_active: is_active == 1,
             asset: RecoveryAsset {
                 original_relative_path: path,
                 exported_path: None,
@@ -1416,6 +1638,13 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 sha256: hash,
             },
         });
+    }
+    if schema_version >= 5
+        && gallery_positions
+            .iter()
+            .any(|(model_id, count)| *count > 0 && !gallery_active.contains(model_id))
+    {
+        return Err(invalid("Thumbnail gallery has no active selection"));
     }
     let folder_ids: BTreeSet<_> = folders
         .iter()
@@ -1437,7 +1666,15 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         }
     }
     for model in &models {
-        if !folder_ids.contains(&model.folder_id) || model.metadata_version <= 0 {
+        if !folder_ids.contains(&model.folder_id)
+            || model.metadata_version <= 0
+            || !matches!(model.catalog_kind.as_str(), "file" | "bookmark")
+            || (model.catalog_kind == "bookmark"
+                && (model.current_revision_id.is_some()
+                    || !model.revisions.is_empty()
+                    || model.manual.is_some()
+                    || model.indexed_source.is_some()))
+        {
             return Err(invalid("A model has unsupported metadata"));
         }
         if let Some(current) = &model.current_revision_id {
@@ -1551,6 +1788,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         bundles,
         filament_sources,
         filaments,
+        captures,
     })
 }
 
@@ -1592,7 +1830,7 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if !(1..=LIBRARY_SCHEMA_VERSION as i64).contains(&version) {
         return Err(invalid(format!(
-            "Unsupported Library schema version {version}; recovery supports versions 1, 2, 3, and 4"
+            "Unsupported Library schema version {version}; recovery supports versions 1 through 5"
         )));
     }
     const TABLES: &[(&str, &[&str])] = &[
@@ -1804,6 +2042,60 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
         )?;
         if phase4_bytes > MAX_METADATA_BYTES {
             return Err(invalid("Schema-4 filament metadata exceeds recovery limit"));
+        }
+    }
+    if version >= 5 {
+        tables.extend_from_slice(&[
+            (
+                "capture_items",
+                &[
+                    "item_id",
+                    "payload_hash",
+                    "status",
+                    "page_model_id",
+                    "created_at",
+                    "received_at",
+                    "updated_at",
+                    "error_code",
+                ],
+            ),
+            (
+                "capture_downloads",
+                &[
+                    "capture_id",
+                    "item_id",
+                    "ordinal",
+                    "file_name",
+                    "expected_hash",
+                    "expected_bytes",
+                    "status",
+                    "model_id",
+                    "error_code",
+                ],
+            ),
+        ]);
+        for (table, required) in [
+            ("models", &["catalog_kind"][..]),
+            ("thumbnails", &["ordinal", "is_active"][..]),
+        ] {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns: BTreeSet<String> = stmt
+                .query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?;
+            if required.iter().any(|column| !columns.contains(*column)) {
+                return Err(invalid(format!(
+                    "Library table {table} has an unsupported schema-5 layout"
+                )));
+            }
+        }
+        let phase5_bytes: i64 = conn.query_row(
+            "SELECT COALESCE((SELECT SUM(length(item_id)+length(payload_hash)+length(status)+length(COALESCE(page_model_id,''))+length(COALESCE(error_code,''))) FROM capture_items),0)
+                  +COALESCE((SELECT SUM(length(capture_id)+length(item_id)+length(file_name)+length(COALESCE(expected_hash,''))+length(status)+length(COALESCE(model_id,''))+length(COALESCE(error_code,''))) FROM capture_downloads),0)",
+            [],
+            |row| row.get(0),
+        )?;
+        if phase5_bytes > MAX_METADATA_BYTES {
+            return Err(invalid("Schema-5 capture metadata exceeds recovery limit"));
         }
     }
     for (table, required) in &tables {

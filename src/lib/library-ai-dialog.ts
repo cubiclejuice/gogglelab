@@ -6,7 +6,14 @@ import type {
   SpoolmanConfig,
   VersionedModelTarget,
 } from "./ipc";
-import { AI_DISCLOSURE, aiAfterTags, aiTargets, buildAiReviewDecisions } from "./library-filaments";
+import {
+  AI_DISCLOSURE,
+  aiAfterTags,
+  aiDisclosure,
+  aiTargets,
+  buildAiReviewDecisions,
+  normalizeCategorySharing,
+} from "./library-filaments";
 
 export class LibraryAiDialog {
   private readonly dialog: HTMLDialogElement;
@@ -171,6 +178,15 @@ export class LibraryAiDialog {
       ["allowNew", "Allow new"],
     ]);
     categoryMode.value = existing?.categoryMode ?? "existingOnly";
+    const categorySharing = this.select("Category sharing", [
+      ["local", "Keep categories local"],
+      ["provider", "Share categories with configured provider"],
+    ]);
+    categorySharing.value = normalizeCategorySharing(existing?.categorySharing);
+    disclosure.textContent = aiDisclosure(categorySharing.value as "local" | "provider");
+    categorySharing.addEventListener("change", () => {
+      disclosure.textContent = aiDisclosure(categorySharing.value as "local" | "provider");
+    });
     const concurrency = this.input("Concurrency", String(existing?.concurrency ?? 1), "number");
     const timeout = this.input("Timeout seconds", String(existing?.timeoutSeconds ?? 30), "number");
     const structuredOutput = this.select("Structured output", [
@@ -202,6 +218,7 @@ export class LibraryAiDialog {
               maxTags: Number(maxTags.value),
               detail: detail.value as AiProviderPublicConfig["detail"],
               categoryMode: categoryMode.value as AiProviderPublicConfig["categoryMode"],
+              categorySharing: categorySharing.value as AiProviderPublicConfig["categorySharing"],
               concurrency: Number(concurrency.value),
               timeoutSeconds: Number(timeout.value),
               structuredOutput:
@@ -230,6 +247,7 @@ export class LibraryAiDialog {
                 maxTags: Number(maxTags.value),
                 detail: detail.value as AiProviderPublicConfig["detail"],
                 categoryMode: categoryMode.value as AiProviderPublicConfig["categoryMode"],
+                categorySharing: categorySharing.value as AiProviderPublicConfig["categorySharing"],
                 concurrency: Number(concurrency.value),
                 timeoutSeconds: Number(timeout.value),
                 structuredOutput:
@@ -276,6 +294,7 @@ export class LibraryAiDialog {
       maxTags,
       detail,
       categoryMode,
+      categorySharing,
       concurrency,
       timeout,
       structuredOutput,

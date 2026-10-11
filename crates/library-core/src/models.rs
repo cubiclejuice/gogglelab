@@ -34,6 +34,75 @@ pub struct Model {
     pub metadata: ModelMetadata,
     pub bundle_id: Option<String>,
     pub source_archive_member: Option<String>,
+    pub catalog_kind: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSort {
+    Name,
+    Size,
+    Date,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelGroupFilter {
+    Standalone,
+    Bundle,
+    Archive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelPageQuery {
+    pub folder_id: Option<String>,
+    pub search: Option<String>,
+    pub sort: ModelSort,
+    pub direction: SortDirection,
+    pub tag_id: Option<String>,
+    pub category: Option<String>,
+    pub designer: Option<String>,
+    pub model_license: Option<String>,
+    pub print_status: Option<PrintStatus>,
+    pub ever_printed: Option<bool>,
+    pub bundle_id: Option<String>,
+    pub root_id: Option<String>,
+    pub filament_id: Option<String>,
+    pub source_missing: Option<bool>,
+    pub duplicates_only: bool,
+    pub source_kind: Option<String>,
+    pub group: Option<ModelGroupFilter>,
+}
+
+impl Default for ModelPageQuery {
+    fn default() -> Self {
+        Self {
+            folder_id: None,
+            search: None,
+            sort: ModelSort::Date,
+            direction: SortDirection::Asc,
+            tag_id: None,
+            category: None,
+            designer: None,
+            model_license: None,
+            print_status: None,
+            ever_printed: None,
+            bundle_id: None,
+            root_id: None,
+            filament_id: None,
+            source_missing: None,
+            duplicates_only: false,
+            source_kind: None,
+            group: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -298,6 +367,75 @@ pub struct ThumbnailCacheEntry {
     pub path: PathBuf,
     pub png_hash: String,
     pub is_custom: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThumbnailGalleryItem {
+    pub id: String,
+    pub model_id: String,
+    pub relative_path: String,
+    pub content_hash: String,
+    pub source_content_hash: Option<String>,
+    pub is_custom: bool,
+    pub ordinal: u16,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapturePageInput {
+    pub url: String,
+    pub title: String,
+    pub designer: Option<String>,
+    pub model_license: Option<String>,
+    pub notes: Option<String>,
+    pub parent_external_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureDownloadInput {
+    pub capture_id: String,
+    pub file_name: String,
+    pub sha256: Option<String>,
+    pub bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureReceiptInput {
+    pub item_id: String,
+    pub payload_hash: String,
+    pub created_at: String,
+    pub page: CapturePageInput,
+    pub downloads: Vec<CaptureDownloadInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureDownloadRecord {
+    pub capture_id: String,
+    pub status: String,
+    pub model_id: Option<String>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureReceipt {
+    pub item_id: String,
+    pub payload_hash: String,
+    pub status: String,
+    pub page_model_id: Option<String>,
+    pub downloads: Vec<CaptureDownloadRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureSummary {
+    pub item_id: String,
+    pub created_at: String,
+    pub status: String,
+    pub page_model_id: Option<String>,
+    pub title: String,
+    pub url: String,
+    pub download_count: u64,
+    pub failed_count: u64,
+    pub needs_file_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

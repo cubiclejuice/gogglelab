@@ -2,10 +2,13 @@ import { expect, test } from "bun:test";
 import {
   AI_DISCLOSURE,
   aiAfterTags,
+  aiDisclosure,
   aiTargets,
   assignmentIdsPreservingUnknown,
   buildAiReviewDecisions,
   filamentReferenceLabel,
+  normalizeCategorySharing,
+  providerReviewConfigKey,
   filamentAssignmentBatch,
   matchesFilamentFilter,
 } from "./library-filaments";
@@ -63,6 +66,22 @@ test("AI targets snapshot optimistic versions and disclosure excludes sensitive 
     { model_id: "a", expected_version: 7 },
   ]);
   expect(AI_DISCLOSURE).toContain("File paths, notes, source URLs, print history");
+});
+
+test("category sharing defaults local, changes disclosure, and invalidates review config keys", () => {
+  expect(normalizeCategorySharing(undefined)).toBe("local");
+  expect(aiDisclosure("local")).toContain("categories stay local");
+  expect(aiDisclosure("provider")).toContain("tag name/category pairs");
+  const base = {
+    id: "provider",
+    model: "vision",
+    detail: "balanced",
+    categoryMode: "existingOnly",
+    structuredOutput: "jsonSchema",
+  };
+  expect(providerReviewConfigKey({ ...base, categorySharing: "local" })).not.toBe(
+    providerReviewConfigKey({ ...base, categorySharing: "provider" }),
+  );
 });
 
 test("AI review requires an explicit accept or reject decision for every successful target", () => {

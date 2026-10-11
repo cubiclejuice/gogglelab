@@ -1,0 +1,29 @@
+services:
+  gogglelab:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: gogglelab-server:local
+    init: true
+    user: "10001:10001"
+    read_only: true
+    ports:
+      - "127.0.0.1:3745:3745"
+    volumes:
+      - gogglelab-data:/data
+      - type: bind
+        source: ${GOGGLELAB_MODELS_PATH:?Set an explicit model folder}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${GOGGLELAB_TOKEN_FILE:?Set an explicit readable secret file}
+        target: /run/secrets/gogglelab-token
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=268435456,mode=1777
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 2.0
+    restart: "no"
+volumes:
+  gogglelab-data:

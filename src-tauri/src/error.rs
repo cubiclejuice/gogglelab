@@ -87,6 +87,14 @@ impl From<stl_core::StlError> for AppError {
     }
 }
 
+impl From<library_protocol::RuntimeError> for AppError {
+    fn from(error: library_protocol::RuntimeError) -> Self {
+        AppError::Library {
+            message: error.message,
+        }
+    }
+}
+
 pub fn map_io_error(e: &std::io::Error) -> AppError {
     match e.kind() {
         std::io::ErrorKind::NotFound => AppError::NotFound,

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -5,17 +6,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use library_core::{Model, ResolvedModelSource};
-use serde::Serialize;
+#[cfg(test)]
+use library_protocol::BundlePreviewMember;
+pub use library_protocol::BundlePreviewSummary;
+use library_protocol::{BundleEngine, Capability, RequestContext};
 use sha2::{Digest, Sha256};
 use tauri::State;
 
 use crate::extension_api::AppError;
 use crate::library_commands::{library_error, LibraryState};
 
+#[cfg(test)]
 const MAX_PREVIEW_MEMBERS: usize = 32;
+#[cfg(test)]
 const MAX_PREVIEW_TRIANGLES: u32 = 2_000_000;
 const MAX_HANDOFF_MEMBERS: usize = 10_000;
 const MAX_HANDOFF_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(test)]
 static TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Default)]
@@ -37,32 +44,18 @@ struct PreparedBundle {
     token: String,
     bundle_id: String,
     snapshot: Vec<BundleSnapshotMember>,
+    #[cfg(test)]
     geometry: Vec<u8>,
     library_generation: u64,
     token_epoch: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BundlePreviewSummary {
-    pub token: String,
-    pub bundle_id: String,
-    pub member_count: usize,
-    pub previewed_count: usize,
-    pub omitted_count: usize,
-    pub triangle_count: u32,
-    pub layout: String,
-    pub members: Vec<BundlePreviewMember>,
-    pub notice: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BundlePreviewMember {
-    pub model_id: String,
-    pub display_name: String,
-    pub triangle_count: u32,
-    pub offset: [f32; 3],
+fn desktop_bundle_context() -> RequestContext {
+    RequestContext {
+        principal_id: "desktop".into(),
+        capabilities: BTreeSet::from([Capability::MediaRead]),
+        request_id: "desktop-bundle".into(),
+    }
 }
 
 #[tauri::command]
@@ -88,13 +81,35 @@ pub async fn library_prepare_bundle_preview(
     let preview = preview.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _io = library.begin_io()?;
-        prepare_bundle_preview(
-            &library,
-            &preview,
-            &bundle_id,
-            generation,
+        let context = desktop_bundle_context();
+        let summary = library
+            .runtime()
+            .prepare_bundle_preview(&context, &bundle_id)
+            .map_err(AppError::from)?;
+        let snapshot = snapshot(&bundle_models(&library, &bundle_id)?)?;
+        let _request_guard = preview.request_commit.lock().unwrap();
+        if preview.latest_requested.load(Ordering::SeqCst) != generation {
+            let _ = library
+                .runtime()
+                .close_bundle_preview(&context, &summary.token);
+            return Err(AppError::Superseded);
+        }
+        if library.management_generation() != library_generation || library.maintenance_active() {
+            return Err(AppError::Library {
+                message: "Library changed while preparing bundle preview".into(),
+            });
+        }
+        let token_epoch = preview.token_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        *preview.prepared.lock().unwrap() = Some(PreparedBundle {
+            token: summary.token.clone(),
+            bundle_id,
+            snapshot,
+            #[cfg(test)]
+            geometry: Vec::new(),
             library_generation,
-        )
+            token_epoch,
+        });
+        Ok(summary)
     })
     .await
     .map_err(|error| AppError::Library {
@@ -108,8 +123,10 @@ pub fn library_bundle_preview_geometry(
     preview: State<'_, BundlePreviewState>,
     token: String,
 ) -> Result<tauri::ipc::Response, AppError> {
-    let guard = preview.prepared.lock().unwrap();
-    let prepared = guard
+    preview
+        .prepared
+        .lock()
+        .unwrap()
         .as_ref()
         .filter(|prepared| {
             prepared.token == token
@@ -119,11 +136,20 @@ pub fn library_bundle_preview_geometry(
         .ok_or_else(|| AppError::Library {
             message: "Bundle preview token is stale".into(),
         })?;
-    Ok(tauri::ipc::Response::new(prepared.geometry.clone()))
+    let mut geometry = Vec::new();
+    library
+        .runtime()
+        .stream_bundle_geometry(&desktop_bundle_context(), &token, &mut geometry)
+        .map_err(AppError::from)?;
+    Ok(tauri::ipc::Response::new(geometry))
 }
 
 #[tauri::command]
-pub fn library_close_bundle_preview(preview: State<'_, BundlePreviewState>, token: String) {
+pub fn library_close_bundle_preview(
+    library: State<'_, LibraryState>,
+    preview: State<'_, BundlePreviewState>,
+    token: String,
+) {
     let mut guard = preview.prepared.lock().unwrap();
     if guard
         .as_ref()
@@ -132,6 +158,9 @@ pub fn library_close_bundle_preview(preview: State<'_, BundlePreviewState>, toke
         *guard = None;
         preview.token_epoch.fetch_add(1, Ordering::SeqCst);
     }
+    let _ = library
+        .runtime()
+        .close_bundle_preview(&desktop_bundle_context(), &token);
 }
 
 #[tauri::command]
@@ -165,6 +194,10 @@ pub async fn library_send_bundle_to_slicer(
     let preview = preview.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _io = library.begin_io()?;
+        library
+            .runtime()
+            .describe_bundle_geometry(&desktop_bundle_context(), &token)
+            .map_err(AppError::from)?;
         send_bundle_to_slicer(
             &library,
             &preview,
@@ -182,6 +215,7 @@ pub async fn library_send_bundle_to_slicer(
     })?
 }
 
+#[cfg(test)]
 fn prepare_bundle_preview(
     library: &LibraryState,
     preview: &BundlePreviewState,
@@ -251,6 +285,8 @@ fn prepare_bundle_preview(
         });
     }
     let geometry = crate::geometry_buffer::build_positions(triangle_count, &positions);
+    let geometry_bytes = geometry.len() as u64;
+    let geometry_sha256 = hex_digest(&geometry);
     let token = format!(
         "bundle-preview-{}-{}-{generation}",
         std::process::id(),
@@ -286,9 +322,13 @@ fn prepare_bundle_preview(
         layout: if combined { "combined" } else { "grid" }.into(),
         members,
         notice,
+        geometry_bytes,
+        geometry_sha256,
+        library_epoch: library.runtime().library_epoch(),
     })
 }
 
+#[cfg(test)]
 fn preview_notice(member_count: usize, previewed_count: usize) -> Option<String> {
     (member_count > previewed_count).then(|| {
         format!(
@@ -343,6 +383,7 @@ fn snapshot_matches(actual: &[BundleSnapshotMember], expected: &[BundleSnapshotM
         })
 }
 
+#[cfg(test)]
 fn is_combined_bundle(models: &[Model]) -> bool {
     let Some(first) = models.first() else {
         return false;
@@ -355,6 +396,7 @@ fn is_combined_bundle(models: &[Model]) -> bool {
         })
 }
 
+#[cfg(test)]
 fn layout_offsets(
     meshes: &[(&Model, stl_core::ParsedStl)],
     combined: bool,
@@ -404,6 +446,7 @@ fn layout_offsets(
     Ok(offsets)
 }
 
+#[cfg(test)]
 fn xy_bounds(mesh: &stl_core::ParsedStl) -> [f32; 4] {
     let mut min = [f32::INFINITY; 2];
     let mut max = [f32::NEG_INFINITY; 2];
@@ -425,6 +468,7 @@ fn xy_bounds(mesh: &stl_core::ParsedStl) -> [f32; 4] {
     }
 }
 
+#[cfg(test)]
 fn load_model(library: &LibraryState, model: &Model) -> Result<stl_core::ParsedStl, AppError> {
     let (resolved, root_limit, library_root) = resolve_source(library, model)?;
     crate::library_commands::validate_indexed_source_limit(&resolved, root_limit)?;
@@ -771,6 +815,7 @@ mod tests {
             metadata: Default::default(),
             bundle_id: Some("b".into()),
             source_archive_member: None,
+            catalog_kind: "file".into(),
         };
         let mesh = stl_core::ParsedStl {
             format: stl_core::StlFormat::Binary,
@@ -1051,6 +1096,7 @@ mod tests {
             metadata: Default::default(),
             bundle_id: Some("b".into()),
             source_archive_member: None,
+            catalog_kind: "file".into(),
         }
     }
 }

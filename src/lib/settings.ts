@@ -44,6 +44,7 @@ export class SettingsPanel {
 
   onUseAccentModelColor: (enabled: boolean) => void = () => {};
   onDefaultColorPreview: (enabled: boolean) => void = () => {};
+  onHide: () => void = () => {};
   constructor(container: HTMLElement) {
     this.root = document.createElement("dialog");
     this.root.className = "settings-dialog";
@@ -230,6 +231,7 @@ export class SettingsPanel {
     if (this.root.open) this.root.close();
     const invoker = this.invoker;
     this.invoker = null;
+    this.onHide();
     invoker?.focus();
   }
 

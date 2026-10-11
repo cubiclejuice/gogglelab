@@ -1,6 +1,6 @@
 # Phase 6: Free headless, browser, MCP and capture
 Date: 2026-10-11
-Status: implementation begins after the completed Phase5 Community/unified build/install gate.
+Status: shared runtime and authenticated catalog/capture HTTP, MCP and browser slices locally verified; remaining scan, geometry, management and integration transports are in progress.
 All implementation is public MPL-2.0 Community with no license requirement.
 
 ## Pinned primary baseline
@@ -137,7 +137,7 @@ Include a self-sufficient AI Install Prompt for headless/MCP/extension artifacts
 
 ## Finding ledger
 Discovery confirms extension scope and expanded pinned MCP tool families.
-Full transport, engine and UI plan challenges remain pending after Phase5 gate.
+Independent plan and implementation challenges are recorded below; remaining feature families require their own executable gates.
 
 ## Adopted independent plan decisions
 - Use library-protocol + library-runtime; extract proven guards before transports.
@@ -166,8 +166,8 @@ Full transport, engine and UI plan challenges remain pending after Phase5 gate.
   Tauri runtime import. Shared child dialogs get first keyboard/cancel handling.
 - Native-only filesystem/slicer capabilities use adapters; remote browser exposes
   authorized paths, upload/download and owned recovery equivalents.
-- Phase5 names-only AI disclosure persists. Optional category egress stays blocked
-  pending authorization; this does not block shared-engine/server work.
+- Phase5 names-only AI disclosure persists. Category egress is a user-controlled provider opt-in with local default;
+  no background or save-triggered requests are permitted.
 - Local Docker29.4.0 now runs at the existing Unix desktop socket. Fixture-only
   build/run/restart tests are permitted; no remote context, live volumes or prune.
 
@@ -181,3 +181,54 @@ Existing whole-repository/CI/skill-supply-chain audits are outside this local ch
 new runtime/transport/capture boundaries require independent audit and dependency
 checks. Work lands as runtime parity, read-only service, mutations/MCP, capture,
 Docker and final app gates. No future slice is called complete from a plan alone.
+
+## Category-sharing setting (owner decision2026-10-11)
+The owner approved a selectable policy with local default. categorySharing is
+local|provider, default local for fresh/legacy config. Each desktop/browser/MCP
+config exposes the same policy; the user sees precise disclosure before generation.
+Provider opt-in adds assigned category pairs and bounded relevant category names;
+no paths/notes/URLs/history/other models' tag names/credentials enter the body.
+No background or saving-triggered calls; config change invalidates reviews.
+Tests compare per-adapter local/opt-in payloads and preserve local category validation.
+Earlier pending-egress notes above are historical; this decision supersedes them.
+
+## Network boundary authorization (2026-10-11)
+Automatic approval review initially rejected non-loopback binding. The owner asked
+for an explanation of LAN/Docker scope, then explicitly replied "approved" to
+implementing opt-in LAN/Docker with mandatory auth, localhost default, desktop
+off until enabled, and synthetic-data development containers published on localhost.
+This resolves that code gate. It does not authorize live-library mounting, public
+deployment, provider calls, DNS/certificate-account changes or external publication.
+Non-loopback startup still requires explicit listen/config, typed Host/Origin
+allowlists and authenticated access. tlsProxy requires HTTPS origins; container
+loopback publication keeps host mapping127.0.0.1. Tests exercise this boundary.
+
+## Current implementation review findings (2026-10-11)
+
+| Source | Severity | Evidence | Action / disposition |
+| --- | --- | --- | --- |
+| Parent transport review | High | `security::admit` released request concurrency after headers while content streaming retained blocking workers and runtime I/O | Transport worker: bound active streams and their lifetime; add disconnect/stall/shutdown tests; pending verification |
+| Parent runtime extraction review | High | Extracted scanner background loop selected enabled catalog roots without validating the operator path mapping | Runtime worker: enforce admitted ID and canonical path for every scan entry point, including restored roots; pending verification |
+| Parent transport review | Medium | `tlsProxy` HTTPS-origin validation was conditioned on non-loopback listen | Transport worker: enforce HTTPS origins for loopback proxy upstreams too; validate public URL against allowlists |
+| Parent MCP review | Medium | Tool listing did not use the request capability set and session did not track initialized acknowledgment | Transport worker: capability-aware tool advertisement and lifecycle tests |
+| Real browser QA | Medium | Author `display:flex` overrode capture section's `hidden` attribute; blob gallery images were blocked by static CSP | UI CSS fixed; image-only blob CSP fixed and real 256px PNG observed; final rebuilt UI regression gate pending |
+| Packaging review | Medium | Embedded desktop listener had no packaged browser assets | Parent resource/build mappings added; native worker connects validated static root; final package gate pending |
+| Review tooling | Low | Perplexity credential transmission was rejected before execution | Public official Caddy documentation fetched without credentials; no credential sent, no workaround attempted |
+
+| Parent extension review | High | Current official Chrome DownloadItem has no tabId, but attribution depended on that property | UI worker: supported canonical referrer/URL snapshot at download creation, preserve across navigation/restart; durable API-shaped tests pending |
+| Parent extension review | High | Queue read-modify-write used concurrent storage calls without serialization | UI worker: serialize queue/failure persistence and inbox operations; simultaneous capture regression pending |
+| Parent extension review | Medium | Extension README described broader automated coverage than the two committed tests and implied click-only extraction | UI worker: add durable integration fixtures and correct passive extractor description |
+
+## Current slice verification
+
+Parent full public workspace test and Clippy gates passed; the pre-existing stl-core/settings warnings and two ignored tests remain. Subsequent affected-code gates include desktop lazy database availability, first-upload initialization and runtime/request permission intersection. Browser metadata edits and print history were exercised against the real authenticated loopback server at 480px, with no horizontal overflow. Access-key stop/reveal races were exercised in the actual component with synthetic callbacks.
+
+The recorded live HTTP/MCP fixture passes 37 assertions and discovers 21 connected tools: metadata, folder, tag, filament, history, gallery and verified download families. It verifies stale edits, atomic second-target failure, capture exact replay and changed-ID refusal, and original STL/3MF bytes/ETags. Source hashes are unchanged. The fixture uses only task-owned data, without provider calls or LAN exposure.
+
+Runtime source admission, shared-state identity, preview reservation bounds, lazy startup, upload capability intersection, extension attribution, queue serialization and exact URL admission findings are fixed and covered by focused regressions. Content streaming uses chunking, bounded admission, producer backpressure deadlines and bounded shutdown. Remaining feature families are hidden until connected; this is a meaningful implementation checkpoint, not a full Phase6 or cross-platform release claim.
+
+Bun audit reports no known vulnerabilities. Native cargo-audit/cargo-deny are unavailable; no automatic third-party tool installation was performed. Final Linux Docker/package and complete feature-family gates remain required.
+
+### Linux container checkpoint evidence
+
+The current local public image builds successfully on Linux ARM64, includes public license/dependency notices and uses a correct /api/v1/health probe. Synthetic fixture checks verify authentication (401 without key), UID10001, read-only source/secret mounts, identical catalog responses after restart, and retained source hashes. The image is local only; no push or live catalog mount occurred. This validates the current connected slice, with a final rebuild required after remaining feature families land.

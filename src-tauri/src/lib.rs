@@ -21,6 +21,7 @@ mod library_thumbnail;
 mod opened_urls;
 mod printers;
 mod recovery;
+mod server_commands;
 mod settings;
 mod slicers;
 mod state;
@@ -62,6 +63,10 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             cli_arg_path,
             opened_urls::opened_urls,
             slicers::detect_slicers,
+            server_commands::library_server_start,
+            server_commands::library_server_stop,
+            server_commands::library_server_status,
+            server_commands::library_server_reveal_access_key,
             handoff::open_in_slicer,
             library_bundle::library_prepare_bundle_preview,
             library_bundle::library_bundle_preview_geometry,
@@ -153,10 +158,35 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
         ])
         .setup(|app| {
             let library_root = app.path().app_data_dir()?.join("library");
-            app.manage(library_commands::LibraryState::new(library_root));
-            app.manage(library_integrations::IntegrationState::load(
+            let library = library_commands::LibraryState::try_new_with_config(
+                library_root,
                 app.path().app_config_dir()?.join("integrations.json"),
-            )?);
+            )
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            let runtime = library.runtime().clone();
+            let integrations = library_integrations::IntegrationState::load(
+                runtime.host_integration_settings_path().to_path_buf(),
+            )?;
+            runtime.install_shared_state(std::sync::Arc::new(integrations.clone()))?;
+            runtime.register_epoch_invalidator(std::sync::Arc::new({
+                let integrations = integrations.clone();
+                move |_| integrations.invalidate_for_library_epoch()
+            }));
+            app.manage(integrations);
+            app.manage(library);
+            app.manage(server_commands::DesktopServerState::new(
+                app.path().app_config_dir()?.join("server-token"),
+                {
+                    let packaged = app.path().resource_dir()?.join("server-web");
+                    #[cfg(debug_assertions)]
+                    let packaged = if packaged.is_dir() {
+                        packaged
+                    } else {
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist-browser")
+                    };
+                    packaged
+                },
+            ));
             library_scan::start_background_scanner(app.handle().clone());
             let loaded = settings::load(app.handle());
             app.set_theme(loaded.appearance_mode.native_theme());

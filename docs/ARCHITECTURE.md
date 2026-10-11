@@ -77,4 +77,4 @@ Native IntegrationState keeps Zeroizing session secrets out of persisted config/
 exports. Single-flight admission bounds jobs; config/library generations and model versions
 reject stale results. Reviewed decisions apply atomically and tokens expire/consume once.
 Known tag identities normalize locally so displayed merge results match stored categories.
-Outbound metadata is names-only; categories/taxonomy remain local pending authorization.
+Category sharing defaults to names-only/local; the owner approved an opt-in provider setting for relevant category labels on explicit generation.

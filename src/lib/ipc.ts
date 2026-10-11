@@ -517,6 +517,7 @@ export interface AiProviderPublicConfig {
   concurrency: number;
   timeoutSeconds: number;
   structuredOutput: "jsonSchema" | "jsonObject" | "plainJson";
+  categorySharing: "local" | "provider";
 }
 
 export interface IntegrationSettings {
@@ -535,6 +536,7 @@ export interface AiSuggestionBatch {
   reviewToken: string;
   providerId: string;
   model: string;
+  categorySharing: "local" | "provider";
   targets: Array<{
     modelId: string;
     expectedVersion: number;
@@ -1056,6 +1058,28 @@ export function aiApplyTagReview(
 
 export function aiDiscardTagReview(reviewToken: string): Promise<void> {
   return invoke("ai_discard_tag_review", { reviewToken });
+}
+
+export interface DesktopLibraryServerStatus {
+  running: boolean;
+  baseUrl: string | null;
+  mcpUrl: string | null;
+}
+
+export function libraryServerStart(port?: number): Promise<DesktopLibraryServerStatus> {
+  return invoke("library_server_start", { port });
+}
+
+export function libraryServerStop(): Promise<DesktopLibraryServerStatus> {
+  return invoke("library_server_stop");
+}
+
+export function libraryServerStatus(): Promise<DesktopLibraryServerStatus> {
+  return invoke("library_server_status");
+}
+
+export function libraryServerRevealAccessKey(): Promise<{ accessKey: string }> {
+  return invoke("library_server_reveal_access_key");
 }
 
 export interface RecoveryManifest {

@@ -569,10 +569,10 @@ fn schema_v3_recovery_preserves_metadata_history_archive_refs_and_categories() {
 }
 
 #[test]
-fn schema_v4_recovery_preserves_catalog_assignments_sources_and_unknown_history_ids() {
+fn schema_v5_recovery_preserves_filaments_gallery_capture_and_unknown_history_ids() {
     use library_core::{
-        FilamentInput, LibraryDb, PrintAttemptInput, PrintOutcome, SpoolmanFilamentRecord,
-        SpoolmanSpoolRecord,
+        CapturePageInput, CaptureReceiptInput, FilamentInput, LibraryDb, PrintAttemptInput,
+        PrintOutcome, SpoolmanFilamentRecord, SpoolmanSpoolRecord,
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -643,12 +643,48 @@ fn schema_v4_recovery_preserves_catalog_assignments_sources_and_unknown_history_
             .unwrap()
             .archived
     );
+    let capture = db
+        .create_or_get_capture_receipt(&CaptureReceiptInput {
+            item_id: "capture-item".into(),
+            payload_hash: "ab".repeat(32),
+            created_at: "2026-10-11T01:00:00Z".into(),
+            page: CapturePageInput {
+                url: "https://example.test/captured".into(),
+                title: "Captured bookmark".into(),
+                designer: None,
+                model_license: None,
+                notes: None,
+                parent_external_id: None,
+            },
+            downloads: vec![],
+        })
+        .unwrap();
+    let bookmark_id = capture.page_model_id.unwrap();
     drop(db);
 
+    let preview = b"gallery thumbnail";
+    fs::write(root.join("thumbnails/capture.png"), preview).unwrap();
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute(
+        "INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash,ordinal,is_active)
+         VALUES('capture-thumbnail',?1,'thumbnails/capture.png',?2,1,NULL,0,1)",
+        params![bookmark_id, sha(preview)],
+    )
+    .unwrap();
+    drop(conn);
+
     let manifest = inspect_library(&root).unwrap();
-    assert_eq!(manifest.library_schema_version, 4);
+    assert_eq!(manifest.library_schema_version, 5);
     assert_eq!(manifest.filament_sources.len(), 1);
     assert_eq!(manifest.filaments.len(), 3);
+    assert_eq!(manifest.captures.len(), 1);
+    let bookmark = manifest
+        .models
+        .iter()
+        .find(|item| item.id == bookmark_id)
+        .unwrap();
+    assert_eq!(bookmark.catalog_kind, "bookmark");
+    assert!(bookmark.thumbnails[0].is_active);
     assert!(
         manifest
             .filaments
@@ -673,9 +709,50 @@ fn schema_v4_recovery_preserves_catalog_assignments_sources_and_unknown_history_
     let selected = export_library_zip(&root, &[model.id], &tmp.path().join("v4.zip")).unwrap();
     assert_eq!(selected.filaments.len(), 3);
     assert_eq!(selected.filament_sources.len(), 1);
+    let selected_capture = export_library_zip(
+        &root,
+        std::slice::from_ref(&bookmark_id),
+        &tmp.path().join("capture-v5.zip"),
+    )
+    .unwrap();
+    assert_eq!(selected_capture.captures.len(), 1);
+    assert_eq!(selected_capture.models.len(), 1);
 
     let conn = Connection::open(root.join("library.sqlite3")).unwrap();
     conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    conn.execute(
+        "UPDATE capture_items SET payload_hash='bad' WHERE item_id='capture-item'",
+        [],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute(
+        "UPDATE capture_items SET payload_hash=?1 WHERE item_id='capture-item'",
+        ["ab".repeat(32)],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE thumbnails SET is_active=0 WHERE id='capture-thumbnail'",
+        [],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute(
+        "UPDATE thumbnails SET is_active=1 WHERE id='capture-thumbnail'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE models SET catalog_kind='file' WHERE id=?1",
+        [&bookmark_id],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute(
+        "UPDATE models SET catalog_kind='bookmark' WHERE id=?1",
+        [&bookmark_id],
+    )
+    .unwrap();
     conn.execute(
         "UPDATE model_filaments SET ordinal=4 WHERE model_id=?1 AND ordinal=1",
         [&recovered.id],

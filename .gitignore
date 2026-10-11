@@ -52,3 +52,7 @@ release-smoke.log
 !docs/PHASE-6-SERVER-MCP-CAPTURE.md
 
 !docs/AI-CATEGORY-SHARING-APPROVAL.md
+
+dist-browser/
+
+!docs/SERVER-INSTALL.md

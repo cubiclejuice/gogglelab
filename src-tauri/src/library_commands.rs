@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 
 use crate::extension_api::{AppError, AppState, ModelSummary};
@@ -8,6 +7,7 @@ use library_core::{
     CatalogSettings, Folder, ImportResult, IndexRoot, LibraryDb, LibraryError, MetadataPatch,
     Model, PrintAttempt, PrintAttemptInput, Tag, VersionedTarget,
 };
+use library_runtime::{LibraryRuntime, RuntimeConfig, RuntimeIoGuard, RuntimeMaintenanceGuard};
 
 use crate::library_scan::{LibraryScanStatus, ScanControl};
 
@@ -71,31 +71,50 @@ pub struct LibraryState {
 }
 
 pub(crate) struct LibraryStateInner {
-    db: Mutex<Option<LibraryDb>>,
-    root: PathBuf,
-    pub(crate) scan: Arc<ScanControl>,
-    maintenance: AtomicBool,
-    management_generation: AtomicU64,
-    lifecycle: Mutex<LifecycleState>,
-}
-#[derive(Default)]
-struct LifecycleState {
-    maintenance: bool,
-    active_io: usize,
+    runtime: Arc<LibraryRuntime>,
 }
 
 impl LibraryState {
+    #[cfg(test)]
     pub fn new(root: PathBuf) -> Self {
-        Self {
+        Self::try_new(root).expect("Library runtime initialization failed")
+    }
+
+    #[cfg(test)]
+    pub fn try_new(root: PathBuf) -> Result<Self, AppError> {
+        let settings_path = root
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("integrations.json");
+        Self::try_new_with_config(root, settings_path)
+    }
+
+    pub fn try_new_with_config(
+        root: PathBuf,
+        integration_settings_path: PathBuf,
+    ) -> Result<Self, AppError> {
+        let runtime = LibraryRuntime::open(RuntimeConfig::desktop(root, integration_settings_path))
+            .map_err(AppError::from)?;
+        Ok(Self::from_runtime(runtime))
+    }
+
+    pub fn from_runtime(runtime: Arc<LibraryRuntime>) -> Self {
+        let state = Self {
             inner: Arc::new(LibraryStateInner {
-                db: Mutex::new(None),
-                root,
-                scan: Arc::new(ScanControl::new()),
-                maintenance: AtomicBool::new(false),
-                management_generation: AtomicU64::new(0),
-                lifecycle: Mutex::new(LifecycleState::default()),
+                runtime: runtime.clone(),
             }),
-        }
+        };
+        let weak = state.weak_inner();
+        runtime.register_scan_completed_hook(Arc::new(move |root_id| {
+            if let Some(inner) = weak.upgrade() {
+                render_thumbnails_for_root(&LibraryState::from_inner(inner), root_id);
+            }
+        }));
+        state
+    }
+
+    pub fn runtime(&self) -> &Arc<LibraryRuntime> {
+        &self.inner.runtime
     }
 
     pub(crate) fn from_inner(inner: Arc<LibraryStateInner>) -> Self {
@@ -107,7 +126,7 @@ impl LibraryState {
     }
 
     pub(crate) fn scan_control(&self) -> &Arc<ScanControl> {
-        &self.inner.scan
+        self.inner.runtime.scan_control()
     }
 
     pub(crate) fn with_db<T>(
@@ -117,89 +136,30 @@ impl LibraryState {
         with_db(self, operation)
     }
     pub(crate) fn root(&self) -> &Path {
-        &self.inner.root
+        self.inner.runtime.host_library_root()
     }
     pub(crate) fn management_generation(&self) -> u64 {
-        self.inner.management_generation.load(Ordering::Acquire)
+        self.inner.runtime.library_epoch()
     }
     pub(crate) fn maintenance_active(&self) -> bool {
-        self.inner.maintenance.load(Ordering::Acquire)
+        self.inner.runtime.maintenance_active()
     }
-    pub(crate) fn begin_io(&self) -> Result<LibraryIoGuard, AppError> {
-        let mut lifecycle = self.inner.lifecycle.lock().unwrap();
-        if lifecycle.maintenance {
-            return Err(AppError::Library {
-                message: "Library maintenance is in progress".into(),
-            });
-        }
-        lifecycle.active_io += 1;
-        Ok(LibraryIoGuard {
-            state: self.clone(),
-        })
+    pub(crate) fn begin_io(&self) -> Result<RuntimeIoGuard, AppError> {
+        self.inner.runtime.begin_io().map_err(AppError::from)
     }
-    pub(crate) fn begin_maintenance(&self) -> Result<MaintenanceGuard, AppError> {
+    pub(crate) fn begin_maintenance(&self) -> Result<RuntimeMaintenanceGuard, AppError> {
         if self.scan_control().status().running {
             return Err(AppError::Library {
                 message: "Library job is running".into(),
             });
         }
-        {
-            let mut lifecycle = self.inner.lifecycle.lock().unwrap();
-            if lifecycle.maintenance || lifecycle.active_io != 0 {
-                return Err(AppError::Library {
-                    message: "Library I/O or maintenance is already running".into(),
-                });
-            }
-            lifecycle.maintenance = true;
-            self.inner.maintenance.store(true, Ordering::Release);
-        }
-        THUMBNAIL_RENDER_LIMITER.wait_idle();
-        let mut db = self.inner.db.lock().unwrap();
-        *db = None;
-        drop(db);
-        Ok(MaintenanceGuard {
-            state: self.clone(),
-            release_on_drop: true,
-        })
-    }
-}
-
-pub(crate) struct LibraryIoGuard {
-    state: LibraryState,
-}
-impl Drop for LibraryIoGuard {
-    fn drop(&mut self) {
-        let mut lifecycle = self.state.inner.lifecycle.lock().unwrap();
-        lifecycle.active_io = lifecycle.active_io.saturating_sub(1);
-    }
-}
-
-pub(crate) struct MaintenanceGuard {
-    state: LibraryState,
-    release_on_drop: bool,
-}
-impl MaintenanceGuard {
-    pub(crate) fn root(&self) -> &Path {
-        self.state.root()
-    }
-    pub(crate) fn invalidate(&self) -> u64 {
-        self.state
+        let guard = self
             .inner
-            .management_generation
-            .fetch_add(1, Ordering::AcqRel)
-            + 1
-    }
-    pub(crate) fn remain_armed(&mut self) {
-        self.release_on_drop = false;
-    }
-}
-impl Drop for MaintenanceGuard {
-    fn drop(&mut self) {
-        if self.release_on_drop {
-            let mut lifecycle = self.state.inner.lifecycle.lock().unwrap();
-            lifecycle.maintenance = false;
-            self.state.inner.maintenance.store(false, Ordering::Release);
-        }
+            .runtime
+            .begin_maintenance()
+            .map_err(AppError::from)?;
+        THUMBNAIL_RENDER_LIMITER.wait_idle();
+        Ok(guard)
     }
 }
 
@@ -209,6 +169,7 @@ pub(crate) fn library_error(error: LibraryError) -> AppError {
     }
 }
 
+#[cfg(test)]
 fn open_library(root: &Path) -> Result<LibraryDb, AppError> {
     LibraryDb::open(root).map_err(library_error)
 }
@@ -217,21 +178,7 @@ pub(crate) fn with_db<T>(
     state: &LibraryState,
     operation: impl FnOnce(&LibraryDb) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
-    if state.inner.maintenance.load(Ordering::Acquire) {
-        return Err(AppError::Library {
-            message: "Library maintenance is in progress".into(),
-        });
-    }
-    let mut guard = state.inner.db.lock().unwrap();
-    if state.inner.maintenance.load(Ordering::Acquire) {
-        return Err(AppError::Library {
-            message: "Library maintenance is in progress".into(),
-        });
-    }
-    if guard.is_none() {
-        *guard = Some(open_library(&state.inner.root)?);
-    }
-    operation(guard.as_ref().unwrap())
+    state.inner.runtime.with_db(operation)
 }
 
 #[tauri::command]
@@ -880,7 +827,7 @@ pub async fn library_purge_thumbnails(
 
 fn purge_thumbnails(state: &LibraryState) -> Result<u64, AppError> {
     let paths = with_db(state, |db| db.purge_thumbnails().map_err(library_error))?;
-    remove_thumbnail_paths(&state.inner.root, paths)
+    remove_thumbnail_paths(state.root(), paths)
 }
 
 fn remove_thumbnail_paths(library_root: &Path, paths: Vec<PathBuf>) -> Result<u64, AppError> {
@@ -1140,6 +1087,30 @@ mod tests {
     #[test]
     fn library_source_identity_is_model_scoped() {
         assert_eq!(library_source_identity("model-42"), "library:model-42");
+    }
+
+    #[test]
+    fn corrupt_optional_library_does_not_prevent_native_state_construction() {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gogglelab-library-corrupt-startup-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let db_path = root.join("library.sqlite3");
+        std::fs::write(&db_path, b"not a sqlite database").unwrap();
+        let before = std::fs::read(&db_path).unwrap();
+
+        let state = LibraryState::try_new(root.clone()).unwrap();
+        assert_eq!(state.management_generation(), 1);
+        assert!(state
+            .runtime()
+            .read_db(|db| db.list_models(None, None))
+            .is_err());
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

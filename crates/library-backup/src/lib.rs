@@ -378,7 +378,7 @@ fn hash_file(path: &Path, limit: u64) -> Result<(u64, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library_core::{FilamentInput, LibraryDb};
+    use library_core::{CapturePageInput, CaptureReceiptInput, FilamentInput, LibraryDb};
     #[test]
     fn backup_round_trip_preserves_database_and_assets() {
         let temp = tempfile::tempdir().unwrap();
@@ -404,6 +404,22 @@ mod tests {
             std::slice::from_ref(&filament.id),
         )
         .unwrap();
+        let capture = db
+            .create_or_get_capture_receipt(&CaptureReceiptInput {
+                item_id: "backup-capture".into(),
+                payload_hash: "ab".repeat(32),
+                created_at: "2026-10-11T00:00:00Z".into(),
+                page: CapturePageInput {
+                    url: "https://example.test/model".into(),
+                    title: "Backup bookmark".into(),
+                    designer: None,
+                    model_license: None,
+                    notes: None,
+                    parent_external_id: None,
+                },
+                downloads: vec![],
+            })
+            .unwrap();
         drop(db);
         let backup = temp.path().join("backup.zip");
         let result = create_backup(&root, &backup).unwrap();
@@ -419,6 +435,14 @@ mod tests {
         assert_eq!(
             restored.get_filament(&filament.id).unwrap().unwrap().name,
             filament.name
+        );
+        assert_eq!(
+            restored
+                .get_capture_receipt("backup-capture")
+                .unwrap()
+                .unwrap()
+                .page_model_id,
+            capture.page_model_id
         );
         assert_eq!(
             fs::read(restored.resolve_model_source(&model.id).unwrap()).unwrap(),
