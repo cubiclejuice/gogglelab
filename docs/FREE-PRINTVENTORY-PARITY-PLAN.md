@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-10
-Status: phases 1–4 implemented and locally built/verified; phase 5 in progress. Native window capture and cross-platform release verification remain outstanding.
+Status: phases 1–5 implemented and locally built/verified; phase 6 in progress. Native window capture and cross-platform release verification remain outstanding.
 
 ## Decision
 
@@ -185,3 +185,18 @@ The user explicitly approved moving the existing private library and slicer-hand
 - Installed SHA256 f98718830607da8941a837a9db47a56a4c65b96af798e09eed751fe6dc97706d,
   process observed; previous app backed up. Native visual/slicer/cross-platform
   runtime gates remain. Phase5 proceeds; all phase5–6 capabilities remain Free.
+
+## Phase 5 local completion (2026-10-11)
+- Public4a34597/unifieddfcd037 add Free filaments, assignments/filters/history pickers,
+  complete pull-only Spoolman reconciliation, secure configurable AI adapters and
+  explicit atomic reviewed tagging. Schema4 recovery/backups retain older schemas.
+- Community86 frontend tests/241 assertions; native151 plus one ignored;
+  core40/recovery17/backup4/network9 and other suites pass. Unified44 frontend tests,
+  native checks and both app builds pass. Both dependency audits are clean.
+- Installed SHA25650e778a4e3668a90bd09a8b868be611140819251457baed559530af517bd5328,
+  process observed; previous app preserved. Native capture remains unavailable.
+- AI categories stay local; optional category metadata egress was rejected by
+  automatic approval review and awaits explicit authorization. Names-only requests
+  and local category rules preserve Free functionality; no provider calls occurred.
+- Phase6 proceeds with this same sharing boundary and the reviewed engine/transport/
+  capture contract. All functionality remains Free; no publication/live exposure.

@@ -1,6 +1,6 @@
 # Phase 5: Free filaments and reviewed AI tagging
 Date: 2026-10-10
-Status: implementation; Phase 4 full Community/unified build/install gate passed.
+Status: locally implemented, built, verified and installed with names-only provider metadata.
 Baseline: Printventory GUIDE at f551c4601c03072362b426c652b5dd37e4c55601.
 
 ## Product contract
@@ -99,4 +99,14 @@ Primary links:
   tinypool2.1.2/source-map-js1.2.2 overrides clear the public Bun audit. Unified audit
   requires repinning the new public package before its final check.
 - Focused final data: core40, recovery17, backup4, network9, native integration13.
-  Full Community/unified package/install gate is being finalized.
+  Full Community gate: frontend86/241 assertions, native151/one ignored,
+  core40/recovery17/backup4/network9 and remaining suites pass with one existing
+  ignored test. Strict owned Clippy and both default workspace checks pass; new
+  warnings removed, unrelated existing warnings retained.
+- Unified frontend44/1198 assertions, native tests/Clippy and macOS packaging pass.
+  Both public/unified Bun audits report no vulnerabilities. Public4a34597/unifieddfcd037.
+- Signature verified; installed executableSHA256:
+  50e778a4e3668a90bd09a8b868be611140819251457baed559530af517bd5328.
+  Process48906 observed; previous app output/app-backups/GoggleLab-before-phase5-20261011.app.
+- Native capture retry still returns cgWindowNotFound; no native visual/slicer or
+  Windows/Linux GUI runtime claim. Phase6 may proceed with current sharing boundary.

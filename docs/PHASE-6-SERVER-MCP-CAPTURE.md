@@ -1,6 +1,6 @@
 # Phase 6: Free headless, browser, MCP and capture
 Date: 2026-10-11
-Status: discovery/spec only; implementation must wait for the Phase 5 full gate.
+Status: implementation begins after the completed Phase5 Community/unified build/install gate.
 All implementation is public MPL-2.0 Community with no license requirement.
 
 ## Pinned primary baseline
@@ -138,3 +138,46 @@ Include a self-sufficient AI Install Prompt for headless/MCP/extension artifacts
 ## Finding ledger
 Discovery confirms extension scope and expanded pinned MCP tool families.
 Full transport, engine and UI plan challenges remain pending after Phase5 gate.
+
+## Adopted independent plan decisions
+- Use library-protocol + library-runtime; extract proven guards before transports.
+  Desktop wrappers and embedded listeners share one Runtime. Standalone fails on
+  the stable sibling OS lock; no PID auto-break. Keep one replica on NAS.
+- Bearer-only v1 bootstrap: operator-generated256-bit token in0600 secret file or
+  injected environment, outside catalog/backups. Browser keeps it memory-only;
+  all data/media/MCP/events require auth, exact configured Host/Origin and limits.
+- Pin MCP2025-11-25 handshake/session transport. GET is authenticated SSE or405,
+  DELETE terminates known session; no array RPC, synthetic unknown sessions or
+  implicit apply. Official SDK defaults must be constrained to this contract.
+- Require two-step one-use action tokens and optimistic versions for physical/
+  destructive actions. Bind principal, operation, IDs/versions/hashes/epoch/request.
+  Persistent idempotency records store hashes/results, never secret request bodies.
+- Operator root handles are authoritative. Restored DB paths cannot create access;
+  disable/remap unadmitted roots. Browser/MCP inputs use IDs/relative destinations.
+  Source-path output is an explicit host capability; downloads are the default
+  remote handoff equivalent when no supported host slicer exists.
+- Add backed-up schema5 gallery ordinal/active selection and normalized capture/
+  receipt/bookmark state. Bookmarks have no fabricated source bytes. Passive
+  downloads with metadata only require admitted desktop bytes or explicit upload.
+- Stream bounded verified media through opaque epoch/TTL handles. Concrete header,
+  body/concurrency/session/preview/event/byte budgets precede handlers. Larger MCP
+  image bodies need a bounded upload contract; do not silently exclude PNG/JPEG.
+- UI needs a transport-neutral LibraryClient and separate browser entry with no
+  Tauri runtime import. Shared child dialogs get first keyboard/cancel handling.
+- Native-only filesystem/slicer capabilities use adapters; remote browser exposes
+  authorized paths, upload/download and owned recovery equivalents.
+- Phase5 names-only AI disclosure persists. Optional category egress stays blocked
+  pending authorization; this does not block shared-engine/server work.
+- Local Docker29.4.0 now runs at the existing Unix desktop socket. Fixture-only
+  build/run/restart tests are permitted; no remote context, live volumes or prune.
+
+## Workstream routing and gate ledger
+Three GPT5.6Sol workers: runtime/data13, transport/security14, UI/capture12;
+forced frontier for migration/auth/input boundaries. No ensemble or fallback.
+Independent CEO/engineering/security/UI/DX plan perspectives agree on the above.
+Critical runtime ownership/confirmation and high auth/path/schema/resource/version
+findings are resolved by this contract and remain executable test gates.
+Existing whole-repository/CI/skill-supply-chain audits are outside this local change;
+new runtime/transport/capture boundaries require independent audit and dependency
+checks. Work lands as runtime parity, read-only service, mutations/MCP, capture,
+Docker and final app gates. No future slice is called complete from a plan alone.
