@@ -10,13 +10,16 @@ use uuid::Uuid;
 
 use crate::error::{io, LibraryError};
 use crate::models::{
-    CatalogSettings, DuplicateGroup, Folder, ImportResult, IndexRoot, IndexedSourceMetadata,
-    MetadataPatch, Model, ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome,
-    PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource, ScanReconcile, ScannedModel,
-    SourceRef, Tag, TagMode, ThumbnailCacheEntry, VersionedModelUpdate, VersionedTarget,
+    CatalogSettings, DuplicateGroup, Filament, FilamentInput, FilamentOrigin, FilamentResourceKind,
+    FilamentSyncSummary, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, MetadataPatch,
+    Model, ModelFilamentAssignment, ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome,
+    PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource, ReviewedTagStrategy,
+    ReviewedTagTarget, ScanReconcile, ScannedModel, SourceRef, SpoolmanFilamentRecord,
+    SpoolmanSource, SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry, VersionedModelUpdate,
+    VersionedTarget,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 pub const ROOT_FOLDER_ID: &str = "root";
 pub const MIN_SCAN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_SCAN_INTERVAL_MINUTES: u32 = 1_440;
@@ -110,9 +113,14 @@ impl LibraryDb {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V1_TO_V2)?;
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
+            conn.execute_batch(MIGRATE_V3_TO_V4)?;
         } else if version == 2 {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
+            conn.execute_batch(MIGRATE_V3_TO_V4)?;
+        } else if version == 3 {
+            create_migration_backup(&conn, &root, version)?;
+            conn.execute_batch(MIGRATE_V3_TO_V4)?;
         }
         conn.execute_batch(ENSURE_CATALOG_SETTINGS)?;
         Ok(Self { conn, root })
@@ -147,6 +155,7 @@ impl LibraryDb {
         let model = stmt.query_row(params![id], model_from_row).optional()?;
         if let Some(mut model) = model {
             model.tags = self.tags_for(&model.id)?;
+            model.filament_ids = self.filament_ids_for_model(&model.id)?;
             Ok(Some(model))
         } else {
             Ok(None)
@@ -178,8 +187,10 @@ impl LibraryDb {
             return Ok(models);
         }
         let mut tags = self.tags_by_model()?;
+        let mut filaments = self.filaments_by_model()?;
         for model in &mut models {
             model.tags = tags.remove(&model.id).unwrap_or_default();
+            model.filament_ids = filaments.remove(&model.id).unwrap_or_default();
         }
         Ok(models)
     }
@@ -198,6 +209,7 @@ impl LibraryDb {
         let mut models = rows.collect::<Result<Vec<_>, _>>()?;
         for model in &mut models {
             model.tags = self.tags_for(&model.id)?;
+            model.filament_ids = self.filament_ids_for_model(&model.id)?;
         }
         Ok(models)
     }
@@ -1849,6 +1861,141 @@ impl LibraryDb {
         Ok(())
     }
 
+    pub fn apply_reviewed_tags(
+        &self,
+        targets: &[ReviewedTagTarget],
+        strategy: ReviewedTagStrategy,
+    ) -> Result<Vec<Model>, LibraryError> {
+        if targets.is_empty() || targets.len() > 50_000 {
+            return Err(LibraryError::InvalidInput(
+                "reviewed tag target count is invalid".into(),
+            ));
+        }
+        let mut model_ids = HashSet::new();
+        let mut accepted_count = 0_usize;
+        let mut validated = Vec::with_capacity(targets.len());
+        for target in targets {
+            accepted_count = accepted_count
+                .checked_add(target.tags.len())
+                .ok_or_else(|| LibraryError::InvalidInput("reviewed tag count overflow".into()))?;
+            if !model_ids.insert(target.model_id.clone())
+                || target.tags.len() > 200
+                || accepted_count > 100_000
+            {
+                return Err(LibraryError::InvalidInput(
+                    "reviewed tag target is duplicated or too large".into(),
+                ));
+            }
+            let mut names = HashSet::new();
+            let mut tags = Vec::with_capacity(target.tags.len());
+            for tag in &target.tags {
+                let name = clean_tag_name(&tag.name)?;
+                let category = clean_optional(tag.category.as_deref(), 120)?;
+                if !names.insert(name.to_lowercase()) {
+                    return Err(LibraryError::InvalidInput(
+                        "reviewed tags contain duplicate names".into(),
+                    ));
+                }
+                tags.push((name, category));
+            }
+            validated.push((target, tags));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (target, _) in &validated {
+            validate_active_model_version(&tx, &target.model_id, target.expected_version)?;
+        }
+        for (target, tags) in &validated {
+            let mut accepted = BTreeMap::<String, Option<String>>::new();
+            let mut represented_categories = BTreeSet::<String>::new();
+            for (name, requested_category) in tags {
+                let existing: Option<(String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT id,category FROM tags WHERE lower(name)=lower(?1)",
+                        params![name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let (id, actual_category) = if let Some((id, actual_category)) = existing {
+                    if requested_category.is_some() && requested_category != &actual_category {
+                        return Err(LibraryError::InvalidInput(format!(
+                            "reviewed tag category conflicts with existing tag: {name}"
+                        )));
+                    }
+                    (id, actual_category)
+                } else {
+                    let id = new_id("tag");
+                    tx.execute(
+                        "INSERT INTO tags(id,name,category) VALUES(?1,?2,?3)",
+                        params![id, name, requested_category],
+                    )?;
+                    (id, requested_category.clone())
+                };
+                if let Some(category) = requested_category {
+                    represented_categories.insert(category.clone());
+                }
+                accepted.insert(id, actual_category);
+            }
+
+            let mut current = BTreeMap::<String, Option<String>>::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT t.id,t.category FROM tags t JOIN model_tags mt ON mt.tag_id=t.id
+                     WHERE mt.model_id=?1",
+                )?;
+                let rows = stmt.query_map(params![target.model_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+                current.extend(rows.collect::<Result<Vec<_>, _>>()?);
+            }
+            let final_tags = match strategy {
+                ReviewedTagStrategy::Append => {
+                    let mut result = current.clone();
+                    result.extend(accepted);
+                    result
+                }
+                ReviewedTagStrategy::Replace => accepted,
+                ReviewedTagStrategy::Merge => {
+                    let mut result = current
+                        .iter()
+                        .filter(|(_, category)| {
+                            category
+                                .as_ref()
+                                .is_none_or(|category| !represented_categories.contains(category))
+                        })
+                        .map(|(id, category)| (id.clone(), category.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    result.extend(accepted);
+                    result
+                }
+            };
+            if final_tags != current {
+                tx.execute(
+                    "DELETE FROM model_tags WHERE model_id=?1",
+                    params![target.model_id],
+                )?;
+                for id in final_tags.keys() {
+                    tx.execute(
+                        "INSERT INTO model_tags(model_id,tag_id) VALUES(?1,?2)",
+                        params![target.model_id, id],
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+                    params![timestamp(),target.model_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        targets
+            .iter()
+            .map(|target| {
+                self.get_model(&target.model_id)?
+                    .ok_or_else(|| LibraryError::ModelNotFound(target.model_id.clone()))
+            })
+            .collect()
+    }
+
     pub fn update_model_metadata(
         &self,
         model_id: &str,
@@ -1998,6 +2145,411 @@ impl LibraryDb {
         Ok(())
     }
 
+    pub fn create_filament(&self, input: &FilamentInput) -> Result<Filament, LibraryError> {
+        let input = validate_filament_input(input)?;
+        let id = new_id("filament");
+        let now = timestamp();
+        self.conn.execute(
+            "INSERT INTO filaments(id,version,brand,material,color,name,notes,origin,resource_kind,
+             archived,source_missing,created_at,updated_at)
+             VALUES(?1,1,?2,?3,?4,?5,?6,'manual','manual',0,0,?7,?7)",
+            params![
+                id,
+                input.brand,
+                input.material,
+                input.color,
+                input.name,
+                input.notes,
+                now
+            ],
+        )?;
+        self.get_filament(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("created filament is missing".into()))
+    }
+
+    pub fn get_filament(&self, id: &str) -> Result<Option<Filament>, LibraryError> {
+        self.conn
+            .query_row(
+                &format!("{FILAMENT_SELECT} WHERE f.id=?1"),
+                params![id],
+                filament_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_filaments(&self, include_unavailable: bool) -> Result<Vec<Filament>, LibraryError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{FILAMENT_SELECT} WHERE ?1 OR (f.archived=0 AND f.source_missing=0)
+             ORDER BY lower(f.brand),lower(f.material),lower(f.name),f.resource_kind,f.external_id,f.id"
+        ))?;
+        let rows = stmt.query_map(params![include_unavailable], filament_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn update_filament(
+        &self,
+        id: &str,
+        expected_version: u64,
+        input: &FilamentInput,
+    ) -> Result<Filament, LibraryError> {
+        let input = validate_filament_input(input)?;
+        let actual: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT version,origin FROM filaments WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((actual, origin)) = actual else {
+            return Err(LibraryError::InvalidInput("filament not found".into()));
+        };
+        if actual as u64 != expected_version {
+            return Err(LibraryError::FilamentVersionConflict {
+                filament_id: id.into(),
+                expected: expected_version,
+                actual: actual as u64,
+            });
+        }
+        if origin != "manual" {
+            return Err(LibraryError::InvalidInput(
+                "Spoolman filaments are updated by synchronization".into(),
+            ));
+        }
+        self.conn.execute(
+            "UPDATE filaments SET brand=?1,material=?2,color=?3,name=?4,notes=?5,
+             version=version+1,updated_at=?6 WHERE id=?7",
+            params![
+                input.brand,
+                input.material,
+                input.color,
+                input.name,
+                input.notes,
+                timestamp(),
+                id
+            ],
+        )?;
+        self.get_filament(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("filament not found".into()))
+    }
+
+    pub fn delete_filament(
+        &self,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<Option<Filament>, LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let actual: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT version,origin FROM filaments WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((actual, origin)) = actual else {
+            return Err(LibraryError::InvalidInput("filament not found".into()));
+        };
+        if actual as u64 != expected_version {
+            return Err(LibraryError::FilamentVersionConflict {
+                filament_id: id.into(),
+                expected: expected_version,
+                actual: actual as u64,
+            });
+        }
+        if origin != "manual" {
+            return Err(LibraryError::InvalidInput(
+                "Spoolman filaments cannot be deleted locally".into(),
+            ));
+        }
+        let referenced: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_filaments WHERE filament_id=?1)
+                 OR EXISTS(SELECT 1 FROM print_attempt_filaments WHERE filament_id=?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if referenced {
+            tx.execute(
+                "UPDATE filaments SET archived=1,version=version+1,updated_at=?1 WHERE id=?2",
+                params![timestamp(), id],
+            )?;
+        } else {
+            tx.execute("DELETE FROM filaments WHERE id=?1", params![id])?;
+        }
+        tx.commit()?;
+        self.get_filament(id)
+    }
+
+    pub fn set_model_filaments(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        filament_ids: &[String],
+    ) -> Result<Model, LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        set_model_filaments_tx(&tx, model_id, expected_version, filament_ids)?;
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    pub fn bulk_set_model_filaments(
+        &self,
+        targets: &[VersionedTarget],
+        filament_ids: &[String],
+    ) -> Result<Vec<Model>, LibraryError> {
+        if targets.is_empty() || targets.len() > 50_000 {
+            return Err(LibraryError::InvalidInput(
+                "filament assignment target count is invalid".into(),
+            ));
+        }
+        validate_filament_ids(filament_ids)?;
+        let mut unique = HashSet::new();
+        if targets
+            .iter()
+            .any(|target| !unique.insert(&target.model_id))
+        {
+            return Err(LibraryError::InvalidInput(
+                "duplicate filament assignment target".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        validate_catalog_filament_ids(&tx, filament_ids)?;
+        for target in targets {
+            validate_active_model_version(&tx, &target.model_id, target.expected_version)?;
+        }
+        for target in targets {
+            write_model_filaments_tx(&tx, &target.model_id, filament_ids)?;
+        }
+        tx.commit()?;
+        targets
+            .iter()
+            .map(|target| {
+                self.get_model(&target.model_id)?
+                    .ok_or_else(|| LibraryError::ModelNotFound(target.model_id.clone()))
+            })
+            .collect()
+    }
+
+    pub fn bulk_assign_model_filaments(
+        &self,
+        assignments: &[ModelFilamentAssignment],
+    ) -> Result<Vec<Model>, LibraryError> {
+        if assignments.is_empty() || assignments.len() > 50_000 {
+            return Err(LibraryError::InvalidInput(
+                "filament assignment count is invalid".into(),
+            ));
+        }
+        let mut unique_models = HashSet::new();
+        for assignment in assignments {
+            if !unique_models.insert(&assignment.target.model_id) {
+                return Err(LibraryError::InvalidInput(
+                    "duplicate filament assignment target".into(),
+                ));
+            }
+            validate_filament_ids(&assignment.filament_ids)?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let all_filament_ids = assignments
+            .iter()
+            .flat_map(|assignment| assignment.filament_ids.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        validate_catalog_filament_ids(&tx, &all_filament_ids)?;
+        for assignment in assignments {
+            validate_active_model_version(
+                &tx,
+                &assignment.target.model_id,
+                assignment.target.expected_version,
+            )?;
+        }
+        for assignment in assignments {
+            write_model_filaments_tx(&tx, &assignment.target.model_id, &assignment.filament_ids)?;
+        }
+        tx.commit()?;
+        assignments
+            .iter()
+            .map(|assignment| {
+                self.get_model(&assignment.target.model_id)?
+                    .ok_or_else(|| LibraryError::ModelNotFound(assignment.target.model_id.clone()))
+            })
+            .collect()
+    }
+
+    pub fn upsert_spoolman_source(&self, base_url: &str) -> Result<SpoolmanSource, LibraryError> {
+        let base_url = validate_spoolman_base_url(base_url)?;
+        if let Some(source) = self
+            .conn
+            .query_row(
+                "SELECT id,base_url,last_synced_at FROM filament_sources WHERE base_url=?1",
+                params![base_url],
+                spoolman_source_from_row,
+            )
+            .optional()?
+        {
+            return Ok(source);
+        }
+        let id = new_id("spoolman");
+        let now = timestamp();
+        self.conn.execute(
+            "INSERT INTO filament_sources(id,kind,base_url,created_at,updated_at)
+             VALUES(?1,'spoolman',?2,?3,?3)",
+            params![id, base_url, now],
+        )?;
+        self.get_spoolman_source(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("Spoolman source is missing".into()))
+    }
+
+    pub fn get_spoolman_source(&self, id: &str) -> Result<Option<SpoolmanSource>, LibraryError> {
+        self.conn
+            .query_row(
+                "SELECT id,base_url,last_synced_at FROM filament_sources WHERE id=?1 AND kind='spoolman'",
+                params![id],
+                spoolman_source_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_spoolman_sources(&self) -> Result<Vec<SpoolmanSource>, LibraryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,base_url,last_synced_at FROM filament_sources WHERE kind='spoolman' ORDER BY lower(base_url),id",
+        )?;
+        let rows = stmt.query_map([], spoolman_source_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn sync_spoolman_snapshot(
+        &self,
+        source_id: &str,
+        filaments: &[SpoolmanFilamentRecord],
+        spools: &[SpoolmanSpoolRecord],
+        completed_at: &str,
+    ) -> Result<FilamentSyncSummary, LibraryError> {
+        if filaments.len().saturating_add(spools.len()) > 100_000 {
+            return Err(LibraryError::InvalidInput(
+                "Spoolman snapshot exceeds 100000 records".into(),
+            ));
+        }
+        let completed_at = normalize_rfc3339(completed_at)?;
+        let mut filament_records = Vec::with_capacity(filaments.len());
+        let mut filament_external_ids = HashSet::new();
+        for record in filaments {
+            let external_id = validate_external_id(&record.external_id)?;
+            if !filament_external_ids.insert(external_id.clone()) {
+                return Err(LibraryError::InvalidInput(
+                    "duplicate Spoolman filament ID".into(),
+                ));
+            }
+            filament_records.push((external_id, validate_spoolman_filament(record)?));
+        }
+        let mut spool_records = Vec::with_capacity(spools.len());
+        let mut spool_external_ids = HashSet::new();
+        for record in spools {
+            let external_id = validate_external_id(&record.external_id)?;
+            let parent_external_id = validate_external_id(&record.filament_external_id)?;
+            if !spool_external_ids.insert(external_id.clone()) {
+                return Err(LibraryError::InvalidInput(
+                    "duplicate Spoolman spool ID".into(),
+                ));
+            }
+            if !filament_external_ids.contains(&parent_external_id) {
+                return Err(LibraryError::InvalidInput(
+                    "Spoolman spool references an unknown filament".into(),
+                ));
+            }
+            spool_records.push((
+                external_id,
+                parent_external_id,
+                validate_spoolman_spool(record)?,
+                record.archived,
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let source_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM filament_sources WHERE id=?1 AND kind='spoolman')",
+            params![source_id],
+            |row| row.get(0),
+        )?;
+        if !source_exists {
+            return Err(LibraryError::InvalidInput(
+                "Spoolman source not found".into(),
+            ));
+        }
+        let mut summary = FilamentSyncSummary {
+            source_id: source_id.into(),
+            seen: filament_records.len() + spool_records.len(),
+            completed_at: completed_at.clone(),
+            ..FilamentSyncSummary::default()
+        };
+        let mut local_filament_ids = HashMap::new();
+        let mut seen = HashSet::new();
+        for (external_id, input) in filament_records {
+            let (id, added, updated) = upsert_remote_filament(
+                &tx,
+                source_id,
+                "filament",
+                &external_id,
+                None,
+                &input,
+                false,
+            )?;
+            summary.added += usize::from(added);
+            summary.updated += usize::from(updated);
+            local_filament_ids.insert(external_id.clone(), id);
+            seen.insert(("filament".to_owned(), external_id));
+        }
+        for (external_id, parent_external_id, input, archived) in spool_records {
+            let parent_id = local_filament_ids.get(&parent_external_id).ok_or_else(|| {
+                LibraryError::InvalidInput("Spoolman filament identity is missing".into())
+            })?;
+            let (_id, added, updated) = upsert_remote_filament(
+                &tx,
+                source_id,
+                "spool",
+                &external_id,
+                Some(parent_id),
+                &input,
+                archived,
+            )?;
+            summary.added += usize::from(added);
+            summary.updated += usize::from(updated);
+            seen.insert(("spool".to_owned(), external_id));
+        }
+        let mut existing = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id,resource_kind,external_id,source_missing FROM filaments WHERE source_id=?1",
+            )?;
+            let rows = stmt.query_map(params![source_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?;
+            existing.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        for (id, kind, external_id, was_missing) in existing {
+            if !seen.contains(&(kind, external_id)) && !was_missing {
+                tx.execute(
+                    "UPDATE filaments SET source_missing=1,version=version+1,updated_at=?1 WHERE id=?2",
+                    params![timestamp(),id],
+                )?;
+                summary.missing += 1;
+            }
+        }
+        tx.execute(
+            "UPDATE filament_sources SET last_synced_at=?1,updated_at=?2 WHERE id=?3",
+            params![completed_at, timestamp(), source_id],
+        )?;
+        tx.commit()?;
+        Ok(summary)
+    }
+
     pub fn create_bundle(&self, model_ids: &[String]) -> Result<String, LibraryError> {
         if model_ids.is_empty() {
             return Err(LibraryError::InvalidInput("bundle requires models".into()));
@@ -2104,6 +2656,29 @@ impl LibraryDb {
         }
         Ok(tags)
     }
+
+    fn filament_ids_for_model(&self, model_id: &str) -> Result<Vec<String>, LibraryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT filament_id FROM model_filaments WHERE model_id=?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![model_id], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<String>, _>>()?)
+    }
+
+    fn filaments_by_model(&self) -> Result<HashMap<String, Vec<String>>, LibraryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model_id,filament_id FROM model_filaments ORDER BY model_id,ordinal",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut filaments = HashMap::<String, Vec<String>>::new();
+        for row in rows {
+            let (model_id, filament_id) = row?;
+            filaments.entry(model_id).or_default().push(filament_id);
+        }
+        Ok(filaments)
+    }
 }
 
 const MODEL_SELECT: &str = "SELECT m.id, m.display_name, m.description, m.folder_id,
@@ -2128,6 +2703,10 @@ const MODEL_SELECT: &str = "SELECT m.id, m.display_name, m.description, m.folder
      LEFT JOIN blobs b ON b.hash = r.blob_hash
      LEFT JOIN indexed_model_data d ON d.model_id = m.id
      LEFT JOIN index_roots ir ON ir.id = m.source_root_id";
+
+const FILAMENT_SELECT: &str = "SELECT f.id,f.version,f.brand,f.material,f.color,f.name,f.notes,
+       f.origin,f.resource_kind,f.source_id,f.external_id,f.parent_filament_id,
+       f.archived,f.source_missing,f.created_at,f.updated_at FROM filaments f";
 
 const SCHEMA: &str = r#"
 CREATE TABLE libraries (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -2222,6 +2801,39 @@ CREATE UNIQUE INDEX indexed_model_source_idx ON models(source_root_id, source_pa
 CREATE TABLE bundles (id TEXT PRIMARY KEY, source_root_id TEXT, source_path TEXT, created_at TEXT NOT NULL, UNIQUE(source_root_id,source_path));
 CREATE TABLE print_attempts (id TEXT PRIMARY KEY, model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE, printed_at TEXT NOT NULL, quantity INTEGER NOT NULL, notes TEXT NOT NULL, outcome TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE print_attempt_filaments (attempt_id TEXT NOT NULL REFERENCES print_attempts(id) ON DELETE CASCADE, filament_id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(attempt_id,filament_id));
+CREATE TABLE filament_sources (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind='spoolman'),
+    base_url TEXT NOT NULL UNIQUE,
+    last_synced_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE filaments (
+    id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+    brand TEXT NOT NULL DEFAULT '', material TEXT NOT NULL DEFAULT '',
+    color TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL CHECK(origin IN ('manual','spoolman')),
+    resource_kind TEXT NOT NULL CHECK(resource_kind IN ('manual','filament','spool')),
+    source_id TEXT REFERENCES filament_sources(id) ON DELETE RESTRICT,
+    external_id TEXT,
+    parent_filament_id TEXT REFERENCES filaments(id) ON DELETE RESTRICT,
+    archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+    source_missing INTEGER NOT NULL DEFAULT 0 CHECK(source_missing IN (0,1)),
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    CHECK((origin='manual' AND resource_kind='manual' AND source_id IS NULL AND external_id IS NULL AND parent_filament_id IS NULL AND source_missing=0)
+       OR (origin='spoolman' AND resource_kind IN ('filament','spool') AND source_id IS NOT NULL AND external_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX filaments_remote_identity_idx ON filaments(source_id,resource_kind,external_id)
+    WHERE source_id IS NOT NULL;
+CREATE TABLE model_filaments (
+    model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    filament_id TEXT NOT NULL REFERENCES filaments(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 4),
+    PRIMARY KEY(model_id,filament_id), UNIQUE(model_id,ordinal)
+);
+CREATE INDEX model_filaments_filament_idx ON model_filaments(filament_id,model_id);
 "#;
 
 const MIGRATE_V1_TO_V2: &str = r#"
@@ -2294,6 +2906,45 @@ PRAGMA user_version=3;
 COMMIT;
 "#;
 
+const MIGRATE_V3_TO_V4: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE filament_sources (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind='spoolman'),
+    base_url TEXT NOT NULL UNIQUE,
+    last_synced_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE filaments (
+    id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+    brand TEXT NOT NULL DEFAULT '', material TEXT NOT NULL DEFAULT '',
+    color TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL CHECK(origin IN ('manual','spoolman')),
+    resource_kind TEXT NOT NULL CHECK(resource_kind IN ('manual','filament','spool')),
+    source_id TEXT REFERENCES filament_sources(id) ON DELETE RESTRICT,
+    external_id TEXT,
+    parent_filament_id TEXT REFERENCES filaments(id) ON DELETE RESTRICT,
+    archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+    source_missing INTEGER NOT NULL DEFAULT 0 CHECK(source_missing IN (0,1)),
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    CHECK((origin='manual' AND resource_kind='manual' AND source_id IS NULL AND external_id IS NULL AND parent_filament_id IS NULL AND source_missing=0)
+       OR (origin='spoolman' AND resource_kind IN ('filament','spool') AND source_id IS NOT NULL AND external_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX filaments_remote_identity_idx ON filaments(source_id,resource_kind,external_id)
+    WHERE source_id IS NOT NULL;
+CREATE TABLE model_filaments (
+    model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    filament_id TEXT NOT NULL REFERENCES filaments(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 4),
+    PRIMARY KEY(model_id,filament_id), UNIQUE(model_id,ordinal)
+);
+CREATE INDEX model_filaments_filament_idx ON model_filaments(filament_id,model_id);
+PRAGMA user_version=4;
+COMMIT;
+"#;
+
 const ENSURE_CATALOG_SETTINGS: &str = r#"
 CREATE TABLE IF NOT EXISTS catalog_settings (
     id TEXT PRIMARY KEY CHECK(id = 'local'),
@@ -2326,6 +2977,7 @@ fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         tags: Vec::new(),
+        filament_ids: Vec::new(),
         source_kind: row.get(12)?,
         source_path: row.get(13)?,
         source_root_id: row.get(14)?,
@@ -2344,6 +2996,48 @@ fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
         },
         bundle_id: row.get(26)?,
         source_archive_member: row.get(27)?,
+    })
+}
+
+fn filament_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Filament> {
+    let origin = match row.get::<_, String>(7)?.as_str() {
+        "manual" => FilamentOrigin::Manual,
+        "spoolman" => FilamentOrigin::Spoolman,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let resource_kind = match row.get::<_, String>(8)?.as_str() {
+        "manual" => FilamentResourceKind::Manual,
+        "filament" => FilamentResourceKind::Filament,
+        "spool" => FilamentResourceKind::Spool,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let version = row.get::<_, i64>(1)?;
+    Ok(Filament {
+        id: row.get(0)?,
+        version: u64::try_from(version)
+            .map_err(|_| invalid_persisted_integer(1, "filament version is negative"))?,
+        brand: row.get(2)?,
+        material: row.get(3)?,
+        color: row.get(4)?,
+        name: row.get(5)?,
+        notes: row.get(6)?,
+        origin,
+        resource_kind,
+        source_id: row.get(9)?,
+        external_id: row.get(10)?,
+        parent_filament_id: row.get(11)?,
+        archived: row.get(12)?,
+        source_missing: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn spoolman_source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpoolmanSource> {
+    Ok(SpoolmanSource {
+        id: row.get(0)?,
+        base_url: row.get(1)?,
+        last_synced_at: row.get(2)?,
     })
 }
 
@@ -2711,6 +3405,293 @@ fn clean_optional(value: Option<&str>, max: usize) -> Result<Option<String>, Lib
             }
         }
         None => Ok(None),
+    }
+}
+
+fn validate_filament_input(input: &FilamentInput) -> Result<FilamentInput, LibraryError> {
+    Ok(FilamentInput {
+        brand: clean_filament_text(&input.brand, 200, false, false)?,
+        material: clean_filament_text(&input.material, 200, false, false)?,
+        color: clean_filament_text(&input.color, 256, false, false)?,
+        name: clean_filament_text(&input.name, 200, true, false)?,
+        notes: clean_filament_text(&input.notes, 20_000, false, true)?,
+    })
+}
+
+fn validate_spoolman_filament(
+    record: &SpoolmanFilamentRecord,
+) -> Result<FilamentInput, LibraryError> {
+    validate_filament_input(&FilamentInput {
+        brand: record.brand.clone(),
+        material: record.material.clone(),
+        color: record.color.clone(),
+        name: record.name.clone(),
+        notes: record.notes.clone(),
+    })
+}
+
+fn validate_spoolman_spool(record: &SpoolmanSpoolRecord) -> Result<FilamentInput, LibraryError> {
+    validate_filament_input(&FilamentInput {
+        brand: record.brand.clone(),
+        material: record.material.clone(),
+        color: record.color.clone(),
+        name: record.name.clone(),
+        notes: record.notes.clone(),
+    })
+}
+
+fn clean_filament_text(
+    value: &str,
+    max: usize,
+    required: bool,
+    multiline: bool,
+) -> Result<String, LibraryError> {
+    let cleaned = value.trim();
+    let invalid_control = cleaned.chars().any(|character| {
+        character == '\0'
+            || (character.is_control() && (!multiline || !matches!(character, '\n' | '\r' | '\t')))
+    });
+    if cleaned.len() > max || invalid_control || (required && cleaned.is_empty()) {
+        return Err(LibraryError::InvalidInput(
+            "filament text field is invalid".into(),
+        ));
+    }
+    Ok(cleaned.into())
+}
+
+fn validate_external_id(value: &str) -> Result<String, LibraryError> {
+    let cleaned = value.trim();
+    if cleaned.is_empty()
+        || value.len() > 256
+        || value.chars().any(char::is_control)
+        || value != cleaned
+    {
+        return Err(LibraryError::InvalidInput(
+            "Spoolman external ID is invalid".into(),
+        ));
+    }
+    Ok(cleaned.into())
+}
+
+fn validate_spoolman_base_url(value: &str) -> Result<String, LibraryError> {
+    let value = value.trim().trim_end_matches('/');
+    if value.len() > 2048
+        || !(value.starts_with("http://") || value.starts_with("https://"))
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || value.contains(['@', '?', '#'])
+        || value
+            .split_once("://")
+            .is_none_or(|(_, remainder)| remainder.is_empty() || remainder.starts_with('/'))
+    {
+        return Err(LibraryError::InvalidInput(
+            "Spoolman base URL must be a bounded HTTP or HTTPS URL".into(),
+        ));
+    }
+    Ok(value.into())
+}
+
+fn validate_filament_ids(ids: &[String]) -> Result<(), LibraryError> {
+    let mut unique = HashSet::new();
+    if ids.len() > 5
+        || ids.iter().any(|id| {
+            id.is_empty()
+                || id.len() > 256
+                || id.trim() != id
+                || id.chars().any(char::is_control)
+                || !unique.insert(id)
+        })
+    {
+        return Err(LibraryError::InvalidInput(
+            "model filament assignments are invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_catalog_filament_ids(
+    tx: &rusqlite::Transaction<'_>,
+    ids: &[String],
+) -> Result<(), LibraryError> {
+    for id in ids {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM filaments WHERE id=?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(LibraryError::InvalidInput(format!(
+                "filament not found: {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn set_model_filaments_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    expected_version: u64,
+    filament_ids: &[String],
+) -> Result<(), LibraryError> {
+    validate_filament_ids(filament_ids)?;
+    validate_catalog_filament_ids(tx, filament_ids)?;
+    set_model_filaments_tx_validated(tx, model_id, expected_version, filament_ids)
+}
+
+fn set_model_filaments_tx_validated(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    expected_version: u64,
+    filament_ids: &[String],
+) -> Result<(), LibraryError> {
+    validate_active_model_version(tx, model_id, expected_version)?;
+    write_model_filaments_tx(tx, model_id, filament_ids)
+}
+
+fn write_model_filaments_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    filament_ids: &[String],
+) -> Result<(), LibraryError> {
+    tx.execute(
+        "DELETE FROM model_filaments WHERE model_id=?1",
+        params![model_id],
+    )?;
+    for (ordinal, filament_id) in filament_ids.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO model_filaments(model_id,filament_id,ordinal) VALUES(?1,?2,?3)",
+            params![model_id, filament_id, ordinal as i64],
+        )?;
+    }
+    tx.execute(
+        "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+        params![timestamp(), model_id],
+    )?;
+    Ok(())
+}
+
+fn validate_active_model_version(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    expected_version: u64,
+) -> Result<(), LibraryError> {
+    let current: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT metadata_version,deleted_at FROM models WHERE id=?1",
+            params![model_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((actual, deleted_at)) = current else {
+        return Err(LibraryError::ModelNotFound(model_id.into()));
+    };
+    if deleted_at.is_some() {
+        return Err(LibraryError::ModelNotFound(model_id.into()));
+    }
+    if actual as u64 != expected_version {
+        return Err(LibraryError::MetadataConflict {
+            model_id: model_id.into(),
+            expected: expected_version,
+            actual: actual as u64,
+        });
+    }
+    Ok(())
+}
+
+fn upsert_remote_filament(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: &str,
+    resource_kind: &str,
+    external_id: &str,
+    parent_filament_id: Option<&String>,
+    input: &FilamentInput,
+    archived: bool,
+) -> Result<(String, bool, bool), LibraryError> {
+    type ExistingRemoteFilament = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        bool,
+        bool,
+    );
+    let existing: Option<ExistingRemoteFilament> = tx
+        .query_row(
+            "SELECT id,brand,material,color,name,notes,parent_filament_id,archived,source_missing
+             FROM filaments WHERE source_id=?1 AND resource_kind=?2 AND external_id=?3",
+            params![source_id, resource_kind, external_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((id, brand, material, color, name, notes, parent, old_archived, missing)) = existing
+    {
+        let changed = brand != input.brand
+            || material != input.material
+            || color != input.color
+            || name != input.name
+            || notes != input.notes
+            || parent.as_deref() != parent_filament_id.map(String::as_str)
+            || old_archived != archived
+            || missing;
+        if changed {
+            tx.execute(
+                "UPDATE filaments SET brand=?1,material=?2,color=?3,name=?4,notes=?5,
+                 parent_filament_id=?6,archived=?7,source_missing=0,version=version+1,updated_at=?8
+                 WHERE id=?9",
+                params![
+                    input.brand,
+                    input.material,
+                    input.color,
+                    input.name,
+                    input.notes,
+                    parent_filament_id,
+                    archived,
+                    timestamp(),
+                    id
+                ],
+            )?;
+        }
+        Ok((id, false, changed))
+    } else {
+        let id = new_id("filament");
+        let now = timestamp();
+        tx.execute(
+            "INSERT INTO filaments(id,version,brand,material,color,name,notes,origin,resource_kind,
+             source_id,external_id,parent_filament_id,archived,source_missing,created_at,updated_at)
+             VALUES(?1,1,?2,?3,?4,?5,?6,'spoolman',?7,?8,?9,?10,?11,0,?12,?12)",
+            params![
+                id,
+                input.brand,
+                input.material,
+                input.color,
+                input.name,
+                input.notes,
+                resource_kind,
+                source_id,
+                external_id,
+                parent_filament_id,
+                archived,
+                now
+            ],
+        )?;
+        Ok((id, true, false))
     }
 }
 fn validated_archive_member(value: &str) -> Result<String, LibraryError> {
@@ -3431,6 +4412,127 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.metadata.notes, None);
         assert_eq!(cleared.description, "");
+    }
+
+    #[test]
+    fn reviewed_ai_tags_apply_atomically_with_category_aware_merge() {
+        use crate::models::ReviewedTag;
+
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("AI review", None).unwrap();
+        let color = db.create_tag("Red", Some("Color")).unwrap();
+        let style = db.create_tag("Cute", Some("Style")).unwrap();
+        let model = db
+            .update_model_metadata(
+                &model.id,
+                model.metadata_version,
+                &MetadataPatch {
+                    tags: Some(vec![color.id, style.id]),
+                    tag_mode: Some(TagMode::Replace),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        let merged = db
+            .apply_reviewed_tags(
+                &[ReviewedTagTarget {
+                    model_id: model.id.clone(),
+                    expected_version: model.metadata_version,
+                    tags: vec![
+                        ReviewedTag {
+                            name: "Blue".into(),
+                            category: Some("Color".into()),
+                        },
+                        ReviewedTag {
+                            name: "Desk toy".into(),
+                            category: None,
+                        },
+                    ],
+                }],
+                ReviewedTagStrategy::Merge,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(merged.tags, ["Blue", "Cute", "Desk toy"]);
+        assert!(!merged.tags.contains(&"Red".into()));
+
+        let other = db.create_model("Stale", None).unwrap();
+        let changed = db
+            .update_model_metadata(
+                &other.id,
+                other.metadata_version,
+                &MetadataPatch {
+                    notes: Some("changed".into()),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            db.apply_reviewed_tags(
+                &[
+                    ReviewedTagTarget {
+                        model_id: merged.id.clone(),
+                        expected_version: merged.metadata_version,
+                        tags: vec![ReviewedTag {
+                            name: "Must roll back".into(),
+                            category: None,
+                        }],
+                    },
+                    ReviewedTagTarget {
+                        model_id: other.id.clone(),
+                        expected_version: other.metadata_version,
+                        tags: vec![],
+                    },
+                ],
+                ReviewedTagStrategy::Append,
+            ),
+            Err(LibraryError::MetadataConflict { .. })
+        ));
+        assert!(!db
+            .list_tags()
+            .unwrap()
+            .iter()
+            .any(|tag| tag.name == "Must roll back"));
+        assert_eq!(db.get_model(&merged.id).unwrap().unwrap().tags, merged.tags);
+        assert!(changed.metadata_version > other.metadata_version);
+
+        assert!(db
+            .apply_reviewed_tags(
+                &[ReviewedTagTarget {
+                    model_id: merged.id.clone(),
+                    expected_version: merged.metadata_version,
+                    tags: vec![
+                        ReviewedTag {
+                            name: "Category rollback".into(),
+                            category: None,
+                        },
+                        ReviewedTag {
+                            name: "Cute".into(),
+                            category: Some("Color".into()),
+                        },
+                    ],
+                }],
+                ReviewedTagStrategy::Append,
+            )
+            .is_err());
+        assert!(!db
+            .list_tags()
+            .unwrap()
+            .iter()
+            .any(|tag| tag.name == "Category rollback"));
+        assert_eq!(db.get_model(&merged.id).unwrap().unwrap().tags, merged.tags);
+        let cleared = db
+            .apply_reviewed_tags(
+                &[ReviewedTagTarget {
+                    model_id: merged.id,
+                    expected_version: merged.metadata_version,
+                    tags: vec![],
+                }],
+                ReviewedTagStrategy::Replace,
+            )
+            .unwrap();
+        assert!(cleared[0].tags.is_empty());
     }
 
     #[test]
@@ -4630,6 +5732,346 @@ mod tests {
         );
         let _ = fs::remove_dir_all(library_root);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn schema_v3_migration_backs_up_and_adds_filament_catalog() {
+        let root = temp_root("schema-v3-filaments");
+        fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "DROP TABLE model_filaments; DROP TABLE filaments; DROP TABLE filament_sources;
+             PRAGMA user_version=3;",
+        )
+        .unwrap();
+        drop(conn);
+        let db = LibraryDb::open(&root).unwrap();
+        assert_eq!(db.list_filaments(true).unwrap(), Vec::<Filament>::new());
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let backup = root.join("library.sqlite3.schema-v3.backup");
+        assert!(backup.is_file());
+        let backup_conn = Connection::open(backup).unwrap();
+        let backup_version: i64 = backup_conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manual_filaments_assign_atomically_archive_references_and_preserve_unknown_history() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Filament model", None).unwrap();
+        let red = db
+            .create_filament(&FilamentInput {
+                brand: "Example".into(),
+                material: "PLA".into(),
+                color: "#FF0000".into(),
+                name: "Red".into(),
+                notes: "local".into(),
+            })
+            .unwrap();
+        let assigned = db
+            .set_model_filaments(
+                &model.id,
+                model.metadata_version,
+                std::slice::from_ref(&red.id),
+            )
+            .unwrap();
+        assert_eq!(assigned.filament_ids, std::slice::from_ref(&red.id));
+        assert!(matches!(
+            db.set_model_filaments(&model.id, model.metadata_version, &[]),
+            Err(LibraryError::MetadataConflict { .. })
+        ));
+        let attempt = db
+            .create_print_attempt(
+                &model.id,
+                &PrintAttemptInput {
+                    printed_at: "2026-10-10T12:00:00Z".into(),
+                    quantity: 1,
+                    notes: String::new(),
+                    filament_ids: vec!["legacy-unknown".into()],
+                    outcome: PrintOutcome::Printed,
+                },
+            )
+            .unwrap();
+        assert_eq!(attempt.filament_ids, ["legacy-unknown"]);
+        let archived = db.delete_filament(&red.id, red.version).unwrap().unwrap();
+        assert!(archived.archived);
+        assert_eq!(
+            db.get_print_attempt(&attempt.id)
+                .unwrap()
+                .unwrap()
+                .filament_ids,
+            ["legacy-unknown"]
+        );
+        let extra = (0..5)
+            .map(|number| {
+                db.create_filament(&FilamentInput {
+                    name: format!("F{number}"),
+                    ..FilamentInput::default()
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let current = db.get_model(&model.id).unwrap().unwrap();
+        assert!(db
+            .set_model_filaments(
+                &model.id,
+                current.metadata_version,
+                &extra.iter().map(|item| item.id.clone()).collect::<Vec<_>>()
+            )
+            .is_ok());
+        let current = db.get_model(&model.id).unwrap().unwrap();
+        let mut six = current.filament_ids.clone();
+        six.push(red.id);
+        assert!(db
+            .set_model_filaments(&model.id, current.metadata_version, &six)
+            .is_err());
+        let unreferenced = db
+            .create_filament(&FilamentInput {
+                name: "Disposable".into(),
+                ..FilamentInput::default()
+            })
+            .unwrap();
+        assert!(db
+            .delete_filament(&unreferenced.id, unreferenced.version)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn heterogeneous_filament_assignments_prevalidate_every_target_atomically() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let a = db.create_model("A", None).unwrap();
+        let b = db.create_model("B", None).unwrap();
+        let make = |name: &str| {
+            db.create_filament(&FilamentInput {
+                name: name.into(),
+                ..FilamentInput::default()
+            })
+            .unwrap()
+        };
+        let first = make("First");
+        let second = make("Second");
+        let shared = make("Shared");
+        let a = db
+            .set_model_filaments(&a.id, a.metadata_version, std::slice::from_ref(&first.id))
+            .unwrap();
+        let b = db
+            .set_model_filaments(&b.id, b.metadata_version, std::slice::from_ref(&second.id))
+            .unwrap();
+        let changed_b = db
+            .update_model_metadata(
+                &b.id,
+                b.metadata_version,
+                &MetadataPatch {
+                    notes: Some("changed".into()),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            db.bulk_assign_model_filaments(&[
+                ModelFilamentAssignment {
+                    target: VersionedTarget {
+                        model_id: a.id.clone(),
+                        expected_version: a.metadata_version,
+                    },
+                    filament_ids: vec![first.id.clone(), shared.id.clone()],
+                },
+                ModelFilamentAssignment {
+                    target: VersionedTarget {
+                        model_id: b.id.clone(),
+                        expected_version: b.metadata_version,
+                    },
+                    filament_ids: vec![second.id.clone(), shared.id.clone()],
+                },
+            ]),
+            Err(LibraryError::MetadataConflict { .. })
+        ));
+        assert_eq!(
+            db.get_model(&a.id).unwrap().unwrap().filament_ids,
+            std::slice::from_ref(&first.id)
+        );
+        assert!(db
+            .bulk_assign_model_filaments(&[
+                ModelFilamentAssignment {
+                    target: VersionedTarget {
+                        model_id: a.id.clone(),
+                        expected_version: a.metadata_version,
+                    },
+                    filament_ids: vec![first.id.clone(), shared.id.clone()],
+                },
+                ModelFilamentAssignment {
+                    target: VersionedTarget {
+                        model_id: b.id.clone(),
+                        expected_version: changed_b.metadata_version,
+                    },
+                    filament_ids: vec!["unknown".into()],
+                },
+            ])
+            .is_err());
+        assert_eq!(
+            db.get_model(&a.id).unwrap().unwrap().filament_ids,
+            std::slice::from_ref(&first.id)
+        );
+        let updated = db
+            .bulk_assign_model_filaments(&[
+                ModelFilamentAssignment {
+                    target: VersionedTarget {
+                        model_id: a.id.clone(),
+                        expected_version: a.metadata_version,
+                    },
+                    filament_ids: vec![first.id.clone(), shared.id.clone()],
+                },
+                ModelFilamentAssignment {
+                    target: VersionedTarget {
+                        model_id: b.id,
+                        expected_version: changed_b.metadata_version,
+                    },
+                    filament_ids: vec![second.id.clone(), shared.id.clone()],
+                },
+            ])
+            .unwrap();
+        assert_eq!(updated[0].filament_ids, [first.id, shared.id.clone()]);
+        assert_eq!(updated[1].filament_ids, [second.id, shared.id]);
+    }
+
+    #[test]
+    fn spoolman_complete_snapshots_keep_ids_and_references_across_missing_and_reappearance() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let source = db
+            .upsert_spoolman_source("http://spoolman.local/api/v1/")
+            .unwrap();
+        let filament = SpoolmanFilamentRecord {
+            external_id: "1".into(),
+            brand: "Vendor".into(),
+            material: "PLA".into(),
+            color: "FF0000".into(),
+            name: "Red PLA".into(),
+            notes: String::new(),
+        };
+        let spool = SpoolmanSpoolRecord {
+            external_id: "10".into(),
+            filament_external_id: "1".into(),
+            brand: filament.brand.clone(),
+            material: filament.material.clone(),
+            color: filament.color.clone(),
+            name: filament.name.clone(),
+            notes: "Shelf A".into(),
+            archived: true,
+        };
+        let first = db
+            .sync_spoolman_snapshot(
+                &source.id,
+                std::slice::from_ref(&filament),
+                std::slice::from_ref(&spool),
+                "2026-10-10T12:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(first.added, 2);
+        let imported = db.list_filaments(true).unwrap();
+        let type_id = imported
+            .iter()
+            .find(|item| item.resource_kind == FilamentResourceKind::Filament)
+            .unwrap()
+            .id
+            .clone();
+        let spool_row = imported
+            .iter()
+            .find(|item| item.resource_kind == FilamentResourceKind::Spool)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            spool_row.parent_filament_id.as_deref(),
+            Some(type_id.as_str())
+        );
+        assert!(spool_row.archived);
+        let repeated = db
+            .sync_spoolman_snapshot(
+                &source.id,
+                std::slice::from_ref(&filament),
+                std::slice::from_ref(&spool),
+                "2026-10-10T12:01:00Z",
+            )
+            .unwrap();
+        assert_eq!(
+            (repeated.added, repeated.updated, repeated.missing),
+            (0, 0, 0)
+        );
+        let model = db.create_model("Synced", None).unwrap();
+        db.set_model_filaments(
+            &model.id,
+            model.metadata_version,
+            std::slice::from_ref(&spool_row.id),
+        )
+        .unwrap();
+        let malformed = SpoolmanSpoolRecord {
+            filament_external_id: "missing".into(),
+            ..spool.clone()
+        };
+        assert!(db
+            .sync_spoolman_snapshot(
+                &source.id,
+                std::slice::from_ref(&filament),
+                &[malformed],
+                "2026-10-10T12:02:00Z"
+            )
+            .is_err());
+        assert!(
+            !db.get_filament(&spool_row.id)
+                .unwrap()
+                .unwrap()
+                .source_missing
+        );
+        let missing = db
+            .sync_spoolman_snapshot(&source.id, &[], &[], "2026-10-10T12:03:00Z")
+            .unwrap();
+        assert_eq!(missing.missing, 2);
+        assert!(
+            db.get_filament(&spool_row.id)
+                .unwrap()
+                .unwrap()
+                .source_missing
+        );
+        assert_eq!(
+            db.get_model(&model.id).unwrap().unwrap().filament_ids,
+            std::slice::from_ref(&spool_row.id)
+        );
+        db.sync_spoolman_snapshot(
+            &source.id,
+            std::slice::from_ref(&filament),
+            std::slice::from_ref(&spool),
+            "2026-10-10T12:04:00Z",
+        )
+        .unwrap();
+        assert!(
+            !db.get_filament(&spool_row.id)
+                .unwrap()
+                .unwrap()
+                .source_missing
+        );
+        assert_eq!(
+            db.get_filament(&spool_row.id).unwrap().unwrap().id,
+            spool_row.id
+        );
+        let other = db
+            .upsert_spoolman_source("https://other.example/api/v1")
+            .unwrap();
+        db.sync_spoolman_snapshot(
+            &other.id,
+            std::slice::from_ref(&filament),
+            std::slice::from_ref(&spool),
+            "2026-10-10T12:05:00Z",
+        )
+        .unwrap();
+        assert_eq!(db.list_filaments(true).unwrap().len(), 4);
     }
 
     #[test]

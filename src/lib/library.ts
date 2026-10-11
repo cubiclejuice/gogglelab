@@ -1,5 +1,6 @@
 import type {
   CatalogSettings,
+  Filament,
   IndexRoot,
   LibraryFolder,
   LibraryModel,
@@ -20,6 +21,7 @@ import {
   type SelectionScope,
 } from "./library-editor";
 import { LibraryPrintHistory } from "./library-history";
+import { filamentLabel, matchesFilamentFilter } from "./library-filaments";
 import {
   chooseRouletteModel,
   explicitScopeIds,
@@ -381,6 +383,7 @@ export class LibraryPanel {
   private readonly categorySelect: HTMLSelectElement;
   private readonly parentSelect: HTMLSelectElement;
   private readonly licenseSelect: HTMLSelectElement;
+  private readonly filamentSelect: HTMLSelectElement;
   private readonly body: HTMLElement;
   private readonly selectionStatus: HTMLElement;
   private readonly metadataEditor: LibraryMetadataEditor;
@@ -391,6 +394,7 @@ export class LibraryPanel {
   private allModels: LibraryModel[] = [];
   private allRoots: IndexRoot[] = [];
   private allTags: LibraryTag[] = [];
+  private allFilaments: Filament[] = [];
   private filteredModels: LibraryModel[] = [];
   private visibleModelIds: string[] = [];
   private readonly selectedModelIds = new Set<string>();
@@ -467,6 +471,8 @@ export class LibraryPanel {
   onClearCustomPreview: (model: LibraryModel) => Promise<void> = async () => {};
   onPreviewBundle: (bundleId: string) => Promise<void> = async () => {};
   onOpenManagement: () => void = () => {};
+  onOpenFilaments: (models: LibraryModel[]) => void = () => {};
+  onOpenIntegrations: (models: LibraryModel[]) => void = () => {};
 
   constructor(container: HTMLElement) {
     this.metadataEditor = new LibraryMetadataEditor(container);
@@ -588,6 +594,15 @@ export class LibraryPanel {
     this.categorySelect = this.selectControl("Tag category", [["", "All categories"]]);
     this.parentSelect = this.selectControl("Parent model", [["", "All parent relationships"]]);
     this.licenseSelect = this.selectControl("Model license", [["", "All licenses"]]);
+    this.filamentSelect = document.createElement("select");
+    this.filamentSelect.className = "library-select";
+    this.filamentSelect.multiple = true;
+    this.filamentSelect.size = 1;
+    this.filamentSelect.setAttribute(
+      "aria-label",
+      "Assigned filaments; choose multiple to match any",
+    );
+    this.filamentSelect.addEventListener("change", () => this.resetAndRender());
     toolbar.append(
       this.searchInput,
       this.sourceSelect,
@@ -601,6 +616,7 @@ export class LibraryPanel {
       this.categorySelect,
       this.parentSelect,
       this.licenseSelect,
+      this.filamentSelect,
     );
 
     this.body = document.createElement("div");
@@ -631,6 +647,14 @@ export class LibraryPanel {
       this.actionButton("Review duplicates", "", () => void this.reviewDuplicates()),
       this.actionButton("Remove selected", "danger", () => void this.removeSelected()),
       this.actionButton("Print roulette", "", () => this.runRoulette()),
+      this.actionButton("Filaments…", "", () => {
+        const models = this.allModels.filter((model) => this.selectedModelIds.has(model.id));
+        this.onOpenFilaments(models);
+      }),
+      this.actionButton("AI tags…", "", () => {
+        const models = this.allModels.filter((model) => this.selectedModelIds.has(model.id));
+        this.onOpenIntegrations(models);
+      }),
     );
     const viewSwitcher = document.createElement("div");
     viewSwitcher.className = "library-view-switcher";
@@ -787,6 +811,7 @@ export class LibraryPanel {
     roots: IndexRoot[] = [],
     settings: CatalogSettings = this.catalogSettings,
     tags: LibraryTag[] = this.allTags,
+    filaments: Filament[] = this.allFilaments,
   ): void {
     for (const modelId of thumbnailCacheInvalidations(this.allModels, models)) {
       this.thumbnailCache.delete(modelId);
@@ -796,8 +821,10 @@ export class LibraryPanel {
     this.allModels = models;
     this.allRoots = roots;
     this.allTags = tags;
+    this.allFilaments = filaments;
     this.tagManager.update(tags);
     this.refreshMetadataFilterOptions(models, tags);
+    this.refreshFilamentFilterOptions(filaments);
     const modelIds = new Set(models.map((model) => model.id));
     for (const id of this.selectedModelIds) if (!modelIds.has(id)) this.selectedModelIds.delete(id);
     this.setCatalogSettings(settings);
@@ -936,6 +963,20 @@ export class LibraryPanel {
     select.replaceChildren();
     for (const [value, label] of options) select.add(new Option(label, value));
     select.value = options.some(([value]) => value === selected) ? selected : options[0][0];
+  }
+
+  private refreshFilamentFilterOptions(filaments: Filament[]): void {
+    const selected = new Set(
+      [...this.filamentSelect.selectedOptions].map((option) => option.value),
+    );
+    this.filamentSelect.replaceChildren();
+    this.filamentSelect.add(new Option("Unassigned", "__unassigned__"));
+    for (const filament of filaments) {
+      const option = new Option(filamentLabel(filament), filament.id);
+      option.disabled = filament.archived || filament.source_missing;
+      this.filamentSelect.add(option);
+    }
+    for (const option of this.filamentSelect.options) option.selected = selected.has(option.value);
   }
 
   private settingField(label: string, control: HTMLElement): HTMLLabelElement {
@@ -1081,6 +1122,7 @@ export class LibraryPanel {
       this.printHistory.show(
         model,
         await this.onListPrintAttempts(model.id),
+        this.allFilaments,
         active instanceof HTMLElement ? active : undefined,
       );
     } catch (error) {
@@ -1100,6 +1142,13 @@ export class LibraryPanel {
       button.setAttribute("aria-pressed", String(mode === this.viewMode));
     }
     this.renderNavigation();
+    const selectedFilamentOptions = [...this.filamentSelect.selectedOptions].map(
+      (option) => option.value,
+    );
+    const selectedFilaments = new Set(
+      selectedFilamentOptions.filter((value) => value !== "__unassigned__"),
+    );
+    const includeUnassigned = selectedFilamentOptions.includes("__unassigned__");
     const models = filterAndSortLibraryModels(this.allModels, {
       query: this.searchInput.value,
       folderId: this.activeFolderId,
@@ -1114,6 +1163,9 @@ export class LibraryPanel {
       if (!matchesPrintedFilter(model, this.printedSelect.value as PrintedFilter)) return false;
       const group = this.groupSelect.value as LibraryGroupFilter;
       if (!matchesLibraryGroup(model, group)) return false;
+      if (!matchesFilamentFilter(model, selectedFilaments, includeUnassigned)) {
+        return false;
+      }
       return matchesLibraryMetadataFilters(
         model,
         {

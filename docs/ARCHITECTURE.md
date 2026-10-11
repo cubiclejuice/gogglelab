@@ -8,7 +8,7 @@ The Rust workspace also contains model parsing/inspection, managed Library stora
 Pro consumes exported frontend contracts and the composable native builder from a pinned `core/` submodule.
 Private source owns custom colorways, palette access and licensing.
 The core registers Library and slicer launch independently of Pro entitlements.
-Library uses the existing app-data library directory and schema-v1 database; initialization is lazy.
+Library uses the existing app-data library directory; schema upgrades are backed up and initialization is lazy.
 The Pro plugin must not register duplicate Library state or commands.
 The generation-checked original-source accessor preserves canonical source paths.
 
@@ -61,3 +61,20 @@ outside the replaceable Library root, and macOS launches use a new instance.
 Preview images normalize bounded PNG/JPEG inputs to small owned PNGs. Safe package
 thumbnail relationships support embedded 3MF images; custom images retain priority over
 regeneration. No new capability depends on license state.
+
+## Free filaments and integrations (phase 5)
+Schema4 adds stable manual/Spoolman catalog rows and ordered max-five model assignments.
+Referenced manual records archive; missing/archived remote records retain identity.
+Filament types and physical spools use separate source-scoped IDs. Complete bounded
+GET-only snapshots reconcile atomically; partial failures do not mark entries missing.
+Recovery schemas1–4 preserve unknown historical IDs and selected dependency rows.
+Heterogeneous batch assignments prevalidate every target before one transaction.
+
+library-integrations implements bounded provider/Spoolman HTTP without GUI dependencies.
+Remote endpoints require HTTPS and admitted pinned DNS/IP destinations; local/private
+endpoints require explicit scope. Redirects and environment proxies are disabled.
+Native IntegrationState keeps Zeroizing session secrets out of persisted config/catalog
+exports. Single-flight admission bounds jobs; config/library generations and model versions
+reject stale results. Reviewed decisions apply atomically and tokens expire/consume once.
+Known tag identities normalize locally so displayed merge results match stored categories.
+Outbound metadata is names-only; categories/taxonomy remain local pending authorization.

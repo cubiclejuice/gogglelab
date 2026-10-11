@@ -1649,6 +1649,105 @@ dialog::backdrop {
   border: 1px dashed var(--warn-border);
   background: var(--warn-bg);
 }
+.library-filament-dialog {
+  width: min(980px, calc(100vw - 32px));
+  max-height: min(800px, calc(100vh - 32px));
+  padding: var(--space-4);
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--sheet);
+  color: var(--text);
+  box-shadow: var(--shadow-sheet);
+}
+.library-filament-dialog header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.library-filament-dialog section {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  border-top: 1px solid var(--hairline);
+}
+.library-filament-dialog section h3,
+.library-filament-row {
+  width: 100%;
+}
+.library-filament-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(90px, 1fr)) auto auto;
+  gap: var(--space-1);
+}
+.library-filament-row input {
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--button-border);
+  border-radius: 4px;
+  background: var(--button);
+  color: var(--text);
+}
+@media (max-width: 760px) {
+  .library-filament-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.library-ai-dialog {
+  width: min(900px, calc(100vw - 32px));
+  max-height: min(820px, calc(100vh - 32px));
+  padding: var(--space-4);
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--sheet);
+  color: var(--text);
+  box-shadow: var(--shadow-sheet);
+}
+.library-ai-dialog header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.library-ai-dialog section {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(120px, 1fr));
+  gap: var(--space-2);
+  border-top: 1px solid var(--hairline);
+}
+.library-ai-dialog section h3,
+.library-ai-dialog section p,
+.library-ai-review {
+  grid-column: 1 / -1;
+}
+.library-ai-dialog input,
+.library-ai-dialog select {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--button-border);
+  border-radius: 4px;
+  background: var(--button);
+  color: var(--text);
+}
+.library-ai-review fieldset {
+  margin-top: var(--space-2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  border: 1px solid var(--hairline);
+}
+@media (max-width: 760px) {
+  .library-ai-dialog section {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .library-ai-dialog section > * {
+    grid-column: 1;
+  }
+}
 .library-editor-dialog header,
 .library-tag-dialog header,
 .library-history-dialog header {

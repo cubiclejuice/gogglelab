@@ -1,4 +1,5 @@
-import type { LibraryModel, PrintAttempt, PrintAttemptInput } from "./ipc";
+import type { Filament, LibraryModel, PrintAttempt, PrintAttemptInput } from "./ipc";
+import { filamentLabel, filamentReferenceLabel } from "./library-filaments";
 
 export function validatePrintAttempt(input: PrintAttemptInput): string | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.printed_at)) return "Choose a valid print date.";
@@ -23,6 +24,7 @@ export class LibraryPrintHistory {
   private readonly dialog: HTMLDialogElement;
   private model: LibraryModel | null = null;
   private attempts: PrintAttempt[] = [];
+  private filaments: Filament[] = [];
   private invoker: HTMLElement | null = null;
   onCreate: (modelId: string, input: PrintAttemptInput) => Promise<void> = async () => {};
   onUpdate: (attemptId: string, input: PrintAttemptInput) => Promise<void> = async () => {};
@@ -38,9 +40,15 @@ export class LibraryPrintHistory {
     container.append(this.dialog);
   }
 
-  show(model: LibraryModel, attempts: PrintAttempt[], invoker?: HTMLElement): void {
+  show(
+    model: LibraryModel,
+    attempts: PrintAttempt[],
+    filaments: Filament[] = [],
+    invoker?: HTMLElement,
+  ): void {
     this.model = model;
     this.attempts = attempts;
+    this.filaments = filaments;
     this.invoker =
       invoker ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     this.render();
@@ -91,11 +99,28 @@ export class LibraryPrintHistory {
     );
     const quantity = this.input("Quantity", "number", String(attempt?.quantity ?? 1));
     quantity.min = "1";
-    const filaments = this.input(
-      "Filament IDs (comma separated, up to 5)",
-      "text",
-      attempt?.filament_ids.join(", ") ?? "",
-    );
+    const filaments = document.createElement("select");
+    filaments.multiple = true;
+    filaments.setAttribute("aria-label", "Filaments used, maximum five");
+    const selectedIds = attempt?.filament_ids ?? [];
+    for (const filament of this.filaments) {
+      const unavailable = filament.archived || filament.source_missing;
+      if (unavailable && !selectedIds.includes(filament.id)) continue;
+      const option = new Option(
+        unavailable
+          ? `${filamentLabel(filament)} (unavailable; deselect to remove)`
+          : filamentLabel(filament),
+        filament.id,
+      );
+      option.selected = selectedIds.includes(filament.id);
+      filaments.add(option);
+    }
+    const known = new Set(this.filaments.map((filament) => filament.id));
+    for (const id of selectedIds.filter((value) => !known.has(value))) {
+      const option = new Option(filamentReferenceLabel(id, this.filaments), id);
+      option.selected = true;
+      filaments.add(option);
+    }
     const outcome = document.createElement("select");
     outcome.setAttribute("aria-label", "Print outcome");
     outcome.add(new Option("Printed", "printed"));
@@ -110,10 +135,7 @@ export class LibraryPrintHistory {
       const input: PrintAttemptInput = {
         printed_at: date.value,
         quantity: Number(quantity.value),
-        filament_ids: filaments.value
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
+        filament_ids: [...filaments.selectedOptions].map((option) => option.value),
         notes: notes.value,
         outcome: outcome.value as "printed" | "failed",
       };

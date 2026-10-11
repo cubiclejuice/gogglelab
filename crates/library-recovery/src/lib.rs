@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 
 pub const MANIFEST_VERSION: u32 = 1;
-pub const LIBRARY_SCHEMA_VERSION: u32 = 3;
+pub const LIBRARY_SCHEMA_VERSION: u32 = 4;
 pub const MAX_COLORWAY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -82,6 +82,13 @@ fn valid_rfc3339(value: &str) -> bool {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).is_ok()
 }
 
+fn invalid_external_id(value: &str) -> bool {
+    value.is_empty()
+        || value.len() > 256
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryManifest {
     pub manifest_version: u32,
@@ -99,6 +106,10 @@ pub struct RecoveryManifest {
     pub catalog_settings: Option<RecoveryCatalogSettings>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bundles: Vec<RecoveryBundle>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filament_sources: Vec<RecoveryFilamentSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filaments: Vec<RecoveryFilament>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +154,8 @@ pub struct RecoveryModel {
     pub organization: Option<RecoveryOrganization>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub print_attempts: Vec<RecoveryPrintAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filament_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +190,36 @@ pub struct RecoveryBundle {
     pub source_root_id: Option<String>,
     pub source_path: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryFilamentSource {
+    pub id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub last_synced_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryFilament {
+    pub id: String,
+    pub version: u64,
+    pub brand: String,
+    pub material: String,
+    pub color: String,
+    pub name: String,
+    pub notes: String,
+    pub origin: String,
+    pub resource_kind: String,
+    pub source_id: Option<String>,
+    pub external_id: Option<String>,
+    pub parent_filament_id: Option<String>,
+    pub archived: bool,
+    pub source_missing: bool,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +447,47 @@ fn select_models(manifest: &mut RecoveryManifest, ids: &[String]) -> Result<(), 
     manifest
         .bundles
         .retain(|bundle| bundle_ids.contains(&bundle.id));
+    let known_filaments: BTreeSet<_> = manifest
+        .filaments
+        .iter()
+        .map(|filament| filament.id.clone())
+        .collect();
+    let parent_filaments: BTreeMap<_, _> = manifest
+        .filaments
+        .iter()
+        .map(|filament| (filament.id.clone(), filament.parent_filament_id.clone()))
+        .collect();
+    let mut filament_ids = BTreeSet::new();
+    for model in &manifest.models {
+        filament_ids.extend(model.filament_ids.iter().cloned());
+        filament_ids.extend(
+            model
+                .print_attempts
+                .iter()
+                .flat_map(|attempt| attempt.filament_ids.iter())
+                .filter(|id| known_filaments.contains(*id))
+                .cloned(),
+        );
+    }
+    let mut pending = filament_ids.iter().cloned().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        if let Some(Some(parent)) = parent_filaments.get(&id) {
+            if filament_ids.insert(parent.clone()) {
+                pending.push(parent.clone());
+            }
+        }
+    }
+    manifest
+        .filaments
+        .retain(|filament| filament_ids.contains(&filament.id));
+    let source_ids: BTreeSet<_> = manifest
+        .filaments
+        .iter()
+        .filter_map(|filament| filament.source_id.as_ref())
+        .collect();
+    manifest
+        .filament_sources
+        .retain(|source| source_ids.contains(&source.id));
     let parents: BTreeMap<String, Option<String>> = manifest
         .folders
         .iter()
@@ -691,6 +775,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 indexed_source: None,
                 organization: None,
                 print_attempts: Vec::new(),
+                filament_ids: Vec::new(),
             })
         },
     )?;
@@ -831,6 +916,219 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             });
         }
     }
+
+    let (filament_sources, filaments) = if schema_version >= 4 {
+        let sources = collect_rows(
+            conn,
+            "SELECT id,kind,base_url,last_synced_at,created_at,updated_at FROM filament_sources ORDER BY id",
+            |row| {
+                Ok(RecoveryFilamentSource {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    base_url: row.get(2)?,
+                    last_synced_at: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        )?;
+        let source_ids: BTreeSet<_> = sources.iter().map(|source| source.id.as_str()).collect();
+        if source_ids.len() != sources.len()
+            || sources.iter().any(|source| {
+                source.kind != "spoolman"
+                    || source.base_url.len() > 2048
+                    || !(source.base_url.starts_with("http://")
+                        || source.base_url.starts_with("https://"))
+                    || source.base_url.contains(['@', '?', '#'])
+                    || source
+                        .base_url
+                        .split_once("://")
+                        .is_none_or(|(_, remainder)| {
+                            remainder.is_empty() || remainder.starts_with('/')
+                        })
+                    || source
+                        .base_url
+                        .chars()
+                        .any(|character| character.is_control() || character.is_whitespace())
+                    || source
+                        .last_synced_at
+                        .as_deref()
+                        .is_some_and(|value| !valid_rfc3339(value))
+            })
+        {
+            return Err(invalid("Filament source metadata is invalid"));
+        }
+        let rows = collect_rows(
+            conn,
+            "SELECT id,version,brand,material,color,name,notes,origin,resource_kind,source_id,
+                    external_id,parent_filament_id,archived,source_missing,created_at,updated_at
+             FROM filaments ORDER BY id",
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                ))
+            },
+        )?;
+        let filament_ids: BTreeSet<_> = rows.iter().map(|row| row.0.clone()).collect();
+        if filament_ids.len() != rows.len() {
+            return Err(invalid("Duplicate filament identity"));
+        }
+        let mut remote_keys = BTreeSet::new();
+        let mut values = Vec::with_capacity(rows.len());
+        for (
+            id,
+            version,
+            brand,
+            material,
+            color,
+            name,
+            notes,
+            origin,
+            resource_kind,
+            source_id,
+            external_id,
+            parent_filament_id,
+            archived,
+            source_missing,
+            created_at,
+            updated_at,
+        ) in rows
+        {
+            let common_invalid = version <= 0
+                || brand.len() > 200
+                || material.len() > 200
+                || color.len() > 256
+                || name.is_empty()
+                || name.len() > 200
+                || notes.len() > 20_000
+                || [&brand, &material, &color, &name]
+                    .into_iter()
+                    .any(|value| value.trim() != value || value.chars().any(char::is_control))
+                || notes.trim() != notes
+                || notes.chars().any(|character| {
+                    character == '\0'
+                        || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+                })
+                || !matches!(archived, 0 | 1)
+                || !matches!(source_missing, 0 | 1);
+            let relationship_invalid = match (origin.as_str(), resource_kind.as_str()) {
+                ("manual", "manual") => {
+                    source_id.is_some()
+                        || external_id.is_some()
+                        || parent_filament_id.is_some()
+                        || source_missing != 0
+                }
+                ("spoolman", "filament") => {
+                    archived != 0
+                        || parent_filament_id.is_some()
+                        || source_id
+                            .as_deref()
+                            .is_none_or(|value| !source_ids.contains(value))
+                        || external_id.as_deref().is_none_or(invalid_external_id)
+                }
+                ("spoolman", "spool") => {
+                    source_id
+                        .as_deref()
+                        .is_none_or(|value| !source_ids.contains(value))
+                        || external_id.as_deref().is_none_or(invalid_external_id)
+                        || parent_filament_id
+                            .as_deref()
+                            .is_none_or(|value| !filament_ids.contains(value))
+                }
+                _ => true,
+            };
+            if common_invalid || relationship_invalid {
+                return Err(invalid("Filament metadata is invalid"));
+            }
+            if let (Some(source), Some(external)) = (&source_id, &external_id) {
+                if !remote_keys.insert((source.clone(), resource_kind.clone(), external.clone())) {
+                    return Err(invalid("Duplicate remote filament identity"));
+                }
+            }
+            values.push(RecoveryFilament {
+                id,
+                version: version as u64,
+                brand,
+                material,
+                color,
+                name,
+                notes,
+                origin,
+                resource_kind,
+                source_id,
+                external_id,
+                parent_filament_id,
+                archived: archived == 1,
+                source_missing: source_missing == 1,
+                created_at,
+                updated_at,
+            });
+        }
+        let by_id: BTreeMap<_, _> = values.iter().map(|value| (&value.id, value)).collect();
+        for value in &values {
+            if value.resource_kind == "spool" {
+                let parent = by_id
+                    .get(value.parent_filament_id.as_ref().unwrap())
+                    .ok_or_else(|| invalid("Spool parent filament is missing"))?;
+                if parent.resource_kind != "filament" || parent.source_id != value.source_id {
+                    return Err(invalid("Spool parent filament source is invalid"));
+                }
+            }
+        }
+        let links = collect_rows(
+            conn,
+            "SELECT model_id,filament_id,ordinal FROM model_filaments ORDER BY model_id,ordinal",
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        let mut assigned: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+        for (model_id, filament_id, ordinal) in links {
+            if !index.contains_key(&model_id) || !filament_ids.contains(&filament_id) {
+                return Err(invalid(
+                    "Model filament assignment has an unknown reference",
+                ));
+            }
+            assigned
+                .entry(model_id)
+                .or_default()
+                .push((ordinal, filament_id));
+        }
+        for (model_id, links) in assigned {
+            let mut unique = BTreeSet::new();
+            if links.len() > 5
+                || links.iter().enumerate().any(|(expected, (ordinal, id))| {
+                    *ordinal != expected as i64 || !unique.insert(id)
+                })
+            {
+                return Err(invalid("Model filament assignment order is invalid"));
+            }
+            models[*index.get(&model_id).unwrap()].filament_ids =
+                links.into_iter().map(|(_, id)| id).collect();
+        }
+        (sources, values)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let index_roots = if schema_version >= 2 {
         let invalid_sources: i64 = conn.query_row(
@@ -1251,6 +1549,8 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         index_roots,
         catalog_settings,
         bundles,
+        filament_sources,
+        filaments,
     })
 }
 
@@ -1292,7 +1592,7 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if !(1..=LIBRARY_SCHEMA_VERSION as i64).contains(&version) {
         return Err(invalid(format!(
-            "Unsupported Library schema version {version}; recovery supports versions 1, 2, and 3"
+            "Unsupported Library schema version {version}; recovery supports versions 1, 2, 3, and 4"
         )));
     }
     const TABLES: &[(&str, &[&str])] = &[
@@ -1457,6 +1757,53 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
         let phase3_bytes:i64=conn.query_row("SELECT COALESCE((SELECT SUM(length(COALESCE(source_archive_member,''))+length(COALESCE(designer,''))+length(COALESCE(source_url,''))+length(COALESCE(notes,''))+length(COALESCE(model_license,''))+length(COALESCE(parent_model_id,''))+length(COALESCE(bundle_id,''))) FROM models),0)+COALESCE((SELECT SUM(length(COALESCE(category,''))) FROM tags),0)+COALESCE((SELECT SUM(length(notes)+length(printed_at)) FROM print_attempts),0)+COALESCE((SELECT SUM(length(filament_id)) FROM print_attempt_filaments),0)",[],|row|row.get(0))?;
         if phase3_bytes > MAX_METADATA_BYTES {
             return Err(invalid("Schema-3 metadata exceeds recovery limit"));
+        }
+    }
+    if version >= 4 {
+        tables.extend_from_slice(&[
+            (
+                "filament_sources",
+                &[
+                    "id",
+                    "kind",
+                    "base_url",
+                    "last_synced_at",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "filaments",
+                &[
+                    "id",
+                    "version",
+                    "brand",
+                    "material",
+                    "color",
+                    "name",
+                    "notes",
+                    "origin",
+                    "resource_kind",
+                    "source_id",
+                    "external_id",
+                    "parent_filament_id",
+                    "archived",
+                    "source_missing",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            ("model_filaments", &["model_id", "filament_id", "ordinal"]),
+        ]);
+        let phase4_bytes: i64 = conn.query_row(
+            "SELECT COALESCE((SELECT SUM(length(id)+length(kind)+length(base_url)+length(COALESCE(last_synced_at,''))) FROM filament_sources),0)
+                  +COALESCE((SELECT SUM(length(id)+length(brand)+length(material)+length(color)+length(name)+length(notes)+length(origin)+length(resource_kind)+length(COALESCE(source_id,''))+length(COALESCE(external_id,''))+length(COALESCE(parent_filament_id,''))) FROM filaments),0)
+                  +COALESCE((SELECT SUM(length(model_id)+length(filament_id)) FROM model_filaments),0)",
+            [],
+            |row| row.get(0),
+        )?;
+        if phase4_bytes > MAX_METADATA_BYTES {
+            return Err(invalid("Schema-4 filament metadata exceeds recovery limit"));
         }
     }
     for (table, required) in &tables {

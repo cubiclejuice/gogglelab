@@ -24,6 +24,7 @@ pub struct Model {
     pub created_at: String,
     pub updated_at: String,
     pub tags: Vec<String>,
+    pub filament_ids: Vec<String>,
     pub source_kind: String,
     pub source_path: Option<String>,
     pub source_root_id: Option<String>,
@@ -33,6 +34,89 @@ pub struct Model {
     pub metadata: ModelMetadata,
     pub bundle_id: Option<String>,
     pub source_archive_member: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilamentOrigin {
+    Manual,
+    Spoolman,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilamentResourceKind {
+    Manual,
+    Filament,
+    Spool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Filament {
+    pub id: String,
+    pub version: u64,
+    pub brand: String,
+    pub material: String,
+    pub color: String,
+    pub name: String,
+    pub notes: String,
+    pub origin: FilamentOrigin,
+    pub resource_kind: FilamentResourceKind,
+    pub source_id: Option<String>,
+    pub external_id: Option<String>,
+    pub parent_filament_id: Option<String>,
+    pub archived: bool,
+    pub source_missing: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilamentInput {
+    pub brand: String,
+    pub material: String,
+    pub color: String,
+    pub name: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpoolmanSource {
+    pub id: String,
+    pub base_url: String,
+    pub last_synced_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpoolmanFilamentRecord {
+    pub external_id: String,
+    pub brand: String,
+    pub material: String,
+    pub color: String,
+    pub name: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpoolmanSpoolRecord {
+    pub external_id: String,
+    pub filament_external_id: String,
+    pub brand: String,
+    pub material: String,
+    pub color: String,
+    pub name: String,
+    pub notes: String,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilamentSyncSummary {
+    pub source_id: String,
+    pub seen: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub missing: usize,
+    pub completed_at: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +173,33 @@ pub struct VersionedModelUpdate {
 pub struct VersionedTarget {
     pub model_id: String,
     pub expected_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelFilamentAssignment {
+    pub target: VersionedTarget,
+    pub filament_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewedTag {
+    pub name: String,
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewedTagTarget {
+    pub model_id: String,
+    pub expected_version: u64,
+    pub tags: Vec<ReviewedTag>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewedTagStrategy {
+    Append,
+    Replace,
+    Merge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

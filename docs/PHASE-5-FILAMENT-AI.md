@@ -78,3 +78,25 @@ Primary links:
   replaces tags in suggested categories and preserves unrelated existing categories.
 - Credentials are session-only; restart clears them. Config export contains no keys.
 - Remaining implementation and independent code/security/UI validation pending.
+
+## Final local contract and reviewed findings
+- Current external payload: bounded normalized preview + display name + assigned tag names.
+  Category names/objects and full taxonomy are local only. Automatic approval review
+  rejected their export and required explicit human authorization. A concrete optional
+  proposal is AI-CATEGORY-SHARING-APPROVAL.md; approval is pending. This does not enable
+  any external request and does not gate Free categorization/review functions.
+- Native category rules enforce none/existing-only/allow-new locally. Known tag identity
+  resolves locally for exact before/after; rename/deletion is revalidated at apply.
+- Independent review fixed single-flight admission, source IDs after restore, malformed
+  Spoolman type coercion, taxonomy races, explicit rejection/all-reject no-op, retryable
+  failed reviews, bounded preview failures, and atomic heterogeneous filament batches.
+- UI review fixed missing model legends, Reject-to-Accept controls and late-token disposal.
+- Browser fixture at480px retains unavailable/unknown refs until explicit removal;
+  exact versioned assignment is captured. AI tests verify exact merge vs rejected
+  unchanged model, visible conflict/retry, cleared dummy session key, busy Generate,
+  late-response discard and invoker focus. Dialogs are448px wide without overflow.
+- Audit identified pre-existing development advisories. Vite6.4.4 plus minimal
+  tinypool2.1.2/source-map-js1.2.2 overrides clear the public Bun audit. Unified audit
+  requires repinning the new public package before its final check.
+- Focused final data: core40, recovery17, backup4, network9, native integration13.
+  Full Community/unified package/install gate is being finalized.

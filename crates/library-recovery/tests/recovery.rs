@@ -569,6 +569,191 @@ fn schema_v3_recovery_preserves_metadata_history_archive_refs_and_categories() {
 }
 
 #[test]
+fn schema_v4_recovery_preserves_catalog_assignments_sources_and_unknown_history_ids() {
+    use library_core::{
+        FilamentInput, LibraryDb, PrintAttemptInput, PrintOutcome, SpoolmanFilamentRecord,
+        SpoolmanSpoolRecord,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("library-v4");
+    let db = LibraryDb::open(&root).unwrap();
+    let model = db.create_model("Filament recovery", None).unwrap();
+    let manual = db
+        .create_filament(&FilamentInput {
+            brand: "Local".into(),
+            material: "PETG".into(),
+            color: "#00AAFF".into(),
+            name: "Ocean".into(),
+            notes: "line one\nline two".into(),
+        })
+        .unwrap();
+    let source = db
+        .upsert_spoolman_source("http://spoolman.local/api/v1")
+        .unwrap();
+    db.sync_spoolman_snapshot(
+        &source.id,
+        &[SpoolmanFilamentRecord {
+            external_id: "1".into(),
+            brand: "Remote".into(),
+            material: "PLA".into(),
+            color: "FF0000".into(),
+            name: "Red".into(),
+            notes: String::new(),
+        }],
+        &[SpoolmanSpoolRecord {
+            external_id: "9".into(),
+            filament_external_id: "1".into(),
+            brand: "Remote".into(),
+            material: "PLA".into(),
+            color: "FF0000".into(),
+            name: "Red".into(),
+            notes: "Shelf A".into(),
+            archived: true,
+        }],
+        "2026-10-10T12:00:00Z",
+    )
+    .unwrap();
+    let remote = db.list_filaments(true).unwrap();
+    let spool = remote
+        .iter()
+        .find(|filament| filament.external_id.as_deref() == Some("9"))
+        .unwrap();
+    let model = db
+        .set_model_filaments(
+            &model.id,
+            model.metadata_version,
+            &[manual.id.clone(), spool.id.clone()],
+        )
+        .unwrap();
+    db.create_print_attempt(
+        &model.id,
+        &PrintAttemptInput {
+            printed_at: "2026-10-10T12:30:00Z".into(),
+            quantity: 1,
+            notes: String::new(),
+            filament_ids: vec![manual.id.clone(), "legacy-unknown".into()],
+            outcome: PrintOutcome::Printed,
+        },
+    )
+    .unwrap();
+    assert!(
+        db.delete_filament(&manual.id, manual.version)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    drop(db);
+
+    let manifest = inspect_library(&root).unwrap();
+    assert_eq!(manifest.library_schema_version, 4);
+    assert_eq!(manifest.filament_sources.len(), 1);
+    assert_eq!(manifest.filaments.len(), 3);
+    assert!(
+        manifest
+            .filaments
+            .iter()
+            .find(|filament| filament.id == manual.id)
+            .unwrap()
+            .archived
+    );
+    let recovered = manifest
+        .models
+        .iter()
+        .find(|item| item.id == model.id)
+        .unwrap();
+    assert_eq!(
+        recovered.filament_ids,
+        [manual.id.clone(), spool.id.clone()]
+    );
+    assert_eq!(
+        recovered.print_attempts[0].filament_ids,
+        [manual.id.clone(), "legacy-unknown".into()]
+    );
+    let selected = export_library_zip(&root, &[model.id], &tmp.path().join("v4.zip")).unwrap();
+    assert_eq!(selected.filaments.len(), 3);
+    assert_eq!(selected.filament_sources.len(), 1);
+
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    conn.execute(
+        "UPDATE model_filaments SET ordinal=4 WHERE model_id=?1 AND ordinal=1",
+        [&recovered.id],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute(
+        "UPDATE model_filaments SET ordinal=1 WHERE model_id=?1 AND ordinal=4",
+        [&recovered.id],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    conn.execute("UPDATE filaments SET version=0 WHERE id=?1", [&manual.id])
+        .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute("UPDATE filaments SET version=1 WHERE id=?1", [&manual.id])
+        .unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+        .unwrap();
+    conn.execute(
+        "UPDATE model_filaments SET filament_id='unknown-filament' WHERE model_id=?1 AND filament_id=?2",
+        params![recovered.id, manual.id],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute(
+        "UPDATE model_filaments SET filament_id=?1 WHERE model_id=?2 AND filament_id='unknown-filament'",
+        params![manual.id, recovered.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE filaments SET parent_filament_id=?1 WHERE id=?2",
+        params![manual.id, spool.id],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute(
+        "UPDATE filaments SET parent_filament_id=(SELECT id FROM filaments WHERE resource_kind='filament' LIMIT 1) WHERE id=?1",
+        [&spool.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE filament_sources SET base_url='http://secret@example.test'",
+        [],
+    )
+    .unwrap();
+    assert!(inspect_library(&root).is_err());
+    conn.execute(
+        "UPDATE filament_sources SET base_url='http://spoolman.local/api/v1'",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints=ON;
+         INSERT INTO filaments(id,version,brand,material,color,name,notes,origin,resource_kind,archived,source_missing,created_at,updated_at)
+           VALUES('extra-1',1,'','','','Extra 1','','manual','manual',0,0,'1','1'),
+                 ('extra-2',1,'','','','Extra 2','','manual','manual',0,0,'1','1'),
+                 ('extra-3',1,'','','','Extra 3','','manual','manual',0,0,'1','1'),
+                 ('extra-4',1,'','','','Extra 4','','manual','manual',0,0,'1','1');",
+    )
+    .unwrap();
+    for (ordinal, id) in [
+        (2, "extra-1"),
+        (3, "extra-2"),
+        (4, "extra-3"),
+        (5, "extra-4"),
+    ] {
+        conn.execute(
+            "INSERT INTO model_filaments(model_id,filament_id,ordinal) VALUES(?1,?2,?3)",
+            params![recovered.id, id, ordinal],
+        )
+        .unwrap();
+    }
+    assert!(inspect_library(&root).is_err());
+}
+
+#[test]
 fn recovery_accepts_core_created_folder_bundle_without_reading_external_sources() {
     use library_core::{LibraryDb, ScannedModel, SourceRef};
     let tmp = tempfile::tempdir().unwrap();

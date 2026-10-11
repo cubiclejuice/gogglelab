@@ -64,6 +64,21 @@ import {
   libraryRestoreBackup,
   libraryPurgeCatalog,
   libraryCleanupOrphanCache,
+  libraryListFilaments,
+  libraryCreateFilament,
+  libraryUpdateFilament,
+  libraryDeleteFilament,
+  librarySetModelFilaments,
+  libraryBulkSetModelFilaments,
+  libraryBulkAssignModelFilaments,
+  integrationGetSettings,
+  integrationSaveSpoolmanConfig,
+  spoolmanPull,
+  integrationSaveAiProvider,
+  integrationDeleteAiProvider,
+  aiSuggestTags,
+  aiApplyTagReview,
+  aiDiscardTagReview,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -102,6 +117,9 @@ import { LibraryManagementDialog } from "./lib/library-management-dialog";
 import { LibraryBundleDialog } from "./lib/library-bundle-dialog";
 import { LibraryDuplicatesDialog } from "./lib/library-duplicates-dialog";
 import { removalTargets } from "./lib/library-management";
+import { LibraryFilamentDialog } from "./lib/library-filament-dialog";
+import { LibraryAiDialog } from "./lib/library-ai-dialog";
+import { filamentAssignmentBatch } from "./lib/library-filaments";
 import "./styles.css";
 
 export function startApp(extensions: AppExtensions): void {
@@ -134,6 +152,8 @@ export function startApp(extensions: AppExtensions): void {
   const libraryManagement = new LibraryManagementDialog(app);
   const libraryBundle = new LibraryBundleDialog(app);
   const libraryDuplicates = new LibraryDuplicatesDialog(app);
+  const libraryFilaments = new LibraryFilamentDialog(app);
+  const libraryAi = new LibraryAiDialog(app);
   const libraryService = {
     listFolders: libraryListFolders,
     listModels: libraryListModels,
@@ -182,6 +202,21 @@ export function startApp(extensions: AppExtensions): void {
     restoreBackup: libraryRestoreBackup,
     purgeCatalog: libraryPurgeCatalog,
     cleanupOrphanCache: libraryCleanupOrphanCache,
+    listFilaments: libraryListFilaments,
+    createFilament: libraryCreateFilament,
+    updateFilament: libraryUpdateFilament,
+    deleteFilament: libraryDeleteFilament,
+    setModelFilaments: librarySetModelFilaments,
+    bulkSetModelFilaments: libraryBulkSetModelFilaments,
+    bulkAssignModelFilaments: libraryBulkAssignModelFilaments,
+    integrationSettings: integrationGetSettings,
+    saveSpoolmanConfig: integrationSaveSpoolmanConfig,
+    spoolmanPull,
+    saveAiProvider: integrationSaveAiProvider,
+    deleteAiProvider: integrationDeleteAiProvider,
+    suggestTags: aiSuggestTags,
+    applyTagReview: aiApplyTagReview,
+    discardTagReview: aiDiscardTagReview,
   };
   let activeEntitlements = withCoreEntitlements(extensions.currentEntitlements?.());
   const main = document.createElement("div");
@@ -750,6 +785,8 @@ export function startApp(extensions: AppExtensions): void {
     libraryManagement.dismiss();
     libraryDuplicates.dismiss();
     void libraryBundle.dismiss();
+    libraryFilaments.dismiss();
+    void libraryAi.dismiss();
     setOverlay({ kind: "hint", text: message });
   }
 
@@ -963,12 +1000,13 @@ export function startApp(extensions: AppExtensions): void {
     };
     activeLibraryRefresh = request;
     try {
-      const [folders, models, roots, catalogSettings, tags] = await Promise.all([
+      const [folders, models, roots, catalogSettings, tags, filaments] = await Promise.all([
         libraryService.listFolders(),
         libraryService.listModels(),
         libraryService.listRoots(),
         libraryService.getCatalogSettings(),
         libraryService.listTags(),
+        libraryService.listFilaments(true),
       ]);
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
@@ -977,7 +1015,7 @@ export function startApp(extensions: AppExtensions): void {
       ) {
         return;
       }
-      libraryPanel.render(folders, models, roots, catalogSettings, tags);
+      libraryPanel.render(folders, models, roots, catalogSettings, tags, filaments);
       if (libraryOperations.isCurrent(owner)) {
         libraryPanel.setStatus(
           "Managed copies are stored locally and survive source-file changes.",
@@ -1249,6 +1287,87 @@ export function startApp(extensions: AppExtensions): void {
     const result = await libraryService.cleanupOrphanCache();
     libraryPanel.setStatus(`Cleaned ${result.files} orphan cache files · ${result.bytes} bytes.`);
   };
+  let filamentDialogModelIds: string[] = [];
+  const refreshFilamentDialog = async () => {
+    const [filaments, models] = await Promise.all([
+      libraryService.listFilaments(true),
+      libraryService.listModels(),
+    ]);
+    libraryFilaments.show(
+      filaments,
+      models.filter((model) => filamentDialogModelIds.includes(model.id)),
+    );
+  };
+  libraryPanel.onOpenFilaments = (models) => {
+    filamentDialogModelIds = models.map((model) => model.id);
+    void libraryService
+      .listFilaments(true)
+      .then((filaments) => libraryFilaments.show(filaments, models))
+      .catch((error) => libraryPanel.setStatus(String(error)));
+  };
+  libraryFilaments.onCreate = async (input) => {
+    await libraryService.createFilament(input);
+    await refreshLibrary();
+    await refreshFilamentDialog();
+  };
+  libraryFilaments.onUpdate = async (id, version, input) => {
+    await libraryService.updateFilament(id, version, input);
+    await refreshLibrary();
+    await refreshFilamentDialog();
+  };
+  libraryFilaments.onArchive = async (id, version) => {
+    await libraryService.deleteFilament(id, version);
+    await refreshLibrary();
+    await refreshFilamentDialog();
+  };
+  libraryFilaments.onAssign = async (updates) => {
+    if (updates.length === 1) {
+      await libraryService.setModelFilaments(
+        updates[0].target.model_id,
+        updates[0].target.expected_version,
+        updates[0].filamentIds,
+      );
+    } else if (updates.length > 1) {
+      const first = JSON.stringify(updates[0].filamentIds);
+      if (updates.every((update) => JSON.stringify(update.filamentIds) === first)) {
+        await libraryService.bulkSetModelFilaments(
+          updates.map((update) => update.target),
+          updates[0].filamentIds,
+        );
+      } else {
+        await libraryService.bulkAssignModelFilaments(filamentAssignmentBatch(updates));
+      }
+    }
+    await refreshLibrary();
+    await refreshFilamentDialog();
+  };
+  libraryPanel.onOpenIntegrations = (models) => {
+    void libraryService
+      .integrationSettings()
+      .then((settings) => libraryAi.show(settings, models))
+      .catch((error) => libraryPanel.setStatus(String(error)));
+  };
+  libraryAi.onSaveSpoolman = async (config) => {
+    await libraryService.saveSpoolmanConfig(config);
+    libraryPanel.setStatus("Spoolman configuration saved. No network request was made.");
+  };
+  libraryAi.onPullSpoolman = async () => {
+    const result = await libraryService.spoolmanPull();
+    await refreshLibrary();
+    return `${result.filamentsUpserted} filament types and ${result.spoolsUpserted} physical spools reconciled. ${result.removedLocally} absent remote mirrors marked unavailable; stable IDs, assignments, and history retained.`;
+  };
+  libraryAi.onSaveProvider = async (config, credential) => {
+    await libraryService.saveAiProvider(config, credential);
+    libraryPanel.setStatus("AI provider settings saved. No provider request was made.");
+  };
+  libraryAi.onDeleteProvider = libraryService.deleteAiProvider;
+  libraryAi.onSuggest = libraryService.suggestTags;
+  libraryAi.onApply = async (token, decisions, strategy) => {
+    await libraryService.applyTagReview(token, decisions, strategy);
+    await refreshLibrary();
+    libraryPanel.setStatus("Reviewed AI tag decisions applied.");
+  };
+  libraryAi.onDiscard = libraryService.discardTagReview;
 
   const unsubscribeEntitlements =
     extensions.subscribeEntitlements?.((entitlements) => {

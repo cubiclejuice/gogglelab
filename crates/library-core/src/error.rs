@@ -34,6 +34,12 @@ pub enum LibraryError {
         expected: u64,
         actual: u64,
     },
+    #[error("filament {filament_id} version conflict: expected {expected}, found {actual}")]
+    FilamentVersionConflict {
+        filament_id: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("unsupported library format: {0}")]
     UnsupportedFormat(String),
     #[error("invalid library input: {0}")]

@@ -33,10 +33,13 @@ stl-core = { path = "../crates/stl-core" }
 library-recovery = { path = "../crates/library-recovery" }
 library-core = { path = "../crates/library-core" }
 library-backup = { path = "../crates/library-backup" }
+library-integrations = { path = "../crates/library-integrations" }
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 quick-xml = "0.41"
 notify = "8.2.0"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+time = { version = "0.3.55", features = ["formatting"] }
+zeroize = "1.8"
 
 [target.'cfg(not(windows))'.dependencies]
 trash = { version = "5.2.9", default-features = false }

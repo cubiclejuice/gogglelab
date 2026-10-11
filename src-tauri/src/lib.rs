@@ -12,7 +12,9 @@ mod handoff;
 mod library_archives;
 mod library_bundle;
 mod library_commands;
+mod library_filaments;
 mod library_images;
+mod library_integrations;
 mod library_management;
 mod library_scan;
 mod library_thumbnail;
@@ -79,6 +81,21 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             library_management::library_management_status,
             library_images::library_set_custom_thumbnail,
             library_images::library_clear_custom_thumbnail,
+            library_integrations::integration_get_settings,
+            library_integrations::integration_save_spoolman_config,
+            library_integrations::spoolman_pull,
+            library_integrations::integration_save_ai_provider,
+            library_integrations::integration_delete_ai_provider,
+            library_integrations::ai_suggest_tags,
+            library_integrations::ai_apply_tag_review,
+            library_integrations::ai_discard_tag_review,
+            library_filaments::library_list_filaments,
+            library_filaments::library_create_filament,
+            library_filaments::library_update_filament,
+            library_filaments::library_delete_filament,
+            library_filaments::library_set_model_filaments,
+            library_filaments::library_bulk_set_model_filaments,
+            library_filaments::library_bulk_assign_model_filaments,
             library_commands::library_list_folders,
             library_commands::library_list_models,
             library_commands::library_create_folder,
@@ -137,6 +154,9 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
         .setup(|app| {
             let library_root = app.path().app_data_dir()?.join("library");
             app.manage(library_commands::LibraryState::new(library_root));
+            app.manage(library_integrations::IntegrationState::load(
+                app.path().app_config_dir()?.join("integrations.json"),
+            )?);
             library_scan::start_background_scanner(app.handle().clone());
             let loaded = settings::load(app.handle());
             app.set_theme(loaded.appearance_mode.native_theme());

@@ -378,7 +378,7 @@ fn hash_file(path: &Path, limit: u64) -> Result<(u64, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library_core::LibraryDb;
+    use library_core::{FilamentInput, LibraryDb};
     #[test]
     fn backup_round_trip_preserves_database_and_assets() {
         let temp = tempfile::tempdir().unwrap();
@@ -389,6 +389,21 @@ mod tests {
         fs::write(&source, &bytes).unwrap();
         let db = LibraryDb::open(&root).unwrap();
         let model = db.import_file(&source, None, None).unwrap().model;
+        let filament = db
+            .create_filament(&FilamentInput {
+                brand: "Local".into(),
+                material: "PLA".into(),
+                color: "#112233".into(),
+                name: "Backup filament".into(),
+                notes: String::new(),
+            })
+            .unwrap();
+        db.set_model_filaments(
+            &model.id,
+            model.metadata_version,
+            std::slice::from_ref(&filament.id),
+        )
+        .unwrap();
         drop(db);
         let backup = temp.path().join("backup.zip");
         let result = create_backup(&root, &backup).unwrap();
@@ -397,6 +412,14 @@ mod tests {
         restore_backup_to_staging(&backup, &staged).unwrap();
         let restored = LibraryDb::open(&staged).unwrap();
         assert_eq!(restored.get_model(&model.id).unwrap().unwrap().id, model.id);
+        assert_eq!(
+            restored.get_model(&model.id).unwrap().unwrap().filament_ids,
+            std::slice::from_ref(&filament.id)
+        );
+        assert_eq!(
+            restored.get_filament(&filament.id).unwrap().unwrap().name,
+            filament.name
+        );
         assert_eq!(
             fs::read(restored.resolve_model_source(&model.id).unwrap()).unwrap(),
             bytes

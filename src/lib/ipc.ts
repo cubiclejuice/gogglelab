@@ -456,6 +456,93 @@ export interface LibraryModel {
   metadata?: CoreMetadata;
   bundle_id?: string | null;
   source_archive_member?: string | null;
+  filament_ids?: string[];
+}
+
+export interface Filament {
+  id: string;
+  version: number;
+  brand: string;
+  material: string;
+  color: string;
+  name: string;
+  notes: string;
+  origin: "manual" | "spoolman";
+  resource_kind: "manual" | "filament" | "spool";
+  source_id: string | null;
+  external_id: string | null;
+  parent_filament_id: string | null;
+  archived: boolean;
+  source_missing: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FilamentInput {
+  brand: string;
+  material: string;
+  color: string;
+  name: string;
+  notes: string;
+}
+
+export interface SpoolmanConfig {
+  baseUrl: string;
+  endpointScope: "local" | "remote";
+  pageSize: number;
+  timeoutSeconds: number;
+}
+
+export interface SpoolmanPullResult {
+  filamentsReceived: number;
+  spoolsReceived: number;
+  filamentsUpserted: number;
+  spoolsUpserted: number;
+  removedLocally: number;
+  lastSuccessfulPullAt: string;
+}
+
+export interface AiProviderPublicConfig {
+  id: string;
+  label: string;
+  kind: "openaiCompatible" | "anthropic" | "gemini";
+  baseUrl: string | null;
+  endpointScope: "local" | "remote";
+  model: string;
+  credentialStorage: "none" | "session";
+  hasCredential: boolean;
+  maxTags: number;
+  detail: "brief" | "balanced" | "detailed";
+  categoryMode: "none" | "existingOnly" | "allowNew";
+  concurrency: number;
+  timeoutSeconds: number;
+  structuredOutput: "jsonSchema" | "jsonObject" | "plainJson";
+}
+
+export interface IntegrationSettings {
+  spoolman: SpoolmanConfig | null;
+  aiProviders: AiProviderPublicConfig[];
+}
+
+export interface AiSuggestion {
+  suggestionId: string;
+  name: string;
+  category: string | null;
+  confidence: number | null;
+}
+
+export interface AiSuggestionBatch {
+  reviewToken: string;
+  providerId: string;
+  model: string;
+  targets: Array<{
+    modelId: string;
+    expectedVersion: number;
+    displayName: string;
+    existingTags: Array<{ name: string; category: string | null }>;
+    suggestions: AiSuggestion[];
+  }>;
+  failures: Array<{ modelId: string; code: string; message: string }>;
 }
 
 export type PrintStatus = "unprinted" | "want" | "queued" | "printing" | "printed" | "failed";
@@ -874,6 +961,101 @@ export function libraryClearCustomThumbnail(
   expectedVersion: number,
 ): Promise<LibraryModel> {
   return invoke("library_clear_custom_thumbnail", { modelId, expectedVersion });
+}
+
+export function libraryListFilaments(includeUnavailable = true): Promise<Filament[]> {
+  return invoke("library_list_filaments", { includeUnavailable });
+}
+
+export function libraryCreateFilament(input: FilamentInput): Promise<Filament> {
+  return invoke("library_create_filament", { input });
+}
+
+export function libraryUpdateFilament(
+  id: string,
+  expectedVersion: number,
+  input: FilamentInput,
+): Promise<Filament> {
+  return invoke("library_update_filament", { id, expectedVersion, input });
+}
+
+export function libraryDeleteFilament(
+  id: string,
+  expectedVersion: number,
+): Promise<Filament | null> {
+  return invoke("library_delete_filament", { id, expectedVersion });
+}
+
+export function librarySetModelFilaments(
+  modelId: string,
+  expectedVersion: number,
+  filamentIds: string[],
+): Promise<LibraryModel> {
+  return invoke("library_set_model_filaments", { modelId, expectedVersion, filamentIds });
+}
+
+export function libraryBulkSetModelFilaments(
+  targets: VersionedModelTarget[],
+  filamentIds: string[],
+): Promise<LibraryModel[]> {
+  return invoke("library_bulk_set_model_filaments", { targets, filamentIds });
+}
+
+export function libraryBulkAssignModelFilaments(
+  assignments: Array<{ target: VersionedModelTarget; filament_ids: string[] }>,
+): Promise<LibraryModel[]> {
+  return invoke("library_bulk_assign_model_filaments", { assignments });
+}
+
+export function integrationGetSettings(): Promise<IntegrationSettings> {
+  return invoke("integration_get_settings");
+}
+
+export function integrationSaveSpoolmanConfig(
+  config: SpoolmanConfig | null,
+): Promise<IntegrationSettings> {
+  return invoke("integration_save_spoolman_config", { config });
+}
+
+export function spoolmanPull(): Promise<SpoolmanPullResult> {
+  return invoke("spoolman_pull");
+}
+
+export function integrationSaveAiProvider(
+  config: AiProviderPublicConfig,
+  credentialUpdate: {
+    action: "keep" | "clear" | "setSession";
+    secret?: string;
+  },
+): Promise<AiProviderPublicConfig> {
+  return invoke("integration_save_ai_provider", { config, credentialUpdate });
+}
+
+export function integrationDeleteAiProvider(providerId: string): Promise<void> {
+  return invoke("integration_delete_ai_provider", { providerId });
+}
+
+export function aiSuggestTags(
+  providerId: string,
+  targets: VersionedModelTarget[],
+): Promise<AiSuggestionBatch> {
+  return invoke("ai_suggest_tags", { providerId, targets });
+}
+
+export function aiApplyTagReview(
+  reviewToken: string,
+  decisions: Array<{
+    modelId: string;
+    action: "accept" | "reject";
+    acceptedSuggestionIds: string[];
+  }>,
+  strategy: "append" | "replace" | "merge",
+): Promise<LibraryModel[]> {
+  return invoke("ai_apply_tag_review", { reviewToken, decisions, strategy });
+}
+
+export function aiDiscardTagReview(reviewToken: string): Promise<void> {
+  return invoke("ai_discard_tag_review", { reviewToken });
 }
 
 export interface RecoveryManifest {

@@ -1,3 +1,13 @@
+# Unreleased: Free filaments and reviewed AI tagging
+Free adds a local filament catalog, model assignments/filtering, and history selections.
+Spoolman pulls retain stable filament-type/spool IDs and referenced missing/archived records.
+AI tagging supports configurable compatible, Anthropic and Gemini providers, optional local
+keys, explicit batch review and append/replace/category-aware merge. Credentials are
+session-only, saving settings performs no network call, and suggestions never apply
+automatically. Current provider payloads contain previews/display names/tag names only;
+categories remain local. Schema4 upgrades are backed up; recovery preserves older schemas.
+Server/MCP/browser-capture implementation and native platform release checks remain pending.
+
 # Unreleased: in-place catalog and thumbnails
 
 Free now supports multiple indexed folders, startup/periodic scans, cancellation, size
