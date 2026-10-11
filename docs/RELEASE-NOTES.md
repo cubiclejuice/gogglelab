@@ -110,3 +110,12 @@ parent/child links, collections and ZIP/folder bundles. ZIP indexing is opt-in p
 archives remain in place. Schema 3 migrations preserve a prior-schema snapshot and
 read-only recovery understands all three schemas. Full multipart preview/handoff and
 backup restore are the next phase. These changes are local and are not a published release.
+
+## Free library management (phase 4, local validation)
+
+Adds duplicate visual review within current filters, recoverable removal/restore,
+explicit loose-source Trash, source reveal, full Library backups, staged restore/purge,
+cache maintenance, directory/parent/license filters and sidebar resizing. Bundle preview
+shows up to 32 parts; handoff sends all admitted members using verified stable copies.
+Custom PNG/JPEG and embedded 3MF preview images are supported. These local changes are
+not a published release; native window capture and cross-platform runtime gates remain.

@@ -133,7 +133,7 @@ fn commit_loaded(
     state: &AppState,
     generation: u64,
     path: &str,
-    _summary: &ModelSummary,
+    summary: &ModelSummary,
     parsed: Arc<stl_core::ParsedModel>,
 ) -> Result<(), AppError> {
     let _request_guard = state.request_commit.lock().unwrap();
@@ -148,6 +148,7 @@ fn commit_loaded(
     *guard = Some(LoadedModel {
         generation,
         path: path.to_string(),
+        source_digest: summary.source_digest.clone(),
         parsed,
     });
     Ok(())
@@ -423,6 +424,16 @@ mod tests {
             summary.source_digest,
             "bba25b28ebe1bf65e6242f3742ded47e1352d81c6b5aedda5784ebf0b233e3fd"
         );
+        assert_eq!(
+            state
+                .current
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source_digest,
+            summary.source_digest
+        );
     }
 
     #[test]
@@ -590,6 +601,7 @@ mod tests {
         *state.current.lock().unwrap() = Some(LoadedModel {
             generation: 8,
             path: "original.3mf".into(),
+            source_digest: String::new(),
             parsed: Arc::new(parsed),
         });
         let plate = geometry_for_plate(&state, 8, Some(1)).unwrap();

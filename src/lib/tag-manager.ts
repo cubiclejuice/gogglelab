@@ -95,6 +95,10 @@ export class LibraryTagManager {
     return input;
   }
 
+  dismiss(): void {
+    this.close();
+  }
+
   private button(label: string, action: () => void): HTMLButtonElement {
     const button = document.createElement("button");
     button.type = "button";

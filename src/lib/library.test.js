@@ -1,13 +1,17 @@
 import { expect, test } from "bun:test";
 import {
   canOpenLibraryModel,
+  clampLibraryNavigationWidth,
   didLibraryScanComplete,
   filterAndSortLibraryModels,
   LIBRARY_CATALOG_TIER,
   LIBRARY_VIEW_MODES,
   libraryFolderDepths,
+  indexedDirectoryNodes,
   matchesLibraryGroup,
   matchesLibraryMetadataFilters,
+  matchesIndexedDirectory,
+  nextLibraryNavigationWidth,
   normalizeLibraryTimestamp,
   normalizeCatalogSettings,
   scanStatusMessage,
@@ -143,6 +147,73 @@ test("metadata filters compose print status, designer, stable tag ID, and catego
       tags,
     ),
   ).toBe(false);
+});
+
+test("directory tree counts descendants and scopes normalized indexed paths", () => {
+  const models = [
+    model("a", { source_root_id: "root", source_path: "parts/gears/a.stl" }),
+    model("b", { source_root_id: "root", source_path: "parts\\b.stl" }),
+    model("zip", {
+      source_root_id: "root",
+      source_path: "archives/pack.zip",
+      source_archive_member: "x.stl",
+    }),
+    model("other", { source_root_id: "other", source_path: "parts/c.stl" }),
+  ];
+  expect(indexedDirectoryNodes(models, "root")).toEqual([
+    { prefix: "archives", name: "archives", depth: 0, count: 1 },
+    { prefix: "parts", name: "parts", depth: 0, count: 2 },
+    { prefix: "parts/gears", name: "gears", depth: 1, count: 1 },
+  ]);
+  expect(matchesIndexedDirectory(models[0], "root", "parts")).toBe(true);
+  expect(matchesIndexedDirectory(models[2], "root", "parts")).toBe(false);
+});
+
+test("parent and license filters compose without confusing no-parent with all", () => {
+  const child = model("child", {
+    metadata: {
+      parent_model_id: "parent",
+      model_license: "CC0",
+      print_status: "unprinted",
+      print_count: 0,
+    },
+  });
+  expect(
+    matchesLibraryMetadataFilters(
+      child,
+      {
+        printStatus: "all",
+        designer: "",
+        tagId: "",
+        category: "",
+        parentId: "parent",
+        license: "CC0",
+      },
+      [],
+    ),
+  ).toBe(true);
+  expect(
+    matchesLibraryMetadataFilters(
+      child,
+      {
+        printStatus: "all",
+        designer: "",
+        tagId: "",
+        category: "",
+        parentId: "__none__",
+        license: "",
+      },
+      [],
+    ),
+  ).toBe(false);
+});
+
+test("sidebar resize keyboard behavior remains within desktop bounds", () => {
+  expect(clampLibraryNavigationWidth(100)).toBe(200);
+  expect(clampLibraryNavigationWidth(900)).toBe(420);
+  expect(nextLibraryNavigationWidth(270, "ArrowRight")).toBe(286);
+  expect(nextLibraryNavigationWidth(270, "Home")).toBe(200);
+  expect(nextLibraryNavigationWidth(270, "End")).toBe(420);
 });
 
 test("all catalog views, settings, and metadata tools remain in the Free feature tier", () => {

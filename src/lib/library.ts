@@ -10,6 +10,7 @@ import type {
   PrintAttemptInput,
   PrintStatus,
   VersionedModelTarget,
+  VersionedRemovalTarget,
 } from "./ipc";
 import {
   LibraryMetadataEditor,
@@ -19,6 +20,12 @@ import {
   type SelectionScope,
 } from "./library-editor";
 import { LibraryPrintHistory } from "./library-history";
+import {
+  chooseRouletteModel,
+  explicitScopeIds,
+  partitionBundleGroups,
+  removalTargets,
+} from "./library-management";
 import { LibraryTagManager } from "./tag-manager";
 
 export type LibrarySort = "name" | "size" | "date";
@@ -50,6 +57,65 @@ export interface LibraryMetadataFilters {
   designer: string;
   tagId: string;
   category: string;
+  parentId: string;
+  license: string;
+}
+
+export interface LibraryDirectoryNode {
+  prefix: string;
+  name: string;
+  depth: number;
+  count: number;
+}
+
+export function clampLibraryNavigationWidth(width: number): number {
+  return Math.min(420, Math.max(200, Math.round(width)));
+}
+
+export function nextLibraryNavigationWidth(current: number, key: string): number {
+  if (key === "Home") return 200;
+  if (key === "End") return 420;
+  if (key === "ArrowLeft") return clampLibraryNavigationWidth(current - 16);
+  if (key === "ArrowRight") return clampLibraryNavigationWidth(current + 16);
+  return clampLibraryNavigationWidth(current);
+}
+
+function normalizedCatalogPath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+}
+
+export function indexedDirectoryNodes(
+  models: LibraryModel[],
+  rootId: string,
+): LibraryDirectoryNode[] {
+  const counts = new Map<string, number>();
+  for (const model of models) {
+    if (model.source_root_id !== rootId || !model.source_path) continue;
+    const parts = normalizedCatalogPath(model.source_path).split("/").filter(Boolean);
+    parts.pop();
+    for (let index = 1; index <= parts.length; index += 1) {
+      const prefix = parts.slice(0, index).join("/");
+      counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
+    }
+  }
+  return [...counts]
+    .map(([prefix, count]) => {
+      const parts = prefix.split("/");
+      return { prefix, count, name: parts.at(-1) ?? prefix, depth: parts.length - 1 };
+    })
+    .sort((a, b) => a.prefix.localeCompare(b.prefix, undefined, { sensitivity: "base" }));
+}
+
+export function matchesIndexedDirectory(
+  model: LibraryModel,
+  rootId: string | null,
+  prefix: string | null,
+): boolean {
+  if (!rootId || !prefix) return true;
+  if (model.source_root_id !== rootId || !model.source_path) return false;
+  const path = normalizedCatalogPath(model.source_path);
+  const normalizedPrefix = normalizedCatalogPath(prefix);
+  return path.startsWith(`${normalizedPrefix}/`);
 }
 
 const PAGE_SIZE = 36;
@@ -221,6 +287,11 @@ export function matchesLibraryMetadataFilters(
     );
     if (!model.tags.some((name) => categoryNames.has(name))) return false;
   }
+  const parent = model.metadata?.parent_model_id ?? "";
+  if (filters.parentId === "__none__" && parent) return false;
+  if (filters.parentId && filters.parentId !== "__none__" && parent !== filters.parentId)
+    return false;
+  if (filters.license && (model.metadata?.model_license ?? "") !== filters.license) return false;
   return true;
 }
 
@@ -284,6 +355,7 @@ export class LibraryPanel {
   private readonly scanStatus: HTMLElement;
   private readonly searchInput: HTMLInputElement;
   private readonly navigation: HTMLElement;
+  private readonly navigationResize: HTMLElement;
   private readonly gallery: HTMLElement;
   private readonly resultCount: HTMLElement;
   private readonly sortSelect: HTMLSelectElement;
@@ -307,6 +379,9 @@ export class LibraryPanel {
   private readonly designerSelect: HTMLSelectElement;
   private readonly tagSelect: HTMLSelectElement;
   private readonly categorySelect: HTMLSelectElement;
+  private readonly parentSelect: HTMLSelectElement;
+  private readonly licenseSelect: HTMLSelectElement;
+  private readonly body: HTMLElement;
   private readonly selectionStatus: HTMLElement;
   private readonly metadataEditor: LibraryMetadataEditor;
   private readonly tagManager: LibraryTagManager;
@@ -321,6 +396,8 @@ export class LibraryPanel {
   private readonly selectedModelIds = new Set<string>();
   private activeFolderId: string | null = null;
   private activeRootId: string | null = null;
+  private activeDirectoryRootId: string | null = null;
+  private activeDirectoryPrefix: string | null = null;
   private activeHistoryModelId: string | null = null;
   private viewMode: LibraryViewMode = "preview";
   private catalogSettings = DEFAULT_CATALOG_SETTINGS;
@@ -382,6 +459,14 @@ export class LibraryPanel {
   onCreateCollection: (name: string) => Promise<void> = async () => {};
   onRenameCollection: (id: string, name: string) => Promise<void> = async () => {};
   onDeleteCollection: (id: string) => Promise<void> = async () => {};
+  onReviewDuplicates: (modelIds: string[]) => Promise<void> = async () => {};
+  onRemoveModels: (targets: VersionedRemovalTarget[]) => Promise<void> = async () => {};
+  onRevealSource: (modelId: string) => Promise<void> = async () => {};
+  onTrashLooseSource: (model: LibraryModel) => Promise<void> = async () => {};
+  onChooseCustomPreview: (model: LibraryModel) => Promise<void> = async () => {};
+  onClearCustomPreview: (model: LibraryModel) => Promise<void> = async () => {};
+  onPreviewBundle: (bundleId: string) => Promise<void> = async () => {};
+  onOpenManagement: () => void = () => {};
 
   constructor(container: HTMLElement) {
     this.metadataEditor = new LibraryMetadataEditor(container);
@@ -445,7 +530,8 @@ export class LibraryPanel {
       () => void this.runAction(this.onAddRoot),
     );
     const closeButton = this.actionButton("Close", "", () => this.hide());
-    actions.append(this.importButton, this.addRootButton, closeButton);
+    const managementButton = this.actionButton("Manage…", "", () => this.onOpenManagement());
+    actions.append(this.importButton, this.addRootButton, managementButton, closeButton);
     header.append(heading, actions);
 
     this.status = document.createElement("div");
@@ -500,6 +586,8 @@ export class LibraryPanel {
     this.designerSelect = this.selectControl("Designer", [["", "All designers"]]);
     this.tagSelect = this.selectControl("Tag", [["", "All tags"]]);
     this.categorySelect = this.selectControl("Tag category", [["", "All categories"]]);
+    this.parentSelect = this.selectControl("Parent model", [["", "All parent relationships"]]);
+    this.licenseSelect = this.selectControl("Model license", [["", "All licenses"]]);
     toolbar.append(
       this.searchInput,
       this.sourceSelect,
@@ -511,10 +599,12 @@ export class LibraryPanel {
       this.designerSelect,
       this.tagSelect,
       this.categorySelect,
+      this.parentSelect,
+      this.licenseSelect,
     );
 
-    const body = document.createElement("div");
-    body.className = "library-body";
+    this.body = document.createElement("div");
+    this.body.className = "library-body";
     this.navigation = document.createElement("aside");
     this.navigation.className = "library-navigation";
     this.navigation.setAttribute("aria-label", "Library sources and folders");
@@ -538,6 +628,9 @@ export class LibraryPanel {
       }),
       this.actionButton("Edit selected…", "", () => this.editSelected()),
       this.actionButton("Create bundle", "", () => void this.createBundle()),
+      this.actionButton("Review duplicates", "", () => void this.reviewDuplicates()),
+      this.actionButton("Remove selected", "danger", () => void this.removeSelected()),
+      this.actionButton("Print roulette", "", () => this.runRoulette()),
     );
     const viewSwitcher = document.createElement("div");
     viewSwitcher.className = "library-view-switcher";
@@ -576,7 +669,17 @@ export class LibraryPanel {
     this.gallery.className = "library-gallery";
     this.gallery.setAttribute("aria-live", "polite");
     content.append(contentHeader, this.gallery);
-    body.append(this.navigation, content);
+    this.navigationResize = document.createElement("div");
+    this.navigationResize.className = "library-navigation-resize";
+    this.navigationResize.tabIndex = 0;
+    this.navigationResize.setAttribute("role", "separator");
+    this.navigationResize.setAttribute("aria-label", "Resize source and collection sidebar");
+    this.navigationResize.setAttribute("aria-orientation", "vertical");
+    this.navigationResize.setAttribute("aria-valuemin", "200");
+    this.navigationResize.setAttribute("aria-valuemax", "420");
+    this.installNavigationResize(this.navigationResize);
+    this.navigation.append(this.navigationResize);
+    this.body.append(this.navigation, content);
 
     const catalogSettings = document.createElement("details");
     catalogSettings.className = "library-catalog-settings";
@@ -638,7 +741,7 @@ export class LibraryPanel {
     this.cancelScanButton.hidden = true;
     scanBar.append(this.scanStatus, this.scanButton, this.cancelScanButton);
 
-    shell.append(header, this.status, toolbar, body, catalogSettings, scanBar);
+    shell.append(header, this.status, toolbar, this.body, catalogSettings, scanBar);
     this.root.append(shell);
     container.appendChild(this.root);
   }
@@ -704,6 +807,16 @@ export class LibraryPanel {
     if (this.activeRootId && !roots.some((root) => root.id === this.activeRootId)) {
       this.activeRootId = null;
     }
+    if (
+      this.activeDirectoryRootId &&
+      (!roots.some((root) => root.id === this.activeDirectoryRootId) ||
+        !indexedDirectoryNodes(models, this.activeDirectoryRootId).some(
+          (node) => node.prefix === this.activeDirectoryPrefix,
+        ))
+    ) {
+      this.activeDirectoryRootId = null;
+      this.activeDirectoryPrefix = null;
+    }
     this.renderContent();
   }
 
@@ -727,6 +840,15 @@ export class LibraryPanel {
     for (const model of this.allModels) this.thumbnailGuard.invalidate(model.id);
   }
 
+  invalidateAfterLibraryReplacement(): void {
+    this.metadataEditor.dismiss();
+    this.tagManager.dismiss();
+    this.printHistory.dismiss();
+    this.selectedModelIds.clear();
+    this.activeHistoryModelId = null;
+    this.clearThumbnailCache();
+  }
+
   private actionButton(label: string, variant: string, action: () => void): HTMLButtonElement {
     const button = document.createElement("button");
     button.type = "button";
@@ -745,12 +867,43 @@ export class LibraryPanel {
     return select;
   }
 
+  private installNavigationResize(handle: HTMLElement): void {
+    let startX = 0;
+    let startWidth = 270;
+    const apply = (width: number) => {
+      const clamped = clampLibraryNavigationWidth(width);
+      this.body.style.setProperty("--library-nav-width", `${clamped}px`);
+      handle.setAttribute("aria-valuenow", String(clamped));
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      if (window.matchMedia("(max-width: 760px)").matches) return;
+      startX = event.clientX;
+      startWidth = this.navigation.getBoundingClientRect().width;
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!handle.hasPointerCapture(event.pointerId)) return;
+      apply(startWidth + event.clientX - startX);
+    });
+    handle.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      apply(nextLibraryNavigationWidth(this.navigation.getBoundingClientRect().width, event.key));
+    });
+    apply(270);
+  }
+
   private refreshMetadataFilterOptions(models: LibraryModel[], tags: LibraryTag[]): void {
     const designers = [
       ...new Set(models.map((model) => model.metadata?.designer?.trim() ?? "").filter(Boolean)),
     ].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
     const categories = [
       ...new Set(tags.map((tag) => tag.category?.trim() ?? "").filter(Boolean)),
+    ].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    const licenses = [
+      ...new Set(
+        models.map((model) => model.metadata?.model_license?.trim() ?? "").filter(Boolean),
+      ),
     ].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
     this.replaceSelectOptions(this.designerSelect, [
       ["", "All designers"],
@@ -766,6 +919,15 @@ export class LibraryPanel {
     this.replaceSelectOptions(this.categorySelect, [
       ["", "All categories"],
       ...categories.map((category): [string, string] => [category, category]),
+    ]);
+    this.replaceSelectOptions(this.parentSelect, [
+      ["", "All parent relationships"],
+      ["__none__", "No parent"],
+      ...models.map((model): [string, string] => [model.id, model.display_name]),
+    ]);
+    this.replaceSelectOptions(this.licenseSelect, [
+      ["", "All licenses"],
+      ...licenses.map((license): [string, string] => [license, license]),
     ]);
   }
 
@@ -874,6 +1036,44 @@ export class LibraryPanel {
     });
   }
 
+  private async reviewDuplicates(): Promise<void> {
+    const ids = explicitScopeIds(this.filteredModels);
+    if (!ids.length) {
+      this.setStatus("No available models are in the current filter.");
+      return;
+    }
+    await this.runAction(() => this.onReviewDuplicates(ids));
+  }
+
+  private async removeSelected(): Promise<void> {
+    const models = this.allModels.filter((model) => this.selectedModelIds.has(model.id));
+    if (!models.length) {
+      this.setStatus("Select models to remove from the catalog.");
+      return;
+    }
+    if (
+      !window.confirm(
+        `Remove ${models.length} selected model${models.length === 1 ? "" : "s"} from the catalog?\n\nSource files will not be deleted. You can restore these records from Removed items.`,
+      )
+    ) {
+      return;
+    }
+    await this.runAction(async () => {
+      await this.onRemoveModels(removalTargets(models));
+      this.selectedModelIds.clear();
+    });
+  }
+
+  private runRoulette(): void {
+    const chosen = chooseRouletteModel(this.filteredModels);
+    if (!chosen) {
+      this.setStatus("No available models are in the current filter.");
+      return;
+    }
+    this.setStatus(`Print Roulette chose ${chosen.display_name}.`);
+    this.onOpenModel(chosen.id);
+  }
+
   private async openPrintHistory(model: LibraryModel): Promise<void> {
     this.activeHistoryModelId = model.id;
     const active = document.activeElement;
@@ -908,6 +1108,9 @@ export class LibraryPanel {
       status: this.statusSelect.value as LibraryStatusFilter,
       sort: this.sortSelect.value as LibrarySort,
     }).filter((model) => {
+      if (!matchesIndexedDirectory(model, this.activeDirectoryRootId, this.activeDirectoryPrefix)) {
+        return false;
+      }
       if (!matchesPrintedFilter(model, this.printedSelect.value as PrintedFilter)) return false;
       const group = this.groupSelect.value as LibraryGroupFilter;
       if (!matchesLibraryGroup(model, group)) return false;
@@ -918,6 +1121,8 @@ export class LibraryPanel {
           designer: this.designerSelect.value,
           tagId: this.tagSelect.value,
           category: this.categorySelect.value,
+          parentId: this.parentSelect.value,
+          license: this.licenseSelect.value,
         },
         this.allTags,
       );
@@ -954,7 +1159,10 @@ export class LibraryPanel {
             },
             { root: this.gallery, rootMargin: "160px" },
           );
-    for (const model of shown) this.gallery.append(this.modelCard(model));
+    const partitioned = partitionBundleGroups(shown);
+    for (const group of partitioned.groups)
+      this.gallery.append(this.bundleRow(group.bundleId, group.models));
+    for (const model of partitioned.singles) this.gallery.append(this.modelCard(model));
     if (shown.length < models.length) {
       const more = this.actionButton(
         `Show ${Math.min(PAGE_SIZE, models.length - shown.length)} more`,
@@ -979,10 +1187,33 @@ export class LibraryPanel {
       sourceHeading,
       this.filterButton("All models", this.activeRootId === null, () => {
         this.activeRootId = null;
+        this.activeDirectoryRootId = null;
+        this.activeDirectoryPrefix = null;
         this.resetAndRender();
       }),
     );
-    for (const root of this.allRoots) sources.append(this.rootCard(root));
+    for (const root of this.allRoots) {
+      sources.append(this.rootCard(root));
+      const tree = document.createElement("div");
+      tree.className = "library-directory-tree";
+      for (const node of indexedDirectoryNodes(this.allModels, root.id)) {
+        const button = this.filterButton(
+          `${node.name} · ${node.count}`,
+          this.activeDirectoryRootId === root.id && this.activeDirectoryPrefix === node.prefix,
+          () => {
+            const alreadySelected =
+              this.activeDirectoryRootId === root.id && this.activeDirectoryPrefix === node.prefix;
+            this.activeRootId = root.id;
+            this.activeDirectoryRootId = alreadySelected ? null : root.id;
+            this.activeDirectoryPrefix = alreadySelected ? null : node.prefix;
+            this.resetAndRender();
+          },
+        );
+        button.style.setProperty("--directory-depth", String(node.depth));
+        tree.append(button);
+      }
+      sources.append(tree);
+    }
     if (!this.allRoots.length) {
       const hint = document.createElement("p");
       hint.className = "library-nav-hint";
@@ -1037,7 +1268,7 @@ export class LibraryPanel {
       }
       folders.append(row);
     }
-    this.navigation.append(sources, folders);
+    this.navigation.append(sources, folders, this.navigationResize);
   }
 
   private filterButton(label: string, selected: boolean, action: () => void): HTMLButtonElement {
@@ -1060,6 +1291,8 @@ export class LibraryPanel {
       this.activeRootId === root.id,
       () => {
         this.activeRootId = this.activeRootId === root.id ? null : root.id;
+        this.activeDirectoryRootId = null;
+        this.activeDirectoryPrefix = null;
         this.resetAndRender();
       },
     );
@@ -1249,8 +1482,74 @@ export class LibraryPanel {
       ),
     );
     edit.setAttribute("aria-label", `Edit metadata for ${model.display_name}`);
-    article.append(preview, open, selected, edit, regenerate);
+    const manage = document.createElement("details");
+    manage.className = "library-card-actions";
+    const manageSummary = document.createElement("summary");
+    manageSummary.textContent = "More";
+    manage.append(
+      manageSummary,
+      this.actionButton(
+        "Reveal source",
+        "",
+        () => void this.runAction(() => this.onRevealSource(model.id)),
+      ),
+      this.actionButton(
+        "Set custom preview…",
+        "",
+        () => void this.runAction(() => this.onChooseCustomPreview(model)),
+      ),
+      this.actionButton(
+        "Clear custom preview",
+        "",
+        () => void this.runAction(() => this.onClearCustomPreview(model)),
+      ),
+    );
+    if (model.source_kind === "indexed" && !model.source_archive_member) {
+      manage.append(
+        this.actionButton("Move original to Trash…", "danger", () => {
+          if (!window.confirm(`Move the source file for “${model.display_name}” to Trash?`)) return;
+          void this.runAction(() => this.onTrashLooseSource(model));
+        }),
+      );
+    }
+    article.append(preview, open, selected, edit, regenerate, manage);
     return article;
+  }
+
+  private bundleRow(bundleId: string, models: LibraryModel[]): HTMLElement {
+    const details = document.createElement("details");
+    details.className = "library-bundle-row";
+    const summary = document.createElement("summary");
+    const label = document.createElement("strong");
+    const fullCount = this.allModels.filter((model) => model.bundle_id === bundleId).length;
+    label.textContent =
+      models.length === fullCount
+        ? `${fullCount} model bundle`
+        : `${models.length} shown of ${fullCount} bundle models`;
+    const meta = document.createElement("span");
+    meta.textContent = `${models.reduce((total, model) => total + model.bytes, 0).toLocaleString()} shown bytes`;
+    summary.append(label, meta);
+    const actions = document.createElement("div");
+    actions.className = "library-bundle-actions";
+    actions.append(
+      this.actionButton(
+        "Preview bundle…",
+        "",
+        () => void this.runAction(() => this.onPreviewBundle(bundleId)),
+      ),
+    );
+    const members = document.createElement("div");
+    members.className = "library-bundle-members";
+    for (const model of models) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.textContent = `${model.display_name} · ${formatLibraryBytes(model.bytes)}`;
+      row.disabled = !canOpenLibraryModel(model);
+      row.addEventListener("click", () => this.onOpenModel(model.id));
+      members.append(row);
+    }
+    details.append(summary, actions, members);
+    return details;
   }
 
   private focusModelEditor(modelId: string): void {

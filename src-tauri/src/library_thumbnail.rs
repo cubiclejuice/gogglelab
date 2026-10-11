@@ -80,7 +80,10 @@ pub fn ensure_thumbnail(
         return Err("Model source changed since it was indexed".into());
     }
     let parsed = stl_core::parse_model(&bytes).map_err(|error| error.to_string())?;
-    let png = render_png(&parsed, settings)?;
+    let png = match crate::library_images::embedded_3mf_thumbnail(&bytes) {
+        Ok(Some(png)) => png,
+        _ => render_png(&parsed, settings)?,
+    };
     let parent = output
         .parent()
         .ok_or_else(|| "Thumbnail output has no parent directory".to_string())?;
@@ -105,6 +108,7 @@ pub fn ensure_thumbnail(
     })
 }
 
+#[cfg(test)]
 pub fn png_data_uri(path: &Path) -> Result<String, String> {
     png_data_uri_validated(path, None)
 }

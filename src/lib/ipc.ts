@@ -544,6 +544,74 @@ export interface CatalogSettings {
   scan_batch_size: number;
 }
 
+export interface VersionedRemovalTarget {
+  modelId: string;
+  expectedVersion: number;
+}
+
+export interface DuplicateGroup {
+  contentHash: string;
+  models: LibraryModel[];
+}
+
+export interface RemovalResult {
+  snapshotId: string;
+  removedIds: string[];
+}
+
+export interface RemovedModel {
+  model: LibraryModel;
+  removedAt: string;
+  snapshotId: string;
+}
+
+export interface TrashResult {
+  snapshotId: string;
+  modelId: string;
+}
+
+export interface BackupResult {
+  path: string;
+  files: number;
+  bytes: number;
+  sha256: string;
+}
+
+export interface RestoreResult {
+  previousLibraryBackup: string;
+  models: number;
+  generation: number;
+}
+
+export interface CleanupResult {
+  files: number;
+  bytes: number;
+}
+
+export interface ManagementStatus {
+  maintenance: boolean;
+  generation: number;
+}
+
+export interface BundlePreviewMember {
+  modelId: string;
+  displayName: string;
+  triangleCount: number;
+  offset: [number, number, number];
+}
+
+export interface BundlePreviewSummary {
+  token: string;
+  bundleId: string;
+  memberCount: number;
+  previewedCount: number;
+  omittedCount: number;
+  triangleCount: number;
+  layout: "combined" | "grid";
+  members: BundlePreviewMember[];
+  notice: string | null;
+}
+
 export function libraryListFolders(): Promise<LibraryFolder[]> {
   return invoke("library_list_folders");
 }
@@ -709,6 +777,103 @@ export function libraryRenameFolder(id: string, name: string): Promise<LibraryFo
 
 export function libraryDeleteFolder(id: string): Promise<void> {
   return invoke("library_delete_folder", { id });
+}
+
+export function libraryDuplicateGroups(modelIds: string[]): Promise<DuplicateGroup[]> {
+  return invoke("library_duplicate_groups", { modelIds });
+}
+
+export function libraryRemoveModels(targets: VersionedRemovalTarget[]): Promise<RemovalResult> {
+  return invoke("library_remove_models", { targets });
+}
+
+export function libraryListRemovedModels(): Promise<RemovedModel[]> {
+  return invoke("library_list_removed_models");
+}
+
+export function libraryRestoreRemoval(snapshotId: string): Promise<LibraryModel[]> {
+  return invoke("library_restore_removal", { snapshotId });
+}
+
+export function libraryTrashLooseSource(
+  modelId: string,
+  expectedVersion: number,
+): Promise<TrashResult> {
+  return invoke("library_trash_loose_source", { modelId, expectedVersion });
+}
+
+export function libraryUndoTrash(snapshotId: string): Promise<LibraryModel> {
+  return invoke("library_undo_trash", { snapshotId });
+}
+
+export function libraryRevealModelSource(
+  modelId: string,
+): Promise<{ path: string; archiveMember?: string | null }> {
+  return invoke("library_reveal_model_source", { modelId });
+}
+
+export function libraryCreateBackup(destinationPath: string): Promise<BackupResult> {
+  return invoke("library_create_backup", { destinationPath });
+}
+
+export function libraryRestoreBackup(sourcePath: string): Promise<RestoreResult> {
+  return invoke("library_restore_backup", { sourcePath });
+}
+
+export function libraryPurgeCatalog(
+  confirmation: string,
+  destinationPath: string,
+): Promise<BackupResult> {
+  return invoke("library_purge_catalog", { confirmation, destinationPath });
+}
+
+export function libraryCleanupOrphanCache(): Promise<CleanupResult> {
+  return invoke("library_cleanup_orphan_cache");
+}
+
+export function libraryManagementStatus(): Promise<ManagementStatus> {
+  return invoke("library_management_status");
+}
+
+export function libraryPrepareBundlePreview(
+  bundleId: string,
+  generation: number,
+): Promise<BundlePreviewSummary> {
+  return invoke("library_prepare_bundle_preview", { bundleId, generation });
+}
+
+export async function libraryBundlePreviewGeometry(token: string): Promise<DecodedGeometry> {
+  const raw = await invoke<ArrayBuffer | Uint8Array | number[]>("library_bundle_preview_geometry", {
+    token,
+  });
+  return decodeGeometryBuffer(raw);
+}
+
+export function libraryCloseBundlePreview(token: string): Promise<void> {
+  return invoke("library_close_bundle_preview", { token });
+}
+
+export function librarySendBundleToSlicer(
+  bundleId: string,
+  slicerId: string,
+  token: string,
+): Promise<void> {
+  return invoke("library_send_bundle_to_slicer", { bundleId, slicerId, token });
+}
+
+export function librarySetCustomThumbnail(
+  modelId: string,
+  expectedVersion: number,
+  path: string,
+): Promise<LibraryModel> {
+  return invoke("library_set_custom_thumbnail", { modelId, expectedVersion, path });
+}
+
+export function libraryClearCustomThumbnail(
+  modelId: string,
+  expectedVersion: number,
+): Promise<LibraryModel> {
+  return invoke("library_clear_custom_thumbnail", { modelId, expectedVersion });
 }
 
 export interface RecoveryManifest {

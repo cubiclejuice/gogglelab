@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 pub struct LoadedModel {
     pub generation: u64,
     pub path: String,
+    pub source_digest: String,
     pub parsed: Arc<stl_core::ParsedModel>,
 }
 

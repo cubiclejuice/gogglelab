@@ -19,6 +19,9 @@ contain the Community features listed below. Private Pro source stays in its sep
 - Cached STL/3MF thumbnail gallery with source/status filters, search, sorting and preview regeneration.
 - Designer, notes, source URLs, model license, tags/categories, status and versioned batch edits.
 - Print history, parent/child links, collections, folder bundles and opt-in in-place ZIP indexing.
+- Exact-filter duplicate review, recoverable removal/Trash/restore, source reveal and full Library backup/restore.
+- Multipart bundle preview and all-member slicer handoff, filtered roulette and safe cache maintenance.
+- Custom PNG/JPEG previews and embedded 3MF images; indexed directory tree and resizable source sidebar.
 - Read-only recovery of existing Library data and raw saved colorway records.
 
 Community owns managed Library and basic slicer handoff. Editable/saved colorways and slicer palette access remain Pro.

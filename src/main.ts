@@ -4,7 +4,7 @@
 import { getCurrentWindow, type DragDropEvent } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   openModel,
   readStepFile,
@@ -47,6 +47,23 @@ import {
   libraryCreateFolder,
   libraryRenameFolder,
   libraryDeleteFolder,
+  libraryDuplicateGroups,
+  libraryRemoveModels,
+  libraryListRemovedModels,
+  libraryRestoreRemoval,
+  libraryTrashLooseSource,
+  libraryUndoTrash,
+  libraryRevealModelSource,
+  libraryPrepareBundlePreview,
+  libraryBundlePreviewGeometry,
+  libraryCloseBundlePreview,
+  librarySendBundleToSlicer,
+  librarySetCustomThumbnail,
+  libraryClearCustomThumbnail,
+  libraryCreateBackup,
+  libraryRestoreBackup,
+  libraryPurgeCatalog,
+  libraryCleanupOrphanCache,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -81,6 +98,10 @@ import { handoffAvailability } from "./lib/handoff-availability";
 import { withCoreEntitlements } from "./lib/core-entitlements";
 import { LibraryPanel } from "./lib/library";
 import { LibraryOperationGuard } from "./lib/library-operation";
+import { LibraryManagementDialog } from "./lib/library-management-dialog";
+import { LibraryBundleDialog } from "./lib/library-bundle-dialog";
+import { LibraryDuplicatesDialog } from "./lib/library-duplicates-dialog";
+import { removalTargets } from "./lib/library-management";
 import "./styles.css";
 
 export function startApp(extensions: AppExtensions): void {
@@ -110,6 +131,9 @@ export function startApp(extensions: AppExtensions): void {
     { once: true },
   );
   const libraryPanel = new LibraryPanel(app);
+  const libraryManagement = new LibraryManagementDialog(app);
+  const libraryBundle = new LibraryBundleDialog(app);
+  const libraryDuplicates = new LibraryDuplicatesDialog(app);
   const libraryService = {
     listFolders: libraryListFolders,
     listModels: libraryListModels,
@@ -141,6 +165,23 @@ export function startApp(extensions: AppExtensions): void {
     createFolder: libraryCreateFolder,
     renameFolder: libraryRenameFolder,
     deleteFolder: libraryDeleteFolder,
+    duplicateGroups: libraryDuplicateGroups,
+    removeModels: libraryRemoveModels,
+    listRemovedModels: libraryListRemovedModels,
+    restoreRemoval: libraryRestoreRemoval,
+    trashLooseSource: libraryTrashLooseSource,
+    undoTrash: libraryUndoTrash,
+    revealModelSource: libraryRevealModelSource,
+    prepareBundlePreview: libraryPrepareBundlePreview,
+    bundlePreviewGeometry: libraryBundlePreviewGeometry,
+    closeBundlePreview: libraryCloseBundlePreview,
+    sendBundleToSlicer: librarySendBundleToSlicer,
+    setCustomThumbnail: librarySetCustomThumbnail,
+    clearCustomThumbnail: libraryClearCustomThumbnail,
+    createBackup: libraryCreateBackup,
+    restoreBackup: libraryRestoreBackup,
+    purgeCatalog: libraryPurgeCatalog,
+    cleanupOrphanCache: libraryCleanupOrphanCache,
   };
   let activeEntitlements = withCoreEntitlements(extensions.currentEntitlements?.());
   const main = document.createElement("div");
@@ -690,6 +731,28 @@ export function startApp(extensions: AppExtensions): void {
     stepController = null;
   }
 
+  function invalidateViewerAfterLibraryReplacement(message: string): void {
+    const nextGeneration = ++generation;
+    pendingLibraryLoad = null;
+    cancelCadPreview();
+    loadingSourcePath = null;
+    loadedSourcePath = null;
+    loadedGeneration = null;
+    loadedFormat = null;
+    clearProgressTimer();
+    plateSession.reset(nextGeneration);
+    colorFeature.reset(nextGeneration);
+    viewport.loadMesh(null);
+    hud.hide();
+    setWindowTitle(null);
+    updateHandoffButton();
+    libraryPanel.invalidateAfterLibraryReplacement();
+    libraryManagement.dismiss();
+    libraryDuplicates.dismiss();
+    void libraryBundle.dismiss();
+    setOverlay({ kind: "hint", text: message });
+  }
+
   function clearProgressTimer() {
     if (progressTimer !== undefined) {
       window.clearTimeout(progressTimer);
@@ -1069,6 +1132,122 @@ export function startApp(extensions: AppExtensions): void {
   libraryPanel.onDeleteCollection = async (id) => {
     await libraryService.deleteFolder(id);
     await refreshLibrary();
+  };
+  libraryPanel.onReviewDuplicates = async (modelIds) => {
+    const groups = await libraryService.duplicateGroups(modelIds);
+    libraryDuplicates.show(groups, modelIds.length);
+  };
+  libraryDuplicates.onGetThumbnail = (modelId) => libraryService.getThumbnail(modelId, false);
+  libraryDuplicates.onRemove = async (models) => {
+    await libraryService.removeModels(removalTargets(models));
+    await refreshLibrary();
+    libraryDuplicates.dismiss();
+    libraryPanel.setStatus(
+      `${models.length} duplicate record${models.length === 1 ? "" : "s"} removed recoverably.`,
+    );
+  };
+  libraryPanel.onRemoveModels = async (targets) => {
+    const result = await libraryService.removeModels(targets);
+    await refreshLibrary();
+    libraryPanel.setStatus(
+      `${result.removedIds.length} model${result.removedIds.length === 1 ? "" : "s"} removed recoverably. Snapshot ${result.snapshotId}.`,
+    );
+  };
+  libraryPanel.onRevealSource = async (modelId) => {
+    const source = await libraryService.revealModelSource(modelId);
+    libraryPanel.setStatus(
+      source.archiveMember
+        ? `Archive source: ${source.path} · member ${source.archiveMember}`
+        : `Source: ${source.path}`,
+    );
+  };
+  libraryPanel.onTrashLooseSource = async (model) => {
+    const result = await libraryService.trashLooseSource(model.id, model.metadata_version);
+    await refreshLibrary();
+    if (window.confirm("Source moved to Trash. Undo this action now?")) {
+      await libraryService.undoTrash(result.snapshotId);
+      await refreshLibrary();
+      libraryPanel.setStatus("Trash action undone.");
+    } else {
+      libraryPanel.setStatus(`Source moved to Trash recoverably. Snapshot ${result.snapshotId}.`);
+    }
+  };
+  libraryPanel.onChooseCustomPreview = async (model) => {
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: "Preview image", extensions: ["png", "jpg", "jpeg"] }],
+    });
+    if (typeof path !== "string") return;
+    await libraryService.setCustomThumbnail(model.id, model.metadata_version, path);
+    libraryPanel.clearThumbnailCache();
+    await refreshLibrary();
+  };
+  libraryPanel.onClearCustomPreview = async (model) => {
+    await libraryService.clearCustomThumbnail(model.id, model.metadata_version);
+    libraryPanel.clearThumbnailCache();
+    await refreshLibrary();
+  };
+  let bundlePreviewGeneration = 0;
+  libraryPanel.onPreviewBundle = async (bundleId) => {
+    const preview = await libraryService.prepareBundlePreview(bundleId, ++bundlePreviewGeneration);
+    await libraryBundle.show(preview, await detectSlicers());
+  };
+  libraryBundle.onClosePreview = libraryService.closeBundlePreview;
+  libraryBundle.onHandoff = libraryService.sendBundleToSlicer;
+  libraryBundle.onLoadGeometry = libraryService.bundlePreviewGeometry;
+  libraryPanel.onOpenManagement = () => {
+    void libraryService
+      .listRemovedModels()
+      .then((removed) => libraryManagement.show(removed))
+      .catch((error) => {
+        libraryPanel.setStatus(
+          `Could not open Library management: ${isAppError(error) ? describeError(error) : String(error)}`,
+        );
+      });
+  };
+  libraryManagement.onRestoreRemoved = async (snapshotId) => {
+    await libraryService.restoreRemoval(snapshotId);
+    await refreshLibrary();
+    libraryManagement.show(await libraryService.listRemovedModels());
+  };
+  libraryManagement.onBackup = async () => {
+    const destination = await saveDialog({ defaultPath: "GoggleLab-Library.gogglelab-backup" });
+    if (!destination) return;
+    const result = await libraryService.createBackup(destination);
+    libraryPanel.setStatus(`Backup created: ${result.files} files · ${result.path}`);
+  };
+  libraryManagement.onRestoreBackup = async () => {
+    const source = await openDialog({
+      multiple: false,
+      filters: [{ name: "GoggleLab backup", extensions: ["gogglelab-backup", "zip"] }],
+    });
+    if (typeof source !== "string") return;
+    if (
+      !window.confirm(
+        "Restore this verified backup and preserve the current Library as rollback data?",
+      )
+    )
+      return;
+    const result = await libraryService.restoreBackup(source);
+    invalidateViewerAfterLibraryReplacement("Library backup restored. Choose a model to continue.");
+    await refreshLibrary();
+    libraryPanel.setStatus(`Backup restored. Previous Library: ${result.previousLibraryBackup}`);
+  };
+  libraryManagement.onChoosePurgeBackupDestination = async () =>
+    await saveDialog({ defaultPath: "GoggleLab-before-purge.gogglelab-backup" });
+  libraryManagement.onPurge = async (confirmation, destinationPath) => {
+    const result = await libraryService.purgeCatalog(confirmation, destinationPath);
+    invalidateViewerAfterLibraryReplacement(
+      "Catalog purged after a restorable backup. The viewer was cleared.",
+    );
+    await refreshLibrary();
+    libraryPanel.setStatus(
+      `Catalog purged after preserving ${result.files} files at ${result.path}.`,
+    );
+  };
+  libraryManagement.onCleanup = async () => {
+    const result = await libraryService.cleanupOrphanCache();
+    libraryPanel.setStatus(`Cleaned ${result.files} orphan cache files · ${result.bytes} bytes.`);
   };
 
   const unsubscribeEntitlements =

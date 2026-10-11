@@ -40,3 +40,24 @@ viewer cache copies are hash checked, while thumbnail-only extraction is tempora
 Disabling ZIP scanning pauses those members instead of falsely marking them missing.
 Read-only recovery exports organization/history and indexed references for schemas 1–3;
 it does not copy external indexed originals. UI metadata is always rendered as text.
+
+## Free management and multipart workflows (phase 4)
+
+Versioned removal preserves tombstones/history and an owned recovery snapshot. Source
+changes advance metadata versions so stale cleanup selections cannot trash changed files.
+Explicit physical Trash is limited to loose indexed files; shared managed blobs and ZIP
+contents survive catalog removal. Delayed restore uses verified owned copies and refuses
+destination collisions. Full backup is separate from the read-only recovery export:
+it contains a consistent SQLite snapshot and hashed owned namespaces. Restore verifies
+the archive/catalog, stages replacement, preserves the previous directory, advances
+metadata versions, and invalidates viewer state before swapping.
+
+Library I/O admission prevents replacement during scanning, thumbnails, source copying
+or viewing. Independent bundle preview state caps geometry at 32 parts with a notice,
+while handoff admits all members and preserves originals. Single and bundle sends verify
+content and launch fresh supported slicers with literal arguments. Handoff copies live
+outside the replaceable Library root, and macOS launches use a new instance.
+
+Preview images normalize bounded PNG/JPEG inputs to small owned PNGs. Safe package
+thumbnail relationships support embedded 3MF images; custom images retain priority over
+regeneration. No new capability depends on license state.

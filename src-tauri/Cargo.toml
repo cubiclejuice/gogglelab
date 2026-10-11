@@ -32,6 +32,9 @@ base64 = "0.22"
 stl-core = { path = "../crates/stl-core" }
 library-recovery = { path = "../crates/library-recovery" }
 library-core = { path = "../crates/library-core" }
+library-backup = { path = "../crates/library-backup" }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+quick-xml = "0.41"
 notify = "8.2.0"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
@@ -42,3 +45,7 @@ trash = { version = "5.2.9", default-features = false }
 trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+
+[dev-dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+tempfile = "3"

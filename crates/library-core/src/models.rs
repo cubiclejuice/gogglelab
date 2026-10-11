@@ -189,6 +189,25 @@ pub struct ThumbnailCacheEntry {
     pub is_custom: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DuplicateGroup {
+    pub content_hash: String,
+    pub models: Vec<Model>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemovalResult {
+    pub snapshot_id: String,
+    pub removed_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemovedModel {
+    pub model: Model,
+    pub removed_at: String,
+    pub snapshot_id: String,
+}
+
 impl Default for CatalogSettings {
     fn default() -> Self {
         Self {

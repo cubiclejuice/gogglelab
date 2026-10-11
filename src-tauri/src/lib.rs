@@ -10,7 +10,10 @@ mod fusion_preview;
 mod geometry_buffer;
 mod handoff;
 mod library_archives;
+mod library_bundle;
 mod library_commands;
+mod library_images;
+mod library_management;
 mod library_scan;
 mod library_thumbnail;
 mod opened_urls;
@@ -41,6 +44,7 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .manage(library_bundle::BundlePreviewState::default())
         .manage(fusion_preview::FusionBridgeState::default())
         .manage(folder_watch::FolderWatchState::default())
         .manage(OpenedUrls::default())
@@ -57,6 +61,24 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             opened_urls::opened_urls,
             slicers::detect_slicers,
             handoff::open_in_slicer,
+            library_bundle::library_prepare_bundle_preview,
+            library_bundle::library_bundle_preview_geometry,
+            library_bundle::library_close_bundle_preview,
+            library_bundle::library_send_bundle_to_slicer,
+            library_management::library_duplicate_groups,
+            library_management::library_remove_models,
+            library_management::library_list_removed_models,
+            library_management::library_restore_removal,
+            library_management::library_reveal_model_source,
+            library_management::library_trash_loose_source,
+            library_management::library_undo_trash,
+            library_management::library_create_backup,
+            library_management::library_restore_backup,
+            library_management::library_purge_catalog,
+            library_management::library_cleanup_orphan_cache,
+            library_management::library_management_status,
+            library_images::library_set_custom_thumbnail,
+            library_images::library_clear_custom_thumbnail,
             library_commands::library_list_folders,
             library_commands::library_list_models,
             library_commands::library_create_folder,

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,10 +10,10 @@ use uuid::Uuid;
 
 use crate::error::{io, LibraryError};
 use crate::models::{
-    CatalogSettings, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, MetadataPatch, Model,
-    ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome, PrintStatus, ResolvedModelSource,
-    ScanReconcile, ScannedModel, SourceRef, Tag, TagMode, ThumbnailCacheEntry,
-    VersionedModelUpdate, VersionedTarget,
+    CatalogSettings, DuplicateGroup, Folder, ImportResult, IndexRoot, IndexedSourceMetadata,
+    MetadataPatch, Model, ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome,
+    PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource, ScanReconcile, ScannedModel,
+    SourceRef, Tag, TagMode, ThumbnailCacheEntry, VersionedModelUpdate, VersionedTarget,
 };
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 3;
@@ -46,12 +46,47 @@ pub struct LibraryDb {
 impl LibraryDb {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, LibraryError> {
         let root = root.as_ref().to_path_buf();
-        for dir in ["originals", "manuals", "thumbnails", "staging", "trash"] {
-            std::fs::create_dir_all(root.join(dir)).map_err(|e| io(root.join(dir), e))?;
+        match std::fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(LibraryError::InvalidInput(
+                    "library root must be a real directory".into(),
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&root).map_err(|e| io(&root, e))?
+            }
+            Err(error) => return Err(io(&root, error)),
         }
         let root = root.canonicalize().map_err(|error| io(&root, error))?;
+        for dir in ["originals", "manuals", "thumbnails", "staging", "trash"] {
+            ensure_owned_directory(&root, dir)?;
+        }
         let db_path = root.join("library.sqlite3");
+        match std::fs::symlink_metadata(&db_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(LibraryError::InvalidInput(
+                    "library database must be a regular owned file".into(),
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io(&db_path, error)),
+        }
         let conn = Connection::open(&db_path)?;
+        let opened_db = std::fs::symlink_metadata(&db_path).map_err(|error| io(&db_path, error))?;
+        if opened_db.file_type().is_symlink()
+            || !opened_db.is_file()
+            || db_path
+                .canonicalize()
+                .map_err(|error| io(&db_path, error))?
+                .parent()
+                != Some(root.as_path())
+        {
+            return Err(LibraryError::InvalidInput(
+                "library database identity changed".into(),
+            ));
+        }
         Self::initialize(conn, root)
     }
 
@@ -147,6 +182,266 @@ impl LibraryDb {
             model.tags = tags.remove(&model.id).unwrap_or_default();
         }
         Ok(models)
+    }
+
+    pub fn list_bundle_models(&self, bundle_id: &str) -> Result<Vec<Model>, LibraryError> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bundles WHERE id=?1)",
+            params![bundle_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(LibraryError::InvalidInput("bundle not found".into()));
+        }
+        let mut stmt=self.conn.prepare(&format!("{MODEL_SELECT} WHERE m.bundle_id=?1 AND m.deleted_at IS NULL ORDER BY lower(m.display_name),m.id"))?;
+        let rows = stmt.query_map(params![bundle_id], model_from_row)?;
+        let mut models = rows.collect::<Result<Vec<_>, _>>()?;
+        for model in &mut models {
+            model.tags = self.tags_for(&model.id)?;
+        }
+        Ok(models)
+    }
+
+    pub fn duplicate_groups(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<DuplicateGroup>, LibraryError> {
+        if model_ids.len() > 50_000 {
+            return Err(LibraryError::InvalidInput(
+                "duplicate scope exceeds 50000 models".into(),
+            ));
+        }
+        let mut unique = HashSet::new();
+        let mut groups: BTreeMap<String, Vec<Model>> = BTreeMap::new();
+        for id in model_ids {
+            if !unique.insert(id) {
+                return Err(LibraryError::InvalidInput(
+                    "duplicate model ID in scope".into(),
+                ));
+            }
+            let active: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM models WHERE id=?1 AND deleted_at IS NULL)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if !active {
+                return Err(LibraryError::ModelNotFound(id.clone()));
+            }
+            let model = self
+                .get_model(id)?
+                .ok_or_else(|| LibraryError::ModelNotFound(id.clone()))?;
+            if let Some(hash) = model.content_hash.clone() {
+                groups.entry(hash).or_default().push(model);
+            }
+        }
+        Ok(groups
+            .into_iter()
+            .filter_map(|(content_hash, models)| {
+                (models.len() > 1).then_some(DuplicateGroup {
+                    content_hash,
+                    models,
+                })
+            })
+            .collect())
+    }
+
+    pub fn remove_models_recoverably(
+        &self,
+        targets: &[VersionedTarget],
+    ) -> Result<RemovalResult, LibraryError> {
+        if targets.is_empty() || targets.len() > 50_000 {
+            return Err(LibraryError::InvalidInput(
+                "removal target count is invalid".into(),
+            ));
+        }
+        let mut unique = HashSet::new();
+        if targets
+            .iter()
+            .any(|target| !unique.insert(&target.model_id))
+        {
+            return Err(LibraryError::InvalidInput(
+                "duplicate removal target".into(),
+            ));
+        }
+        let snapshot_id = new_id("removal");
+        let now = timestamp();
+        let tx = self.conn.unchecked_transaction()?;
+        for target in targets {
+            let row: Option<(i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT metadata_version,deleted_at FROM models WHERE id=?1",
+                    params![target.model_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (actual, deleted) =
+                row.ok_or_else(|| LibraryError::ModelNotFound(target.model_id.clone()))?;
+            if actual as u64 != target.expected_version {
+                return Err(LibraryError::MetadataConflict {
+                    model_id: target.model_id.clone(),
+                    expected: target.expected_version,
+                    actual: actual as u64,
+                });
+            }
+            if deleted.is_some() {
+                return Err(LibraryError::InvalidInput(
+                    "model is already removed".into(),
+                ));
+            }
+            tx.execute("UPDATE models SET deleted_at=?1,metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",params![now,target.model_id])?;
+            tx.execute(
+                "DELETE FROM jobs WHERE model_id=?1 AND kind='removal'",
+                params![target.model_id],
+            )?;
+            tx.execute("INSERT INTO jobs(id,model_id,kind,status,retry_count,created_at,updated_at) VALUES(?1,?2,'removal',?3,0,?4,?4)",params![new_id("removal-item"),target.model_id,snapshot_id,now])?;
+        }
+        tx.commit()?;
+        Ok(RemovalResult {
+            snapshot_id,
+            removed_ids: targets
+                .iter()
+                .map(|target| target.model_id.clone())
+                .collect(),
+        })
+    }
+
+    pub fn list_removed_models(&self) -> Result<Vec<RemovedModel>, LibraryError> {
+        let rows = {
+            let mut stmt=self.conn.prepare("SELECT m.id,m.deleted_at,j.status FROM models m JOIN jobs j ON j.model_id=m.id AND j.kind='removal' WHERE m.deleted_at IS NOT NULL ORDER BY m.deleted_at DESC,m.id")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        rows.into_iter()
+            .map(|(id, removed_at, snapshot_id)| {
+                Ok(RemovedModel {
+                    model: self
+                        .get_model(&id)?
+                        .ok_or_else(|| LibraryError::ModelNotFound(id.clone()))?,
+                    removed_at,
+                    snapshot_id,
+                })
+            })
+            .collect()
+    }
+
+    pub fn restore_removal(&self, snapshot_id: &str) -> Result<Vec<Model>, LibraryError> {
+        let ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT model_id FROM jobs WHERE kind='removal' AND status=?1 ORDER BY model_id",
+            )?;
+            let rows = stmt.query_map(params![snapshot_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if ids.is_empty() {
+            return Err(LibraryError::InvalidInput(
+                "removal snapshot not found".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for id in &ids {
+            let deleted: Option<String> = tx
+                .query_row(
+                    "SELECT deleted_at FROM models WHERE id=?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if deleted.is_none() {
+                return Err(LibraryError::InvalidInput(
+                    "removal snapshot conflicts with active model".into(),
+                ));
+            }
+            tx.execute("UPDATE models SET deleted_at=NULL,metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",params![timestamp(),id])?;
+        }
+        tx.execute(
+            "DELETE FROM jobs WHERE kind='removal' AND status=?1",
+            params![snapshot_id],
+        )?;
+        tx.commit()?;
+        ids.iter()
+            .map(|id| {
+                self.get_model(id)?
+                    .ok_or_else(|| LibraryError::ModelNotFound(id.clone()))
+            })
+            .collect()
+    }
+
+    pub fn restore_removal_with_owned_source(
+        &self,
+        snapshot_id: &str,
+        model_id: &str,
+        content_hash: &str,
+        bytes: u64,
+        modified_at: u64,
+    ) -> Result<Model, LibraryError> {
+        validate_hash(content_hash)?;
+        let stored_bytes = i64::try_from(bytes)
+            .map_err(|_| LibraryError::InvalidInput("source byte count is too large".into()))?;
+        let stored_modified_at = i64::try_from(modified_at)
+            .map_err(|_| LibraryError::InvalidInput("source timestamp is too large".into()))?;
+        let ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT model_id FROM jobs WHERE kind='removal' AND status=?1 ORDER BY model_id",
+            )?;
+            let rows = stmt.query_map(params![snapshot_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if ids.len() != 1 || ids[0] != model_id {
+            return Err(LibraryError::InvalidInput(
+                "owned source recovery does not match removal snapshot".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        type RecoverySourceRow = (Option<String>, String, Option<String>, String, i64);
+        let source: Option<RecoverySourceRow> = tx
+            .query_row(
+                "SELECT m.deleted_at,m.source_kind,m.source_archive_member,d.content_hash,d.bytes
+                 FROM models m JOIN indexed_model_data d ON d.model_id=m.id WHERE m.id=?1",
+                params![model_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((deleted_at, source_kind, archive_member, stored_hash, catalog_bytes)) = source
+        else {
+            return Err(LibraryError::ModelNotFound(model_id.to_owned()));
+        };
+        if deleted_at.is_none()
+            || source_kind != "indexed"
+            || archive_member.is_some()
+            || stored_hash != content_hash
+            || catalog_bytes != stored_bytes
+        {
+            return Err(LibraryError::InvalidInput(
+                "owned source recovery conflicts with catalog".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE models SET deleted_at=NULL,source_missing=0,source_modified_at=?1,
+                    metadata_version=metadata_version+1,updated_at=?2 WHERE id=?3",
+            params![stored_modified_at, timestamp(), model_id],
+        )?;
+        tx.execute(
+            "DELETE FROM jobs WHERE kind='removal' AND status=?1",
+            params![snapshot_id],
+        )?;
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.to_owned()))
     }
 
     pub fn create_folder(
@@ -254,55 +549,6 @@ impl LibraryDb {
         let source = source.as_ref();
         let folder_id = folder_id.unwrap_or(ROOT_FOLDER_ID);
         self.ensure_folder(folder_id)?;
-        let metadata = std::fs::metadata(source).map_err(|e| io(source, e))?;
-        if !metadata.is_file() {
-            return Err(LibraryError::InvalidInput("source is not a file".into()));
-        }
-        let bytes = std::fs::read(source).map_err(|e| io(source, e))?;
-        if metadata.len() != bytes.len() as u64 {
-            return Err(LibraryError::SourceChanged);
-        }
-        let parsed = stl_core::parse_model(&bytes)?;
-        let format = match parsed.format {
-            stl_core::StlFormat::Binary => "stl-binary",
-            stl_core::StlFormat::Ascii => "stl-ascii",
-            stl_core::StlFormat::ThreeMf => "3mf",
-        };
-        let hash = hex_digest(&bytes);
-        let extension = source
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("stl")
-            .to_ascii_lowercase();
-        let relative_path = format!("originals/{hash}.{extension}");
-        let destination = self.root.join(&relative_path);
-        let staging = self
-            .root
-            .join("staging")
-            .join(format!("{}.part", Uuid::new_v4()));
-        std::fs::write(&staging, &bytes).map_err(|e| io(&staging, e))?;
-        let reused_blob = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM blobs WHERE hash = ?1",
-                params![hash],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some();
-        if !reused_blob {
-            if let Err(error) = std::fs::rename(&staging, &destination) {
-                let _ = std::fs::remove_file(&staging);
-                return Err(io(&destination, error));
-            }
-        } else {
-            let _ = std::fs::remove_file(&staging);
-        }
-
-        let original_name = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("model.stl");
         let display_name = display_name
             .map(str::to_owned)
             .or_else(|| {
@@ -312,6 +558,104 @@ impl LibraryDb {
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "Model".into());
+        let display_name = clean_name(&display_name, "Model")?;
+        let metadata = std::fs::symlink_metadata(source).map_err(|e| io(source, e))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(LibraryError::InvalidInput("source is not a file".into()));
+        }
+        if metadata.len() > MAX_INDEXED_FILE_BYTES {
+            return Err(LibraryError::InvalidInput(
+                "source exceeds the native file size limit".into(),
+            ));
+        }
+        let mut file = std::fs::File::open(source).map_err(|error| io(source, error))?;
+        let opened = file.metadata().map_err(|error| io(source, error))?;
+        if !opened.is_file()
+            || opened.len() != metadata.len()
+            || opened.len() > MAX_INDEXED_FILE_BYTES
+        {
+            return Err(LibraryError::SourceChanged);
+        }
+        let mut bytes = Vec::with_capacity(opened.len() as usize);
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_INDEXED_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io(source, error))?;
+        let after = file.metadata().map_err(|error| io(source, error))?;
+        if metadata.len() != bytes.len() as u64
+            || bytes.len() as u64 > MAX_INDEXED_FILE_BYTES
+            || after.len() != opened.len()
+        {
+            return Err(LibraryError::SourceChanged);
+        }
+        let parsed = stl_core::parse_model(&bytes)?;
+        let (format, extension) = match parsed.format {
+            stl_core::StlFormat::Binary => ("stl-binary", "stl"),
+            stl_core::StlFormat::Ascii => ("stl-ascii", "stl"),
+            stl_core::StlFormat::ThreeMf => ("3mf", "3mf"),
+        };
+        let hash = hex_digest(&bytes);
+        let relative_path = format!("originals/{hash}.{extension}");
+        let originals = ensure_owned_directory(&self.root, "originals")?;
+        let staging_root = ensure_owned_directory(&self.root, "staging")?;
+        let destination = originals.join(format!("{hash}.{extension}"));
+        let staging = staging_root.join(format!("{}.part", Uuid::new_v4()));
+        let mut staged = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .map_err(|error| io(&staging, error))?;
+        staged
+            .write_all(&bytes)
+            .map_err(|error| io(&staging, error))?;
+        drop(staged);
+        let blob = self
+            .conn
+            .query_row(
+                "SELECT relative_path,bytes FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let mut reused_blob = blob.is_some();
+        if let Some((stored, stored_bytes)) = blob {
+            if stored != relative_path || stored_bytes != bytes.len() as i64 {
+                let _ = std::fs::remove_file(&staging);
+                return Err(LibraryError::InvalidInput(
+                    "blob catalog metadata is inconsistent".into(),
+                ));
+            }
+            if let Err(error) = validate_managed_blob(&destination, &hash, bytes.len() as u64) {
+                let _ = std::fs::remove_file(&staging);
+                return Err(error);
+            }
+            let _ = std::fs::remove_file(&staging);
+        } else {
+            match std::fs::hard_link(&staging, &destination) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&staging);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Err(error) =
+                        validate_managed_blob(&destination, &hash, bytes.len() as u64)
+                    {
+                        let _ = std::fs::remove_file(&staging);
+                        return Err(error);
+                    }
+                    let _ = std::fs::remove_file(&staging);
+                    reused_blob = true;
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(io(&destination, error));
+                }
+            }
+        }
+
+        let original_name = source
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("model.stl");
         let model_id = new_id("model");
         let revision_id = new_id("revision");
         let now = timestamp();
@@ -323,7 +667,7 @@ impl LibraryDb {
         tx.execute(
             "INSERT INTO models (id, display_name, description, folder_id, current_revision_id, metadata_version, created_at, updated_at)
              VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?5)",
-            params![model_id, clean_name(&display_name, "Model")?, folder_id, revision_id, now],
+            params![model_id, display_name, folder_id, revision_id, now],
         )?;
         tx.execute(
             "INSERT INTO revisions (id, model_id, blob_hash, original_name, format, bytes, created_at)
@@ -568,14 +912,14 @@ impl LibraryDb {
             ..ScanReconcile::default()
         };
         for (relative, archive_member, entry) in validated {
-            let existing: Option<String> = tx
+            let existing: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT m.id
+                    "SELECT m.id, d.content_hash
                      FROM models m JOIN indexed_model_data d ON d.model_id = m.id
                      WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1 AND m.source_path = ?2
                        AND COALESCE(m.source_archive_member,'')=COALESCE(?3,'')",
                     params![root_id, relative, archive_member],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
             let original_name = archive_member.as_deref().unwrap_or(&relative);
@@ -584,7 +928,8 @@ impl LibraryDb {
                 .and_then(|value| value.to_str())
                 .unwrap_or("model")
                 .to_owned();
-            if let Some(model_id) = existing {
+            if let Some((model_id, existing_hash)) = existing {
+                let content_changed = existing_hash != entry.content_hash;
                 tx.execute(
                     "UPDATE indexed_model_data SET content_hash = ?1, original_name = ?2,
                             format = ?3, bytes = ?4, outer_fingerprint=?5 WHERE model_id = ?6",
@@ -599,8 +944,13 @@ impl LibraryDb {
                 )?;
                 tx.execute(
                     "UPDATE models SET source_missing = 0, source_modified_at = ?1,
-                            updated_at = ?2 WHERE id = ?3",
-                    params![entry.modified_at as i64, timestamp(), model_id],
+                            metadata_version = metadata_version + ?2, updated_at = ?3 WHERE id = ?4",
+                    params![
+                        entry.modified_at as i64,
+                        if content_changed { 1_i64 } else { 0_i64 },
+                        timestamp(),
+                        model_id
+                    ],
                 )?;
                 result.updated += 1;
             } else {
@@ -890,7 +1240,8 @@ impl LibraryDb {
             tx.execute("DELETE FROM models WHERE id = ?1", params![new_id])?;
             tx.execute(
                 "UPDATE models SET source_path = ?1, source_archive_member=?2, source_missing = 0,
-                        source_modified_at = ?3, updated_at = ?4 WHERE id = ?5",
+                        source_modified_at = ?3, metadata_version=metadata_version+1,
+                        updated_at = ?4 WHERE id = ?5",
                 params![
                     new_path,
                     if new_member.is_empty() {
@@ -1098,6 +1449,96 @@ impl LibraryDb {
         )
     }
 
+    pub fn set_custom_thumbnail(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        png_hash: &str,
+        thumbnail_relative_path: &Path,
+    ) -> Result<Model, LibraryError> {
+        let relative = validated_relative_path(thumbnail_relative_path)?;
+        if Path::new(&relative).components().next()
+            != Some(Component::Normal("thumbnails".as_ref()))
+        {
+            return Err(LibraryError::InvalidInput(
+                "custom thumbnail must be stored under thumbnails".into(),
+            ));
+        }
+        validated_thumbnail_cache_path(&self.root, Path::new(&relative), png_hash)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let row: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT metadata_version,deleted_at FROM models WHERE id=?1",
+                params![model_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (actual, deleted) = row.ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))?;
+        if actual as u64 != expected_version {
+            return Err(LibraryError::MetadataConflict {
+                model_id: model_id.into(),
+                expected: expected_version,
+                actual: actual as u64,
+            });
+        }
+        if deleted.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "removed model cannot change preview".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM thumbnails WHERE model_id=?1 AND is_custom=1",
+            params![model_id],
+        )?;
+        tx.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash) VALUES(?1,?2,?3,?4,1,NULL)",params![new_id("custom-thumbnail"),model_id,relative,png_hash])?;
+        tx.execute(
+            "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+            params![timestamp(), model_id],
+        )?;
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    pub fn clear_custom_thumbnail(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+    ) -> Result<Model, LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let row: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT metadata_version,deleted_at FROM models WHERE id=?1",
+                params![model_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (actual, deleted) = row.ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))?;
+        if actual as u64 != expected_version {
+            return Err(LibraryError::MetadataConflict {
+                model_id: model_id.into(),
+                expected: expected_version,
+                actual: actual as u64,
+            });
+        }
+        if deleted.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "removed model cannot change preview".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM thumbnails WHERE model_id=?1 AND is_custom=1",
+            params![model_id],
+        )?;
+        tx.execute(
+            "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+            params![timestamp(), model_id],
+        )?;
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
     fn set_thumbnail_for_source_with_expected_settings(
         &self,
         model_id: &str,
@@ -1213,6 +1654,46 @@ impl LibraryDb {
                 })
             })
             .transpose()
+    }
+
+    pub fn thumbnail_relative_paths(&self) -> Result<HashSet<String>, LibraryError> {
+        let mut stmt = self.conn.prepare("SELECT relative_path FROM thumbnails")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+    pub fn catalog_content_hashes(&self) -> Result<HashSet<String>, LibraryError> {
+        let mut hashes = HashSet::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT blob_hash FROM revisions UNION SELECT content_hash FROM indexed_model_data",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                hashes.insert(row?);
+            }
+        }
+        Ok(hashes)
+    }
+    pub fn max_metadata_version(&self) -> Result<u64, LibraryError> {
+        let value: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(metadata_version),0) FROM models",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(value)
+            .map_err(|_| LibraryError::InvalidInput("catalog metadata version is invalid".into()))
+    }
+    pub fn bump_all_metadata_versions_above(&self, floor: u64) -> Result<(), LibraryError> {
+        let next = floor
+            .checked_add(1)
+            .ok_or_else(|| LibraryError::InvalidInput("metadata version exhausted".into()))?;
+        let next = i64::try_from(next)
+            .map_err(|_| LibraryError::InvalidInput("metadata version exhausted".into()))?;
+        self.conn.execute(
+            "UPDATE models SET metadata_version=?1,updated_at=?2",
+            params![next, timestamp()],
+        )?;
+        Ok(())
     }
 
     pub fn purge_stale_thumbnails(&self) -> Result<Vec<PathBuf>, LibraryError> {
@@ -1992,6 +2473,55 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, LibraryError> {
     path.canonicalize().map_err(|error| io(path, error))
 }
 
+fn ensure_owned_directory(root: &Path, name: &str) -> Result<PathBuf, LibraryError> {
+    let path = root.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(LibraryError::InvalidInput(format!(
+                "managed {name} namespace is unsafe"
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&path).map_err(|error| io(&path, error))?
+        }
+        Err(error) => return Err(io(&path, error)),
+    }
+    let canonical = path.canonicalize().map_err(|error| io(&path, error))?;
+    if canonical.parent() != Some(root) || canonical != path {
+        return Err(LibraryError::InvalidInput(format!(
+            "managed {name} namespace identity changed"
+        )));
+    }
+    Ok(path)
+}
+fn validate_managed_blob(
+    path: &Path,
+    expected_hash: &str,
+    expected_bytes: u64,
+) -> Result<(), LibraryError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_bytes
+    {
+        return Err(LibraryError::InvalidInput(
+            "managed blob target is unsafe or inconsistent".into(),
+        ));
+    }
+    let mut file = std::fs::File::open(path).map_err(|error| io(path, error))?;
+    let mut digest = Sha256::new();
+    let copied = std::io::copy(
+        &mut (&mut file).take(expected_bytes.saturating_add(1)),
+        &mut digest,
+    )
+    .map_err(|error| io(path, error))?;
+    if copied != expected_bytes || format!("{:x}", digest.finalize()) != expected_hash {
+        return Err(LibraryError::InvalidInput(
+            "managed blob target hash mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validated_relative_path(path: &Path) -> Result<String, LibraryError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -2086,7 +2616,7 @@ fn validated_thumbnail_cache_path(
                     let mut file =
                         std::fs::File::open(&current).map_err(|error| io(&current, error))?;
                     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-                    file.by_ref()
+                    std::io::Read::by_ref(&mut file)
                         .take(MAX_CACHED_THUMBNAIL_BYTES + 1)
                         .read_to_end(&mut bytes)
                         .map_err(|error| io(&current, error))?;
@@ -3454,6 +3984,137 @@ mod tests {
     }
 
     #[test]
+    fn management_duplicates_removal_restore_and_custom_previews_are_scoped_and_versioned() {
+        let root = temp_root("management-core");
+        let sources = temp_root("management-core-source");
+        fs::create_dir_all(&sources).unwrap();
+        let source = sources.join("part.stl");
+        fs::write(&source, stl_fixture()).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let first = db.import_file(&source, None, Some("First")).unwrap().model;
+        let second = db.import_file(&source, None, Some("Second")).unwrap().model;
+        assert!(db
+            .duplicate_groups(std::slice::from_ref(&first.id))
+            .unwrap()
+            .is_empty());
+        let groups = db
+            .duplicate_groups(&[first.id.clone(), second.id.clone()])
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].models.len(), 2);
+        let managed = db.resolve_model_source(&first.id).unwrap();
+        let before = fs::read(&managed).unwrap();
+        let removal = db
+            .remove_models_recoverably(&[VersionedTarget {
+                model_id: first.id.clone(),
+                expected_version: first.metadata_version,
+            }])
+            .unwrap();
+        assert_eq!(db.list_models(None, None).unwrap().len(), 1);
+        assert_eq!(fs::read(&managed).unwrap(), before);
+        assert_eq!(db.list_removed_models().unwrap().len(), 1);
+        let restored = db.restore_removal(&removal.snapshot_id).unwrap();
+        assert_eq!(restored[0].id, first.id);
+        assert_eq!(db.list_models(None, None).unwrap().len(), 2);
+        let png = png_fixture();
+        let hash = hex_digest(&png);
+        let relative = Path::new("thumbnails/custom-management.png");
+        fs::write(db.root().join(relative), png).unwrap();
+        let current = db.get_model(&first.id).unwrap().unwrap();
+        let custom = db
+            .set_custom_thumbnail(&first.id, current.metadata_version, &hash, relative)
+            .unwrap();
+        assert!(
+            db.thumbnail_cache_entry_for_model(&first.id)
+                .unwrap()
+                .unwrap()
+                .is_custom
+        );
+        assert!(matches!(
+            db.clear_custom_thumbnail(&first.id, current.metadata_version),
+            Err(LibraryError::MetadataConflict { .. })
+        ));
+        let cleared = db
+            .clear_custom_thumbnail(&first.id, custom.metadata_version)
+            .unwrap();
+        assert!(!db
+            .thumbnail_cache_entry_for_model(&first.id)
+            .unwrap()
+            .is_some_and(|entry| entry.is_custom));
+        assert!(cleared.metadata_version > custom.metadata_version);
+        let floor = db.max_metadata_version().unwrap();
+        db.bump_all_metadata_versions_above(floor).unwrap();
+        assert!(db.get_model(&first.id).unwrap().unwrap().metadata_version > floor);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn indexed_tombstones_survive_rescan_and_zip_member_removal_never_changes_archive() {
+        let library = temp_root("management-indexed");
+        let sources = temp_root("management-indexed-source");
+        fs::create_dir_all(&sources).unwrap();
+        let archive = sources.join("pack.zip");
+        let archive_bytes = b"outer archive unchanged";
+        fs::write(&archive, archive_bytes).unwrap();
+        let db = LibraryDb::open(&library).unwrap();
+        let root = db.add_index_root(&sources, 60, 1024).unwrap();
+        let entries = [
+            ScannedModel {
+                relative_path: "pack.zip".into(),
+                content_hash: hash(1),
+                bytes: 10,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("A".into()),
+                archive_member: Some("a.stl".into()),
+                outer_fingerprint: Some("fp".into()),
+            },
+            ScannedModel {
+                relative_path: "pack.zip".into(),
+                content_hash: hash(2),
+                bytes: 10,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("B".into()),
+                archive_member: Some("b.stl".into()),
+                outer_fingerprint: Some("fp".into()),
+            },
+        ];
+        let added = db.record_scan_entries(&root.id, &entries).unwrap();
+        let seen = entries
+            .iter()
+            .map(|entry| SourceRef {
+                relative_path: entry.relative_path.clone(),
+                archive_member: entry.archive_member.clone(),
+            })
+            .collect::<Vec<_>>();
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &added.added_model_ids, "1")
+            .unwrap();
+        let models = db.list_models(None, None).unwrap();
+        let removed = models
+            .iter()
+            .find(|model| model.source_archive_member.as_deref() == Some("a.stl"))
+            .unwrap();
+        let removal = db
+            .remove_models_recoverably(&[VersionedTarget {
+                model_id: removed.id.clone(),
+                expected_version: removed.metadata_version,
+            }])
+            .unwrap();
+        db.record_scan_entries(&root.id, &entries).unwrap();
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &[], "2")
+            .unwrap();
+        assert_eq!(db.list_models(None, None).unwrap().len(), 1);
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        let restored = db.restore_removal(&removal.snapshot_id).unwrap();
+        assert_eq!(restored[0].id, removed.id);
+        assert_eq!(db.list_models(None, None).unwrap().len(), 2);
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
     fn thumbnail_appearance_settings_invalidate_generated_rows_and_preserve_custom() {
         let root = temp_root("catalog-settings-thumbnails");
         let source_dir = temp_root("catalog-settings-thumbnails-source");
@@ -3699,6 +4360,61 @@ mod tests {
     }
 
     #[test]
+    fn import_rejects_oversize_before_read_and_never_overwrites_or_follows_owned_namespace_links() {
+        let root = temp_root("import-hardening");
+        let sources = temp_root("import-hardening-source");
+        fs::create_dir_all(&sources).unwrap();
+        let oversized = sources.join("oversized.stl");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_INDEXED_FILE_BYTES + 1).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        assert!(db.import_file(&oversized, None, None).is_err());
+        assert!(db.list_models(None, None).unwrap().is_empty());
+        let source = sources.join("part.stl");
+        let bytes = stl_fixture();
+        fs::write(&source, &bytes).unwrap();
+        let hash = hex_digest(&bytes);
+        let destination = db.root().join("originals").join(format!("{hash}.stl"));
+        let sentinel = vec![b'x'; bytes.len()];
+        fs::write(&destination, &sentinel).unwrap();
+        assert!(db.import_file(&source, None, None).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), sentinel);
+        assert!(db.list_models(None, None).unwrap().is_empty());
+        drop(db);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp_root("import-hardening-outside");
+            fs::create_dir_all(&outside).unwrap();
+            fs::remove_file(&destination).unwrap();
+            fs::remove_dir(root.join("originals")).unwrap();
+            symlink(&outside, root.join("originals")).unwrap();
+            let reopened = LibraryDb::open(&root);
+            assert!(reopened.is_err());
+            assert!(outside.read_dir().unwrap().next().is_none());
+            let _ = fs::remove_file(root.join("originals"));
+            let _ = fs::remove_dir_all(outside);
+        }
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_open_rejects_symlinked_database_file() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("db-symlink");
+        let outside = temp_root("db-symlink-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("database"), b"not sqlite").unwrap();
+        symlink(outside.join("database"), root.join("library.sqlite3")).unwrap();
+        assert!(LibraryDb::open(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
     fn indexed_scan_is_in_place_and_reconciles_change_rename_missing_and_duplicates() {
         let library_root = temp_root("indexed-library");
         let source_root = temp_root("indexed-source");
@@ -3807,6 +4523,14 @@ mod tests {
         assert_eq!(rename_result.renamed, 1);
         let after_rename = db.get_model(&unique.id).unwrap().unwrap();
         assert_eq!(after_rename.display_name, "Unique metadata");
+        assert!(after_rename.metadata_version > unique.metadata_version);
+        assert!(matches!(
+            db.remove_models_recoverably(&[VersionedTarget {
+                model_id: unique.id.clone(),
+                expected_version: unique.metadata_version,
+            }]),
+            Err(LibraryError::MetadataConflict { .. })
+        ));
         assert!(after_rename
             .source_path
             .as_deref()
@@ -3852,14 +4576,19 @@ mod tests {
         };
         db.record_scan_entries(&root.id, std::slice::from_ref(&changed))
             .unwrap();
+        let after_content_change = db.get_model(&unique.id).unwrap().unwrap();
         assert_eq!(
-            db.get_model(&unique.id)
-                .unwrap()
-                .unwrap()
-                .content_hash
-                .as_deref(),
+            after_content_change.content_hash.as_deref(),
             Some(hash(3).as_str())
         );
+        assert!(after_content_change.metadata_version > after_rename.metadata_version);
+        assert!(matches!(
+            db.remove_models_recoverably(&[VersionedTarget {
+                model_id: unique.id.clone(),
+                expected_version: after_rename.metadata_version,
+            }]),
+            Err(LibraryError::MetadataConflict { .. })
+        ));
         assert!(db.thumbnail_for_model(&unique.id).unwrap().is_none());
         assert_eq!(
             db.purge_stale_thumbnails().unwrap(),
@@ -3871,7 +4600,22 @@ mod tests {
 
         db.record_scan_entries(&root.id, std::slice::from_ref(&changed))
             .unwrap();
-        assert!(!db.get_model(&unique.id).unwrap().unwrap().source_missing);
+        let unchanged = db.get_model(&unique.id).unwrap().unwrap();
+        assert!(!unchanged.source_missing);
+        assert_eq!(
+            unchanged.metadata_version,
+            after_content_change.metadata_version
+        );
+        let timestamp_only = ScannedModel {
+            modified_at: changed.modified_at + 1,
+            ..changed.clone()
+        };
+        db.record_scan_entries(&root.id, std::slice::from_ref(&timestamp_only))
+            .unwrap();
+        assert_eq!(
+            db.get_model(&unique.id).unwrap().unwrap().metadata_version,
+            after_content_change.metadata_version
+        );
         let completed = db
             .complete_scan(&root.id, &["renamed.stl".into()], "scan-3")
             .unwrap();

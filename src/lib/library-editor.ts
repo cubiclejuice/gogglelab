@@ -289,6 +289,10 @@ export class LibraryMetadataEditor {
     return button;
   }
 
+  dismiss(): void {
+    this.close();
+  }
+
   private close(): void {
     if (this.dialog.open) this.dialog.close();
     const invoker = this.invoker;

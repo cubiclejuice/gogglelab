@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 
 use crate::extension_api::{AppError, AppState, ModelSummary};
@@ -37,6 +38,12 @@ impl RenderLimiter {
         *active += 1;
         RenderPermit(self)
     }
+    fn wait_idle(&self) {
+        let mut active = self.active.lock().unwrap();
+        while *active != 0 {
+            active = self.available.wait(active).unwrap();
+        }
+    }
 }
 
 impl Drop for RenderPermit<'_> {
@@ -67,6 +74,14 @@ pub(crate) struct LibraryStateInner {
     db: Mutex<Option<LibraryDb>>,
     root: PathBuf,
     pub(crate) scan: Arc<ScanControl>,
+    maintenance: AtomicBool,
+    management_generation: AtomicU64,
+    lifecycle: Mutex<LifecycleState>,
+}
+#[derive(Default)]
+struct LifecycleState {
+    maintenance: bool,
+    active_io: usize,
 }
 
 impl LibraryState {
@@ -76,6 +91,9 @@ impl LibraryState {
                 db: Mutex::new(None),
                 root,
                 scan: Arc::new(ScanControl::new()),
+                maintenance: AtomicBool::new(false),
+                management_generation: AtomicU64::new(0),
+                lifecycle: Mutex::new(LifecycleState::default()),
             }),
         }
     }
@@ -98,6 +116,91 @@ impl LibraryState {
     ) -> Result<T, AppError> {
         with_db(self, operation)
     }
+    pub(crate) fn root(&self) -> &Path {
+        &self.inner.root
+    }
+    pub(crate) fn management_generation(&self) -> u64 {
+        self.inner.management_generation.load(Ordering::Acquire)
+    }
+    pub(crate) fn maintenance_active(&self) -> bool {
+        self.inner.maintenance.load(Ordering::Acquire)
+    }
+    pub(crate) fn begin_io(&self) -> Result<LibraryIoGuard, AppError> {
+        let mut lifecycle = self.inner.lifecycle.lock().unwrap();
+        if lifecycle.maintenance {
+            return Err(AppError::Library {
+                message: "Library maintenance is in progress".into(),
+            });
+        }
+        lifecycle.active_io += 1;
+        Ok(LibraryIoGuard {
+            state: self.clone(),
+        })
+    }
+    pub(crate) fn begin_maintenance(&self) -> Result<MaintenanceGuard, AppError> {
+        if self.scan_control().status().running {
+            return Err(AppError::Library {
+                message: "Library job is running".into(),
+            });
+        }
+        {
+            let mut lifecycle = self.inner.lifecycle.lock().unwrap();
+            if lifecycle.maintenance || lifecycle.active_io != 0 {
+                return Err(AppError::Library {
+                    message: "Library I/O or maintenance is already running".into(),
+                });
+            }
+            lifecycle.maintenance = true;
+            self.inner.maintenance.store(true, Ordering::Release);
+        }
+        THUMBNAIL_RENDER_LIMITER.wait_idle();
+        let mut db = self.inner.db.lock().unwrap();
+        *db = None;
+        drop(db);
+        Ok(MaintenanceGuard {
+            state: self.clone(),
+            release_on_drop: true,
+        })
+    }
+}
+
+pub(crate) struct LibraryIoGuard {
+    state: LibraryState,
+}
+impl Drop for LibraryIoGuard {
+    fn drop(&mut self) {
+        let mut lifecycle = self.state.inner.lifecycle.lock().unwrap();
+        lifecycle.active_io = lifecycle.active_io.saturating_sub(1);
+    }
+}
+
+pub(crate) struct MaintenanceGuard {
+    state: LibraryState,
+    release_on_drop: bool,
+}
+impl MaintenanceGuard {
+    pub(crate) fn root(&self) -> &Path {
+        self.state.root()
+    }
+    pub(crate) fn invalidate(&self) -> u64 {
+        self.state
+            .inner
+            .management_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1
+    }
+    pub(crate) fn remain_armed(&mut self) {
+        self.release_on_drop = false;
+    }
+}
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            let mut lifecycle = self.state.inner.lifecycle.lock().unwrap();
+            lifecycle.maintenance = false;
+            self.state.inner.maintenance.store(false, Ordering::Release);
+        }
+    }
 }
 
 pub(crate) fn library_error(error: LibraryError) -> AppError {
@@ -114,7 +217,17 @@ pub(crate) fn with_db<T>(
     state: &LibraryState,
     operation: impl FnOnce(&LibraryDb) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
+    if state.inner.maintenance.load(Ordering::Acquire) {
+        return Err(AppError::Library {
+            message: "Library maintenance is in progress".into(),
+        });
+    }
     let mut guard = state.inner.db.lock().unwrap();
+    if state.inner.maintenance.load(Ordering::Acquire) {
+        return Err(AppError::Library {
+            message: "Library maintenance is in progress".into(),
+        });
+    }
     if guard.is_none() {
         *guard = Some(open_library(&state.inner.root)?);
     }
@@ -444,11 +557,22 @@ pub fn library_start_thumbnail_job(
     state: tauri::State<'_, LibraryState>,
     regenerate: bool,
 ) -> Result<(), AppError> {
+    if state.maintenance_active() {
+        return Err(AppError::Library {
+            message: "Library maintenance is in progress".into(),
+        });
+    }
     let state = state.inner().clone();
     let model_ids = thumbnail_job_models(&state, None)?;
     if !state.scan_control().try_begin(0, "thumbnails") {
         return Err(AppError::Library {
             message: "A library scan or thumbnail job is already running".into(),
+        });
+    }
+    if state.maintenance_active() {
+        state.scan_control().finish();
+        return Err(AppError::Library {
+            message: "Library maintenance is in progress".into(),
         });
     }
     state.scan_control().set_thumbnail_progress(model_ids.len());
@@ -559,7 +683,13 @@ pub(crate) fn get_thumbnail(
     model_id: &str,
     regenerate: bool,
 ) -> Result<Option<String>, AppError> {
-    if !regenerate {
+    let _io_guard = state.begin_io()?;
+    let custom = with_db(state, |db| {
+        db.thumbnail_cache_entry_for_model(model_id)
+            .map(|entry| entry.is_some_and(|entry| entry.is_custom))
+            .map_err(library_error)
+    })?;
+    if custom || !regenerate {
         if let Ok(Some(cached)) = with_db(state, |db| cached_thumbnail(db, model_id)) {
             return Ok(Some(cached));
         }
@@ -623,6 +753,11 @@ pub(crate) fn get_thumbnail(
     }
     let _render_permit =
         THUMBNAIL_RENDER_LIMITER.acquire(settings.thumbnail_concurrency.clamp(1, 2) as usize);
+    if state.maintenance_active() {
+        return Err(AppError::Library {
+            message: "Library maintenance is in progress".into(),
+        });
+    }
     let temporary_member = if let Some(member) = source.archive_member.as_deref() {
         Some(
             crate::library_archives::extract_member_to_temporary(
@@ -658,9 +793,7 @@ pub(crate) fn get_thumbnail(
     with_db(state, |db| {
         persist_generated_thumbnail(db, model_id, &content_hash, &settings, &thumbnail)
     })?;
-    crate::library_thumbnail::png_data_uri(&library_root.join(thumbnail.relative_path))
-        .map(Some)
-        .map_err(|message| AppError::Library { message })
+    with_db(state, |db| cached_thumbnail(db, model_id))
 }
 
 fn persist_generated_thumbnail(
@@ -838,6 +971,7 @@ pub fn library_open_model(
     model_id: String,
     generation: u64,
 ) -> Result<ModelSummary, AppError> {
+    let _io_guard = library_state.begin_io()?;
     let (source, library_root, indexed_limit) = with_db(&library_state, |db| {
         let model = db
             .get_model(&model_id)

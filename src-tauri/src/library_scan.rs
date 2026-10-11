@@ -199,6 +199,9 @@ fn start_scan(
     root_id: Option<String>,
     selected_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
+    if state.maintenance_active() {
+        return Err("Library maintenance is in progress".into());
+    }
     let roots = state
         .with_db(|db| {
             db.list_index_roots()
@@ -219,6 +222,10 @@ fn start_scan(
     }
     if !state.scan_control().try_begin(roots.len(), "scan") {
         return Err("A library scan is already running".into());
+    }
+    if state.maintenance_active() {
+        state.scan_control().finish();
+        return Err("Library maintenance is in progress".into());
     }
     let scanner_state = state.clone();
     if let Err(error) = thread::Builder::new()
@@ -251,6 +258,7 @@ fn run_scan(state: LibraryState, roots: Vec<IndexRoot>) {
 }
 
 fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, String> {
+    let _io_guard = state.begin_io().map_err(app_error_text)?;
     let canonical_root = root
         .path
         .canonicalize()

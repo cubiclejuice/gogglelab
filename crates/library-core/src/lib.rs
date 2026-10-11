@@ -8,8 +8,8 @@ pub use db::{
 };
 pub use error::LibraryError;
 pub use models::{
-    CatalogSettings, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, MetadataPatch, Model,
-    ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome, PrintStatus, ResolvedModelSource,
-    ScanReconcile, ScannedModel, SourceRef, Tag, TagMode, ThumbnailCacheEntry,
-    VersionedModelUpdate, VersionedTarget,
+    CatalogSettings, DuplicateGroup, Folder, ImportResult, IndexRoot, IndexedSourceMetadata,
+    MetadataPatch, Model, ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome,
+    PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource, ScanReconcile, ScannedModel,
+    SourceRef, Tag, TagMode, ThumbnailCacheEntry, VersionedModelUpdate, VersionedTarget,
 };
