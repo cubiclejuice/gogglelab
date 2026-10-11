@@ -1,7 +1,7 @@
 # Phase 4: library management, backup and multipart workflows
 
 Date: 2026-10-10
-Status: implementation begins after the phase-3 local gate.
+Status: locally implemented, verified, packaged and installed; Phase 5 may proceed.
 Every capability below is Free in Community and the unified app.
 Pinned upstream: f551c4601c03072362b426c652b5dd37e4c55601 (GUIDE.md).
 
@@ -99,4 +99,16 @@ Pinned upstream: f551c4601c03072362b426c652b5dd37e4c55601 (GUIDE.md).
   before typed PURGE admission. No live purge/removal/provider action is performed here.
 - Independent review targets new data/I/O boundaries. A full unrelated repository secrets,
   CI and skill-supply-chain audit is deferred; network/auth auditing applies in phases 5–6.
-- Full Community/unified gate and local install remain pending before phase 5.
+- Full Community gate: 80 frontend tests/226 assertions; native 138 passing/1 ignored;
+  storage 35; backup 4; recovery 16; other workspace suites pass with one existing
+  ignored test. Default Clippy passes with existing unrelated warnings. New core
+  warning fixed; changed-crate --no-deps Clippy with -D warnings passes.
+- Community and unified macOS packaging pass; unified frontend 44 tests and native
+  workspace/default Clippy pass. Local public b28ff37 / unified a50835c.
+- Installed executable SHA256:
+  f98718830607da8941a837a9db47a56a4c65b96af798e09eed751fe6dc97706d.
+  Signature verified and process 66749 launched. Previous bundle preserved at
+  output/app-backups/GoggleLab-before-phase4-20261010.app.
+- Native window capture remains unavailable (cgWindowNotFound). Browser/fixture
+  evidence does not establish native visual interactions, actual slicer launch,
+  Windows/Linux runtime behavior or external release readiness.

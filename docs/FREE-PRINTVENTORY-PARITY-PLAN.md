@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-10
-Status: phases 1–3 implemented and locally built/verified; phase 4 in progress. Native window capture and cross-platform release verification remain outstanding.
+Status: phases 1–4 implemented and locally built/verified; phase 5 in progress. Native window capture and cross-platform release verification remain outstanding.
 
 ## Decision
 
@@ -174,3 +174,14 @@ The user explicitly approved moving the existing private library and slicer-hand
   Previous bundle: output/app-backups/GoggleLab-before-phase3-20261010.app.
 - Native app launched; CUA capture remains unavailable. No native visual or cross-platform
   release claim. Remaining phases 4–6 retain full scope and remain entirely Free.
+
+## Phase 4 local completion
+- Public b28ff37 / unified a50835c deliver recoverable removals and source undo,
+  verified backups/restore, duplicate review, stable multipart handoff, custom
+  and embedded image previews, filtered roulette and remaining catalog filters.
+- Final Community: frontend 80 tests/226 assertions; native 138 plus one ignored;
+  core35/backup4/recovery16 and other suites pass. Both app builds and unified
+  checks pass. Existing unrelated warnings and ignored tests remain documented.
+- Installed SHA256 f98718830607da8941a837a9db47a56a4c65b96af798e09eed751fe6dc97706d,
+  process observed; previous app backed up. Native visual/slicer/cross-platform
+  runtime gates remain. Phase5 proceeds; all phase5–6 capabilities remain Free.
