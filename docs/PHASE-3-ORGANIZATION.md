@@ -1,7 +1,7 @@
 # Phase 3: organization, metadata and print history
 
 Date: 2026-10-10
-Status: in progress after phase 2 local gate.
+Status: local gate complete; phase 4 may proceed.
 All capabilities are Community/Free in standalone and unified builds.
 
 ## Outcome
@@ -81,3 +81,18 @@ models. Manage virtual collections and group in-place source folders/ZIP bundles
   other workspace suites passed with two existing ignored tests. Frontend: 72 tests /
   205 assertions. Standalone app packaging passed. Unified packaging/install remains the
   final local gate before phase 4.
+
+
+## Final local gate
+- Public implementation checkpoint 33e1e8e; unified checkpoint dacadd9.
+- Final Community frontend/native/default Clippy and standalone build passed. No new
+  library warnings remain; existing stl-core/settings warnings and two ignored tests remain.
+- Unified frontend 44 tests, native workspace/default Clippy and app packaging passed.
+  Locks add only existing time dependency edges; no dependency upgrade.
+- Installed /Applications/GoggleLab.app signature and exact executable hash verified:
+  c1ff4ace5775176e23191dff0d4b16359c57658aac447d1ffab3450a2ab2f9d8.
+- App launched (PID 43676 at verification). Previous app preserved at
+  output/app-backups/GoggleLab-before-phase3-20261010.app.
+- Native CUA capture still returns cgWindowNotFound. Native window appearance is not
+  asserted. Browser fixtures plus isolated real native/data fixtures remain the evidence.
+- Windows/Linux runtime checks remain release gates. No push/release/provider action.

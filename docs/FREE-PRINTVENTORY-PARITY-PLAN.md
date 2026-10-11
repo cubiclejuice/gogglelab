@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-10
-Status: phases 1–2 implemented and locally built/verified; phase 3 in progress. Native window capture and cross-platform release verification remain outstanding.
+Status: phases 1–3 implemented and locally built/verified; phase 4 in progress. Native window capture and cross-platform release verification remain outstanding.
 
 ## Decision
 
@@ -159,3 +159,18 @@ The user explicitly approved moving the existing private library and slicer-hand
   appearance is not asserted. Windows/Linux runtime validation remains a release gate.
 - Remaining phases 3–6 retain their full scope, plus pinned-guide file-management,
   archive indexing, thumbnail-image formats and browser-extension discovery requirements.
+
+
+## Phase 3 local completion
+- Public 33e1e8e / unified dacadd9 add Free organization, categorized tags, versioned
+  batch edits, explicit filters, print history, parent relations and stable folder/ZIP bundles.
+- Native ZIP tests include actual nested 3MF parsing/PNG generation and verified extraction.
+  Original archives remain unchanged. Incomplete scans do not reconcile or advance dates.
+- Final checks: 72 Community frontend tests, 111 native tests, 31 storage tests, 16 recovery
+  tests; remaining workspace suites and default Clippy passed with pre-existing warnings
+  and two ignored tests. Unified frontend 44 tests, native checks and packaging passed.
+- Installed executable hash:
+  c1ff4ace5775176e23191dff0d4b16359c57658aac447d1ffab3450a2ab2f9d8.
+  Previous bundle: output/app-backups/GoggleLab-before-phase3-20261010.app.
+- Native app launched; CUA capture remains unavailable. No native visual or cross-platform
+  release claim. Remaining phases 4–6 retain full scope and remain entirely Free.
