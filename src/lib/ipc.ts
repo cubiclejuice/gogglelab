@@ -453,6 +453,62 @@ export interface LibraryModel {
   /** Native index fingerprint in epoch nanoseconds; legacy catalogs may contain epoch seconds. */
   source_modified_at?: number | null;
   thumbnail_path?: string | null;
+  metadata?: CoreMetadata;
+  bundle_id?: string | null;
+  source_archive_member?: string | null;
+}
+
+export type PrintStatus = "unprinted" | "want" | "queued" | "printing" | "printed" | "failed";
+
+export interface CoreMetadata {
+  designer?: string | null;
+  source_url?: string | null;
+  notes?: string | null;
+  model_license?: string | null;
+  print_status: PrintStatus;
+  parent_model_id?: string | null;
+  last_printed_at?: string | null;
+  print_count: number;
+}
+
+export interface LibraryTag {
+  id: string;
+  name: string;
+  category?: string | null;
+}
+
+export interface MetadataPatch {
+  designer?: string;
+  source_url?: string;
+  notes?: string;
+  model_license?: string;
+  print_status?: PrintStatus;
+  tags?: string[];
+  tag_mode?: "replace" | "merge";
+  folder_id?: string;
+  parent_model_id?: string;
+}
+
+export interface VersionedModelTarget {
+  model_id: string;
+  expected_version: number;
+}
+
+export type PrintOutcome = "printed" | "failed";
+
+export interface PrintAttemptInput {
+  printed_at: string;
+  quantity: number;
+  notes: string;
+  filament_ids: string[];
+  outcome: PrintOutcome;
+}
+
+export interface PrintAttempt extends PrintAttemptInput {
+  id: string;
+  model_id: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface IndexRoot {
@@ -462,6 +518,7 @@ export interface IndexRoot {
   last_scanned_at: string | null;
   scan_interval_minutes: number;
   max_file_bytes: number;
+  scan_zip: boolean;
 }
 
 export interface LibraryScanStatus {
@@ -527,6 +584,7 @@ export function libraryUpdateRoot(root: IndexRoot): Promise<IndexRoot> {
     enabled: root.enabled,
     scanIntervalMinutes: root.scan_interval_minutes,
     maxFileBytes: root.max_file_bytes,
+    scanZip: root.scan_zip,
   });
 }
 
@@ -564,6 +622,93 @@ export function libraryGetCatalogSettings(): Promise<CatalogSettings> {
 
 export function librarySetCatalogSettings(settings: CatalogSettings): Promise<CatalogSettings> {
   return invoke("library_set_catalog_settings", { settings });
+}
+
+export function libraryListTags(): Promise<LibraryTag[]> {
+  return invoke("library_list_tags");
+}
+
+export function libraryCreateTag(name: string, category: string | null): Promise<LibraryTag> {
+  return invoke("library_create_tag", { name, category });
+}
+
+export function libraryUpdateTag(
+  tagId: string,
+  name: string,
+  category: string | null,
+): Promise<LibraryTag> {
+  return invoke("library_update_tag", { tagId, name, category });
+}
+
+export function libraryDeleteTag(tagId: string): Promise<void> {
+  return invoke("library_delete_tag", { tagId });
+}
+
+export function libraryUpdateModelMetadata(
+  modelId: string,
+  expectedVersion: number,
+  patch: MetadataPatch,
+): Promise<LibraryModel> {
+  return invoke("library_update_model_metadata", { modelId, expectedVersion, patch });
+}
+
+export function libraryUpdateModelsMetadata(
+  targets: VersionedModelTarget[],
+  patch: MetadataPatch,
+): Promise<LibraryModel[]> {
+  return invoke("library_update_models_metadata", { targets, patch });
+}
+
+export function libraryCreatePrintAttempt(
+  modelId: string,
+  input: PrintAttemptInput,
+): Promise<PrintAttempt> {
+  return invoke("library_create_print_attempt", { modelId, input });
+}
+
+export function libraryListPrintAttempts(modelId: string): Promise<PrintAttempt[]> {
+  return invoke("library_list_print_attempts", { modelId });
+}
+
+export function libraryGetPrintAttempt(attemptId: string): Promise<PrintAttempt | null> {
+  return invoke("library_get_print_attempt", { attemptId });
+}
+
+export function libraryUpdatePrintAttempt(
+  attemptId: string,
+  input: PrintAttemptInput,
+): Promise<PrintAttempt> {
+  return invoke("library_update_print_attempt", { attemptId, input });
+}
+
+export function libraryDeletePrintAttempt(attemptId: string): Promise<void> {
+  return invoke("library_delete_print_attempt", { attemptId });
+}
+
+export function libraryCreateBundle(modelIds: string[]): Promise<string> {
+  return invoke("library_create_bundle", { modelIds });
+}
+
+export function librarySetModelBundle(
+  modelId: string,
+  bundleId: string | null,
+): Promise<LibraryModel> {
+  return invoke("library_set_model_bundle", { modelId, bundleId });
+}
+
+export function libraryCreateFolder(
+  name: string,
+  parentId: string | null = null,
+): Promise<LibraryFolder> {
+  return invoke("library_create_folder", { name, parentId });
+}
+
+export function libraryRenameFolder(id: string, name: string): Promise<LibraryFolder> {
+  return invoke("library_rename_folder", { id, name });
+}
+
+export function libraryDeleteFolder(id: string): Promise<void> {
+  return invoke("library_delete_folder", { id });
 }
 
 export interface RecoveryManifest {

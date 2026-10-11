@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 
 pub const MANIFEST_VERSION: u32 = 1;
-pub const LIBRARY_SCHEMA_VERSION: u32 = 2;
+pub const LIBRARY_SCHEMA_VERSION: u32 = 3;
 pub const MAX_COLORWAY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -68,6 +68,20 @@ fn invalid(message: impl Into<String>) -> RecoveryError {
     RecoveryError::Invalid(message.into())
 }
 
+fn safe_relative(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !value.contains('\\')
+        && !value.contains('\0')
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+fn valid_rfc3339(value: &str) -> bool {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).is_ok()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryManifest {
     pub manifest_version: u32,
@@ -83,6 +97,8 @@ pub struct RecoveryManifest {
     pub index_roots: Vec<RecoveryIndexRoot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_settings: Option<RecoveryCatalogSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<RecoveryBundle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +112,8 @@ pub struct RecoveryFolder {
 pub struct RecoveryTag {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +139,44 @@ pub struct RecoveryModel {
     pub thumbnails: Vec<RecoveryThumbnail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_source: Option<RecoveryIndexedSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<RecoveryOrganization>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub print_attempts: Vec<RecoveryPrintAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryOrganization {
+    pub designer: Option<String>,
+    pub source_url: Option<String>,
+    pub notes: Option<String>,
+    pub model_license: Option<String>,
+    pub print_status: String,
+    pub parent_model_id: Option<String>,
+    pub last_printed_at: Option<String>,
+    pub print_count: u64,
+    pub bundle_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPrintAttempt {
+    pub id: String,
+    pub model_id: String,
+    pub printed_at: String,
+    pub quantity: u32,
+    pub notes: String,
+    pub outcome: String,
+    pub filament_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryBundle {
+    pub id: String,
+    pub source_root_id: Option<String>,
+    pub source_path: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +195,8 @@ pub struct RecoveryIndexRoot {
     pub last_scanned_at: Option<String>,
     pub scan_interval_minutes: u32,
     pub max_file_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scan_zip: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +209,14 @@ pub struct RecoveryIndexedSource {
     pub original_name: String,
     pub format: String,
     pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_member: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_fingerprint: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,18 +351,40 @@ fn select_models(manifest: &mut RecoveryManifest, ids: &[String]) -> Result<(), 
     if ids.is_empty() {
         return Ok(());
     }
-    let selected: BTreeSet<_> = ids.iter().collect();
-    if selected.len() != ids.len() {
+    let requested: BTreeSet<_> = ids.iter().collect();
+    if requested.len() != ids.len() {
         return Err(invalid("Duplicate model ID in recovery selection"));
     }
     let found: BTreeSet<_> = manifest
         .models
         .iter()
         .map(|model| &model.id)
-        .filter(|id| selected.contains(id))
+        .filter(|id| requested.contains(id))
         .collect();
-    if found != selected {
+    if found != requested {
         return Err(invalid("Recovery selection contains an unknown model ID"));
+    }
+    let by_id: BTreeMap<_, _> = manifest
+        .models
+        .iter()
+        .map(|model| {
+            (
+                model.id.clone(),
+                model
+                    .organization
+                    .as_ref()
+                    .and_then(|org| org.parent_model_id.clone()),
+            )
+        })
+        .collect();
+    let mut selected: BTreeSet<String> = ids.iter().cloned().collect();
+    let mut pending = selected.iter().cloned().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        if let Some(Some(parent)) = by_id.get(&id) {
+            if selected.insert(parent.clone()) {
+                pending.push(parent.clone());
+            }
+        }
     }
     manifest.models.retain(|model| selected.contains(&model.id));
     manifest
@@ -308,6 +396,14 @@ fn select_models(manifest: &mut RecoveryManifest, ids: &[String]) -> Result<(), 
         .map(|link| &link.tag_id)
         .collect();
     manifest.tags.retain(|tag| tag_ids.contains(&tag.id));
+    let bundle_ids: BTreeSet<_> = manifest
+        .models
+        .iter()
+        .filter_map(|model| model.organization.as_ref()?.bundle_id.as_ref())
+        .collect();
+    manifest
+        .bundles
+        .retain(|bundle| bundle_ids.contains(&bundle.id));
     let parents: BTreeMap<String, Option<String>> = manifest
         .folders
         .iter()
@@ -523,12 +619,45 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             })
         },
     )?;
-    let tags = collect_rows(conn, "SELECT id, name FROM tags ORDER BY id", |row| {
-        Ok(RecoveryTag {
-            id: row.get(0)?,
-            name: row.get(1)?,
+    let tags = collect_rows(
+        conn,
+        if schema_version >= 3 {
+            "SELECT id,name,category FROM tags ORDER BY id"
+        } else {
+            "SELECT id,name,NULL FROM tags ORDER BY id"
+        },
+        |row| {
+            Ok(RecoveryTag {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                category: row.get(2)?,
+            })
+        },
+    )?;
+    if tags.iter().any(|tag| {
+        tag.name.is_empty()
+            || tag.name.len() > 256
+            || tag
+                .category
+                .as_deref()
+                .is_some_and(|value| value.len() > 120)
+    }) {
+        return Err(invalid("Tag metadata is invalid"));
+    }
+    if schema_version >= 3
+        && tags.iter().any(|tag| {
+            tag.name.trim() != tag.name
+                || tag.name.contains('/')
+                || tag.name.contains('\\')
+                || tag.name.chars().any(char::is_control)
+                || tag
+                    .category
+                    .as_deref()
+                    .is_some_and(|value| value.trim() != value)
         })
-    })?;
+    {
+        return Err(invalid("Schema-3 tag metadata is invalid"));
+    }
     let model_tags = collect_rows(
         conn,
         "SELECT model_id, tag_id FROM model_tags ORDER BY model_id, tag_id",
@@ -560,6 +689,8 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 manual: None,
                 thumbnails: Vec::new(),
                 indexed_source: None,
+                organization: None,
+                print_attempts: Vec::new(),
             })
         },
     )?;
@@ -568,6 +699,138 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         .enumerate()
         .map(|(position, model)| (model.id.clone(), position))
         .collect();
+
+    let bundles = if schema_version >= 3 {
+        collect_rows(
+            conn,
+            "SELECT id,source_root_id,source_path,created_at FROM bundles ORDER BY id",
+            |row| {
+                Ok(RecoveryBundle {
+                    id: row.get(0)?,
+                    source_root_id: row.get(1)?,
+                    source_path: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+    let bundle_ids: BTreeSet<_> = bundles.iter().map(|bundle| bundle.id.as_str()).collect();
+    if bundle_ids.len() != bundles.len() {
+        return Err(invalid("Duplicate bundle identity"));
+    }
+
+    if schema_version >= 3 {
+        let rows=collect_rows(conn,"SELECT id,designer,source_url,notes,model_license,print_status,parent_model_id,last_printed_at,print_count,bundle_id FROM models ORDER BY id",|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,i64>(8)?,row.get::<_,Option<String>>(9)?)))?;
+        for (
+            id,
+            designer,
+            source_url,
+            notes,
+            model_license,
+            print_status,
+            parent_model_id,
+            last_printed_at,
+            print_count,
+            bundle_id,
+        ) in rows
+        {
+            if !matches!(
+                print_status.as_str(),
+                "unprinted" | "want" | "queued" | "printing" | "printed" | "failed"
+            ) || print_count < 0
+                || source_url.as_deref().is_some_and(|url| {
+                    url.len() > 2048 || !(url.starts_with("http://") || url.starts_with("https://"))
+                })
+                || last_printed_at
+                    .as_deref()
+                    .is_some_and(|date| !valid_rfc3339(date))
+                || bundle_id
+                    .as_deref()
+                    .is_some_and(|id| !bundle_ids.contains(id))
+            {
+                return Err(invalid("Model organization metadata is invalid"));
+            }
+            let position = *index
+                .get(&id)
+                .ok_or_else(|| invalid("Unknown model organization metadata"))?;
+            models[position].organization = Some(RecoveryOrganization {
+                designer,
+                source_url,
+                notes,
+                model_license,
+                print_status,
+                parent_model_id,
+                last_printed_at,
+                print_count: print_count as u64,
+                bundle_id,
+            });
+        }
+
+        let attempts=collect_rows(conn,"SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at FROM print_attempts ORDER BY model_id,printed_at,id",|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?)))?;
+        let filament_rows=collect_rows(conn,"SELECT attempt_id,filament_id,ordinal FROM print_attempt_filaments ORDER BY attempt_id,ordinal",|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?;
+        let mut filaments: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+        for (attempt, filament, ordinal) in filament_rows {
+            if ordinal < 0 {
+                return Err(invalid("Print attempt filament order is invalid"));
+            }
+            filaments
+                .entry(attempt)
+                .or_default()
+                .push((ordinal, filament));
+        }
+        let attempt_ids: BTreeSet<_> = attempts.iter().map(|row| row.0.as_str()).collect();
+        if attempt_ids.len() != attempts.len()
+            || filaments
+                .keys()
+                .any(|id| !attempt_ids.contains(id.as_str()))
+        {
+            return Err(invalid("A filament references an unknown print attempt"));
+        }
+        for (id, model_id, printed_at, quantity, notes, outcome, created_at, updated_at) in attempts
+        {
+            if !(1..=10_000).contains(&quantity)
+                || notes.len() > 20_000
+                || !matches!(outcome.as_str(), "printed" | "failed")
+                || !valid_rfc3339(&printed_at)
+            {
+                return Err(invalid("Print attempt metadata is invalid"));
+            }
+            let position = *index
+                .get(&model_id)
+                .ok_or_else(|| invalid("Print attempt references unknown model"))?;
+            let mut values = filaments.remove(&id).unwrap_or_default();
+            values.sort_by_key(|v| v.0);
+            let mut unique = BTreeSet::new();
+            if values.len() > 5
+                || values
+                    .iter()
+                    .enumerate()
+                    .any(|(expected, (ordinal, _))| *ordinal != expected as i64)
+                || values.iter().any(|(_, f)| {
+                    f.is_empty()
+                        || f.len() > 256
+                        || f.trim() != f
+                        || f.chars().any(char::is_control)
+                        || !unique.insert(f)
+                })
+            {
+                return Err(invalid("Print attempt filaments are invalid"));
+            }
+            models[position].print_attempts.push(RecoveryPrintAttempt {
+                id,
+                model_id,
+                printed_at,
+                quantity: quantity as u32,
+                notes,
+                outcome,
+                filament_ids: values.into_iter().map(|(_, f)| f).collect(),
+                created_at,
+                updated_at,
+            });
+        }
+    }
 
     let index_roots = if schema_version >= 2 {
         let invalid_sources: i64 = conn.query_row(
@@ -585,17 +848,33 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             ));
         }
 
-        let roots = collect_rows(conn,
-            "SELECT id,path,enabled,last_scanned_at,scan_interval_minutes,max_file_bytes FROM index_roots ORDER BY id",
-            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?,row.get::<_, i64>(4)?,row.get::<_, i64>(5)?)))?;
+        let roots = collect_rows(
+            conn,
+            if schema_version >= 3 {
+                "SELECT id,path,enabled,last_scanned_at,scan_interval_minutes,max_file_bytes,scan_zip FROM index_roots ORDER BY id"
+            } else {
+                "SELECT id,path,enabled,last_scanned_at,scan_interval_minutes,max_file_bytes,0 FROM index_roots ORDER BY id"
+            },
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )?;
         let mut result = Vec::new();
-        for (id, path, enabled, last_scanned_at, interval, limit) in roots {
+        for (id, path, enabled, last_scanned_at, interval, limit, scan_zip) in roots {
             if !Path::new(&path).is_absolute()
                 || !(0..=1).contains(&enabled)
                 || !(1..=1440).contains(&interval)
                 || limit <= 0
                 || limit > 100 * 1024 * 1024
+                || !(0..=1).contains(&scan_zip)
             {
                 return Err(invalid("An indexed root has invalid configuration"));
             }
@@ -606,16 +885,34 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 last_scanned_at,
                 scan_interval_minutes: interval as u32,
                 max_file_bytes: limit as u64,
+                scan_zip: scan_zip == 1,
             });
         }
         let root_ids: BTreeSet<_> = result.iter().map(|root| root.id.as_str()).collect();
-        let sources = collect_rows(conn,
-            "SELECT m.id,m.source_root_id,m.source_path,m.source_missing,m.source_modified_at,
-              d.content_hash,d.original_name,d.format,d.bytes FROM models m
-              LEFT JOIN indexed_model_data d ON d.model_id=m.id WHERE m.source_kind='indexed' ORDER BY m.id",
-            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,row.get::<_, Option<i64>>(4)?,row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,row.get::<_, String>(7)?,row.get::<_, i64>(8)?)))?;
+        let sources = collect_rows(
+            conn,
+            if schema_version >= 3 {
+                "SELECT m.id,m.source_root_id,m.source_path,m.source_missing,m.source_modified_at,d.content_hash,d.original_name,d.format,d.bytes,m.source_archive_member,d.outer_fingerprint FROM models m LEFT JOIN indexed_model_data d ON d.model_id=m.id WHERE m.source_kind='indexed' ORDER BY m.id"
+            } else {
+                "SELECT m.id,m.source_root_id,m.source_path,m.source_missing,m.source_modified_at,d.content_hash,d.original_name,d.format,d.bytes,NULL,NULL FROM models m
+              LEFT JOIN indexed_model_data d ON d.model_id=m.id WHERE m.source_kind='indexed' ORDER BY m.id"
+            },
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )?;
         for (
             model_id,
             root_id,
@@ -626,13 +923,15 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             original_name,
             format,
             bytes,
+            archive_member,
+            outer_fingerprint,
         ) in sources
         {
             let relative = Path::new(&relative_path);
             if !root_ids.contains(root_id.as_str())
                 || relative.is_absolute()
                 || relative_path.contains('\\')
-                || relative_path.contains(' ')
+                || relative_path.contains('\0')
                 || relative_path
                     .split('/')
                     .any(|part| part.is_empty() || part == "." || part == "..")
@@ -644,6 +943,11 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 || bytes < 0
                 || content_hash.len() != 64
                 || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || archive_member
+                    .as_deref()
+                    .is_some_and(|member| !safe_relative(member))
+                || archive_member.is_some() != outer_fingerprint.is_some()
+                || outer_fingerprint.as_deref().is_some_and(str::is_empty)
             {
                 return Err(invalid("An indexed model has invalid source metadata"));
             }
@@ -659,6 +963,8 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 original_name,
                 format,
                 bytes: bytes as u64,
+                archive_member,
+                outer_fingerprint,
             });
         }
         result
@@ -846,6 +1152,92 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             }
         }
     }
+    let root_ids: BTreeSet<_> = index_roots.iter().map(|root| root.id.as_str()).collect();
+    for bundle in &bundles {
+        if bundle.source_root_id.is_some() != bundle.source_path.is_some()
+            || bundle
+                .source_root_id
+                .as_deref()
+                .is_some_and(|id| !root_ids.contains(id))
+            || bundle
+                .source_path
+                .as_deref()
+                .is_some_and(|path| !safe_relative(path))
+        {
+            return Err(invalid("Bundle source metadata is invalid"));
+        }
+    }
+    for model in &models {
+        if let Some(org) = &model.organization {
+            if org
+                .parent_model_id
+                .as_deref()
+                .is_some_and(|id| !index.contains_key(id))
+            {
+                return Err(invalid("Model parent reference is invalid"));
+            }
+            let mut current = org.parent_model_id.as_deref();
+            let mut visited = BTreeSet::new();
+            while let Some(id) = current {
+                if id == model.id || !visited.insert(id) {
+                    return Err(invalid("Model parent cycle detected"));
+                }
+                current = models[*index.get(id).unwrap()]
+                    .organization
+                    .as_ref()
+                    .and_then(|value| value.parent_model_id.as_deref());
+            }
+            let printed = model
+                .print_attempts
+                .iter()
+                .filter(|a| a.outcome == "printed");
+            let count: u64 = printed
+                .clone()
+                .try_fold(0_u64, |total, attempt| {
+                    total.checked_add(u64::from(attempt.quantity))
+                })
+                .ok_or_else(|| invalid("Model print count overflowed"))?;
+            let last = printed.map(|a| a.printed_at.as_str()).max();
+            if count != org.print_count || last != org.last_printed_at.as_deref() {
+                return Err(invalid("Model print summary is inconsistent"));
+            }
+            if let Some(bundle_id) = org.bundle_id.as_deref() {
+                let bundle = bundles
+                    .iter()
+                    .find(|bundle| bundle.id == bundle_id)
+                    .ok_or_else(|| invalid("Model bundle is missing"))?;
+                if let Some(bundle_root) = bundle.source_root_id.as_deref() {
+                    let source = model.indexed_source.as_ref().ok_or_else(|| {
+                        invalid("Managed model cannot reference an automatic source bundle")
+                    })?;
+                    if bundle_root != source.root_id {
+                        return Err(invalid(
+                            "Automatic bundle root does not match its model source",
+                        ));
+                    }
+                    let expected = if source.archive_member.is_some() {
+                        source.relative_path.clone()
+                    } else {
+                        let parent = Path::new(&source.relative_path)
+                            .parent()
+                            .and_then(Path::to_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                invalid(
+                                    "Root-level model cannot reference an automatic folder bundle",
+                                )
+                            })?;
+                        format!("{}/", parent.trim_end_matches('/'))
+                    };
+                    if bundle.source_path.as_deref() != Some(expected.as_str()) {
+                        return Err(invalid(
+                            "Automatic bundle path does not match its model source",
+                        ));
+                    }
+                }
+            }
+        }
+    }
     Ok(RecoveryManifest {
         manifest_version: MANIFEST_VERSION,
         library_schema_version: schema_version,
@@ -858,6 +1250,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         models,
         index_roots,
         catalog_settings,
+        bundles,
     })
 }
 
@@ -899,7 +1292,7 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if !(1..=LIBRARY_SCHEMA_VERSION as i64).contains(&version) {
         return Err(invalid(format!(
-            "Unsupported Library schema version {version}; recovery supports versions 1 and 2"
+            "Unsupported Library schema version {version}; recovery supports versions 1, 2, and 3"
         )));
     }
     const TABLES: &[(&str, &[&str])] = &[
@@ -959,7 +1352,7 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
         ),
     ];
     let mut tables = TABLES.to_vec();
-    if version == 2 {
+    if version >= 2 {
         tables.extend_from_slice(&[
             (
                 "index_roots",
@@ -1005,6 +1398,65 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
         )?;
         if source_bytes > MAX_METADATA_BYTES {
             return Err(invalid("Indexed metadata exceeds recovery limit"));
+        }
+    }
+    if version >= 3 {
+        tables.extend_from_slice(&[
+            (
+                "bundles",
+                &["id", "source_root_id", "source_path", "created_at"],
+            ),
+            (
+                "print_attempts",
+                &[
+                    "id",
+                    "model_id",
+                    "printed_at",
+                    "quantity",
+                    "notes",
+                    "outcome",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "print_attempt_filaments",
+                &["attempt_id", "filament_id", "ordinal"],
+            ),
+        ]);
+        for (table, required) in [
+            (
+                "models",
+                &[
+                    "source_archive_member",
+                    "designer",
+                    "source_url",
+                    "notes",
+                    "model_license",
+                    "print_status",
+                    "parent_model_id",
+                    "last_printed_at",
+                    "print_count",
+                    "bundle_id",
+                ][..],
+            ),
+            ("tags", &["category"][..]),
+            ("index_roots", &["scan_zip"][..]),
+            ("indexed_model_data", &["outer_fingerprint"][..]),
+        ] {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns: BTreeSet<String> = stmt
+                .query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?;
+            if required.iter().any(|column| !columns.contains(*column)) {
+                return Err(invalid(format!(
+                    "Library table {table} has an unsupported schema-3 layout"
+                )));
+            }
+        }
+        let phase3_bytes:i64=conn.query_row("SELECT COALESCE((SELECT SUM(length(COALESCE(source_archive_member,''))+length(COALESCE(designer,''))+length(COALESCE(source_url,''))+length(COALESCE(notes,''))+length(COALESCE(model_license,''))+length(COALESCE(parent_model_id,''))+length(COALESCE(bundle_id,''))) FROM models),0)+COALESCE((SELECT SUM(length(COALESCE(category,''))) FROM tags),0)+COALESCE((SELECT SUM(length(notes)+length(printed_at)) FROM print_attempts),0)+COALESCE((SELECT SUM(length(filament_id)) FROM print_attempt_filaments),0)",[],|row|row.get(0))?;
+        if phase3_bytes > MAX_METADATA_BYTES {
+            return Err(invalid("Schema-3 metadata exceeds recovery limit"));
         }
     }
     for (table, required) in &tables {

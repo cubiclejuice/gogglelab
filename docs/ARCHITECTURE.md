@@ -25,3 +25,18 @@ failed/cancelled scans do not infer missing data. Indexed sources are validated 
 immutable canonical roots at use. Thumbnail rendering runs in bounded blocking tasks and
 stores deterministic PNGs keyed by source hash and renderer version. The read-only recovery
 reader accepts schemas 1 and 2 and preserves indexed references without reading originals.
+
+## Free organization and archive indexing (phase 3)
+
+Library schema 3 adds metadata, categorized tags, print attempts/filament references,
+parent relations and stable bundles without changing original files or library identities.
+Metadata batches require expected versions and commit atomically. Print counts and last
+successful dates derive from history, independently of the current queue/status selection.
+Before schema upgrades, SQLite creates a consistent snapshot with VACUUM INTO.
+
+ZIP scans are opt-in per indexed root. Compound outer-path/member identities retain
+metadata. Bounded streaming scans verify an archive payload fingerprint; on-demand
+viewer cache copies are hash checked, while thumbnail-only extraction is temporary.
+Disabling ZIP scanning pauses those members instead of falsely marking them missing.
+Read-only recovery exports organization/history and indexed references for schemas 1–3;
+it does not copy external indexed originals. UI metadata is always rendered as text.

@@ -6,7 +6,7 @@ use std::sync::{Mutex, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use library_core::{IndexRoot, ScanReconcile, ScannedModel};
+use library_core::{IndexRoot, ScanReconcile, ScannedModel, SourceRef};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::Manager;
@@ -270,7 +270,10 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
                 .map_err(super::library_commands::library_error)
         })
         .map_err(app_error_text)?;
-    let mut seen = Vec::<PathBuf>::new();
+    let mut seen = Vec::<SourceRef>::new();
+    if !root.scan_zip {
+        preserve_paused_archive_sources(state, root, &mut seen)?;
+    }
     let mut batch = Vec::<ScannedModel>::with_capacity(batch_size);
     let mut reconciled = ScanReconcile::default();
     let mut complete = true;
@@ -324,7 +327,8 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
                 stack.push(path);
                 continue;
             }
-            if !metadata.is_file() || !is_model_path(&path) {
+            let is_archive = root.scan_zip && is_zip_path(&path);
+            if !metadata.is_file() || (!is_model_path(&path) && !is_archive) {
                 continue;
             }
             state.scan_control().status.lock().unwrap().files_visited += 1;
@@ -358,8 +362,34 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
                 .strip_prefix(&canonical_root)
                 .expect("canonical containment was checked")
                 .to_path_buf();
-            seen.push(relative.clone());
+            if is_archive {
+                match scan_archive_file(
+                    state,
+                    root,
+                    &canonical_path,
+                    &relative,
+                    &metadata,
+                    &mut seen,
+                    &mut batch,
+                    batch_size,
+                    &mut reconciled,
+                ) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        complete = false;
+                        state
+                            .scan_control()
+                            .error(format!("{}: {error}", path.display()));
+                    }
+                }
+                continue;
+            }
+            seen.push(SourceRef {
+                relative_path: relative.clone(),
+                archive_member: None,
+            });
             if metadata.len() > root.max_file_bytes {
+                complete = false;
                 state.scan_control().error(format!(
                     "Skipped {} because it exceeds the {} byte limit",
                     path.display(),
@@ -370,7 +400,7 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
             let modified_at = modified_nanos(&metadata);
             let unchanged = state
                 .with_db(|db| {
-                    db.indexed_source_metadata(&root.id, &relative)
+                    db.indexed_source_metadata(&root.id, &relative, None)
                         .map_err(super::library_commands::library_error)
                 })
                 .map_err(app_error_text)?
@@ -403,7 +433,7 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
     if complete && !state.scan_control().cancel.load(Ordering::Acquire) {
         let result = state
             .with_db(|db| {
-                db.complete_scan_with_new_models(
+                db.complete_scan_sources_with_new_models(
                     &root.id,
                     &seen,
                     &reconciled.added_model_ids,
@@ -420,12 +450,66 @@ fn scan_root(state: &LibraryState, root: &IndexRoot) -> Result<ScanReconcile, St
     Ok(reconciled)
 }
 
+fn preserve_paused_archive_sources(
+    state: &LibraryState,
+    root: &IndexRoot,
+    seen: &mut Vec<SourceRef>,
+) -> Result<(), String> {
+    let models = state
+        .with_db(|db| {
+            db.list_models(None, None)
+                .map_err(super::library_commands::library_error)
+        })
+        .map_err(app_error_text)?;
+    for model in models {
+        if model.source_root_id.as_deref() != Some(&root.id) {
+            continue;
+        }
+        let Some(archive_member) = model.source_archive_member else {
+            continue;
+        };
+        let source_path = model
+            .source_path
+            .as_deref()
+            .ok_or_else(|| "Archive model has no source path".to_string())?;
+        let source_path = Path::new(source_path);
+        let relative_path = if source_path.is_absolute() {
+            source_path
+                .strip_prefix(&root.path)
+                .map_err(|_| "Archive model source escaped its configured root".to_string())?
+                .to_path_buf()
+        } else {
+            source_path.to_path_buf()
+        };
+        if relative_path.as_os_str().is_empty()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("Archive model source path is invalid".into());
+        }
+        if seen.len() == MAX_SCAN_FILES {
+            return Err(format!(
+                "Root exceeds the safety limit of {MAX_SCAN_FILES} model files"
+            ));
+        }
+        seen.push(SourceRef {
+            relative_path,
+            archive_member: Some(archive_member),
+        });
+    }
+    Ok(())
+}
+
 fn scan_file(
     path: &Path,
     relative_path: PathBuf,
     expected_bytes: u64,
     modified_at: u64,
 ) -> Result<ScannedModel, String> {
+    if expected_bytes > stl_core::limits::MAX_FILE_BYTES {
+        return Err("Model exceeds the native 100 MiB scan limit".into());
+    }
     let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();
     (&mut file)
@@ -460,7 +544,101 @@ fn scan_file(
         format: format.into(),
         modified_at,
         display_name,
+        archive_member: None,
+        outer_fingerprint: None,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_archive_file(
+    state: &LibraryState,
+    root: &IndexRoot,
+    archive_path: &Path,
+    relative_path: &Path,
+    metadata: &fs::Metadata,
+    seen: &mut Vec<SourceRef>,
+    batch: &mut Vec<ScannedModel>,
+    batch_size: usize,
+    reconciled: &mut ScanReconcile,
+) -> Result<(), String> {
+    let cancelled = || state.scan_control().cancelled();
+    let inventory = crate::library_archives::archive_inventory_with_cancel(
+        archive_path,
+        root.max_file_bytes,
+        &cancelled,
+    )?;
+    let existing = state
+        .with_db(|db| {
+            db.indexed_archive_metadata(&root.id, relative_path)
+                .map_err(super::library_commands::library_error)
+        })
+        .map_err(app_error_text)?;
+    let expected_members = inventory
+        .member_paths
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    let existing_members = existing
+        .iter()
+        .filter_map(|entry| entry.archive_member.as_ref())
+        .collect::<std::collections::HashSet<_>>();
+    if existing.len() == inventory.member_paths.len()
+        && existing_members == expected_members
+        && existing
+            .iter()
+            .all(|entry| entry.outer_fingerprint.as_deref() == Some(&inventory.outer_fingerprint))
+    {
+        for member in inventory.member_paths {
+            if seen.len() == MAX_SCAN_FILES {
+                return Err(format!(
+                    "Root exceeds the safety limit of {MAX_SCAN_FILES} model files"
+                ));
+            }
+            seen.push(SourceRef {
+                relative_path: relative_path.to_path_buf(),
+                archive_member: Some(member),
+            });
+        }
+        return Ok(());
+    }
+
+    let scan = crate::library_archives::scan_archive_with_cancel(
+        archive_path,
+        root.max_file_bytes,
+        &cancelled,
+    )?;
+    if scan.outer_fingerprint != inventory.outer_fingerprint {
+        return Err("Archive changed between metadata and content scans".into());
+    }
+    let modified_at = modified_nanos(metadata);
+    for member in scan.members {
+        if state.scan_control().cancelled() {
+            return Err("Archive scan was cancelled".into());
+        }
+        if seen.len() == MAX_SCAN_FILES {
+            return Err(format!(
+                "Root exceeds the safety limit of {MAX_SCAN_FILES} model files"
+            ));
+        }
+        seen.push(SourceRef {
+            relative_path: relative_path.to_path_buf(),
+            archive_member: Some(member.member_path.clone()),
+        });
+        batch.push(ScannedModel {
+            relative_path: relative_path.to_path_buf(),
+            content_hash: member.content_hash,
+            bytes: member.bytes,
+            format: member.format,
+            modified_at,
+            display_name: member.display_name,
+            archive_member: Some(member.member_path),
+            outer_fingerprint: Some(scan.outer_fingerprint.clone()),
+        });
+        if batch.len() == batch_size {
+            let result = flush_batch(state, &root.id, batch)?;
+            add_reconcile(reconciled, &result);
+        }
+    }
+    Ok(())
 }
 
 fn flush_batch(
@@ -505,6 +683,12 @@ fn is_model_path(path: &Path) -> bool {
         })
 }
 
+fn is_zip_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+}
+
 /// Full-resolution Unix timestamp used by schema-2 `source_modified_at`.
 /// Legacy second-resolution values remain readable but will be re-indexed once.
 fn modified_nanos(metadata: &fs::Metadata) -> u64 {
@@ -531,6 +715,7 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -551,6 +736,30 @@ mod tests {
         bytes[80..84].copy_from_slice(&1_u32.to_le_bytes());
         bytes.extend_from_slice(&[0_u8; 50]);
         bytes
+    }
+
+    fn three_mf_cube() -> Vec<u8> {
+        let model = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+<resources><object id="1" type="model"><mesh><vertices>
+<vertex x="0" y="0" z="0"/><vertex x="20" y="0" z="0"/>
+<vertex x="20" y="20" z="0"/><vertex x="0" y="20" z="0"/>
+<vertex x="0" y="0" z="20"/><vertex x="20" y="0" z="20"/>
+<vertex x="20" y="20" z="20"/><vertex x="0" y="20" z="20"/>
+</vertices><triangles>
+<triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+<triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+<triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+<triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+<triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+<triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+</triangles></mesh></object></resources><build><item objectid="1"/></build></model>"#;
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("3D/3dmodel.model", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(model.as_bytes()).unwrap();
+        archive.finish().unwrap().into_inner()
     }
 
     #[test]
@@ -589,6 +798,7 @@ mod tests {
             last_scanned_at: Some(now_seconds().to_string()),
             scan_interval_minutes: 60,
             max_file_bytes: 1024,
+            scan_zip: false,
         };
         assert!(root_should_scan(&root, true));
         assert!(!root_should_scan(&root, false));
@@ -737,6 +947,324 @@ mod tests {
             .unwrap();
         assert_eq!(models.len(), 2);
         assert!(models.iter().all(|model| !model.source_missing));
+        let _ = fs::remove_dir_all(catalog);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn oversized_changed_source_keeps_scan_incomplete_and_is_refused_for_open() {
+        let catalog = temp_root("oversized-catalog");
+        let source = temp_root("oversized-source");
+        let path = source.join("growing.stl");
+        fs::write(&path, triangle_stl()).unwrap();
+        let state = LibraryState::new(catalog.clone());
+        let root = state
+            .with_db(|db| {
+                db.add_index_root(&source, 60, 150)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        scan_root(&state, &root).unwrap();
+        let (model_id, original_hash, last_scanned_at) = state
+            .with_db(|db| {
+                let model = db
+                    .list_models(None, None)
+                    .map_err(super::super::library_commands::library_error)?
+                    .remove(0);
+                let scanned = db
+                    .list_index_roots()
+                    .map_err(super::super::library_commands::library_error)?
+                    .remove(0)
+                    .last_scanned_at;
+                Ok((model.id, model.content_hash.unwrap(), scanned))
+            })
+            .unwrap();
+        use std::fs::OpenOptions;
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0_u8; 100]).unwrap();
+        drop(file);
+
+        scan_root(&state, &root).unwrap();
+        state
+            .with_db(|db| {
+                let model = db
+                    .get_model(&model_id)
+                    .map_err(super::super::library_commands::library_error)?
+                    .unwrap();
+                assert_eq!(model.content_hash.as_deref(), Some(original_hash.as_str()));
+                let scanned = db
+                    .list_index_roots()
+                    .map_err(super::super::library_commands::library_error)?
+                    .remove(0);
+                assert_eq!(scanned.last_scanned_at, last_scanned_at);
+                let resolved = db
+                    .resolve_model_source_ref(&model_id)
+                    .map_err(super::super::library_commands::library_error)?;
+                assert!(crate::library_commands::validate_indexed_source_limit(
+                    &resolved,
+                    Some(root.max_file_bytes)
+                )
+                .is_err());
+                Ok(())
+            })
+            .unwrap();
+        let _ = fs::remove_dir_all(catalog);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn zip_scan_indexes_members_as_one_bundle_and_cleans_thumbnail_extractions() {
+        let catalog = temp_root("zip-catalog");
+        let source = temp_root("zip-source");
+        let archive_path = source.join("bundle.zip");
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for name in ["parts/one.stl", "parts/two.stl"] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(&triangle_stl()).unwrap();
+        }
+        archive.finish().unwrap();
+        let source_modified = fs::metadata(&archive_path).unwrap().modified().unwrap();
+        let state = LibraryState::new(catalog.clone());
+        let mut root = state
+            .with_db(|db| {
+                db.add_index_root(&source, 60, 1024 * 1024)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        root.scan_zip = true;
+        let root = state
+            .with_db(|db| {
+                db.update_index_root(&root)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+
+        scan_root(&state, &root).unwrap();
+        let models = state
+            .with_db(|db| {
+                db.list_models(None, None)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().all(|model| model.bundle_id.is_some()));
+        assert_eq!(models[0].bundle_id, models[1].bundle_id);
+        assert!(models
+            .iter()
+            .all(|model| model.source_archive_member.is_some()));
+        assert!(models.iter().all(|model| model.thumbnail_path.is_some()));
+        assert_eq!(
+            source_modified,
+            fs::metadata(&archive_path).unwrap().modified().unwrap()
+        );
+        assert!(!fs::read_dir(catalog.join("staging"))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("archive-thumbnail-")));
+
+        let mut paused_root = root.clone();
+        paused_root.scan_zip = false;
+        let paused_root = state
+            .with_db(|db| {
+                db.update_index_root(&paused_root)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        fs::remove_file(&archive_path).unwrap();
+        scan_root(&state, &paused_root).unwrap();
+        let paused_models = state
+            .with_db(|db| {
+                db.list_models(None, None)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        assert!(paused_models.iter().all(|model| !model.source_missing));
+
+        let mut enabled_root = paused_root;
+        enabled_root.scan_zip = true;
+        let enabled_root = state
+            .with_db(|db| {
+                db.update_index_root(&enabled_root)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        scan_root(&state, &enabled_root).unwrap();
+        let missing_models = state
+            .with_db(|db| {
+                db.list_models(None, None)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        assert!(missing_models.iter().all(|model| model.source_missing));
+        let _ = fs::remove_dir_all(catalog);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn zip_scan_repairs_a_partial_prior_member_batch() {
+        let catalog = temp_root("zip-partial-catalog");
+        let source = temp_root("zip-partial-source");
+        let archive_path = source.join("bundle.zip");
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for name in ["parts/one.stl", "parts/two.stl"] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&triangle_stl()).unwrap();
+        }
+        writer.finish().unwrap();
+        let state = LibraryState::new(catalog.clone());
+        let mut root = state
+            .with_db(|db| {
+                db.add_index_root(&source, 60, 1024 * 1024)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        root.scan_zip = true;
+        let root = state
+            .with_db(|db| {
+                db.update_index_root(&root)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        let archive_scan =
+            crate::library_archives::scan_archive(&archive_path, root.max_file_bytes).unwrap();
+        let first = &archive_scan.members[0];
+        state
+            .with_db(|db| {
+                db.record_scan_entries(
+                    &root.id,
+                    &[ScannedModel {
+                        relative_path: PathBuf::from("bundle.zip"),
+                        content_hash: first.content_hash.clone(),
+                        bytes: first.bytes,
+                        format: first.format.clone(),
+                        modified_at: modified_nanos(&fs::metadata(&archive_path).unwrap()),
+                        display_name: first.display_name.clone(),
+                        archive_member: Some(first.member_path.clone()),
+                        outer_fingerprint: Some(archive_scan.outer_fingerprint.clone()),
+                    }],
+                )
+                .map(|_| ())
+                .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        assert_eq!(
+            state
+                .with_db(|db| db
+                    .list_models(None, None)
+                    .map_err(super::super::library_commands::library_error))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        scan_root(&state, &root).unwrap();
+        assert_eq!(
+            state
+                .with_db(|db| db
+                    .list_models(None, None)
+                    .map_err(super::super::library_commands::library_error))
+                .unwrap()
+                .len(),
+            2
+        );
+        let _ = fs::remove_dir_all(catalog);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn zip_scan_renders_and_extracts_a_real_3mf_member_without_mutating_outer_archive() {
+        let catalog = temp_root("zip-3mf-catalog");
+        let source = temp_root("zip-3mf-source");
+        let archive_path = source.join("models.zip");
+        let member_bytes = three_mf_cube();
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("nested/cube.3mf", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&member_bytes).unwrap();
+        writer.finish().unwrap();
+        let outer_before = fs::read(&archive_path).unwrap();
+        let outer_hash_before = Sha256::digest(&outer_before);
+        let outer_modified_before = fs::metadata(&archive_path).unwrap().modified().unwrap();
+
+        let state = LibraryState::new(catalog.clone());
+        let mut root = state
+            .with_db(|db| {
+                db.add_index_root(&source, 60, 100 * 1024 * 1024)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        root.scan_zip = true;
+        let root = state
+            .with_db(|db| {
+                db.update_index_root(&root)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        scan_root(&state, &root).unwrap();
+
+        let model = state
+            .with_db(|db| {
+                Ok(db
+                    .list_models(None, None)
+                    .map_err(super::super::library_commands::library_error)?
+                    .remove(0))
+            })
+            .unwrap();
+        assert_eq!(model.format.as_deref(), Some("3mf"));
+        assert_eq!(
+            model.source_archive_member.as_deref(),
+            Some("nested/cube.3mf")
+        );
+        let thumbnail = model.thumbnail_path.as_deref().unwrap();
+        let thumbnail_bytes = fs::read(catalog.join(thumbnail)).unwrap();
+        assert!(thumbnail_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(thumbnail_bytes.len() > 500);
+
+        let resolved = state
+            .with_db(|db| {
+                db.resolve_model_source_ref(&model.id)
+                    .map_err(super::super::library_commands::library_error)
+            })
+            .unwrap();
+        let cached = crate::library_archives::extract_member_to_cache(
+            &catalog.canonicalize().unwrap(),
+            &resolved.outer_path,
+            resolved.archive_member.as_deref().unwrap(),
+            resolved.outer_fingerprint.as_deref().unwrap(),
+            &resolved.content_hash,
+            resolved.bytes,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&cached).unwrap(), member_bytes);
+        let parsed = stl_core::parse_model(&fs::read(cached).unwrap()).unwrap();
+        assert_eq!(parsed.format, stl_core::StlFormat::ThreeMf);
+        assert_eq!(parsed.triangle_count, 12);
+        assert_eq!(
+            outer_hash_before.as_slice(),
+            Sha256::digest(fs::read(&archive_path).unwrap()).as_slice()
+        );
+        assert_eq!(
+            outer_modified_before,
+            fs::metadata(&archive_path).unwrap().modified().unwrap()
+        );
+        assert!(!fs::read_dir(catalog.join("staging"))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("archive-thumbnail-")));
         let _ = fs::remove_dir_all(catalog);
         let _ = fs::remove_dir_all(source);
     }

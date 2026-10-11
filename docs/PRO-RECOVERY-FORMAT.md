@@ -1,6 +1,6 @@
 # Library and saved colorway recovery format, version 1
 
-This is the public recovery contract for existing GoggleLab Library data. The recovery reader is independent of the writable Library implementation. It reads `app_data_dir/library/library.sqlite3` with SQLite's read-only flag, in a read transaction, and never initializes a missing database or runs a migration. It accepts schema versions 1 and 2 without migrating. An unknown or incomplete schema is an error; the reader leaves the source intact.
+This is the public recovery contract for existing GoggleLab Library data. The recovery reader is independent of the writable Library implementation. It reads `app_data_dir/library/library.sqlite3` with SQLite's read-only flag, in a read transaction, and never initializes a missing database or runs a migration. It accepts schema versions 1, 2 and 3 without migrating. An unknown or incomplete schema is an error; the reader leaves the source intact.
 
 The v1 reader requires the existing `libraries`, `folders`, `blobs`, `models`, `revisions`, `tags`, `model_tags`, `manuals`, `thumbnails`, and `jobs` tables and their v1 columns. `folders` preserve `id`, `name`, and `parent_id`. Each model preserves its ID, `library:<model_id>` source identity, display name, description, folder ID, current revision ID, metadata version, deletion time, and creation/update times. Every revision is joined by `revisions.model_id` and `revisions.blob_hash = blobs.hash`; it preserves revision ID, model ID, blob hash, original name, format, creation time, byte count, and the managed blob path. Tag IDs/names and model-tag links remain explicit. Referenced manuals and thumbnails retain their paths and hashes; thumbnails also retain their IDs and `is_custom` state. Unreferenced staging, trash, jobs, and blobs are not exported.
 
@@ -42,3 +42,18 @@ source_content_hash records which model geometry produced it. Custom thumbnails 
 their original ownership and are excluded from the generated-cache purge.
 
 Schema-2 exports also retain optional catalog_settings (preview size/background, bounded render concurrency, and scan batch size). Older schema-2 catalogs without that singleton remain readable.
+
+
+## Organization and archive references in schema 3
+
+Schema-3 manifests add optional model organization and print_attempts, manifest
+bundles, tag category, root scan_zip, and indexed source archive_member /
+outer_fingerprint. Print attempts retain dates, quantities, outcomes, notes and ordered
+filament references. Lifetime success count/date must agree with the print log; current
+status is independent. Parent links must be valid and acyclic. A selected export includes
+its parent chain and needed bundle identities so those references remain recoverable.
+
+Schema-1/2 exports omit empty new fields. Multiline notes and legacy strings remain text;
+bounds protect the read-only parser. Archive references are exported without opening
+the external archive. ZIP source files and external loose originals are not included;
+preserve or separately back up those indexed directories when moving a library.

@@ -30,6 +30,101 @@ pub struct Model {
     pub source_missing: bool,
     pub source_modified_at: Option<u64>,
     pub thumbnail_path: Option<String>,
+    pub metadata: ModelMetadata,
+    pub bundle_id: Option<String>,
+    pub source_archive_member: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrintStatus {
+    #[default]
+    Unprinted,
+    Want,
+    Queued,
+    Printing,
+    Printed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelMetadata {
+    pub designer: Option<String>,
+    pub source_url: Option<String>,
+    pub notes: Option<String>,
+    pub model_license: Option<String>,
+    pub print_status: PrintStatus,
+    pub parent_model_id: Option<String>,
+    pub last_printed_at: Option<String>,
+    pub print_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TagMode {
+    Replace,
+    Merge,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataPatch {
+    pub designer: Option<String>,
+    pub source_url: Option<String>,
+    pub notes: Option<String>,
+    pub model_license: Option<String>,
+    pub print_status: Option<PrintStatus>,
+    pub tags: Option<Vec<String>>,
+    pub tag_mode: Option<TagMode>,
+    pub folder_id: Option<String>,
+    pub parent_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionedModelUpdate {
+    pub model_id: String,
+    pub expected_version: u64,
+    pub patch: MetadataPatch,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionedTarget {
+    pub model_id: String,
+    pub expected_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrintOutcome {
+    Printed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrintAttemptInput {
+    pub printed_at: String,
+    pub quantity: u32,
+    pub notes: String,
+    pub filament_ids: Vec<String>,
+    pub outcome: PrintOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrintAttempt {
+    pub id: String,
+    pub model_id: String,
+    pub printed_at: String,
+    pub quantity: u32,
+    pub notes: String,
+    pub filament_ids: Vec<String>,
+    pub outcome: PrintOutcome,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +135,7 @@ pub struct IndexRoot {
     pub last_scanned_at: Option<String>,
     pub scan_interval_minutes: u32,
     pub max_file_bytes: u64,
+    pub scan_zip: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +146,23 @@ pub struct ScannedModel {
     pub format: String,
     pub modified_at: u64,
     pub display_name: Option<String>,
+    pub archive_member: Option<String>,
+    pub outer_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SourceRef {
+    pub relative_path: PathBuf,
+    pub archive_member: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedModelSource {
+    pub outer_path: PathBuf,
+    pub archive_member: Option<String>,
+    pub outer_fingerprint: Option<String>,
+    pub content_hash: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +170,8 @@ pub struct IndexedSourceMetadata {
     pub bytes: u64,
     pub modified_at: u64,
     pub content_hash: String,
+    pub archive_member: Option<String>,
+    pub outer_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

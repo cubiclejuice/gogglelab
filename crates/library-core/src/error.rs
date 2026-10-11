@@ -28,6 +28,12 @@ pub enum LibraryError {
     IndexRootNotFound(String),
     #[error("source file changed while it was being imported")]
     SourceChanged,
+    #[error("model {model_id} metadata version conflict: expected {expected}, found {actual}")]
+    MetadataConflict {
+        model_id: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("unsupported library format: {0}")]
     UnsupportedFormat(String),
     #[error("invalid library input: {0}")]

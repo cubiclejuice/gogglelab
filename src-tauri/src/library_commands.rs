@@ -1,15 +1,18 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 
 use crate::extension_api::{AppError, AppState, ModelSummary};
 use library_core::{
-    CatalogSettings, Folder, ImportResult, IndexRoot, LibraryDb, LibraryError, Model,
+    CatalogSettings, Folder, ImportResult, IndexRoot, LibraryDb, LibraryError, MetadataPatch,
+    Model, PrintAttempt, PrintAttemptInput, Tag, VersionedTarget,
 };
 
 use crate::library_scan::{LibraryScanStatus, ScanControl};
 
 static THUMBNAIL_RENDER_LIMITER: LazyLock<RenderLimiter> = LazyLock::new(RenderLimiter::new);
+static THUMBNAIL_KEY_LOCKS: LazyLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct RenderLimiter {
     active: Mutex<usize>,
@@ -42,6 +45,17 @@ impl Drop for RenderPermit<'_> {
         *active = active.saturating_sub(1);
         self.0.available.notify_one();
     }
+}
+
+fn thumbnail_key_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = THUMBNAIL_KEY_LOCKS.lock().unwrap();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key.to_owned(), Arc::downgrade(&lock));
+    lock
 }
 
 #[derive(Clone)]
@@ -169,6 +183,145 @@ pub fn library_delete_folder(
 }
 
 #[tauri::command]
+pub fn library_list_tags(state: tauri::State<'_, LibraryState>) -> Result<Vec<Tag>, AppError> {
+    with_db(&state, |db| db.list_tags().map_err(library_error))
+}
+
+#[tauri::command]
+pub fn library_create_tag(
+    state: tauri::State<'_, LibraryState>,
+    name: String,
+    category: Option<String>,
+) -> Result<Tag, AppError> {
+    with_db(&state, |db| {
+        db.create_tag(&name, category.as_deref())
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_update_tag(
+    state: tauri::State<'_, LibraryState>,
+    tag_id: String,
+    name: String,
+    category: Option<String>,
+) -> Result<Tag, AppError> {
+    with_db(&state, |db| {
+        db.rename_tag(&tag_id, &name, category.as_deref())
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_delete_tag(
+    state: tauri::State<'_, LibraryState>,
+    tag_id: String,
+) -> Result<(), AppError> {
+    with_db(&state, |db| db.delete_tag(&tag_id).map_err(library_error))
+}
+
+#[tauri::command]
+pub fn library_update_model_metadata(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+    expected_version: u64,
+    patch: MetadataPatch,
+) -> Result<Model, AppError> {
+    with_db(&state, |db| {
+        db.update_model_metadata(&model_id, expected_version, &patch)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_update_models_metadata(
+    state: tauri::State<'_, LibraryState>,
+    targets: Vec<VersionedTarget>,
+    patch: MetadataPatch,
+) -> Result<Vec<Model>, AppError> {
+    with_db(&state, |db| {
+        db.bulk_update_metadata(&targets, &patch)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_create_print_attempt(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+    input: PrintAttemptInput,
+) -> Result<PrintAttempt, AppError> {
+    with_db(&state, |db| {
+        db.create_print_attempt(&model_id, &input)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_list_print_attempts(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+) -> Result<Vec<PrintAttempt>, AppError> {
+    with_db(&state, |db| {
+        db.list_print_attempts(&model_id).map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_get_print_attempt(
+    state: tauri::State<'_, LibraryState>,
+    attempt_id: String,
+) -> Result<Option<PrintAttempt>, AppError> {
+    with_db(&state, |db| {
+        db.get_print_attempt(&attempt_id).map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_update_print_attempt(
+    state: tauri::State<'_, LibraryState>,
+    attempt_id: String,
+    input: PrintAttemptInput,
+) -> Result<PrintAttempt, AppError> {
+    with_db(&state, |db| {
+        db.update_print_attempt(&attempt_id, &input)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_delete_print_attempt(
+    state: tauri::State<'_, LibraryState>,
+    attempt_id: String,
+) -> Result<(), AppError> {
+    with_db(&state, |db| {
+        db.delete_print_attempt(&attempt_id).map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_create_bundle(
+    state: tauri::State<'_, LibraryState>,
+    model_ids: Vec<String>,
+) -> Result<String, AppError> {
+    with_db(&state, |db| {
+        db.create_bundle(&model_ids).map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_set_model_bundle(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+    bundle_id: Option<String>,
+) -> Result<Model, AppError> {
+    with_db(&state, |db| {
+        db.set_model_bundle(&model_id, bundle_id.as_deref())
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
 pub fn library_import_file(
     state: tauri::State<'_, LibraryState>,
     source_path: String,
@@ -225,6 +378,7 @@ pub fn library_update_root(
     enabled: bool,
     scan_interval_minutes: u32,
     max_file_bytes: u64,
+    scan_zip: bool,
 ) -> Result<IndexRoot, AppError> {
     if !(1..=1440).contains(&scan_interval_minutes)
         || max_file_bytes == 0
@@ -247,6 +401,7 @@ pub fn library_update_root(
             enabled,
             scan_interval_minutes,
             max_file_bytes,
+            scan_zip,
             ..root
         })
         .map_err(library_error)
@@ -409,17 +564,6 @@ pub(crate) fn get_thumbnail(
             return Ok(Some(cached));
         }
     }
-    let render_concurrency = with_db(state, |db| {
-        db.get_catalog_settings()
-            .map(|settings| settings.thumbnail_concurrency.min(2) as usize)
-            .map_err(library_error)
-    })?;
-    let _render_permit = THUMBNAIL_RENDER_LIMITER.acquire(render_concurrency);
-    if !regenerate {
-        if let Ok(Some(cached)) = with_db(state, |db| cached_thumbnail(db, model_id)) {
-            return Ok(Some(cached));
-        }
-    }
     let source = with_db(state, |db| {
         let model = db
             .get_model(model_id)
@@ -430,23 +574,83 @@ pub(crate) fn get_thumbnail(
         let Some(content_hash) = model.content_hash else {
             return Ok(None);
         };
-        let source = db.resolve_model_source(model_id).map_err(library_error)?;
+        if model.source_kind == "indexed" {
+            let root_id = model
+                .source_root_id
+                .as_deref()
+                .ok_or_else(|| AppError::Library {
+                    message: "Indexed model has no source root".into(),
+                })?;
+            let limit = db
+                .list_index_roots()
+                .map_err(library_error)?
+                .into_iter()
+                .find(|root| root.id == root_id)
+                .ok_or_else(|| AppError::Library {
+                    message: "Indexed model source root was removed".into(),
+                })?
+                .max_file_bytes;
+            if model.bytes > limit {
+                return Err(AppError::Library {
+                    message: format!(
+                        "Indexed model exceeds its source root limit of {limit} bytes"
+                    ),
+                });
+            }
+        }
+        let source = db
+            .resolve_model_source_ref(model_id)
+            .map_err(library_error)?;
         Ok(Some((
             source,
             content_hash,
-            model.bytes,
             db.root().to_path_buf(),
             db.get_catalog_settings().map_err(library_error)?,
         )))
     })?;
-    let Some((source_path, content_hash, source_bytes, library_root, settings)) = source else {
+    let Some((source, content_hash, library_root, settings)) = source else {
         return Ok(None);
     };
+    let key = crate::library_thumbnail::thumbnail_relative_path(&content_hash, &settings)
+        .to_string_lossy()
+        .into_owned();
+    let key_lock = thumbnail_key_lock(&key);
+    let _key_guard = key_lock.lock().unwrap();
+    if !regenerate {
+        if let Ok(Some(cached)) = with_db(state, |db| cached_thumbnail(db, model_id)) {
+            return Ok(Some(cached));
+        }
+    }
+    let _render_permit =
+        THUMBNAIL_RENDER_LIMITER.acquire(settings.thumbnail_concurrency.clamp(1, 2) as usize);
+    let temporary_member = if let Some(member) = source.archive_member.as_deref() {
+        Some(
+            crate::library_archives::extract_member_to_temporary(
+                &library_root,
+                &source.outer_path,
+                member,
+                source
+                    .outer_fingerprint
+                    .as_deref()
+                    .ok_or_else(|| AppError::Library {
+                        message: "Archive model has no source fingerprint".into(),
+                    })?,
+                &source.content_hash,
+                source.bytes,
+            )
+            .map_err(|message| AppError::Library { message })?,
+        )
+    } else {
+        None
+    };
+    let source_path = temporary_member
+        .as_ref()
+        .map_or(source.outer_path.as_path(), |member| member.path());
     let thumbnail = crate::library_thumbnail::ensure_thumbnail(
         &library_root,
-        &source_path,
+        source_path,
         &content_hash,
-        source_bytes,
+        source.bytes,
         &settings,
         regenerate,
     )
@@ -634,16 +838,58 @@ pub fn library_open_model(
     model_id: String,
     generation: u64,
 ) -> Result<ModelSummary, AppError> {
-    let path = {
-        let mut guard = library_state.inner.db.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(open_library(&library_state.inner.root)?);
-        }
-        guard
-            .as_ref()
-            .unwrap()
-            .resolve_model_source(&model_id)
+    let (source, library_root, indexed_limit) = with_db(&library_state, |db| {
+        let model = db
+            .get_model(&model_id)
             .map_err(library_error)?
+            .ok_or_else(|| AppError::Library {
+                message: format!("Model not found: {model_id}"),
+            })?;
+        let indexed_limit = if model.source_kind == "indexed" {
+            let root_id = model
+                .source_root_id
+                .as_deref()
+                .ok_or_else(|| AppError::Library {
+                    message: "Indexed model has no source root".into(),
+                })?;
+            Some(
+                db.list_index_roots()
+                    .map_err(library_error)?
+                    .into_iter()
+                    .find(|root| root.id == root_id)
+                    .ok_or_else(|| AppError::Library {
+                        message: "Indexed model source root was removed".into(),
+                    })?
+                    .max_file_bytes,
+            )
+        } else {
+            None
+        };
+        Ok((
+            db.resolve_model_source_ref(&model_id)
+                .map_err(library_error)?,
+            db.root().to_path_buf(),
+            indexed_limit,
+        ))
+    })?;
+    validate_indexed_source_limit(&source, indexed_limit)?;
+    let path = if let Some(member) = source.archive_member.as_deref() {
+        crate::library_archives::extract_member_to_cache(
+            &library_root,
+            &source.outer_path,
+            member,
+            source
+                .outer_fingerprint
+                .as_deref()
+                .ok_or_else(|| AppError::Library {
+                    message: "Archive model has no source fingerprint".into(),
+                })?,
+            &source.content_hash,
+            source.bytes,
+        )
+        .map_err(|message| AppError::Library { message })?
+    } else {
+        source.outer_path
     };
     crate::extension_api::load_model_from_path(
         app,
@@ -652,6 +898,28 @@ pub fn library_open_model(
         generation,
         &library_source_identity(&model_id),
     )
+}
+
+pub(crate) fn validate_indexed_source_limit(
+    source: &library_core::ResolvedModelSource,
+    indexed_limit: Option<u64>,
+) -> Result<(), AppError> {
+    let Some(limit) = indexed_limit else {
+        return Ok(());
+    };
+    let actual = if source.archive_member.is_some() {
+        source.bytes
+    } else {
+        std::fs::symlink_metadata(&source.outer_path)
+            .map_err(|error| crate::error::map_io_error(&error))?
+            .len()
+    };
+    if actual > limit {
+        return Err(AppError::Library {
+            message: format!("Indexed model exceeds its source root limit of {limit} bytes"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -809,6 +1077,8 @@ mod tests {
                     format: "stl-binary".into(),
                     modified_at: 1,
                     display_name: Some("Cached".into()),
+                    archive_member: None,
+                    outer_fingerprint: None,
                 }],
             )
             .unwrap();

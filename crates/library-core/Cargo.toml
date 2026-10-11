@@ -10,4 +10,5 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 stl-core = { path = "../stl-core" }
 thiserror = "2"
+time = { version = "0.3.55", features = ["formatting", "parsing"] }
 uuid = { version = "1.26", features = ["v4"] }

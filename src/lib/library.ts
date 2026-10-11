@@ -4,12 +4,28 @@ import type {
   LibraryFolder,
   LibraryModel,
   LibraryScanStatus,
+  LibraryTag,
+  MetadataPatch,
+  PrintAttempt,
+  PrintAttemptInput,
+  PrintStatus,
+  VersionedModelTarget,
 } from "./ipc";
+import {
+  LibraryMetadataEditor,
+  matchesPrintedFilter,
+  selectionScopeIds,
+  type PrintedFilter,
+  type SelectionScope,
+} from "./library-editor";
+import { LibraryPrintHistory } from "./library-history";
+import { LibraryTagManager } from "./tag-manager";
 
 export type LibrarySort = "name" | "size" | "date";
 export type LibrarySourceFilter = "all" | "managed" | "indexed";
 export type LibraryStatusFilter = "all" | "available" | "missing";
 export type LibraryViewMode = "list" | "preview" | "detailed";
+export type LibraryGroupFilter = "all" | "standalone" | "bundle" | "zip";
 export const LIBRARY_CATALOG_TIER = "free" as const;
 export const LIBRARY_VIEW_MODES: readonly LibraryViewMode[] = ["list", "preview", "detailed"];
 
@@ -27,6 +43,13 @@ export interface LibraryViewOptions {
   source: LibrarySourceFilter;
   status: LibraryStatusFilter;
   sort: LibrarySort;
+}
+
+export interface LibraryMetadataFilters {
+  printStatus: "all" | PrintStatus;
+  designer: string;
+  tagId: string;
+  category: string;
 }
 
 const PAGE_SIZE = 36;
@@ -98,6 +121,11 @@ export function filterAndSortLibraryModels(
         model.description,
         model.source_path ?? "",
         model.format ?? "",
+        model.metadata?.designer ?? "",
+        model.metadata?.source_url ?? "",
+        model.metadata?.notes ?? "",
+        model.metadata?.model_license ?? "",
+        model.metadata?.print_status ?? "",
         ...model.tags,
       ]
         .join(" ")
@@ -162,6 +190,38 @@ export function normalizeCatalogSettings(settings: CatalogSettings): CatalogSett
 
 export function canOpenLibraryModel(model: LibraryModel): boolean {
   return !model.source_missing;
+}
+
+export function matchesLibraryGroup(model: LibraryModel, group: LibraryGroupFilter): boolean {
+  if (group === "standalone") return !model.bundle_id && !model.source_archive_member;
+  if (group === "bundle") return Boolean(model.bundle_id);
+  if (group === "zip") return Boolean(model.source_archive_member);
+  return true;
+}
+
+export function matchesLibraryMetadataFilters(
+  model: LibraryModel,
+  filters: LibraryMetadataFilters,
+  tags: LibraryTag[],
+): boolean {
+  if (
+    filters.printStatus !== "all" &&
+    (model.metadata?.print_status ?? "unprinted") !== filters.printStatus
+  ) {
+    return false;
+  }
+  if (filters.designer && (model.metadata?.designer ?? "") !== filters.designer) return false;
+  if (filters.tagId) {
+    const tag = tags.find((candidate) => candidate.id === filters.tagId);
+    if (!tag || !model.tags.includes(tag.name)) return false;
+  }
+  if (filters.category) {
+    const categoryNames = new Set(
+      tags.filter((tag) => (tag.category ?? "") === filters.category).map((tag) => tag.name),
+    );
+    if (!model.tags.some((name) => categoryNames.has(name))) return false;
+  }
+  return true;
 }
 
 export function didLibraryScanComplete(
@@ -241,12 +301,27 @@ export class LibraryPanel {
   private readonly thumbnailBackgroundInput: HTMLInputElement;
   private readonly thumbnailConcurrencyInput: HTMLInputElement;
   private readonly scanBatchSizeInput: HTMLInputElement;
+  private readonly printedSelect: HTMLSelectElement;
+  private readonly groupSelect: HTMLSelectElement;
+  private readonly printStatusSelect: HTMLSelectElement;
+  private readonly designerSelect: HTMLSelectElement;
+  private readonly tagSelect: HTMLSelectElement;
+  private readonly categorySelect: HTMLSelectElement;
+  private readonly selectionStatus: HTMLElement;
+  private readonly metadataEditor: LibraryMetadataEditor;
+  private readonly tagManager: LibraryTagManager;
+  private readonly printHistory: LibraryPrintHistory;
   private invoker: HTMLElement | null = null;
   private allFolders: LibraryFolder[] = [];
   private allModels: LibraryModel[] = [];
   private allRoots: IndexRoot[] = [];
+  private allTags: LibraryTag[] = [];
+  private filteredModels: LibraryModel[] = [];
+  private visibleModelIds: string[] = [];
+  private readonly selectedModelIds = new Set<string>();
   private activeFolderId: string | null = null;
   private activeRootId: string | null = null;
+  private activeHistoryModelId: string | null = null;
   private viewMode: LibraryViewMode = "preview";
   private catalogSettings = DEFAULT_CATALOG_SETTINGS;
   private page = 1;
@@ -291,8 +366,47 @@ export class LibraryPanel {
   onSaveCatalogSettings: (settings: CatalogSettings) => Promise<CatalogSettings> = async (
     settings,
   ) => settings;
+  onSaveMetadata: (targets: VersionedModelTarget[], patch: MetadataPatch) => Promise<void> =
+    async () => {};
+  onCreateTag: (name: string, category: string | null) => Promise<void> = async () => {};
+  onUpdateTag: (id: string, name: string, category: string | null) => Promise<void> =
+    async () => {};
+  onDeleteTag: (id: string) => Promise<void> = async () => {};
+  onListPrintAttempts: (modelId: string) => Promise<PrintAttempt[]> = async () => [];
+  onCreatePrintAttempt: (modelId: string, input: PrintAttemptInput) => Promise<void> =
+    async () => {};
+  onUpdatePrintAttempt: (attemptId: string, input: PrintAttemptInput) => Promise<void> =
+    async () => {};
+  onDeletePrintAttempt: (attemptId: string) => Promise<void> = async () => {};
+  onCreateBundle: (modelIds: string[]) => Promise<void> = async () => {};
+  onCreateCollection: (name: string) => Promise<void> = async () => {};
+  onRenameCollection: (id: string, name: string) => Promise<void> = async () => {};
+  onDeleteCollection: (id: string) => Promise<void> = async () => {};
 
   constructor(container: HTMLElement) {
+    this.metadataEditor = new LibraryMetadataEditor(container);
+    this.tagManager = new LibraryTagManager(container);
+    this.printHistory = new LibraryPrintHistory(container);
+    this.metadataEditor.onSave = async (targets, patch) => {
+      await this.onSaveMetadata(targets, patch);
+    };
+    this.metadataEditor.onManageTags = () => this.tagManager.show(this.allTags);
+    this.metadataEditor.onHistory = (model) => void this.openPrintHistory(model);
+    this.tagManager.onCreate = (name, category) => this.onCreateTag(name, category);
+    this.tagManager.onUpdate = (id, name, category) => this.onUpdateTag(id, name, category);
+    this.tagManager.onDelete = (id) => this.onDeleteTag(id);
+    this.printHistory.onCreate = async (modelId, input) => {
+      await this.onCreatePrintAttempt(modelId, input);
+      await this.refreshPrintHistory(modelId);
+    };
+    this.printHistory.onUpdate = async (attemptId, input) => {
+      await this.onUpdatePrintAttempt(attemptId, input);
+      if (this.activeHistoryModelId) await this.refreshPrintHistory(this.activeHistoryModelId);
+    };
+    this.printHistory.onDelete = async (attemptId) => {
+      await this.onDeletePrintAttempt(attemptId);
+      if (this.activeHistoryModelId) await this.refreshPrintHistory(this.activeHistoryModelId);
+    };
     this.root = document.createElement("dialog");
     this.root.className = "library-panel";
     this.root.setAttribute("aria-labelledby", "library-title");
@@ -362,7 +476,42 @@ export class LibraryPanel {
       ["date", "Newest"],
       ["size", "Largest"],
     ]);
-    toolbar.append(this.searchInput, this.sourceSelect, this.statusSelect, this.sortSelect);
+    this.printedSelect = this.selectControl("Print history", [
+      ["all", "Any print history"],
+      ["never", "Never printed"],
+      ["ever", "Ever printed"],
+      ["last30", "Printed in 30 days"],
+    ]);
+    this.groupSelect = this.selectControl("Model group", [
+      ["all", "All groups"],
+      ["standalone", "Standalone"],
+      ["bundle", "Bundles"],
+      ["zip", "ZIP members"],
+    ]);
+    this.printStatusSelect = this.selectControl("Print status", [
+      ["all", "Any print status"],
+      ["unprinted", "Unprinted"],
+      ["want", "Want to print"],
+      ["queued", "Queued"],
+      ["printing", "Printing"],
+      ["printed", "Printed"],
+      ["failed", "Failed"],
+    ]);
+    this.designerSelect = this.selectControl("Designer", [["", "All designers"]]);
+    this.tagSelect = this.selectControl("Tag", [["", "All tags"]]);
+    this.categorySelect = this.selectControl("Tag category", [["", "All categories"]]);
+    toolbar.append(
+      this.searchInput,
+      this.sourceSelect,
+      this.statusSelect,
+      this.sortSelect,
+      this.printedSelect,
+      this.groupSelect,
+      this.printStatusSelect,
+      this.designerSelect,
+      this.tagSelect,
+      this.categorySelect,
+    );
 
     const body = document.createElement("div");
     body.className = "library-body";
@@ -375,6 +524,21 @@ export class LibraryPanel {
     contentHeader.className = "library-content-header";
     this.resultCount = document.createElement("div");
     this.resultCount.className = "library-result-count";
+    const selectionActions = document.createElement("div");
+    selectionActions.className = "library-selection-actions";
+    this.selectionStatus = document.createElement("span");
+    this.selectionStatus.setAttribute("role", "status");
+    selectionActions.append(
+      this.selectionStatus,
+      this.actionButton("Select visible", "", () => this.selectScope("visible")),
+      this.actionButton("Select all filtered", "", () => this.selectScope("filtered")),
+      this.actionButton("Clear selection", "", () => {
+        this.selectedModelIds.clear();
+        this.renderContent();
+      }),
+      this.actionButton("Edit selected…", "", () => this.editSelected()),
+      this.actionButton("Create bundle", "", () => void this.createBundle()),
+    );
     const viewSwitcher = document.createElement("div");
     viewSwitcher.className = "library-view-switcher";
     viewSwitcher.setAttribute("role", "group");
@@ -407,7 +571,7 @@ export class LibraryPanel {
     );
     this.purgeButton = this.actionButton("Clear previews", "", () => void this.purgeThumbnails());
     thumbnailActions.append(this.generateMissingButton, this.regenerateAllButton, this.purgeButton);
-    contentHeader.append(this.resultCount, viewSwitcher, thumbnailActions);
+    contentHeader.append(this.resultCount, viewSwitcher, thumbnailActions, selectionActions);
     this.gallery = document.createElement("div");
     this.gallery.className = "library-gallery";
     this.gallery.setAttribute("aria-live", "polite");
@@ -519,6 +683,7 @@ export class LibraryPanel {
     models: LibraryModel[],
     roots: IndexRoot[] = [],
     settings: CatalogSettings = this.catalogSettings,
+    tags: LibraryTag[] = this.allTags,
   ): void {
     for (const modelId of thumbnailCacheInvalidations(this.allModels, models)) {
       this.thumbnailCache.delete(modelId);
@@ -527,6 +692,11 @@ export class LibraryPanel {
     this.allFolders = folders;
     this.allModels = models;
     this.allRoots = roots;
+    this.allTags = tags;
+    this.tagManager.update(tags);
+    this.refreshMetadataFilterOptions(models, tags);
+    const modelIds = new Set(models.map((model) => model.id));
+    for (const id of this.selectedModelIds) if (!modelIds.has(id)) this.selectedModelIds.delete(id);
     this.setCatalogSettings(settings);
     if (this.activeFolderId && !folders.some((folder) => folder.id === this.activeFolderId)) {
       this.activeFolderId = null;
@@ -573,6 +743,37 @@ export class LibraryPanel {
     for (const [value, text] of options) select.add(new Option(text, value));
     select.addEventListener("change", () => this.resetAndRender());
     return select;
+  }
+
+  private refreshMetadataFilterOptions(models: LibraryModel[], tags: LibraryTag[]): void {
+    const designers = [
+      ...new Set(models.map((model) => model.metadata?.designer?.trim() ?? "").filter(Boolean)),
+    ].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    const categories = [
+      ...new Set(tags.map((tag) => tag.category?.trim() ?? "").filter(Boolean)),
+    ].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    this.replaceSelectOptions(this.designerSelect, [
+      ["", "All designers"],
+      ...designers.map((designer): [string, string] => [designer, designer]),
+    ]);
+    this.replaceSelectOptions(this.tagSelect, [
+      ["", "All tags"],
+      ...tags.map((tag): [string, string] => [
+        tag.id,
+        tag.category ? `${tag.category}: ${tag.name}` : tag.name,
+      ]),
+    ]);
+    this.replaceSelectOptions(this.categorySelect, [
+      ["", "All categories"],
+      ...categories.map((category): [string, string] => [category, category]),
+    ]);
+  }
+
+  private replaceSelectOptions(select: HTMLSelectElement, options: Array<[string, string]>): void {
+    const selected = select.value;
+    select.replaceChildren();
+    for (const [value, label] of options) select.add(new Option(label, value));
+    select.value = options.some(([value]) => value === selected) ? selected : options[0][0];
   }
 
   private settingField(label: string, control: HTMLElement): HTMLLabelElement {
@@ -632,6 +833,65 @@ export class LibraryPanel {
     this.renderContent();
   }
 
+  private selectScope(scope: SelectionScope): void {
+    const ids = selectionScopeIds(
+      this.filteredModels.map((model) => model.id),
+      this.visibleModelIds,
+      scope,
+    );
+    for (const id of ids) this.selectedModelIds.add(id);
+    this.renderContent();
+  }
+
+  private editSelected(): void {
+    const models = this.allModels.filter((model) => this.selectedModelIds.has(model.id));
+    if (!models.length) {
+      this.setStatus("Select one or more models to edit.");
+      return;
+    }
+    const active = document.activeElement;
+    this.metadataEditor.show(
+      models,
+      this.allModels,
+      this.allTags,
+      this.allFolders,
+      active instanceof HTMLElement ? active : this.root,
+      () => this.searchInput.focus(),
+    );
+  }
+
+  private async createBundle(): Promise<void> {
+    const ids = [...this.selectedModelIds];
+    if (ids.length < 2) {
+      this.setStatus("Select at least two models to create a bundle.");
+      return;
+    }
+    await this.runAction(async () => {
+      await this.onCreateBundle(ids);
+      this.selectedModelIds.clear();
+      this.setStatus(`Created a bundle containing ${ids.length} models.`);
+      this.renderContent();
+    });
+  }
+
+  private async openPrintHistory(model: LibraryModel): Promise<void> {
+    this.activeHistoryModelId = model.id;
+    const active = document.activeElement;
+    try {
+      this.printHistory.show(
+        model,
+        await this.onListPrintAttempts(model.id),
+        active instanceof HTMLElement ? active : undefined,
+      );
+    } catch (error) {
+      this.setStatus(`Could not load print history: ${libraryErrorMessage(error)}`);
+    }
+  }
+
+  private async refreshPrintHistory(modelId: string): Promise<void> {
+    this.printHistory.update(await this.onListPrintAttempts(modelId));
+  }
+
   private renderContent(): void {
     this.renderRevision += 1;
     this.observer?.disconnect();
@@ -647,18 +907,39 @@ export class LibraryPanel {
       source: this.sourceSelect.value as LibrarySourceFilter,
       status: this.statusSelect.value as LibraryStatusFilter,
       sort: this.sortSelect.value as LibrarySort,
+    }).filter((model) => {
+      if (!matchesPrintedFilter(model, this.printedSelect.value as PrintedFilter)) return false;
+      const group = this.groupSelect.value as LibraryGroupFilter;
+      if (!matchesLibraryGroup(model, group)) return false;
+      return matchesLibraryMetadataFilters(
+        model,
+        {
+          printStatus: this.printStatusSelect.value as "all" | PrintStatus,
+          designer: this.designerSelect.value,
+          tagId: this.tagSelect.value,
+          category: this.categorySelect.value,
+        },
+        this.allTags,
+      );
     });
+    this.filteredModels = models;
+    this.visibleModelIds = [];
+    this.selectionStatus.textContent = `${this.selectedModelIds.size} selected`;
     this.resultCount.textContent = `${models.length.toLocaleString()} model${models.length === 1 ? "" : "s"}`;
     this.gallery.replaceChildren();
     if (!models.length) {
       const empty = document.createElement("div");
       empty.className = "library-empty";
-      empty.innerHTML =
-        "<strong>No models found</strong><span>Adjust the filters, import copies, or index a folder.</span>";
+      const emptyTitle = document.createElement("strong");
+      emptyTitle.textContent = "No models found";
+      const emptyHelp = document.createElement("span");
+      emptyHelp.textContent = "Adjust the filters, import copies, or index a folder.";
+      empty.append(emptyTitle, emptyHelp);
       this.gallery.append(empty);
       return;
     }
     const shown = models.slice(0, this.page * PAGE_SIZE);
+    this.visibleModelIds = shown.map((model) => model.id);
     this.observer =
       typeof IntersectionObserver === "undefined"
         ? null
@@ -713,8 +994,14 @@ export class LibraryPanel {
     const folderHeading = document.createElement("h3");
     folderHeading.className = "library-section-label";
     folderHeading.textContent = "Collections";
+    const createCollection = this.actionButton("New collection", "", () => {
+      const name = window.prompt("Collection name");
+      if (!name?.trim()) return;
+      void this.runAction(() => this.onCreateCollection(name.trim()));
+    });
     folders.append(
       folderHeading,
+      createCollection,
       this.filterButton("All collections", this.activeFolderId === null, () => {
         this.activeFolderId = null;
         this.resetAndRender();
@@ -732,7 +1019,23 @@ export class LibraryPanel {
       );
       button.style.setProperty("--folder-depth", String(depths.get(folder.id) ?? 0));
       button.classList.add("library-folder-row");
-      folders.append(button);
+      const row = document.createElement("div");
+      row.className = "library-collection-row";
+      row.append(button);
+      if (folder.id !== "root") {
+        row.append(
+          this.actionButton("Rename", "", () => {
+            const name = window.prompt("Rename collection", folder.name);
+            if (!name?.trim()) return;
+            void this.runAction(() => this.onRenameCollection(folder.id, name.trim()));
+          }),
+          this.actionButton("Delete", "danger", () => {
+            if (!window.confirm(`Delete the empty collection “${folder.name}”?`)) return;
+            void this.runAction(() => this.onDeleteCollection(folder.id));
+          }),
+        );
+      }
+      folders.append(row);
     }
     this.navigation.append(sources, folders);
   }
@@ -783,6 +1086,12 @@ export class LibraryPanel {
       1,
       100,
     );
+    const scanZipField = document.createElement("label");
+    scanZipField.className = "library-root-check";
+    const scanZip = document.createElement("input");
+    scanZip.type = "checkbox";
+    scanZip.checked = root.scan_zip;
+    scanZipField.append(scanZip, document.createTextNode(" Scan ZIP archives"));
     const save = this.actionButton(
       "Save",
       "",
@@ -793,6 +1102,7 @@ export class LibraryPanel {
             enabled: enabled.checked,
             scan_interval_minutes: Number(interval.value),
             max_file_bytes: Number(maxMb.value) * 1048576,
+            scan_zip: scanZip.checked,
           }),
         ),
     );
@@ -811,7 +1121,7 @@ export class LibraryPanel {
       }
       void this.runAction(() => this.onRemoveRoot(root.id));
     });
-    config.append(intervalField, maxMbField, save, scan, remove);
+    config.append(intervalField, maxMbField, scanZipField, save, scan, remove);
     const last = document.createElement("div");
     last.className = "library-root-last";
     const lastScanned = normalizeLibraryTimestamp(root.last_scanned_at);
@@ -849,6 +1159,16 @@ export class LibraryPanel {
     article.className = "library-model";
     article.dataset.modelId = model.id;
     if (model.source_missing) article.classList.add("is-missing");
+    const selected = document.createElement("input");
+    selected.type = "checkbox";
+    selected.className = "library-model-select";
+    selected.checked = this.selectedModelIds.has(model.id);
+    selected.setAttribute("aria-label", `Select ${model.display_name}`);
+    selected.addEventListener("change", () => {
+      if (selected.checked) this.selectedModelIds.add(model.id);
+      else this.selectedModelIds.delete(model.id);
+      this.selectionStatus.textContent = `${this.selectedModelIds.size} selected`;
+    });
     const preview = document.createElement("div");
     preview.className = "library-model-preview";
     preview.setAttribute("aria-hidden", "true");
@@ -900,15 +1220,45 @@ export class LibraryPanel {
       : "Update time unavailable";
     const tags = document.createElement("span");
     tags.textContent = model.tags.length ? `Tags: ${model.tags.join(", ")}` : "No tags";
-    details.append(description, path, updated, tags);
+    const grouping = document.createElement("span");
+    grouping.textContent = model.source_archive_member
+      ? `ZIP member: ${model.source_archive_member}`
+      : model.bundle_id
+        ? `Bundle: ${model.bundle_id}`
+        : "Standalone model";
+    const print = document.createElement("span");
+    print.textContent = `Print status: ${model.metadata?.print_status ?? "unprinted"} · ${model.metadata?.print_count ?? 0} successful`;
+    const designer = document.createElement("span");
+    designer.textContent = model.metadata?.designer
+      ? `Designer: ${model.metadata.designer}`
+      : "Designer unknown";
+    const sourceUrl = document.createElement("span");
+    sourceUrl.textContent = model.metadata?.source_url
+      ? `Source: ${model.metadata.source_url}`
+      : "No source URL";
+    details.append(description, designer, sourceUrl, path, updated, tags, print, grouping);
     open.append(name, meta, source, details);
     const regenerate = this.actionButton("Refresh preview", "library-regenerate", () => {
       this.thumbnailCache.delete(model.id);
       void this.requestThumbnail(model.id, article, true);
     });
     regenerate.setAttribute("aria-label", `Regenerate preview for ${model.display_name}`);
-    article.append(preview, open, regenerate);
+    const edit = this.actionButton("Edit", "library-edit-model", () =>
+      this.metadataEditor.show([model], this.allModels, this.allTags, this.allFolders, edit, () =>
+        this.focusModelEditor(model.id),
+      ),
+    );
+    edit.setAttribute("aria-label", `Edit metadata for ${model.display_name}`);
+    article.append(preview, open, selected, edit, regenerate);
     return article;
+  }
+
+  private focusModelEditor(modelId: string): void {
+    const card = [...this.gallery.querySelectorAll<HTMLElement>(".library-model")].find(
+      (candidate) => candidate.dataset.modelId === modelId,
+    );
+    const edit = card?.querySelector<HTMLButtonElement>(".library-edit-model");
+    (edit ?? this.searchInput).focus();
   }
 
   private async requestThumbnail(

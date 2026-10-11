@@ -101,3 +101,12 @@ Application data roots for the official app:
 - Windows: `%APPDATA%/com.sonicparke.stl-handoff/`
 - Linux: `~/.local/share/com.sonicparke.stl-handoff/` or the equivalent under
   `$XDG_DATA_HOME`
+
+## Free library organization (phase 3, local validation)
+
+The Community and unified Free app include categorized tags, designer/license/source
+metadata, explicit batch edits, print history with quantities and filament references,
+parent/child links, collections and ZIP/folder bundles. ZIP indexing is opt-in per root;
+archives remain in place. Schema 3 migrations preserve a prior-schema snapshot and
+read-only recovery understands all three schemas. Full multipart preview/handoff and
+backup restore are the next phase. These changes are local and are not a published release.

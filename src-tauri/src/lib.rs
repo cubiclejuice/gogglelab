@@ -9,6 +9,7 @@ mod fs_portability;
 mod fusion_preview;
 mod geometry_buffer;
 mod handoff;
+mod library_archives;
 mod library_commands;
 mod library_scan;
 mod library_thumbnail;
@@ -76,6 +77,19 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             library_commands::library_get_catalog_settings,
             library_commands::library_set_catalog_settings,
             library_commands::library_start_thumbnail_job,
+            library_commands::library_list_tags,
+            library_commands::library_create_tag,
+            library_commands::library_update_tag,
+            library_commands::library_delete_tag,
+            library_commands::library_update_model_metadata,
+            library_commands::library_update_models_metadata,
+            library_commands::library_create_print_attempt,
+            library_commands::library_list_print_attempts,
+            library_commands::library_get_print_attempt,
+            library_commands::library_update_print_attempt,
+            library_commands::library_delete_print_attempt,
+            library_commands::library_create_bundle,
+            library_commands::library_set_model_bundle,
             settings::get_default_slicer,
             settings::set_default_slicer,
             settings::get_settings,

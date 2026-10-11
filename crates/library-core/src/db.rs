@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,11 +10,13 @@ use uuid::Uuid;
 
 use crate::error::{io, LibraryError};
 use crate::models::{
-    CatalogSettings, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, Model, ScanReconcile,
-    ScannedModel, ThumbnailCacheEntry,
+    CatalogSettings, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, MetadataPatch, Model,
+    ModelMetadata, PrintAttempt, PrintAttemptInput, PrintOutcome, PrintStatus, ResolvedModelSource,
+    ScanReconcile, ScannedModel, SourceRef, Tag, TagMode, ThumbnailCacheEntry,
+    VersionedModelUpdate, VersionedTarget,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 pub const ROOT_FOLDER_ID: &str = "root";
 pub const MIN_SCAN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_SCAN_INTERVAL_MINUTES: u32 = 1_440;
@@ -22,6 +24,19 @@ pub const MAX_INDEXED_FILE_BYTES: u64 = stl_core::limits::MAX_FILE_BYTES;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_CACHED_THUMBNAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+// Internal SQLite projection shared by managed and indexed source resolution.
+type SourceResolutionRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+);
 
 pub struct LibraryDb {
     conn: Connection,
@@ -59,6 +74,10 @@ impl LibraryDb {
         } else if version == 1 {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V1_TO_V2)?;
+            conn.execute_batch(MIGRATE_V2_TO_V3)?;
+        } else if version == 2 {
+            create_migration_backup(&conn, &root, version)?;
+            conn.execute_batch(MIGRATE_V2_TO_V3)?;
         }
         conn.execute_batch(ENSURE_CATALOG_SETTINGS)?;
         Ok(Self { conn, root })
@@ -334,11 +353,12 @@ impl LibraryDb {
             last_scanned_at: None,
             scan_interval_minutes,
             max_file_bytes,
+            scan_zip: false,
         };
         self.conn.execute(
             "INSERT INTO index_roots
-             (id, path, enabled, last_scanned_at, scan_interval_minutes, max_file_bytes)
-             VALUES (?1, ?2, 1, NULL, ?3, ?4)",
+             (id, path, enabled, last_scanned_at, scan_interval_minutes, max_file_bytes, scan_zip)
+             VALUES (?1, ?2, 1, NULL, ?3, ?4, 0)",
             params![
                 root.id,
                 root.path.to_string_lossy(),
@@ -351,7 +371,7 @@ impl LibraryDb {
 
     pub fn list_index_roots(&self) -> Result<Vec<IndexRoot>, LibraryError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, enabled, last_scanned_at, scan_interval_minutes, max_file_bytes
+            "SELECT id, path, enabled, last_scanned_at, scan_interval_minutes, max_file_bytes, scan_zip
              FROM index_roots ORDER BY lower(path), id",
         )?;
         let rows = stmt.query_map([], index_root_from_row)?;
@@ -420,13 +440,14 @@ impl LibraryDb {
         }
         let changed = self.conn.execute(
             "UPDATE index_roots SET path = ?1, enabled = ?2, scan_interval_minutes = ?3,
-                    max_file_bytes = ?4
-             WHERE id = ?5",
+                    max_file_bytes = ?4, scan_zip = ?5
+             WHERE id = ?6",
             params![
                 existing.path.to_string_lossy(),
                 root.enabled,
                 i64::from(root.scan_interval_minutes),
                 root.max_file_bytes as i64,
+                root.scan_zip,
                 root.id
             ],
         )?;
@@ -454,24 +475,49 @@ impl LibraryDb {
         &self,
         root_id: &str,
         relative_path: &Path,
+        archive_member: Option<&str>,
     ) -> Result<Option<IndexedSourceMetadata>, LibraryError> {
         let relative_path = validated_relative_path(relative_path)?;
+        let archive_member = archive_member.map(validated_archive_member).transpose()?;
         self.conn
             .query_row(
-                "SELECT d.bytes, m.source_modified_at, d.content_hash
+                "SELECT d.bytes, m.source_modified_at, d.content_hash,
+                        m.source_archive_member, d.outer_fingerprint
                  FROM models m JOIN indexed_model_data d ON d.model_id = m.id
-                 WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1 AND m.source_path = ?2",
-                params![root_id, relative_path],
+                 WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1 AND m.source_path = ?2
+                   AND COALESCE(m.source_archive_member,'') = COALESCE(?3,'')",
+                params![root_id, relative_path, archive_member],
                 |row| {
                     Ok(IndexedSourceMetadata {
                         bytes: row.get::<_, i64>(0)? as u64,
                         modified_at: row.get::<_, i64>(1)? as u64,
                         content_hash: row.get(2)?,
+                        archive_member: row.get(3)?,
+                        outer_fingerprint: row.get(4)?,
                     })
                 },
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn indexed_archive_metadata(
+        &self,
+        root_id: &str,
+        relative_path: &Path,
+    ) -> Result<Vec<IndexedSourceMetadata>, LibraryError> {
+        let relative = validated_relative_path(relative_path)?;
+        let mut stmt = self.conn.prepare("SELECT d.bytes,m.source_modified_at,d.content_hash,m.source_archive_member,d.outer_fingerprint FROM models m JOIN indexed_model_data d ON d.model_id=m.id WHERE m.source_kind='indexed' AND m.source_root_id=?1 AND m.source_path=?2 AND m.source_archive_member IS NOT NULL ORDER BY m.source_archive_member")?;
+        let rows = stmt.query_map(params![root_id, relative], |row| {
+            Ok(IndexedSourceMetadata {
+                bytes: row.get::<_, i64>(0)? as u64,
+                modified_at: row.get::<_, i64>(1)? as u64,
+                content_hash: row.get(2)?,
+                archive_member: row.get(3)?,
+                outer_fingerprint: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn record_scan_entries(
@@ -489,7 +535,19 @@ impl LibraryDb {
         let mut paths = HashSet::with_capacity(entries.len());
         for entry in entries {
             let relative = validated_relative_path(&entry.relative_path)?;
-            if !paths.insert(relative.clone()) {
+            let archive_member = entry
+                .archive_member
+                .as_deref()
+                .map(validated_archive_member)
+                .transpose()?;
+            if archive_member.is_some()
+                && entry.outer_fingerprint.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(LibraryError::InvalidInput(
+                    "archive entries require an outer fingerprint".into(),
+                ));
+            }
+            if !paths.insert((relative.clone(), archive_member.clone())) {
                 return Err(LibraryError::InvalidInput(
                     "scan batch contains duplicate relative paths".into(),
                 ));
@@ -501,7 +559,7 @@ impl LibraryDb {
                 ));
             }
             resolve_under_root(&root.path, Path::new(&relative))?;
-            validated.push((relative, entry));
+            validated.push((relative, archive_member, entry));
         }
 
         let tx = self.conn.unchecked_transaction()?;
@@ -509,17 +567,19 @@ impl LibraryDb {
             seen: validated.len(),
             ..ScanReconcile::default()
         };
-        for (relative, entry) in validated {
+        for (relative, archive_member, entry) in validated {
             let existing: Option<String> = tx
                 .query_row(
                     "SELECT m.id
                      FROM models m JOIN indexed_model_data d ON d.model_id = m.id
-                     WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1 AND m.source_path = ?2",
-                    params![root_id, relative],
+                     WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1 AND m.source_path = ?2
+                       AND COALESCE(m.source_archive_member,'')=COALESCE(?3,'')",
+                    params![root_id, relative, archive_member],
                     |row| row.get(0),
                 )
                 .optional()?;
-            let original_name = Path::new(&relative)
+            let original_name = archive_member.as_deref().unwrap_or(&relative);
+            let original_name = Path::new(original_name)
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("model")
@@ -527,12 +587,13 @@ impl LibraryDb {
             if let Some(model_id) = existing {
                 tx.execute(
                     "UPDATE indexed_model_data SET content_hash = ?1, original_name = ?2,
-                            format = ?3, bytes = ?4 WHERE model_id = ?5",
+                            format = ?3, bytes = ?4, outer_fingerprint=?5 WHERE model_id = ?6",
                     params![
                         entry.content_hash,
                         original_name,
                         entry.format,
                         entry.bytes as i64,
+                        entry.outer_fingerprint,
                         model_id
                     ],
                 )?;
@@ -544,6 +605,11 @@ impl LibraryDb {
                 result.updated += 1;
             } else {
                 let model_id = new_id("model");
+                let bundle_id = if archive_member.is_some() {
+                    Some(ensure_archive_bundle(&tx, root_id, &relative)?)
+                } else {
+                    None
+                };
                 let display_name = entry
                     .display_name
                     .as_deref()
@@ -561,8 +627,8 @@ impl LibraryDb {
                     "INSERT INTO models
                      (id, display_name, description, folder_id, metadata_version, created_at,
                       updated_at, source_kind, source_path, source_root_id, source_missing,
-                      source_modified_at)
-                     VALUES (?1, ?2, '', ?3, 1, ?4, ?4, 'indexed', ?5, ?6, 0, ?7)",
+                      source_modified_at, source_archive_member, bundle_id)
+                     VALUES (?1, ?2, '', ?3, 1, ?4, ?4, 'indexed', ?5, ?6, 0, ?7, ?8, ?9)",
                     params![
                         model_id,
                         display_name,
@@ -570,19 +636,22 @@ impl LibraryDb {
                         now,
                         relative,
                         root_id,
-                        entry.modified_at as i64
+                        entry.modified_at as i64,
+                        archive_member,
+                        bundle_id
                     ],
                 )?;
                 tx.execute(
                     "INSERT INTO indexed_model_data
-                     (model_id, content_hash, original_name, format, bytes)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (model_id, content_hash, original_name, format, bytes, outer_fingerprint)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         model_id,
                         entry.content_hash,
                         original_name,
                         entry.format,
-                        entry.bytes as i64
+                        entry.bytes as i64,
+                        entry.outer_fingerprint
                     ],
                 )?;
                 result.added_model_ids.push(model_id);
@@ -609,6 +678,29 @@ impl LibraryDb {
         newly_added_model_ids: &[String],
         completed_at: &str,
     ) -> Result<ScanReconcile, LibraryError> {
+        let seen = seen_relative_paths
+            .iter()
+            .cloned()
+            .map(|relative_path| SourceRef {
+                relative_path,
+                archive_member: None,
+            })
+            .collect::<Vec<_>>();
+        self.complete_scan_sources_with_new_models(
+            root_id,
+            &seen,
+            newly_added_model_ids,
+            completed_at,
+        )
+    }
+
+    pub fn complete_scan_sources_with_new_models(
+        &self,
+        root_id: &str,
+        seen_sources: &[SourceRef],
+        newly_added_model_ids: &[String],
+        completed_at: &str,
+    ) -> Result<ScanReconcile, LibraryError> {
         let root = self
             .get_index_root(root_id)?
             .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.to_owned()))?;
@@ -620,15 +712,24 @@ impl LibraryDb {
                 "configured root identity changed".into(),
             ));
         }
-        let seen = seen_relative_paths
+        let seen = seen_sources
             .iter()
-            .map(|path| validated_relative_path(path))
+            .map(|source| -> Result<SourceRef, LibraryError> {
+                Ok(SourceRef {
+                    relative_path: PathBuf::from(validated_relative_path(&source.relative_path)?),
+                    archive_member: source
+                        .archive_member
+                        .as_deref()
+                        .map(validated_archive_member)
+                        .transpose()?,
+                })
+            })
             .collect::<Result<HashSet<_>, _>>()?;
         let tx = self.conn.unchecked_transaction()?;
         let mut indexed = Vec::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT m.id, m.source_path, d.content_hash
+                "SELECT m.id, m.source_path, m.source_archive_member, d.content_hash
                  FROM models m JOIN indexed_model_data d ON d.model_id = m.id
                  WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1",
             )?;
@@ -636,7 +737,8 @@ impl LibraryDb {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             indexed.extend(rows.collect::<Result<Vec<_>, _>>()?);
@@ -645,22 +747,45 @@ impl LibraryDb {
         let newly_added = newly_added_model_ids.iter().collect::<HashSet<_>>();
         let mut absent_by_hash: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut present_by_hash: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for (id, path, hash) in &indexed {
-            let target = if seen.contains(path) {
+        for (id, path, member, hash) in &indexed {
+            let source = SourceRef {
+                relative_path: PathBuf::from(path),
+                archive_member: member.clone(),
+            };
+            let target = if seen.contains(&source) {
                 &mut present_by_hash
             } else {
                 &mut absent_by_hash
             };
-            target
-                .entry(hash.clone())
-                .or_default()
-                .push((id.clone(), path.clone()));
+            target.entry(hash.clone()).or_default().push((
+                id.clone(),
+                format!("{}\0{}", path, member.as_deref().unwrap_or("")),
+            ));
         }
 
         let mut result = ScanReconcile {
             seen: seen.len(),
             ..ScanReconcile::default()
         };
+        let mut rename_targets = HashMap::<String, (String, String, String)>::new();
+        for (hash, absent) in &absent_by_hash {
+            let Some(present) = present_by_hash.get(hash) else {
+                continue;
+            };
+            if absent.len() != 1 || present.len() != 1 {
+                continue;
+            }
+            let (old_id, _) = &absent[0];
+            let (new_id, new_key) = &present[0];
+            if old_id == new_id || !newly_added.contains(new_id) {
+                continue;
+            }
+            let (new_path, new_member) = new_key.split_once('\0').unwrap();
+            rename_targets.insert(
+                old_id.clone(),
+                (new_id.clone(), new_path.to_owned(), new_member.to_owned()),
+            );
+        }
         for (hash, absent) in absent_by_hash.iter() {
             let Some(present) = present_by_hash.get(hash) else {
                 continue;
@@ -669,27 +794,119 @@ impl LibraryDb {
                 continue;
             }
             let (old_id, _) = &absent[0];
-            let (new_id, new_path) = &present[0];
+            let (new_id, new_key) = &present[0];
             if old_id == new_id || !newly_added.contains(new_id) {
                 continue;
             }
-            let (modified_at, original_name, format, bytes): (i64, String, String, i64) = tx
+            let (new_path, new_member) = new_key.split_once('\0').unwrap();
+            let (modified_at, original_name, format, bytes, outer_fingerprint): (i64, String, String, i64, Option<String>) = tx
                 .query_row(
-                    "SELECT m.source_modified_at, d.original_name, d.format, d.bytes
+                    "SELECT m.source_modified_at, d.original_name, d.format, d.bytes,d.outer_fingerprint
                      FROM models m JOIN indexed_model_data d ON d.model_id = m.id WHERE m.id = ?1",
                     params![new_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,row.get(4)?)),
                 )?;
+            let old_archive_member: Option<String> = tx.query_row(
+                "SELECT source_archive_member FROM models WHERE id=?1",
+                params![old_id],
+                |row| row.get(0),
+            )?;
+            let new_is_archive_member = !new_member.is_empty();
+            let archive_kind_changed = old_archive_member.is_some() != new_is_archive_member;
+            if archive_kind_changed {
+                let old_bundle:Option<(Option<String>,Option<String>)>=tx.query_row("SELECT m.bundle_id,b.source_root_id FROM models m LEFT JOIN bundles b ON b.id=m.bundle_id WHERE m.id=?1",params![old_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+                if let Some((Some(_), Some(_))) = old_bundle {
+                    if new_member.is_empty() {
+                        tx.execute(
+                            "UPDATE models SET bundle_id=NULL WHERE id=?1",
+                            params![old_id],
+                        )?;
+                    } else {
+                        let new_bundle: Option<String> = tx
+                            .query_row(
+                                "SELECT bundle_id FROM models WHERE id=?1",
+                                params![new_id],
+                                |row| row.get(0),
+                            )
+                            .optional()?
+                            .flatten();
+                        tx.execute(
+                            "UPDATE models SET bundle_id=?1 WHERE id=?2",
+                            params![new_bundle, old_id],
+                        )?;
+                    }
+                }
+            }
+            if !archive_kind_changed && !new_member.is_empty() {
+                let old_bundle:Option<(Option<String>,Option<String>)>=tx.query_row("SELECT m.bundle_id,b.source_root_id FROM models m LEFT JOIN bundles b ON b.id=m.bundle_id WHERE m.id=?1",params![old_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+                let new_bundle: Option<String> = tx
+                    .query_row(
+                        "SELECT bundle_id FROM models WHERE id=?1",
+                        params![new_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some((Some(old_bundle_id), Some(_))) = old_bundle {
+                    if let Some(new_bundle_id) = new_bundle {
+                        if new_bundle_id != old_bundle_id {
+                            let mut refs = Vec::new();
+                            {
+                                let mut stmt=tx.prepare("SELECT id,source_path,source_archive_member FROM models WHERE bundle_id=?1")?;
+                                let rows = stmt.query_map(params![old_bundle_id], |row| {
+                                    Ok((
+                                        row.get::<_, String>(0)?,
+                                        row.get::<_, String>(1)?,
+                                        row.get::<_, Option<String>>(2)?,
+                                    ))
+                                })?;
+                                refs.extend(rows.collect::<Result<Vec<_>, _>>()?);
+                            }
+                            let all_moving = refs.iter().all(|(id, _, _)| {
+                                rename_targets
+                                    .get(id)
+                                    .is_some_and(|(_, target_path, _)| target_path == new_path)
+                            });
+                            if all_moving {
+                                tx.execute(
+                                    "UPDATE models SET bundle_id=?1 WHERE bundle_id=?2",
+                                    params![old_bundle_id, new_bundle_id],
+                                )?;
+                                tx.execute(
+                                    "DELETE FROM bundles WHERE id=?1",
+                                    params![new_bundle_id],
+                                )?;
+                                tx.execute("UPDATE bundles SET source_root_id=?1,source_path=?2 WHERE id=?3",params![root_id,new_path,old_bundle_id])?;
+                            } else {
+                                tx.execute(
+                                    "UPDATE models SET bundle_id=?1 WHERE id=?2",
+                                    params![new_bundle_id, old_id],
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
             tx.execute("DELETE FROM models WHERE id = ?1", params![new_id])?;
             tx.execute(
-                "UPDATE models SET source_path = ?1, source_missing = 0,
-                        source_modified_at = ?2, updated_at = ?3 WHERE id = ?4",
-                params![new_path, modified_at, timestamp(), old_id],
+                "UPDATE models SET source_path = ?1, source_archive_member=?2, source_missing = 0,
+                        source_modified_at = ?3, updated_at = ?4 WHERE id = ?5",
+                params![
+                    new_path,
+                    if new_member.is_empty() {
+                        None
+                    } else {
+                        Some(new_member)
+                    },
+                    modified_at,
+                    timestamp(),
+                    old_id
+                ],
             )?;
             tx.execute(
-                "UPDATE indexed_model_data SET original_name = ?1, format = ?2, bytes = ?3
-                 WHERE model_id = ?4",
-                params![original_name, format, bytes, old_id],
+                "UPDATE indexed_model_data SET original_name = ?1, format = ?2, bytes = ?3,outer_fingerprint=?4
+                 WHERE model_id = ?5",
+                params![original_name, format, bytes, outer_fingerprint, old_id],
             )?;
             result.renamed += 1;
         }
@@ -697,22 +914,30 @@ impl LibraryDb {
         let mut ids_and_paths = Vec::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT id, source_path FROM models
+                "SELECT id, source_path,source_archive_member FROM models
                  WHERE source_kind = 'indexed' AND source_root_id = ?1",
             )?;
             let rows = stmt.query_map(params![root_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
             ids_and_paths.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
-        for (id, path) in ids_and_paths {
-            let missing = !seen.contains(&path);
+        for (id, path, member) in ids_and_paths {
+            let missing = !seen.contains(&SourceRef {
+                relative_path: PathBuf::from(path),
+                archive_member: member,
+            });
             tx.execute(
                 "UPDATE models SET source_missing = ?1 WHERE id = ?2",
                 params![missing, id],
             )?;
             result.missing += usize::from(missing);
         }
+        reconcile_folder_bundles(&tx, root_id)?;
         let changed = tx.execute(
             "UPDATE index_roots SET last_scanned_at = ?1 WHERE id = ?2",
             params![completed_at, root_id],
@@ -725,14 +950,23 @@ impl LibraryDb {
     }
 
     pub fn resolve_model_source(&self, model_id: &str) -> Result<PathBuf, LibraryError> {
-        let source: Option<(String, Option<String>, Option<String>, bool, Option<String>)> = self
+        Ok(self.resolve_model_source_ref(model_id)?.outer_path)
+    }
+
+    pub fn resolve_model_source_ref(
+        &self,
+        model_id: &str,
+    ) -> Result<ResolvedModelSource, LibraryError> {
+        let source: Option<SourceResolutionRow> = self
             .conn
             .query_row(
                 "SELECT m.source_kind, m.source_path, m.source_root_id, m.source_missing,
-                        b.relative_path
+                        b.relative_path,m.source_archive_member,d.outer_fingerprint,
+                        COALESCE(r.blob_hash,d.content_hash),COALESCE(r.bytes,d.bytes,0)
                  FROM models m
                  LEFT JOIN revisions r ON r.id = m.current_revision_id
                  LEFT JOIN blobs b ON b.hash = r.blob_hash
+                 LEFT JOIN indexed_model_data d ON d.model_id=m.id
                  WHERE m.id = ?1",
                 params![model_id],
                 |row| {
@@ -742,12 +976,27 @@ impl LibraryDb {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
             .optional()?;
-        let (source_kind, source_path, source_root_id, source_missing, managed_path) =
-            source.ok_or_else(|| LibraryError::ModelNotFound(model_id.to_owned()))?;
+        let (
+            source_kind,
+            source_path,
+            source_root_id,
+            source_missing,
+            managed_path,
+            archive_member,
+            outer_fingerprint,
+            content_hash,
+            bytes,
+        ) = source.ok_or_else(|| LibraryError::ModelNotFound(model_id.to_owned()))?;
+        let content_hash = content_hash
+            .ok_or_else(|| LibraryError::InvalidInput("model source has no content hash".into()))?;
         if source_missing {
             return Err(LibraryError::InvalidInput("model source is missing".into()));
         }
@@ -763,7 +1012,13 @@ impl LibraryDb {
                         "managed model source must be stored under originals".into(),
                     ));
                 }
-                resolve_under_root(&self.root, Path::new(&relative))
+                Ok(ResolvedModelSource {
+                    outer_path: resolve_under_root(&self.root, Path::new(&relative))?,
+                    archive_member: None,
+                    outer_fingerprint: None,
+                    content_hash,
+                    bytes: bytes as u64,
+                })
             }
             "indexed" => {
                 let root_id = source_root_id.ok_or_else(|| {
@@ -775,7 +1030,13 @@ impl LibraryDb {
                 let relative = source_path.ok_or_else(|| {
                     LibraryError::InvalidInput("indexed model has no source path".into())
                 })?;
-                resolve_under_root(&root.path, Path::new(&relative))
+                Ok(ResolvedModelSource {
+                    outer_path: resolve_under_root(&root.path, Path::new(&relative))?,
+                    archive_member,
+                    outer_fingerprint,
+                    content_hash,
+                    bytes: bytes as u64,
+                })
             }
             _ => Err(LibraryError::InvalidInput(
                 "unknown model source kind".into(),
@@ -1018,7 +1279,7 @@ impl LibraryDb {
     fn get_index_root(&self, id: &str) -> Result<Option<IndexRoot>, LibraryError> {
         self.conn
             .query_row(
-                "SELECT id, path, enabled, last_scanned_at, scan_interval_minutes, max_file_bytes
+                "SELECT id, path, enabled, last_scanned_at, scan_interval_minutes, max_file_bytes, scan_zip
                  FROM index_roots WHERE id = ?1",
                 params![id],
                 index_root_from_row,
@@ -1043,6 +1304,274 @@ impl LibraryDb {
             }
         }
         Ok(())
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<Tag>, LibraryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,name,category FROM tags ORDER BY COALESCE(category,''),lower(name),id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Tag {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                category: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn create_tag(&self, name: &str, category: Option<&str>) -> Result<Tag, LibraryError> {
+        let name = clean_tag_name(name)?;
+        let category = clean_optional(category, 120)?;
+        let id = new_id("tag");
+        self.conn.execute(
+            "INSERT INTO tags(id,name,category) VALUES(?1,?2,?3)",
+            params![id, name, category],
+        )?;
+        Ok(Tag { id, name, category })
+    }
+
+    pub fn rename_tag(
+        &self,
+        id: &str,
+        name: &str,
+        category: Option<&str>,
+    ) -> Result<Tag, LibraryError> {
+        let name = clean_tag_name(name)?;
+        let category = clean_optional(category, 120)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let affected = tag_model_ids(&tx, id)?;
+        if tx.execute(
+            "UPDATE tags SET name=?1,category=?2 WHERE id=?3",
+            params![name, category, id],
+        )? == 0
+        {
+            return Err(LibraryError::InvalidInput("tag not found".into()));
+        }
+        bump_models(&tx, &affected)?;
+        tx.commit()?;
+        Ok(Tag {
+            id: id.into(),
+            name,
+            category,
+        })
+    }
+
+    pub fn delete_tag(&self, id: &str) -> Result<(), LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let affected = tag_model_ids(&tx, id)?;
+        if tx.execute("DELETE FROM tags WHERE id=?1", params![id])? == 0 {
+            return Err(LibraryError::InvalidInput("tag not found".into()));
+        }
+        bump_models(&tx, &affected)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_model_metadata(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        patch: &MetadataPatch,
+    ) -> Result<Model, LibraryError> {
+        self.update_models_metadata(&[VersionedModelUpdate {
+            model_id: model_id.into(),
+            expected_version,
+            patch: patch.clone(),
+        }])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    pub fn update_models_metadata(
+        &self,
+        updates: &[VersionedModelUpdate],
+    ) -> Result<Vec<Model>, LibraryError> {
+        let mut unique = HashSet::new();
+        for update in updates {
+            if !unique.insert(update.model_id.clone()) {
+                return Err(LibraryError::InvalidInput(
+                    "duplicate model in metadata batch".into(),
+                ));
+            }
+            validate_metadata_patch(&update.patch)?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for update in updates {
+            apply_metadata_patch(
+                &tx,
+                &update.model_id,
+                update.expected_version,
+                &update.patch,
+            )?;
+        }
+        tx.commit()?;
+        updates
+            .iter()
+            .map(|u| {
+                self.get_model(&u.model_id)?
+                    .ok_or_else(|| LibraryError::ModelNotFound(u.model_id.clone()))
+            })
+            .collect()
+    }
+    pub fn bulk_update_metadata(
+        &self,
+        targets: &[VersionedTarget],
+        patch: &MetadataPatch,
+    ) -> Result<Vec<Model>, LibraryError> {
+        if targets.len() > 50_000 {
+            return Err(LibraryError::InvalidInput(
+                "metadata batch exceeds 50000 models".into(),
+            ));
+        }
+        validate_metadata_patch(patch)?;
+        let mut unique = HashSet::new();
+        if targets.iter().any(|t| !unique.insert(t.model_id.clone())) {
+            return Err(LibraryError::InvalidInput(
+                "duplicate model in metadata batch".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for target in targets {
+            apply_metadata_patch(&tx, &target.model_id, target.expected_version, patch)?;
+        }
+        tx.commit()?;
+        targets
+            .iter()
+            .map(|t| {
+                self.get_model(&t.model_id)?
+                    .ok_or_else(|| LibraryError::ModelNotFound(t.model_id.clone()))
+            })
+            .collect()
+    }
+
+    pub fn create_print_attempt(
+        &self,
+        model_id: &str,
+        input: &PrintAttemptInput,
+    ) -> Result<PrintAttempt, LibraryError> {
+        validate_print_attempt(input)?;
+        self.ensure_model(model_id)?;
+        let id = new_id("print");
+        let now = timestamp();
+        let tx = self.conn.unchecked_transaction()?;
+        write_print_attempt(&tx, &id, model_id, input, &now, true)?;
+        recompute_print_summary(&tx, model_id)?;
+        tx.commit()?;
+        self.get_print_attempt(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt missing".into()))
+    }
+    pub fn list_print_attempts(&self, model_id: &str) -> Result<Vec<PrintAttempt>, LibraryError> {
+        let mut stmt=self.conn.prepare("SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at FROM print_attempts WHERE model_id=?1 ORDER BY printed_at DESC,id DESC")?;
+        let rows = stmt.query_map(params![model_id], attempt_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut a = row?;
+            a.filament_ids = attempt_filaments(&self.conn, &a.id)?;
+            out.push(a);
+        }
+        Ok(out)
+    }
+    pub fn get_print_attempt(&self, id: &str) -> Result<Option<PrintAttempt>, LibraryError> {
+        let mut a=self.conn.query_row("SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at FROM print_attempts WHERE id=?1",params![id],attempt_from_row).optional()?;
+        if let Some(ref mut value) = a {
+            value.filament_ids = attempt_filaments(&self.conn, id)?;
+        }
+        Ok(a)
+    }
+    pub fn update_print_attempt(
+        &self,
+        id: &str,
+        input: &PrintAttemptInput,
+    ) -> Result<PrintAttempt, LibraryError> {
+        validate_print_attempt(input)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let model_id: String = tx
+            .query_row(
+                "SELECT model_id FROM print_attempts WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))?;
+        write_print_attempt(&tx, id, &model_id, input, &timestamp(), false)?;
+        recompute_print_summary(&tx, &model_id)?;
+        tx.commit()?;
+        self.get_print_attempt(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))
+    }
+    pub fn delete_print_attempt(&self, id: &str) -> Result<(), LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let model_id: String = tx
+            .query_row(
+                "SELECT model_id FROM print_attempts WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))?;
+        tx.execute("DELETE FROM print_attempts WHERE id=?1", params![id])?;
+        recompute_print_summary(&tx, &model_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn create_bundle(&self, model_ids: &[String]) -> Result<String, LibraryError> {
+        if model_ids.is_empty() {
+            return Err(LibraryError::InvalidInput("bundle requires models".into()));
+        }
+        let id = new_id("bundle");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO bundles(id,created_at) VALUES(?1,?2)",
+            params![id, timestamp()],
+        )?;
+        for model in model_ids {
+            if tx.execute("UPDATE models SET bundle_id=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE id=?3",params![id,timestamp(),model])?==0{return Err(LibraryError::ModelNotFound(model.clone()));}
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+    pub fn set_model_bundle(
+        &self,
+        model_id: &str,
+        bundle_id: Option<&str>,
+    ) -> Result<Model, LibraryError> {
+        if let Some(id) = bundle_id {
+            let source_root: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT source_root_id FROM bundles WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match source_root {
+                None => return Err(LibraryError::InvalidInput("bundle not found".into())),
+                Some(Some(_)) => {
+                    return Err(LibraryError::InvalidInput(
+                        "automatic source bundles are managed by scanning".into(),
+                    ))
+                }
+                Some(None) => {}
+            }
+        }
+        if self.conn.execute("UPDATE models SET bundle_id=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE id=?3",params![bundle_id,timestamp(),model_id])?==0{return Err(LibraryError::ModelNotFound(model_id.into()));}
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    fn ensure_model(&self, id: &str) -> Result<(), LibraryError> {
+        if self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM models WHERE id=?1)",
+            params![id],
+            |r| r.get(0),
+        )? {
+            Ok(())
+        } else {
+            Err(LibraryError::ModelNotFound(id.into()))
+        }
     }
 
     fn ensure_folder(&self, id: &str) -> Result<(), LibraryError> {
@@ -1109,7 +1638,10 @@ const MODEL_SELECT: &str = "SELECT m.id, m.display_name, m.description, m.folder
              WHERE t.model_id = m.id
                AND (t.is_custom = 1 OR t.source_content_hash IS NULL
                     OR t.source_content_hash = COALESCE(r.blob_hash, d.content_hash))
-             ORDER BY t.is_custom DESC, t.id LIMIT 1)
+             ORDER BY t.is_custom DESC, t.id LIMIT 1),
+            m.designer, m.source_url, m.notes, m.model_license, m.print_status,
+            m.parent_model_id, m.last_printed_at, m.print_count, m.bundle_id,
+            m.source_archive_member
      FROM models m
      LEFT JOIN revisions r ON r.id = m.current_revision_id
      LEFT JOIN blobs b ON b.hash = r.blob_hash
@@ -1157,7 +1689,13 @@ CREATE TABLE models (
     source_path TEXT,
     source_root_id TEXT,
     source_missing INTEGER NOT NULL DEFAULT 0 CHECK(source_missing IN (0, 1)),
-    source_modified_at INTEGER
+    source_modified_at INTEGER,
+    source_archive_member TEXT,
+    designer TEXT, source_url TEXT, notes TEXT, model_license TEXT,
+    print_status TEXT NOT NULL DEFAULT 'unprinted',
+    parent_model_id TEXT,
+    last_printed_at TEXT, print_count INTEGER NOT NULL DEFAULT 0,
+    bundle_id TEXT
 );
 CREATE INDEX models_folder_idx ON models(folder_id, deleted_at, created_at, id);
 CREATE TABLE revisions (
@@ -1170,7 +1708,7 @@ CREATE TABLE revisions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX revisions_model_idx ON revisions(model_id, created_at);
-CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE);
+CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, category TEXT);
 CREATE TABLE model_tags (
     model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
     tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
@@ -1186,18 +1724,23 @@ CREATE TABLE index_roots (
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
     last_scanned_at TEXT,
     scan_interval_minutes INTEGER NOT NULL CHECK(scan_interval_minutes BETWEEN 1 AND 1440),
-    max_file_bytes INTEGER NOT NULL CHECK(max_file_bytes BETWEEN 1 AND 104857600)
+    max_file_bytes INTEGER NOT NULL CHECK(max_file_bytes BETWEEN 1 AND 104857600),
+    scan_zip INTEGER NOT NULL DEFAULT 0 CHECK(scan_zip IN (0,1))
 );
 CREATE TABLE indexed_model_data (
     model_id TEXT PRIMARY KEY REFERENCES models(id) ON DELETE CASCADE,
     content_hash TEXT NOT NULL,
     original_name TEXT NOT NULL,
     format TEXT NOT NULL,
-    bytes INTEGER NOT NULL CHECK(bytes >= 0)
+    bytes INTEGER NOT NULL CHECK(bytes >= 0),
+    outer_fingerprint TEXT
 );
 CREATE INDEX indexed_model_hash_idx ON indexed_model_data(content_hash, model_id);
-CREATE UNIQUE INDEX indexed_model_source_idx ON models(source_root_id, source_path)
+CREATE UNIQUE INDEX indexed_model_source_idx ON models(source_root_id, source_path, COALESCE(source_archive_member,''))
     WHERE source_kind = 'indexed';
+CREATE TABLE bundles (id TEXT PRIMARY KEY, source_root_id TEXT, source_path TEXT, created_at TEXT NOT NULL, UNIQUE(source_root_id,source_path));
+CREATE TABLE print_attempts (id TEXT PRIMARY KEY, model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE, printed_at TEXT NOT NULL, quantity INTEGER NOT NULL, notes TEXT NOT NULL, outcome TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE print_attempt_filaments (attempt_id TEXT NOT NULL REFERENCES print_attempts(id) ON DELETE CASCADE, filament_id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(attempt_id,filament_id));
 "#;
 
 const MIGRATE_V1_TO_V2: &str = r#"
@@ -1245,6 +1788,31 @@ PRAGMA user_version = 2;
 COMMIT;
 "#;
 
+const MIGRATE_V2_TO_V3: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE index_roots ADD COLUMN scan_zip INTEGER NOT NULL DEFAULT 0 CHECK(scan_zip IN (0,1));
+ALTER TABLE models ADD COLUMN source_archive_member TEXT;
+ALTER TABLE models ADD COLUMN designer TEXT;
+ALTER TABLE models ADD COLUMN source_url TEXT;
+ALTER TABLE models ADD COLUMN notes TEXT;
+UPDATE models SET notes = description WHERE description != '';
+ALTER TABLE models ADD COLUMN model_license TEXT;
+ALTER TABLE models ADD COLUMN print_status TEXT NOT NULL DEFAULT 'unprinted';
+ALTER TABLE models ADD COLUMN parent_model_id TEXT;
+ALTER TABLE models ADD COLUMN last_printed_at TEXT;
+ALTER TABLE models ADD COLUMN print_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE models ADD COLUMN bundle_id TEXT;
+ALTER TABLE tags ADD COLUMN category TEXT;
+ALTER TABLE indexed_model_data ADD COLUMN outer_fingerprint TEXT;
+DROP INDEX indexed_model_source_idx;
+CREATE UNIQUE INDEX indexed_model_source_idx ON models(source_root_id, source_path, COALESCE(source_archive_member,'')) WHERE source_kind='indexed';
+CREATE TABLE bundles (id TEXT PRIMARY KEY, source_root_id TEXT, source_path TEXT, created_at TEXT NOT NULL, UNIQUE(source_root_id,source_path));
+CREATE TABLE print_attempts (id TEXT PRIMARY KEY, model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE, printed_at TEXT NOT NULL, quantity INTEGER NOT NULL, notes TEXT NOT NULL, outcome TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE print_attempt_filaments (attempt_id TEXT NOT NULL REFERENCES print_attempts(id) ON DELETE CASCADE, filament_id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(attempt_id,filament_id));
+PRAGMA user_version=3;
+COMMIT;
+"#;
+
 const ENSURE_CATALOG_SETTINGS: &str = r#"
 CREATE TABLE IF NOT EXISTS catalog_settings (
     id TEXT PRIMARY KEY CHECK(id = 'local'),
@@ -1283,19 +1851,47 @@ fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
         source_missing: row.get(15)?,
         source_modified_at: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
         thumbnail_path: row.get(17)?,
+        metadata: ModelMetadata {
+            designer: row.get(18)?,
+            source_url: row.get(19)?,
+            notes: row.get(20)?,
+            model_license: row.get(21)?,
+            print_status: parse_print_status(row.get::<_, String>(22)?)?,
+            parent_model_id: row.get(23)?,
+            last_printed_at: row.get(24)?,
+            print_count: row.get::<_, i64>(25)? as u64,
+        },
+        bundle_id: row.get(26)?,
+        source_archive_member: row.get(27)?,
     })
+}
+
+fn parse_print_status(value: String) -> rusqlite::Result<PrintStatus> {
+    match value.as_str() {
+        "unprinted" => Ok(PrintStatus::Unprinted),
+        "want" => Ok(PrintStatus::Want),
+        "queued" => Ok(PrintStatus::Queued),
+        "printing" => Ok(PrintStatus::Printing),
+        "printed" => Ok(PrintStatus::Printed),
+        "failed" => Ok(PrintStatus::Failed),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn index_root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRoot> {
     let enabled: i64 = row.get(2)?;
     let scan_interval: i64 = row.get(4)?;
     let max_file_bytes: i64 = row.get(5)?;
+    let scan_zip: i64 = row.get(6)?;
     let scan_interval_minutes = u32::try_from(scan_interval)
         .map_err(|_| invalid_persisted_integer(4, "scan interval is outside u32"))?;
     let max_file_bytes = u64::try_from(max_file_bytes)
         .map_err(|_| invalid_persisted_integer(5, "maximum file size is negative"))?;
     if !(0..=1).contains(&enabled) {
         return Err(invalid_persisted_integer(2, "enabled must be zero or one"));
+    }
+    if !(0..=1).contains(&scan_zip) {
+        return Err(invalid_persisted_integer(6, "scan_zip must be zero or one"));
     }
     if !(MIN_SCAN_INTERVAL_MINUTES..=MAX_SCAN_INTERVAL_MINUTES).contains(&scan_interval_minutes) {
         return Err(invalid_persisted_integer(
@@ -1316,6 +1912,7 @@ fn index_root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRoot> {
         last_scanned_at: row.get(3)?,
         scan_interval_minutes,
         max_file_bytes,
+        scan_zip: scan_zip == 1,
     })
 }
 
@@ -1338,6 +1935,15 @@ fn clean_name(value: &str, kind: &str) -> Result<String, LibraryError> {
         )));
     }
     Ok(name.to_owned())
+}
+
+fn clean_tag_name(value: &str) -> Result<String, LibraryError> {
+    if value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(LibraryError::InvalidInput(
+            "Tag name exceeds its limit or contains control characters".into(),
+        ));
+    }
+    clean_name(value, "Tag")
 }
 
 fn timestamp() -> String {
@@ -1560,6 +2166,445 @@ fn validate_catalog_settings(settings: &CatalogSettings) -> Result<(), LibraryEr
     Ok(())
 }
 
+fn clean_optional(value: Option<&str>, max: usize) -> Result<Option<String>, LibraryError> {
+    match value {
+        Some(v) => {
+            let v = v.trim();
+            if v.is_empty() {
+                Ok(None)
+            } else if v.len() > max {
+                Err(LibraryError::InvalidInput(
+                    "metadata value is too long".into(),
+                ))
+            } else {
+                Ok(Some(v.into()))
+            }
+        }
+        None => Ok(None),
+    }
+}
+fn validated_archive_member(value: &str) -> Result<String, LibraryError> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        Err(LibraryError::InvalidInput("unsafe archive member".into()))
+    } else {
+        Ok(value.into())
+    }
+}
+fn ensure_archive_bundle(
+    tx: &rusqlite::Transaction<'_>,
+    root: &str,
+    path: &str,
+) -> Result<String, LibraryError> {
+    if let Some(id) = tx
+        .query_row(
+            "SELECT id FROM bundles WHERE source_root_id=?1 AND source_path=?2",
+            params![root, path],
+            |r| r.get(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+    let id = new_id("bundle");
+    tx.execute(
+        "INSERT INTO bundles(id,source_root_id,source_path,created_at) VALUES(?1,?2,?3,?4)",
+        params![id, root, path, timestamp()],
+    )?;
+    Ok(id)
+}
+fn reconcile_folder_bundles(
+    tx: &rusqlite::Transaction<'_>,
+    root_id: &str,
+) -> Result<(), LibraryError> {
+    #[derive(Clone)]
+    struct Item {
+        id: String,
+        bundle_id: Option<String>,
+        auto_bundle: Option<String>,
+        manual: bool,
+    }
+    let mut groups: BTreeMap<Option<String>, Vec<Item>> = BTreeMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT m.id,m.source_path,m.bundle_id,b.id,b.source_root_id
+             FROM models m LEFT JOIN bundles b ON b.id=m.bundle_id
+             WHERE m.source_kind='indexed' AND m.source_root_id=?1
+               AND m.source_archive_member IS NULL AND m.source_missing=0",
+        )?;
+        let rows = stmt.query_map(params![root_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, path, bundle_id, bundle_exists, bundle_root) = row?;
+            let parent = Path::new(&path)
+                .parent()
+                .and_then(Path::to_str)
+                .filter(|parent| !parent.is_empty())
+                .map(str::to_owned);
+            let manual = bundle_id.is_some() && bundle_exists.is_some() && bundle_root.is_none();
+            let auto_bundle = bundle_root.is_some().then_some(bundle_id.clone()).flatten();
+            groups.entry(parent).or_default().push(Item {
+                id,
+                bundle_id,
+                auto_bundle,
+                manual,
+            });
+        }
+    }
+    let mut bundle_folders: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    for (folder, items) in &groups {
+        for item in items {
+            if !item.manual {
+                if let Some(bundle) = &item.auto_bundle {
+                    bundle_folders
+                        .entry(bundle.clone())
+                        .or_default()
+                        .insert(folder.clone());
+                }
+            }
+        }
+    }
+    for (folder, items) in groups {
+        let eligible = items
+            .into_iter()
+            .filter(|item| !item.manual)
+            .collect::<Vec<_>>();
+        if folder.is_none() || eligible.len() < 2 {
+            for item in eligible {
+                if item.auto_bundle.is_some() {
+                    tx.execute("UPDATE models SET bundle_id=NULL,metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",params![timestamp(),item.id])?;
+                }
+            }
+            continue;
+        }
+        let marker = format!("{}/", folder.unwrap().trim_end_matches('/'));
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM bundles WHERE source_root_id=?1 AND source_path=?2",
+                params![root_id, marker],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let bundle_id = if let Some(id) = existing {
+            id
+        } else {
+            let candidates = eligible
+                .iter()
+                .filter_map(|item| item.auto_bundle.clone())
+                .collect::<BTreeSet<_>>();
+            if candidates.len() == 1
+                && bundle_folders
+                    .get(candidates.iter().next().unwrap())
+                    .is_some_and(|folders| folders.len() == 1)
+            {
+                let id = candidates.into_iter().next().unwrap();
+                tx.execute(
+                    "UPDATE bundles SET source_root_id=?1,source_path=?2 WHERE id=?3",
+                    params![root_id, marker, id],
+                )?;
+                id
+            } else {
+                let id = new_id("bundle");
+                tx.execute("INSERT INTO bundles(id,source_root_id,source_path,created_at) VALUES(?1,?2,?3,?4)",params![id,root_id,marker,timestamp()])?;
+                id
+            }
+        };
+        for item in eligible {
+            if item.bundle_id.as_deref() != Some(&bundle_id) {
+                tx.execute("UPDATE models SET bundle_id=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE id=?3",params![bundle_id,timestamp(),item.id])?;
+            }
+        }
+    }
+    Ok(())
+}
+fn print_status_value(value: &PrintStatus) -> &'static str {
+    match value {
+        PrintStatus::Unprinted => "unprinted",
+        PrintStatus::Want => "want",
+        PrintStatus::Queued => "queued",
+        PrintStatus::Printing => "printing",
+        PrintStatus::Printed => "printed",
+        PrintStatus::Failed => "failed",
+    }
+}
+fn print_outcome_value(value: &PrintOutcome) -> &'static str {
+    match value {
+        PrintOutcome::Printed => "printed",
+        PrintOutcome::Failed => "failed",
+    }
+}
+fn validate_metadata_patch(p: &MetadataPatch) -> Result<(), LibraryError> {
+    clean_optional(p.designer.as_deref(), 200)?;
+    clean_optional(p.source_url.as_deref(), 2048)?;
+    clean_optional(p.notes.as_deref(), 20_000)?;
+    clean_optional(p.model_license.as_deref(), 200)?;
+    if let Some(url) = clean_optional(p.source_url.as_deref(), 2048)? {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(LibraryError::InvalidInput(
+                "source URL must use http or https".into(),
+            ));
+        }
+    }
+    if let Some(tags) = &p.tags {
+        if tags.len() > 200 {
+            return Err(LibraryError::InvalidInput("too many tags".into()));
+        }
+    }
+    Ok(())
+}
+fn apply_metadata_patch(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    expected_version: u64,
+    patch: &MetadataPatch,
+) -> Result<(), LibraryError> {
+    let actual: i64 = tx
+        .query_row(
+            "SELECT metadata_version FROM models WHERE id=?1",
+            params![model_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| LibraryError::ModelNotFound(model_id.to_owned()))?;
+    if actual as u64 != expected_version {
+        return Err(LibraryError::MetadataConflict {
+            model_id: model_id.to_owned(),
+            expected: expected_version,
+            actual: actual as u64,
+        });
+    }
+    if let Some(folder) = &patch.folder_id {
+        let ok: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folders WHERE id=?1)",
+            params![folder],
+            |r| r.get(0),
+        )?;
+        if !ok {
+            return Err(LibraryError::FolderNotFound(folder.clone()));
+        }
+    }
+    if let Some(parent) = &patch.parent_model_id {
+        let parent = parent.trim();
+        if !parent.is_empty() {
+            ensure_no_parent_cycle(tx, model_id, parent)?;
+        }
+    }
+    let designer = patch
+        .designer
+        .as_deref()
+        .map(|v| clean_optional(Some(v), 200))
+        .transpose()?
+        .flatten();
+    let source_url = patch
+        .source_url
+        .as_deref()
+        .map(|v| clean_optional(Some(v), 2048))
+        .transpose()?
+        .flatten();
+    let notes = patch
+        .notes
+        .as_deref()
+        .map(|v| clean_optional(Some(v), 20_000))
+        .transpose()?
+        .flatten();
+    let license = patch
+        .model_license
+        .as_deref()
+        .map(|v| clean_optional(Some(v), 200))
+        .transpose()?
+        .flatten();
+    let parent = patch.parent_model_id.as_deref().map(str::trim).map(|v| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.to_owned())
+        }
+    });
+    tx.execute("UPDATE models SET designer=CASE WHEN ?1 THEN ?2 ELSE designer END,source_url=CASE WHEN ?3 THEN ?4 ELSE source_url END,notes=CASE WHEN ?5 THEN ?6 ELSE notes END,description=CASE WHEN ?5 THEN COALESCE(?6,'') ELSE description END,model_license=CASE WHEN ?7 THEN ?8 ELSE model_license END,print_status=COALESCE(?9,print_status),folder_id=COALESCE(?10,folder_id),parent_model_id=CASE WHEN ?11 THEN ?12 ELSE parent_model_id END,metadata_version=metadata_version+1,updated_at=?13 WHERE id=?14",params![patch.designer.is_some(),designer,patch.source_url.is_some(),source_url,patch.notes.is_some(),notes,patch.model_license.is_some(),license,patch.print_status.as_ref().map(print_status_value),patch.folder_id,patch.parent_model_id.is_some(),parent.flatten(),timestamp(),model_id])?;
+    if let Some(tags) = &patch.tags {
+        for id in tags {
+            let ok: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE id=?1)",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if !ok {
+                return Err(LibraryError::InvalidInput(format!("tag not found: {id}")));
+            }
+        }
+        if !matches!(patch.tag_mode, Some(TagMode::Merge)) {
+            tx.execute(
+                "DELETE FROM model_tags WHERE model_id=?1",
+                params![model_id],
+            )?;
+        }
+        for id in tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO model_tags(model_id,tag_id) VALUES(?1,?2)",
+                params![model_id, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+fn ensure_no_parent_cycle(
+    tx: &rusqlite::Transaction<'_>,
+    model: &str,
+    parent: &str,
+) -> Result<(), LibraryError> {
+    let mut cur = Some(parent.to_owned());
+    while let Some(id) = cur {
+        if id == model {
+            return Err(LibraryError::InvalidInput("model parent cycle".into()));
+        }
+        cur = tx
+            .query_row(
+                "SELECT parent_model_id FROM models WHERE id=?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::ModelNotFound(id.clone()))?;
+    }
+    Ok(())
+}
+fn tag_model_ids(tx: &rusqlite::Transaction<'_>, tag: &str) -> Result<Vec<String>, LibraryError> {
+    let mut s = tx.prepare("SELECT model_id FROM model_tags WHERE tag_id=?1")?;
+    let r = s.query_map(params![tag], |row| row.get(0))?;
+    Ok(r.collect::<Result<Vec<_>, _>>()?)
+}
+fn bump_models(tx: &rusqlite::Transaction<'_>, ids: &[String]) -> Result<(), LibraryError> {
+    for id in ids {
+        tx.execute(
+            "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+            params![timestamp(), id],
+        )?;
+    }
+    Ok(())
+}
+fn validate_print_attempt(i: &PrintAttemptInput) -> Result<(), LibraryError> {
+    if i.quantity == 0
+        || i.quantity > 10_000
+        || i.notes.len() > 20_000
+        || i.filament_ids.len() > 5
+        || i.filament_ids.iter().any(|id| {
+            id.is_empty() || id.len() > 256 || id.trim() != id || id.chars().any(char::is_control)
+        })
+        || normalize_rfc3339(&i.printed_at).is_err()
+    {
+        return Err(LibraryError::InvalidInput("invalid print attempt".into()));
+    }
+    Ok(())
+}
+fn write_print_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    model: &str,
+    i: &PrintAttemptInput,
+    now: &str,
+    create: bool,
+) -> Result<(), LibraryError> {
+    let printed_at = normalize_rfc3339(&i.printed_at)?;
+    if create {
+        tx.execute(
+            "INSERT INTO print_attempts VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![
+                id,
+                model,
+                printed_at,
+                i.quantity,
+                i.notes,
+                print_outcome_value(&i.outcome),
+                now
+            ],
+        )?;
+    } else {
+        tx.execute("UPDATE print_attempts SET printed_at=?1,quantity=?2,notes=?3,outcome=?4,updated_at=?5 WHERE id=?6",params![printed_at,i.quantity,i.notes,print_outcome_value(&i.outcome),now,id])?;
+        tx.execute(
+            "DELETE FROM print_attempt_filaments WHERE attempt_id=?1",
+            params![id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE models SET print_status=?1 WHERE id=?2",
+        params![print_outcome_value(&i.outcome), model],
+    )?;
+    let mut seen = HashSet::new();
+    for (n, f) in i.filament_ids.iter().enumerate() {
+        if !seen.insert(f) {
+            return Err(LibraryError::InvalidInput("duplicate filament".into()));
+        }
+        tx.execute(
+            "INSERT INTO print_attempt_filaments VALUES(?1,?2,?3)",
+            params![id, f, n as i64],
+        )?;
+    }
+    Ok(())
+}
+fn recompute_print_summary(
+    tx: &rusqlite::Transaction<'_>,
+    model: &str,
+) -> Result<(), LibraryError> {
+    let (count,last):(i64,Option<String>)=tx.query_row("SELECT COALESCE(SUM(CASE WHEN outcome='printed' THEN quantity ELSE 0 END),0),MAX(CASE WHEN outcome='printed' THEN printed_at END) FROM print_attempts WHERE model_id=?1",params![model],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    tx.execute("UPDATE models SET print_count=?1,last_printed_at=?2,metadata_version=metadata_version+1,updated_at=?3 WHERE id=?4",params![count,last,timestamp(),model])?;
+    Ok(())
+}
+fn attempt_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrintAttempt> {
+    let o: String = r.get(5)?;
+    Ok(PrintAttempt {
+        id: r.get(0)?,
+        model_id: r.get(1)?,
+        printed_at: r.get(2)?,
+        quantity: r.get::<_, i64>(3)? as u32,
+        notes: r.get(4)?,
+        filament_ids: Vec::new(),
+        outcome: if o == "printed" {
+            PrintOutcome::Printed
+        } else {
+            PrintOutcome::Failed
+        },
+        created_at: r.get(6)?,
+        updated_at: r.get(7)?,
+    })
+}
+fn attempt_filaments(conn: &Connection, id: &str) -> Result<Vec<String>, LibraryError> {
+    let mut s = conn.prepare(
+        "SELECT filament_id FROM print_attempt_filaments WHERE attempt_id=?1 ORDER BY ordinal",
+    )?;
+    let r = s.query_map(params![id], |row| row.get(0))?;
+    Ok(r.collect::<Result<Vec<_>, _>>()?)
+}
+fn normalize_rfc3339(value: &str) -> Result<String, LibraryError> {
+    use time::format_description::well_known::Rfc3339;
+    use time::{OffsetDateTime, UtcOffset};
+    let parsed = OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| LibraryError::InvalidInput("printed_at must be RFC3339".into()))?
+        .to_offset(UtcOffset::UTC);
+    let millis = parsed.unix_timestamp_nanos().div_euclid(1_000_000);
+    let normalized = OffsetDateTime::from_unix_timestamp_nanos(millis * 1_000_000)
+        .map_err(|_| LibraryError::InvalidInput("printed_at is outside supported range".into()))?;
+    let format = time::format_description::parse_borrowed::<2>(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+    )
+    .map_err(|_| LibraryError::InvalidInput("timestamp format is unavailable".into()))?;
+    normalized
+        .format(&format)
+        .map_err(|_| LibraryError::InvalidInput("printed_at is outside supported range".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1717,6 +2762,698 @@ mod tests {
     }
 
     #[test]
+    fn metadata_tags_history_and_parent_updates_are_versioned_and_atomic() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let a = db.create_model("A", None).unwrap();
+        let b = db.create_model("B", None).unwrap();
+        let tag = db.create_tag("Mechanical", Some("Type")).unwrap();
+        let patch = MetadataPatch {
+            designer: Some("Ada".into()),
+            notes: Some("notes".into()),
+            tags: Some(vec![tag.id.clone()]),
+            tag_mode: Some(TagMode::Replace),
+            parent_model_id: Some(b.id.clone()),
+            ..MetadataPatch::default()
+        };
+        let a = db.update_model_metadata(&a.id, 1, &patch).unwrap();
+        assert_eq!(a.metadata.designer.as_deref(), Some("Ada"));
+        assert_eq!(a.tags, vec!["Mechanical"]);
+        assert_eq!(a.metadata.parent_model_id.as_deref(), Some(b.id.as_str()));
+        assert!(matches!(
+            db.update_model_metadata(&a.id, 1, &MetadataPatch::default()),
+            Err(LibraryError::MetadataConflict { .. })
+        ));
+        assert!(db
+            .update_model_metadata(
+                &b.id,
+                1,
+                &MetadataPatch {
+                    parent_model_id: Some(a.id.clone()),
+                    ..MetadataPatch::default()
+                }
+            )
+            .is_err());
+        let before = a.metadata_version;
+        assert!(db
+            .bulk_update_metadata(
+                &[
+                    VersionedTarget {
+                        model_id: a.id.clone(),
+                        expected_version: before
+                    },
+                    VersionedTarget {
+                        model_id: b.id.clone(),
+                        expected_version: 999
+                    }
+                ],
+                &MetadataPatch {
+                    notes: Some("bulk".into()),
+                    ..MetadataPatch::default()
+                }
+            )
+            .is_err());
+        assert_eq!(
+            db.get_model(&a.id).unwrap().unwrap().metadata_version,
+            before
+        );
+        let renamed = db.rename_tag(&tag.id, "Hardware", Some("Type")).unwrap();
+        assert_eq!(renamed.name, "Hardware");
+        let bumped = db.get_model(&a.id).unwrap().unwrap();
+        assert!(bumped.metadata_version > before);
+        assert_eq!(bumped.tags, vec!["Hardware"]);
+        db.delete_tag(&tag.id).unwrap();
+        assert!(db.get_model(&a.id).unwrap().unwrap().tags.is_empty());
+        let attempt = db
+            .create_print_attempt(
+                &a.id,
+                &PrintAttemptInput {
+                    printed_at: "2026-10-10T12:00:00-05:00".into(),
+                    quantity: 2,
+                    notes: "good".into(),
+                    filament_ids: vec!["pla-red".into()],
+                    outcome: PrintOutcome::Printed,
+                },
+            )
+            .unwrap();
+        assert_eq!(attempt.filament_ids, vec!["pla-red"]);
+        assert_eq!(attempt.printed_at, "2026-10-10T17:00:00.000Z");
+        let printed = db.get_model(&a.id).unwrap().unwrap();
+        assert_eq!(printed.metadata.print_count, 2);
+        assert_eq!(
+            printed.metadata.last_printed_at.as_deref(),
+            Some("2026-10-10T17:00:00.000Z")
+        );
+        let failed_attempt = db
+            .create_print_attempt(
+                &a.id,
+                &PrintAttemptInput {
+                    printed_at: "2026-10-11T00:00:00Z".into(),
+                    quantity: 1,
+                    notes: "failed".into(),
+                    filament_ids: vec![],
+                    outcome: PrintOutcome::Failed,
+                },
+            )
+            .unwrap();
+        db.update_print_attempt(
+            &failed_attempt.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-11T01:00:00+01:00".into(),
+                quantity: 1,
+                notes: "failed edited".into(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Failed,
+            },
+        )
+        .unwrap();
+        let after_failure = db.get_model(&a.id).unwrap().unwrap();
+        assert_eq!(after_failure.metadata.print_status, PrintStatus::Failed);
+        assert_eq!(after_failure.metadata.print_count, 2);
+        assert_eq!(
+            after_failure.metadata.last_printed_at.as_deref(),
+            Some("2026-10-10T17:00:00.000Z")
+        );
+        let current = db.get_model(&a.id).unwrap().unwrap();
+        db.update_model_metadata(
+            &a.id,
+            current.metadata_version,
+            &MetadataPatch {
+                print_status: Some(PrintStatus::Queued),
+                ..MetadataPatch::default()
+            },
+        )
+        .unwrap();
+        db.delete_print_attempt(&attempt.id).unwrap();
+        assert_eq!(
+            db.get_model(&a.id).unwrap().unwrap().metadata.print_status,
+            PrintStatus::Queued
+        );
+        let current = db.get_model(&a.id).unwrap().unwrap();
+        let cleared = db
+            .update_model_metadata(
+                &a.id,
+                current.metadata_version,
+                &MetadataPatch {
+                    notes: Some(String::new()),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.metadata.notes, None);
+        assert_eq!(cleared.description, "");
+    }
+
+    #[test]
+    fn print_timestamps_use_strict_rfc3339_and_fixed_utc_milliseconds() {
+        assert_eq!(
+            normalize_rfc3339("2024-02-29T23:59:59.123987+02:30").unwrap(),
+            "2024-02-29T21:29:59.123Z"
+        );
+        for invalid in [
+            "2023-02-29T00:00:00Z",
+            "2026-01-01T-1:00:00Z",
+            "2026-01-01T00:-1:00Z",
+            "💥2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00+25:00",
+        ] {
+            assert!(normalize_rfc3339(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn archive_members_are_distinct_and_auto_grouped_in_a_stable_bundle() {
+        let library = temp_root("archive-library");
+        let sources = temp_root("archive-source");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("parts.zip"), b"archive").unwrap();
+        let db = LibraryDb::open(&library).unwrap();
+        let mut root = db.add_index_root(&sources, 60, 1024).unwrap();
+        root.scan_zip = true;
+        db.update_index_root(&root).unwrap();
+        let entries = [
+            ScannedModel {
+                relative_path: "parts.zip".into(),
+                content_hash: hash(1),
+                bytes: 10,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("A".into()),
+                archive_member: Some("a.stl".into()),
+                outer_fingerprint: Some("fp1".into()),
+            },
+            ScannedModel {
+                relative_path: "parts.zip".into(),
+                content_hash: hash(1),
+                bytes: 10,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("B".into()),
+                archive_member: Some("b.stl".into()),
+                outer_fingerprint: Some("fp1".into()),
+            },
+        ];
+        let added = db.record_scan_entries(&root.id, &entries).unwrap();
+        assert_eq!(added.added, 2);
+        let seen = vec![
+            SourceRef {
+                relative_path: "parts.zip".into(),
+                archive_member: Some("a.stl".into()),
+            },
+            SourceRef {
+                relative_path: "parts.zip".into(),
+                archive_member: Some("b.stl".into()),
+            },
+        ];
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &added.added_model_ids, "1")
+            .unwrap();
+        let models = db.list_models(None, None).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].bundle_id, models[1].bundle_id);
+        assert_ne!(models[0].id, models[1].id);
+        let resolved = db.resolve_model_source_ref(&models[0].id).unwrap();
+        assert_eq!(
+            resolved.outer_path,
+            sources.join("parts.zip").canonicalize().unwrap()
+        );
+        assert_eq!(resolved.outer_fingerprint.as_deref(), Some("fp1"));
+        assert!(resolved.archive_member.is_some());
+        let again = db.record_scan_entries(&root.id, &entries).unwrap();
+        assert_eq!(again.added, 0);
+        assert_eq!(
+            db.list_models(None, None).unwrap()[0].bundle_id,
+            models[0].bundle_id
+        );
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn archive_outer_rename_updates_automatic_bundle_path_without_changing_ids() {
+        let library = temp_root("archive-rename-library");
+        let sources = temp_root("archive-rename-source");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("pack.zip"), b"first").unwrap();
+        let db = LibraryDb::open(&library).unwrap();
+        let root = db.add_index_root(&sources, 60, 1024).unwrap();
+        let first = ScannedModel {
+            relative_path: "pack.zip".into(),
+            content_hash: hash(1),
+            bytes: 10,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: Some("Part".into()),
+            archive_member: Some("part.stl".into()),
+            outer_fingerprint: Some("fp1".into()),
+        };
+        let added = db
+            .record_scan_entries(&root.id, std::slice::from_ref(&first))
+            .unwrap();
+        db.complete_scan_sources_with_new_models(
+            &root.id,
+            &[SourceRef {
+                relative_path: "pack.zip".into(),
+                archive_member: Some("part.stl".into()),
+            }],
+            &added.added_model_ids,
+            "1",
+        )
+        .unwrap();
+        let original = db.list_models(None, None).unwrap().pop().unwrap();
+        let bundle = original.bundle_id.clone().unwrap();
+        fs::rename(sources.join("pack.zip"), sources.join("renamed.zip")).unwrap();
+        let renamed = ScannedModel {
+            relative_path: "renamed.zip".into(),
+            outer_fingerprint: Some("fp2".into()),
+            modified_at: 2,
+            ..first
+        };
+        let batch = db
+            .record_scan_entries(&root.id, std::slice::from_ref(&renamed))
+            .unwrap();
+        db.complete_scan_sources_with_new_models(
+            &root.id,
+            &[SourceRef {
+                relative_path: "renamed.zip".into(),
+                archive_member: Some("part.stl".into()),
+            }],
+            &batch.added_model_ids,
+            "2",
+        )
+        .unwrap();
+        let current = db.get_model(&original.id).unwrap().unwrap();
+        assert_eq!(current.id, original.id);
+        assert_eq!(current.bundle_id.as_deref(), Some(bundle.as_str()));
+        let bundle_path: String = db
+            .conn
+            .query_row(
+                "SELECT source_path FROM bundles WHERE id=?1",
+                params![bundle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bundle_path, "renamed.zip");
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn moving_one_archive_member_splits_automatic_bundle_without_rewriting_remaining_source() {
+        let library = temp_root("archive-split-library");
+        let sources = temp_root("archive-split-source");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("old.zip"), b"old").unwrap();
+        fs::write(sources.join("new.zip"), b"new").unwrap();
+        let db = LibraryDb::open(&library).unwrap();
+        let root = db.add_index_root(&sources, 60, 1024).unwrap();
+        let old = [
+            ScannedModel {
+                relative_path: "old.zip".into(),
+                content_hash: hash(1),
+                bytes: 84,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("A".into()),
+                archive_member: Some("a.stl".into()),
+                outer_fingerprint: Some("oldfp".into()),
+            },
+            ScannedModel {
+                relative_path: "old.zip".into(),
+                content_hash: hash(2),
+                bytes: 84,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("B".into()),
+                archive_member: Some("b.stl".into()),
+                outer_fingerprint: Some("oldfp".into()),
+            },
+        ];
+        let added = db.record_scan_entries(&root.id, &old).unwrap();
+        let initial_seen = old
+            .iter()
+            .map(|entry| SourceRef {
+                relative_path: entry.relative_path.clone(),
+                archive_member: entry.archive_member.clone(),
+            })
+            .collect::<Vec<_>>();
+        db.complete_scan_sources_with_new_models(
+            &root.id,
+            &initial_seen,
+            &added.added_model_ids,
+            "1",
+        )
+        .unwrap();
+        let before = db.list_models(None, None).unwrap();
+        let a = before
+            .iter()
+            .find(|m| m.source_archive_member.as_deref() == Some("a.stl"))
+            .unwrap();
+        let b = before
+            .iter()
+            .find(|m| m.source_archive_member.as_deref() == Some("b.stl"))
+            .unwrap();
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        let old_bundle = b.bundle_id.clone().unwrap();
+        let moved = ScannedModel {
+            relative_path: "new.zip".into(),
+            content_hash: hash(1),
+            bytes: 84,
+            format: "stl-binary".into(),
+            modified_at: 2,
+            display_name: Some("A".into()),
+            archive_member: Some("a.stl".into()),
+            outer_fingerprint: Some("newfp".into()),
+        };
+        let batch = db
+            .record_scan_entries(&root.id, std::slice::from_ref(&moved))
+            .unwrap();
+        let seen = [
+            SourceRef {
+                relative_path: "new.zip".into(),
+                archive_member: Some("a.stl".into()),
+            },
+            SourceRef {
+                relative_path: "old.zip".into(),
+                archive_member: Some("b.stl".into()),
+            },
+        ];
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &batch.added_model_ids, "2")
+            .unwrap();
+        let a = db.get_model(&a_id).unwrap().unwrap();
+        let b = db.get_model(&b_id).unwrap().unwrap();
+        assert_ne!(a.bundle_id, b.bundle_id);
+        assert_eq!(b.bundle_id.as_deref(), Some(old_bundle.as_str()));
+        let old_path: String = db
+            .conn
+            .query_row(
+                "SELECT source_path FROM bundles WHERE id=?1",
+                params![old_bundle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_path, "old.zip");
+        let new_path: String = db
+            .conn
+            .query_row(
+                "SELECT source_path FROM bundles WHERE id=?1",
+                params![a.bundle_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_path, "new.zip");
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn archive_member_to_loose_transition_does_not_reuse_archive_bundle() {
+        let library = temp_root("archive-loose-library");
+        let sources = temp_root("archive-loose-source");
+        fs::create_dir_all(sources.join("folder")).unwrap();
+        fs::write(sources.join("old.zip"), b"old").unwrap();
+        fs::write(sources.join("folder/a.stl"), b"a").unwrap();
+        let db = LibraryDb::open(&library).unwrap();
+        let root = db.add_index_root(&sources, 60, 1024).unwrap();
+        let old = [
+            ScannedModel {
+                relative_path: "old.zip".into(),
+                content_hash: hash(1),
+                bytes: 1,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: None,
+                archive_member: Some("a.stl".into()),
+                outer_fingerprint: Some("fp".into()),
+            },
+            ScannedModel {
+                relative_path: "old.zip".into(),
+                content_hash: hash(2),
+                bytes: 1,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: None,
+                archive_member: Some("b.stl".into()),
+                outer_fingerprint: Some("fp".into()),
+            },
+        ];
+        let added = db.record_scan_entries(&root.id, &old).unwrap();
+        let seen = old
+            .iter()
+            .map(|e| SourceRef {
+                relative_path: e.relative_path.clone(),
+                archive_member: e.archive_member.clone(),
+            })
+            .collect::<Vec<_>>();
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &added.added_model_ids, "1")
+            .unwrap();
+        let models = db.list_models(None, None).unwrap();
+        let a = models
+            .iter()
+            .find(|m| m.source_archive_member.as_deref() == Some("a.stl"))
+            .unwrap();
+        let b = models
+            .iter()
+            .find(|m| m.source_archive_member.as_deref() == Some("b.stl"))
+            .unwrap();
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        let archive_bundle = b.bundle_id.clone().unwrap();
+        let loose = ScannedModel {
+            relative_path: "folder/a.stl".into(),
+            content_hash: hash(1),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 2,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        };
+        let batch = db
+            .record_scan_entries(&root.id, std::slice::from_ref(&loose))
+            .unwrap();
+        let seen = [
+            SourceRef {
+                relative_path: "folder/a.stl".into(),
+                archive_member: None,
+            },
+            SourceRef {
+                relative_path: "old.zip".into(),
+                archive_member: Some("b.stl".into()),
+            },
+        ];
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &batch.added_model_ids, "2")
+            .unwrap();
+        let a = db.get_model(&a_id).unwrap().unwrap();
+        let b = db.get_model(&b_id).unwrap().unwrap();
+        assert!(a.source_archive_member.is_none());
+        assert!(a.bundle_id.is_none());
+        assert_eq!(b.bundle_id.as_deref(), Some(archive_bundle.as_str()));
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn completed_scan_auto_groups_subfolders_with_stable_bundles_and_preserves_manual_assignments()
+    {
+        let library = temp_root("folder-bundle-library");
+        let sources = temp_root("folder-bundle-source");
+        fs::create_dir_all(sources.join("nested")).unwrap();
+        fs::create_dir_all(sources.join("solo")).unwrap();
+        for path in ["nested/a.stl", "nested/b.stl", "solo/c.stl", "root.stl"] {
+            fs::write(sources.join(path), path.as_bytes()).unwrap();
+        }
+        let db = LibraryDb::open(&library).unwrap();
+        let root = db.add_index_root(&sources, 60, 1024).unwrap();
+        let make = |path: &str, n: u8| ScannedModel {
+            relative_path: path.into(),
+            content_hash: hash(n),
+            bytes: path.len() as u64,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        };
+        let initial = [
+            make("nested/a.stl", 1),
+            make("nested/b.stl", 2),
+            make("solo/c.stl", 3),
+            make("root.stl", 4),
+        ];
+        let added = db.record_scan_entries(&root.id, &initial).unwrap();
+        let seen = initial
+            .iter()
+            .map(|entry| SourceRef {
+                relative_path: entry.relative_path.clone(),
+                archive_member: None,
+            })
+            .collect::<Vec<_>>();
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &added.added_model_ids, "1")
+            .unwrap();
+        let models = db.list_models(None, None).unwrap();
+        let a = models
+            .iter()
+            .find(|m| m.source_path.as_deref().unwrap().ends_with("nested/a.stl"))
+            .unwrap();
+        let b = models
+            .iter()
+            .find(|m| m.source_path.as_deref().unwrap().ends_with("nested/b.stl"))
+            .unwrap();
+        let stable_bundle = a.bundle_id.clone().unwrap();
+        let a_id = a.id.clone();
+        assert_eq!(b.bundle_id.as_deref(), Some(stable_bundle.as_str()));
+        assert!(models
+            .iter()
+            .find(|m| m.source_path.as_deref().unwrap().ends_with("solo/c.stl"))
+            .unwrap()
+            .bundle_id
+            .is_none());
+        assert!(models
+            .iter()
+            .find(|m| m.source_path.as_deref().unwrap().ends_with("root.stl"))
+            .unwrap()
+            .bundle_id
+            .is_none());
+        fs::rename(sources.join("nested"), sources.join("renamed")).unwrap();
+        let renamed = [
+            make("renamed/a.stl", 1),
+            make("renamed/b.stl", 2),
+            make("solo/c.stl", 3),
+            make("root.stl", 4),
+        ];
+        let batch = db.record_scan_entries(&root.id, &renamed).unwrap();
+        let seen = renamed
+            .iter()
+            .map(|entry| SourceRef {
+                relative_path: entry.relative_path.clone(),
+                archive_member: None,
+            })
+            .collect::<Vec<_>>();
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &batch.added_model_ids, "2")
+            .unwrap();
+        let models = db.list_models(None, None).unwrap();
+        let renamed_a = models
+            .iter()
+            .find(|m| m.source_path.as_deref().unwrap().ends_with("renamed/a.stl"))
+            .unwrap();
+        assert_eq!(renamed_a.id, a_id);
+        assert_eq!(renamed_a.bundle_id.as_deref(), Some(stable_bundle.as_str()));
+        assert!(db
+            .set_model_bundle(&renamed_a.id, Some(&stable_bundle))
+            .is_err());
+        let manual = db
+            .create_bundle(std::slice::from_ref(&renamed_a.id))
+            .unwrap();
+        db.complete_scan_sources_with_new_models(&root.id, &seen, &[], "3")
+            .unwrap();
+        let models = db.list_models(None, None).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == renamed_a.id)
+                .unwrap()
+                .bundle_id
+                .as_deref(),
+            Some(manual.as_str())
+        );
+        assert!(models
+            .iter()
+            .find(|m| m.source_path.as_deref().unwrap().ends_with("renamed/b.stl"))
+            .unwrap()
+            .bundle_id
+            .is_none());
+        drop(db);
+        let reopened = LibraryDb::open(&library).unwrap();
+        assert_eq!(
+            reopened
+                .get_model(&a_id)
+                .unwrap()
+                .unwrap()
+                .bundle_id
+                .as_deref(),
+            Some(manual.as_str())
+        );
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn tag_and_filament_inputs_are_bounded_at_the_storage_boundary() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Bounded", None).unwrap();
+        for name in [
+            "x".repeat(257),
+            "line\\nfeed".replace("\\n", "\n"),
+            "null\0".to_owned(),
+        ] {
+            assert!(db.create_tag(&name, None).is_err());
+        }
+        let tag = db.create_tag("Valid", None).unwrap();
+        assert!(db.rename_tag(&tag.id, &"x".repeat(257), None).is_err());
+        assert_eq!(db.list_tags().unwrap()[0].name, "Valid");
+        for ids in [
+            (0..6).map(|n| format!("filament-{n}")).collect::<Vec<_>>(),
+            vec!["x".repeat(257)],
+            vec!["".into()],
+            vec!["bad\nref".into()],
+            vec![" padded ".into()],
+            vec!["duplicate".into(), "duplicate".into()],
+        ] {
+            let input = PrintAttemptInput {
+                printed_at: "2026-10-10T00:00:00.000Z".into(),
+                quantity: 1,
+                notes: String::new(),
+                filament_ids: ids,
+                outcome: PrintOutcome::Printed,
+            };
+            assert!(db.create_print_attempt(&model.id, &input).is_err());
+            assert!(db.list_print_attempts(&model.id).unwrap().is_empty());
+            assert_eq!(
+                db.get_model(&model.id)
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+                    .print_count,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn print_history_persists_across_restart() {
+        let root = temp_root("history-restart");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("History", None).unwrap();
+        let attempt = db
+            .create_print_attempt(
+                &model.id,
+                &PrintAttemptInput {
+                    printed_at: "2026-10-10T12:34:56.789Z".into(),
+                    quantity: 3,
+                    notes: "persist".into(),
+                    filament_ids: vec!["f1".into(), "f2".into()],
+                    outcome: PrintOutcome::Printed,
+                },
+            )
+            .unwrap();
+        drop(db);
+        let reopened = LibraryDb::open(&root).unwrap();
+        let loaded = reopened.get_print_attempt(&attempt.id).unwrap().unwrap();
+        assert_eq!(loaded.quantity, 3);
+        assert_eq!(loaded.filament_ids, vec!["f1", "f2"]);
+        assert_eq!(
+            reopened
+                .get_model(&model.id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .print_count,
+            3
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn thumbnail_appearance_settings_invalidate_generated_rows_and_preserve_custom() {
         let root = temp_root("catalog-settings-thumbnails");
         let source_dir = temp_root("catalog-settings-thumbnails-source");
@@ -1834,7 +3571,7 @@ mod tests {
             params![content_hash, storage_path, source_bytes.len() as i64],
         )
         .unwrap();
-        conn.execute("INSERT INTO models (id, display_name, description, folder_id, current_revision_id, metadata_version, created_at, updated_at) VALUES ('model-v1', 'Tagged Bracket', '', 'root', 'revision-v1', 1, '1', '1')", []).unwrap();
+        conn.execute("INSERT INTO models (id, display_name, description, folder_id, current_revision_id, metadata_version, created_at, updated_at) VALUES ('model-v1', 'Tagged Bracket', 'legacy notes', 'root', 'revision-v1', 1, '1', '1')", []).unwrap();
         conn.execute("INSERT INTO revisions VALUES ('revision-v1', 'model-v1', ?1, 'Tagged Bracket.stl', 'stl-binary', ?2, '1')", params![content_hash, source_bytes.len() as i64]).unwrap();
         conn.execute("INSERT INTO tags VALUES ('tag-existing', 'Favorite')", [])
             .unwrap();
@@ -1865,6 +3602,7 @@ mod tests {
         );
         assert_eq!(existing.tags, vec!["Favorite"]);
         assert_eq!(existing.source_kind, "managed");
+        assert_eq!(existing.metadata.notes.as_deref(), Some("legacy notes"));
         assert_eq!(fs::read(root.join(storage_path)).unwrap(), source_bytes);
         drop(db);
 
@@ -1890,6 +3628,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(backup_name, "Tagged Bracket");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v2_migration_creates_backup_and_preserves_legacy_notes() {
+        let root = temp_root("existing-v2");
+        fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+        conn.execute_batch(TEST_SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute("INSERT INTO models (id,display_name,description,folder_id,metadata_version,created_at,updated_at) VALUES ('legacy','Legacy','keep me','root',1,'1','1')",[]).unwrap();
+        conn.execute_batch(MIGRATE_V1_TO_V2).unwrap();
+        drop(conn);
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.get_model("legacy").unwrap().unwrap();
+        assert_eq!(model.metadata.notes.as_deref(), Some("keep me"));
+        drop(db);
+        let backup = root.join("library.sqlite3.schema-v2.backup");
+        assert!(backup.is_file());
+        let backup_conn = Connection::open(backup).unwrap();
+        let version: i64 = backup_conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1955,6 +3717,8 @@ mod tests {
                 format: "stl-binary".into(),
                 modified_at: 1,
                 display_name: Some("Unique metadata".into()),
+                archive_member: None,
+                outer_fingerprint: None,
             },
             ScannedModel {
                 relative_path: "duplicate-a.stl".into(),
@@ -1963,6 +3727,8 @@ mod tests {
                 format: "stl-binary".into(),
                 modified_at: 1,
                 display_name: None,
+                archive_member: None,
+                outer_fingerprint: None,
             },
             ScannedModel {
                 relative_path: "duplicate-b.stl".into(),
@@ -1971,6 +3737,8 @@ mod tests {
                 format: "stl-binary".into(),
                 modified_at: 1,
                 display_name: None,
+                archive_member: None,
+                outer_fingerprint: None,
             },
         ];
         assert_eq!(db.record_scan_entries(&root.id, &initial).unwrap().added, 3);
@@ -2018,6 +3786,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 2,
             display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
         };
         let rename_batch = db
             .record_scan_entries(&root.id, std::slice::from_ref(&renamed))
@@ -2077,6 +3847,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 3,
             display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
         };
         db.record_scan_entries(&root.id, std::slice::from_ref(&changed))
             .unwrap();
@@ -2140,6 +3912,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 1,
             display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
         };
         assert!(matches!(
             db.record_scan_entries(&root.id, &[entry]),
@@ -2208,6 +3982,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 1,
             display_name: Some("Offline part".into()),
+            archive_member: None,
+            outer_fingerprint: None,
         };
         let added = db.record_scan_entries(&root.id, &[entry]).unwrap();
         let model_id = added.added_model_ids[0].clone();
@@ -2256,6 +4032,8 @@ mod tests {
                 format: "stl-binary".into(),
                 modified_at: 1,
                 display_name: Some("Metadata A".into()),
+                archive_member: None,
+                outer_fingerprint: None,
             },
             ScannedModel {
                 relative_path: "b.stl".into(),
@@ -2264,6 +4042,8 @@ mod tests {
                 format: "stl-binary".into(),
                 modified_at: 1,
                 display_name: Some("Metadata B".into()),
+                archive_member: None,
+                outer_fingerprint: None,
             },
         ];
         let added = db.record_scan_entries(&root.id, &entries).unwrap();
@@ -2315,6 +4095,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 1,
             display_name: Some("Old metadata".into()),
+            archive_member: None,
+            outer_fingerprint: None,
         };
         let first = db
             .record_scan_entries(&root.id, std::slice::from_ref(&old))
@@ -2334,6 +4116,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 2,
             display_name: Some("Cancelled identity".into()),
+            archive_member: None,
+            outer_fingerprint: None,
         };
         let cancelled = db
             .record_scan_entries(&root.id, std::slice::from_ref(&new))
@@ -2387,6 +4171,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 1,
             display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
         };
         assert!(db.record_scan_entries(&root.id, &[escaped]).is_err());
         let linked = ScannedModel {
@@ -2396,6 +4182,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 1,
             display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
         };
         assert!(db.record_scan_entries(&root.id, &[linked]).is_err());
         fs::remove_file(source_root.join("link.stl")).unwrap();
@@ -2409,6 +4197,8 @@ mod tests {
             format: "stl-binary".into(),
             modified_at: 1,
             display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
         };
         assert!(db.record_scan_entries(&root.id, &[replaced_root]).is_err());
         let _ = fs::remove_dir_all(library_root);

@@ -1846,6 +1846,7 @@ dependencies = [
  "sha2",
  "stl-core",
  "thiserror 2.0.20",
+ "time",
  "uuid",
 ]
 
@@ -1853,11 +1854,13 @@ dependencies = [
 name = "library-recovery"
 version = "0.1.0"
 dependencies = [
+ "library-core",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "time",
  "zip",
 ]
 

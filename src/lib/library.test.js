@@ -6,6 +6,8 @@ import {
   LIBRARY_CATALOG_TIER,
   LIBRARY_VIEW_MODES,
   libraryFolderDepths,
+  matchesLibraryGroup,
+  matchesLibraryMetadataFilters,
   normalizeLibraryTimestamp,
   normalizeCatalogSettings,
   scanStatusMessage,
@@ -91,7 +93,59 @@ test("catalog search spans roots and source/status filters compose", () => {
   ).toEqual(["missing"]);
 });
 
-test("all catalog view modes and settings remain in the Free feature tier", () => {
+test("group filters distinguish standalone, bundle, and ZIP-member models", () => {
+  expect(matchesLibraryGroup(model("plain"), "standalone")).toBe(true);
+  expect(matchesLibraryGroup(model("bundle", { bundle_id: "bundle-1" }), "bundle")).toBe(true);
+  expect(matchesLibraryGroup(model("zip", { source_archive_member: "parts/a.stl" }), "zip")).toBe(
+    true,
+  );
+  expect(
+    matchesLibraryGroup(model("zip", { source_archive_member: "parts/a.stl" }), "standalone"),
+  ).toBe(false);
+});
+
+test("metadata filters compose print status, designer, stable tag ID, and category", () => {
+  const tags = [
+    { id: "tag-mech", name: "Mechanical", category: "Type" },
+    { id: "tag-favorite", name: "Favorite", category: "Workflow" },
+  ];
+  const candidate = model("candidate", {
+    tags: ["Mechanical", "Favorite"],
+    metadata: {
+      designer: "Ada",
+      print_status: "queued",
+      print_count: 0,
+    },
+  });
+  expect(
+    matchesLibraryMetadataFilters(
+      candidate,
+      {
+        printStatus: "queued",
+        designer: "Ada",
+        tagId: "tag-mech",
+        category: "Workflow",
+      },
+      tags,
+    ),
+  ).toBe(true);
+  expect(
+    matchesLibraryMetadataFilters(
+      candidate,
+      { printStatus: "printed", designer: "Ada", tagId: "tag-mech", category: "Workflow" },
+      tags,
+    ),
+  ).toBe(false);
+  expect(
+    matchesLibraryMetadataFilters(
+      candidate,
+      { printStatus: "all", designer: "", tagId: "deleted-tag-id", category: "" },
+      tags,
+    ),
+  ).toBe(false);
+});
+
+test("all catalog views, settings, and metadata tools remain in the Free feature tier", () => {
   expect(LIBRARY_CATALOG_TIER).toBe("free");
   expect(LIBRARY_VIEW_MODES).toEqual(["list", "preview", "detailed"]);
 });

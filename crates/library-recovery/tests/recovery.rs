@@ -385,3 +385,542 @@ fn schema_v2_recovery_rejects_unknown_source_kind_and_out_of_range_root() {
     .unwrap();
     assert!(inspect_library(&root).is_err());
 }
+
+#[test]
+fn schema_v3_recovery_preserves_metadata_history_archive_refs_and_categories() {
+    let (tmp, root) = fixture();
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE models ADD source_kind TEXT NOT NULL DEFAULT 'managed';
+         ALTER TABLE models ADD source_path TEXT;
+         ALTER TABLE models ADD source_root_id TEXT;
+         ALTER TABLE models ADD source_missing INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE models ADD source_modified_at INTEGER;
+         ALTER TABLE models ADD source_archive_member TEXT;
+         ALTER TABLE models ADD designer TEXT;
+         ALTER TABLE models ADD source_url TEXT;
+         ALTER TABLE models ADD notes TEXT;
+         ALTER TABLE models ADD model_license TEXT;
+         ALTER TABLE models ADD print_status TEXT NOT NULL DEFAULT 'unprinted';
+         ALTER TABLE models ADD parent_model_id TEXT;
+         ALTER TABLE models ADD last_printed_at TEXT;
+         ALTER TABLE models ADD print_count INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE models ADD bundle_id TEXT;
+         ALTER TABLE tags ADD category TEXT;
+         ALTER TABLE thumbnails ADD source_content_hash TEXT;
+         CREATE TABLE index_roots(id TEXT PRIMARY KEY,path TEXT,enabled INTEGER,last_scanned_at TEXT,scan_interval_minutes INTEGER,max_file_bytes INTEGER,scan_zip INTEGER);
+         CREATE TABLE indexed_model_data(model_id TEXT PRIMARY KEY,content_hash TEXT,original_name TEXT,format TEXT,bytes INTEGER,outer_fingerprint TEXT);
+         CREATE TABLE bundles(id TEXT PRIMARY KEY,source_root_id TEXT,source_path TEXT,created_at TEXT);
+         CREATE TABLE print_attempts(id TEXT PRIMARY KEY,model_id TEXT,printed_at TEXT,quantity INTEGER,notes TEXT,outcome TEXT,created_at TEXT,updated_at TEXT);
+         CREATE TABLE print_attempt_filaments(attempt_id TEXT,filament_id TEXT,ordinal INTEGER);
+         INSERT INTO index_roots VALUES('r3','/unavailable/archive-models',1,NULL,60,52428800,1);
+         INSERT INTO bundles VALUES('bundle3','r3','pack.zip','1');
+         INSERT INTO bundles VALUES('manual3',NULL,NULL,'1');
+         INSERT INTO models (id,display_name,description,folder_id,current_revision_id,metadata_version,deleted_at,created_at,updated_at,source_kind,source_path,source_root_id,source_missing,source_modified_at,source_archive_member,print_status,print_count,bundle_id)
+           VALUES('archive-member','Gear','', 'root',NULL,1,NULL,'1','1','indexed','pack.zip','r3',0,1,'parts/gear.stl','unprinted',0,'bundle3');
+         INSERT INTO indexed_model_data VALUES('archive-member','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','gear.stl','stl-binary',84,'zipmeta:test');
+         UPDATE models SET designer='Ada',source_url='https://example.test/model',notes='preserve notes',
+            model_license='CC0',print_status='queued',last_printed_at='2026-10-10T17:00:00.000Z',
+            print_count=2,bundle_id='manual3' WHERE id='model-1';
+         UPDATE tags SET category='Prototype';
+         INSERT INTO print_attempts VALUES('attempt3','model-1','2026-10-10T17:00:00.000Z',2,'good print','printed','1','1');
+         INSERT INTO print_attempt_filaments VALUES('attempt3','PLA-blue',0);
+         PRAGMA user_version=3;"
+    ).unwrap();
+    let boundary_tag = "T".repeat(256);
+    let boundary_filament = "F".repeat(256);
+    conn.execute("UPDATE tags SET name=?1 WHERE id='tag-1'", [&boundary_tag])
+        .unwrap();
+    conn.execute(
+        "UPDATE print_attempt_filaments SET filament_id=?1 WHERE attempt_id='attempt3'",
+        [&boundary_filament],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE models SET notes=?1 WHERE id='model-1'",
+        ["line one\nline two\tindented"],
+    )
+    .unwrap();
+    drop(conn);
+    let before = fs::read(root.join("library.sqlite3")).unwrap();
+    let manifest = inspect_library(&root).unwrap();
+    assert_eq!(manifest.library_schema_version, 3);
+    let organized = manifest
+        .models
+        .iter()
+        .find(|model| model.id == "model-1")
+        .unwrap();
+    assert_eq!(
+        organized.organization.as_ref().unwrap().designer.as_deref(),
+        Some("Ada")
+    );
+    assert_eq!(
+        organized.organization.as_ref().unwrap().print_status,
+        "queued"
+    );
+    assert_eq!(organized.print_attempts[0].quantity, 2);
+    assert_eq!(
+        organized.organization.as_ref().unwrap().notes.as_deref(),
+        Some("line one\nline two\tindented")
+    );
+    assert_eq!(
+        organized.print_attempts[0].filament_ids,
+        [boundary_filament]
+    );
+    assert_eq!(manifest.tags[0].name, boundary_tag);
+    assert_eq!(manifest.tags[0].category.as_deref(), Some("Prototype"));
+    assert_eq!(manifest.bundles[0].id, "bundle3");
+    assert!(manifest.index_roots[0].scan_zip);
+    let archive_model = manifest
+        .models
+        .iter()
+        .find(|model| model.id == "archive-member")
+        .unwrap();
+    assert_eq!(
+        archive_model
+            .indexed_source
+            .as_ref()
+            .unwrap()
+            .archive_member
+            .as_deref(),
+        Some("parts/gear.stl")
+    );
+    assert_eq!(
+        archive_model
+            .indexed_source
+            .as_ref()
+            .unwrap()
+            .outer_fingerprint
+            .as_deref(),
+        Some("zipmeta:test")
+    );
+    let exported = export_library_zip(&root, &[], &tmp.path().join("v3.zip")).unwrap();
+    assert_eq!(
+        exported
+            .models
+            .iter()
+            .find(|model| model.id == "model-1")
+            .unwrap()
+            .print_attempts
+            .len(),
+        1
+    );
+    assert_eq!(fs::read(root.join("library.sqlite3")).unwrap(), before);
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE models SET parent_model_id='model-1' WHERE id='model-1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(inspect_library(&root).is_err());
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE models SET parent_model_id=NULL WHERE id='model-1'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE print_attempts SET printed_at='not-a-date',quantity=10001 WHERE id='attempt3'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(inspect_library(&root).is_err());
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute("UPDATE print_attempts SET printed_at='2026-10-10T17:00:00.000Z',quantity=2 WHERE id='attempt3'", []).unwrap();
+    conn.execute(
+        "UPDATE print_attempt_filaments SET ordinal=2 WHERE attempt_id='attempt3'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(inspect_library(&root).is_err());
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE print_attempt_filaments SET ordinal=0 WHERE attempt_id='attempt3'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE indexed_model_data SET outer_fingerprint='' WHERE model_id='archive-member'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(inspect_library(&root).is_err());
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute("UPDATE indexed_model_data SET outer_fingerprint='zipmeta:test' WHERE model_id='archive-member'", []).unwrap();
+    conn.execute(
+        "UPDATE bundles SET source_path='wrong.zip' WHERE id='bundle3'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(inspect_library(&root).is_err());
+    let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE bundles SET source_root_id=NULL,source_path=NULL WHERE id='bundle3'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(inspect_library(&root).is_ok());
+}
+
+#[test]
+fn recovery_accepts_core_created_folder_bundle_without_reading_external_sources() {
+    use library_core::{LibraryDb, ScannedModel, SourceRef};
+    let tmp = tempfile::tempdir().unwrap();
+    let library = tmp.path().join("library");
+    let source = tmp.path().join("source");
+    fs::create_dir_all(source.join("folder")).unwrap();
+    fs::write(source.join("folder/a.stl"), b"a").unwrap();
+    fs::write(source.join("folder/b.stl"), b"b").unwrap();
+    fs::write(source.join("folder/c.stl"), b"c").unwrap();
+    fs::write(source.join("folder/d.stl"), b"d").unwrap();
+    let db = LibraryDb::open(&library).unwrap();
+    let root = db.add_index_root(&source, 60, 1024).unwrap();
+    let entries = [
+        ScannedModel {
+            relative_path: "folder/a.stl".into(),
+            content_hash: "11".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+        ScannedModel {
+            relative_path: "folder/c.stl".into(),
+            content_hash: "33".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+        ScannedModel {
+            relative_path: "folder/d.stl".into(),
+            content_hash: "44".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+        ScannedModel {
+            relative_path: "folder/b.stl".into(),
+            content_hash: "22".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+    ];
+    let added = db.record_scan_entries(&root.id, &entries).unwrap();
+    let seen = entries
+        .iter()
+        .map(|entry| SourceRef {
+            relative_path: entry.relative_path.clone(),
+            archive_member: None,
+        })
+        .collect::<Vec<_>>();
+    db.complete_scan_sources_with_new_models(&root.id, &seen, &added.added_model_ids, "1")
+        .unwrap();
+    let old_bundle = db.list_models(None, None).unwrap()[0]
+        .bundle_id
+        .clone()
+        .unwrap();
+    fs::create_dir_all(source.join("split")).unwrap();
+    fs::rename(source.join("folder/c.stl"), source.join("split/c.stl")).unwrap();
+    fs::rename(source.join("folder/d.stl"), source.join("split/d.stl")).unwrap();
+    let split_entries = [
+        ScannedModel {
+            relative_path: "folder/a.stl".into(),
+            content_hash: "11".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+        ScannedModel {
+            relative_path: "folder/b.stl".into(),
+            content_hash: "22".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+        ScannedModel {
+            relative_path: "split/c.stl".into(),
+            content_hash: "33".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 2,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+        ScannedModel {
+            relative_path: "split/d.stl".into(),
+            content_hash: "44".repeat(32),
+            bytes: 1,
+            format: "stl-binary".into(),
+            modified_at: 2,
+            display_name: None,
+            archive_member: None,
+            outer_fingerprint: None,
+        },
+    ];
+    let batch = db.record_scan_entries(&root.id, &split_entries).unwrap();
+    let split_seen = split_entries
+        .iter()
+        .map(|entry| SourceRef {
+            relative_path: entry.relative_path.clone(),
+            archive_member: None,
+        })
+        .collect::<Vec<_>>();
+    db.complete_scan_sources_with_new_models(&root.id, &split_seen, &batch.added_model_ids, "2")
+        .unwrap();
+    drop(db);
+    fs::remove_dir_all(&source).unwrap();
+    let manifest = inspect_library(&library).unwrap();
+    let bundle_ids = manifest
+        .models
+        .iter()
+        .map(|model| model.organization.as_ref().unwrap().bundle_id.clone())
+        .collect::<Vec<_>>();
+    assert!(bundle_ids[0].is_some());
+    let folder_models = manifest
+        .models
+        .iter()
+        .filter(|model| {
+            model
+                .indexed_source
+                .as_ref()
+                .unwrap()
+                .relative_path
+                .starts_with("folder/")
+        })
+        .collect::<Vec<_>>();
+    let split_models = manifest
+        .models
+        .iter()
+        .filter(|model| {
+            model
+                .indexed_source
+                .as_ref()
+                .unwrap()
+                .relative_path
+                .starts_with("split/")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        folder_models[0].organization.as_ref().unwrap().bundle_id,
+        folder_models[1].organization.as_ref().unwrap().bundle_id
+    );
+    assert_eq!(
+        folder_models[0]
+            .organization
+            .as_ref()
+            .unwrap()
+            .bundle_id
+            .as_deref(),
+        Some(old_bundle.as_str())
+    );
+    assert_eq!(
+        split_models[0].organization.as_ref().unwrap().bundle_id,
+        split_models[1].organization.as_ref().unwrap().bundle_id
+    );
+    assert_ne!(
+        folder_models[0].organization.as_ref().unwrap().bundle_id,
+        split_models[0].organization.as_ref().unwrap().bundle_id
+    );
+    let bundle = manifest
+        .bundles
+        .iter()
+        .find(|bundle| bundle.id == old_bundle)
+        .unwrap();
+    assert_eq!(bundle.source_path.as_deref(), Some("folder/"));
+}
+
+#[test]
+fn recovery_accepts_core_reconciled_archive_rename_with_stable_bundle() {
+    use library_core::{LibraryDb, ScannedModel, SourceRef};
+    let tmp = tempfile::tempdir().unwrap();
+    let library = tmp.path().join("library");
+    let source = tmp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("pack.zip"), b"one").unwrap();
+    let db = LibraryDb::open(&library).unwrap();
+    let root = db.add_index_root(&source, 60, 1024).unwrap();
+    let first = ScannedModel {
+        relative_path: "pack.zip".into(),
+        content_hash: "33".repeat(32),
+        bytes: 84,
+        format: "stl-binary".into(),
+        modified_at: 1,
+        display_name: None,
+        archive_member: Some("part.stl".into()),
+        outer_fingerprint: Some("fp1".into()),
+    };
+    let added = db
+        .record_scan_entries(&root.id, std::slice::from_ref(&first))
+        .unwrap();
+    db.complete_scan_sources_with_new_models(
+        &root.id,
+        &[SourceRef {
+            relative_path: "pack.zip".into(),
+            archive_member: Some("part.stl".into()),
+        }],
+        &added.added_model_ids,
+        "1",
+    )
+    .unwrap();
+    let original = db.list_models(None, None).unwrap().pop().unwrap();
+    let bundle = original.bundle_id.clone().unwrap();
+    fs::rename(source.join("pack.zip"), source.join("renamed.zip")).unwrap();
+    let renamed = ScannedModel {
+        relative_path: "renamed.zip".into(),
+        modified_at: 2,
+        outer_fingerprint: Some("fp2".into()),
+        ..first
+    };
+    let batch = db
+        .record_scan_entries(&root.id, std::slice::from_ref(&renamed))
+        .unwrap();
+    db.complete_scan_sources_with_new_models(
+        &root.id,
+        &[SourceRef {
+            relative_path: "renamed.zip".into(),
+            archive_member: Some("part.stl".into()),
+        }],
+        &batch.added_model_ids,
+        "2",
+    )
+    .unwrap();
+    drop(db);
+    fs::remove_dir_all(&source).unwrap();
+    let manifest = inspect_library(&library).unwrap();
+    let model = manifest
+        .models
+        .iter()
+        .find(|model| model.id == original.id)
+        .unwrap();
+    assert_eq!(
+        model.organization.as_ref().unwrap().bundle_id.as_deref(),
+        Some(bundle.as_str())
+    );
+    let bundle = manifest
+        .bundles
+        .iter()
+        .find(|item| item.id == bundle)
+        .unwrap();
+    assert_eq!(bundle.source_path.as_deref(), Some("renamed.zip"));
+}
+
+#[test]
+fn recovery_accepts_partial_archive_move_with_missing_old_member_and_split_bundles() {
+    use library_core::{LibraryDb, ScannedModel, SourceRef};
+    let tmp = tempfile::tempdir().unwrap();
+    let library = tmp.path().join("library");
+    let source = tmp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("old.zip"), b"old").unwrap();
+    fs::write(source.join("new.zip"), b"new").unwrap();
+    let db = LibraryDb::open(&library).unwrap();
+    let root = db.add_index_root(&source, 60, 1024).unwrap();
+    let old = [
+        ScannedModel {
+            relative_path: "old.zip".into(),
+            content_hash: "55".repeat(32),
+            bytes: 84,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: Some("a.stl".into()),
+            outer_fingerprint: Some("oldfp".into()),
+        },
+        ScannedModel {
+            relative_path: "old.zip".into(),
+            content_hash: "66".repeat(32),
+            bytes: 84,
+            format: "stl-binary".into(),
+            modified_at: 1,
+            display_name: None,
+            archive_member: Some("b.stl".into()),
+            outer_fingerprint: Some("oldfp".into()),
+        },
+    ];
+    let added = db.record_scan_entries(&root.id, &old).unwrap();
+    let seen = old
+        .iter()
+        .map(|entry| SourceRef {
+            relative_path: entry.relative_path.clone(),
+            archive_member: entry.archive_member.clone(),
+        })
+        .collect::<Vec<_>>();
+    db.complete_scan_sources_with_new_models(&root.id, &seen, &added.added_model_ids, "1")
+        .unwrap();
+    let before = db.list_models(None, None).unwrap();
+    let a = before
+        .iter()
+        .find(|m| m.source_archive_member.as_deref() == Some("a.stl"))
+        .unwrap();
+    let b = before
+        .iter()
+        .find(|m| m.source_archive_member.as_deref() == Some("b.stl"))
+        .unwrap();
+    let a_id = a.id.clone();
+    let b_id = b.id.clone();
+    let old_bundle = b.bundle_id.clone().unwrap();
+    let moved = ScannedModel {
+        relative_path: "new.zip".into(),
+        content_hash: "55".repeat(32),
+        bytes: 84,
+        format: "stl-binary".into(),
+        modified_at: 2,
+        display_name: None,
+        archive_member: Some("a.stl".into()),
+        outer_fingerprint: Some("newfp".into()),
+    };
+    let batch = db
+        .record_scan_entries(&root.id, std::slice::from_ref(&moved))
+        .unwrap();
+    db.complete_scan_sources_with_new_models(
+        &root.id,
+        &[SourceRef {
+            relative_path: "new.zip".into(),
+            archive_member: Some("a.stl".into()),
+        }],
+        &batch.added_model_ids,
+        "2",
+    )
+    .unwrap();
+    drop(db);
+    fs::remove_dir_all(&source).unwrap();
+    let manifest = inspect_library(&library).unwrap();
+    let a = manifest.models.iter().find(|m| m.id == a_id).unwrap();
+    let b = manifest.models.iter().find(|m| m.id == b_id).unwrap();
+    assert_ne!(
+        a.organization.as_ref().unwrap().bundle_id.as_deref(),
+        Some(old_bundle.as_str())
+    );
+    assert_eq!(
+        b.organization.as_ref().unwrap().bundle_id.as_deref(),
+        Some(old_bundle.as_str())
+    );
+    assert!(b.indexed_source.as_ref().unwrap().missing);
+    let exported = export_library_zip(&library, &[], &tmp.path().join("partial.zip")).unwrap();
+    assert_eq!(exported.models.len(), 2);
+}

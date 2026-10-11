@@ -33,6 +33,20 @@ import {
   libraryStartThumbnailJob,
   libraryGetCatalogSettings,
   librarySetCatalogSettings,
+  libraryListTags,
+  libraryCreateTag,
+  libraryUpdateTag,
+  libraryDeleteTag,
+  libraryUpdateModelMetadata,
+  libraryUpdateModelsMetadata,
+  libraryCreatePrintAttempt,
+  libraryListPrintAttempts,
+  libraryUpdatePrintAttempt,
+  libraryDeletePrintAttempt,
+  libraryCreateBundle,
+  libraryCreateFolder,
+  libraryRenameFolder,
+  libraryDeleteFolder,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -113,6 +127,20 @@ export function startApp(extensions: AppExtensions): void {
     startThumbnailJob: libraryStartThumbnailJob,
     getCatalogSettings: libraryGetCatalogSettings,
     setCatalogSettings: librarySetCatalogSettings,
+    listTags: libraryListTags,
+    createTag: libraryCreateTag,
+    updateTag: libraryUpdateTag,
+    deleteTag: libraryDeleteTag,
+    updateModelMetadata: libraryUpdateModelMetadata,
+    updateModelsMetadata: libraryUpdateModelsMetadata,
+    createPrintAttempt: libraryCreatePrintAttempt,
+    listPrintAttempts: libraryListPrintAttempts,
+    updatePrintAttempt: libraryUpdatePrintAttempt,
+    deletePrintAttempt: libraryDeletePrintAttempt,
+    createBundle: libraryCreateBundle,
+    createFolder: libraryCreateFolder,
+    renameFolder: libraryRenameFolder,
+    deleteFolder: libraryDeleteFolder,
   };
   let activeEntitlements = withCoreEntitlements(extensions.currentEntitlements?.());
   const main = document.createElement("div");
@@ -872,11 +900,12 @@ export function startApp(extensions: AppExtensions): void {
     };
     activeLibraryRefresh = request;
     try {
-      const [folders, models, roots, catalogSettings] = await Promise.all([
+      const [folders, models, roots, catalogSettings, tags] = await Promise.all([
         libraryService.listFolders(),
         libraryService.listModels(),
         libraryService.listRoots(),
         libraryService.getCatalogSettings(),
+        libraryService.listTags(),
       ]);
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
@@ -885,7 +914,7 @@ export function startApp(extensions: AppExtensions): void {
       ) {
         return;
       }
-      libraryPanel.render(folders, models, roots, catalogSettings);
+      libraryPanel.render(folders, models, roots, catalogSettings, tags);
       if (libraryOperations.isCurrent(owner)) {
         libraryPanel.setStatus(
           "Managed copies are stored locally and survive source-file changes.",
@@ -990,6 +1019,56 @@ export function startApp(extensions: AppExtensions): void {
     libraryPanel.clearThumbnailCache();
     await refreshLibrary();
     return saved;
+  };
+  libraryPanel.onSaveMetadata = async (targets, patch) => {
+    if (targets.length === 1) {
+      const target = targets[0];
+      await libraryService.updateModelMetadata(target.model_id, target.expected_version, patch);
+    } else {
+      await libraryService.updateModelsMetadata(targets, patch);
+    }
+    await refreshLibrary();
+  };
+  libraryPanel.onCreateTag = async (name, category) => {
+    await libraryService.createTag(name, category);
+    await refreshLibrary();
+  };
+  libraryPanel.onUpdateTag = async (id, name, category) => {
+    await libraryService.updateTag(id, name, category);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeleteTag = async (id) => {
+    await libraryService.deleteTag(id);
+    await refreshLibrary();
+  };
+  libraryPanel.onListPrintAttempts = libraryService.listPrintAttempts;
+  libraryPanel.onCreatePrintAttempt = async (modelId, input) => {
+    await libraryService.createPrintAttempt(modelId, input);
+    await refreshLibrary();
+  };
+  libraryPanel.onUpdatePrintAttempt = async (attemptId, input) => {
+    await libraryService.updatePrintAttempt(attemptId, input);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeletePrintAttempt = async (attemptId) => {
+    await libraryService.deletePrintAttempt(attemptId);
+    await refreshLibrary();
+  };
+  libraryPanel.onCreateBundle = async (modelIds) => {
+    await libraryService.createBundle(modelIds);
+    await refreshLibrary();
+  };
+  libraryPanel.onCreateCollection = async (name) => {
+    await libraryService.createFolder(name);
+    await refreshLibrary();
+  };
+  libraryPanel.onRenameCollection = async (id, name) => {
+    await libraryService.renameFolder(id, name);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeleteCollection = async (id) => {
+    await libraryService.deleteFolder(id);
+    await refreshLibrary();
   };
 
   const unsubscribeEntitlements =
