@@ -1,6 +1,6 @@
 # Phase 6: Free headless, browser, MCP and capture
 Date: 2026-10-11
-Status: shared runtime and authenticated catalog/capture HTTP, MCP and browser slices locally verified; remaining scan, geometry, management and integration transports are in progress.
+Status: shared runtime, authenticated browser, scan, geometry, gallery, management, and HTTP/MCP catalog slices are implemented and verified locally. Phase 6 remains open: approved network transport and physical-source actions await the owner's explicit answers; compatibility gaps and final release gates remain.
 All implementation is public MPL-2.0 Community with no license requirement.
 
 ## Pinned primary baseline
@@ -232,3 +232,44 @@ Bun audit reports no known vulnerabilities. Native cargo-audit/cargo-deny are un
 ### Linux container checkpoint evidence
 
 The current local public image builds successfully on Linux ARM64, includes public license/dependency notices and uses a correct /api/v1/health probe. Synthetic fixture checks verify authentication (401 without key), UID10001, read-only source/secret mounts, identical catalog responses after restart, and retained source hashes. The image is local only; no push or live catalog mount occurred. This validates the current connected slice, with a final rebuild required after remaining feature families land.
+
+### Catalog, geometry and recovery continuation (2026-10-11)
+
+Live loopback fixture evidence (disposable data only):
+
+- 157 original source files were visited; ZIP members brought indexed entries to 158. All original hashes remained unchanged. The catalog has 162 records including managed fixtures and two capture bookmarks.
+- Thumbnail rendering completed for all 158 indexed entries without scan errors. Evidence: `output/phase6-fixture/scan-catalog-checks.json`.
+- Browser Load more retained all 162 records across quiet event reconnects. Saving metadata now also retains the same page count; the observed first-page reset was fixed and retested.
+- Authored 3MF materials rendered as two red/blue cubes in the actual public Three.js viewport. Screenshot: `output/phase6-authored-3mf-viewer.png`. The fixture has no plate metadata, so its whole-build notice is expected; this does not verify multi-plate rendering.
+- A 33-member bundle preview explicitly shows 32 members. Browser ZIP download contains all 33 members, each matching original STL bytes. Evidence: `output/phase6-fixture/browser-bundle-33.zip`.
+- Embedded metadata proposals start unchecked. Explicitly selecting designer, notes, and license applies those fields and preserves source bytes.
+- Opaque operator root IDs work for manual scans. Standalone startup scheduling is now connected and capability-gated.
+- Print batch HTTP replay returns identical receipt IDs, changed payload under the same key fails with 409, and persisted history has no duplicates. Browser logging applies to exactly the selected two models and retains 162 loaded records. Evidence: `output/phase6-fixture/live-catalog-bundle-checks.json`.
+
+Current management gates include consistent backup/export, staged restore with canonical operator mappings, one-use principal-bound plans, and recoverable catalog removal. Parent review identified restore-input fingerprint binding and post-admission epoch/revision rechecks; fixes and focused regressions must pass before that slice is checkpointed.
+
+Automatic approval review rejected proposed physical-source mutation code because broad parity authorization was judged insufficient for original-file changes. An explicit user question covers implementing recoverable trash/undo, guarded moves, purge with backup, and orphan cleanup, testing only disposable fixtures. Until answered, these variants remain unsupported. No personal model source was changed.
+
+A proposed direct AI/Spoolman extraction was also rejected over potential credential/metadata egress during development. The implementation now uses an injectable transport and mock tests, with no real provider calls. Production transport wiring still needs its full settings, privacy, principal/epoch, and user-action gates verified.
+
+Phase 6 remains in progress. These checks do not constitute a full parity or release claim; final integration, all-feature transport/browser checks, refreshed Linux image, Community/unified app builds, installation, and independent review remain required.
+
+### Verification refresh (2026-10-12)
+
+- Full public workspace tests pass after schema6. Relevant slices include Core **48/48**, backup **4/4**, recovery **17/17**, runtime **59/59**, server **23/23**, and server CLI **2/2**; historical ignored tests remain.
+- After the last MCP capability change, the complete server package again passes **23 library tests + 2 CLI tests**. Its support predicate now hides AI generation and Spoolman sync while the injected server transport is disabled; Spoolman configuration writes require CatalogWrite.
+- Strict Clippy passes for the changed Core, protocol, runtime, server, recovery and backup crates. The latest complete frontend checks pass with **131 tests / 389 assertions**.
+- The browser production build passes; Vite reports the lazy 3D viewport bundle at 558 kB minified. This is a known build warning, not a test failure.
+- Fresh regressions cover source directory prefix filtering before keyset pagination, the per-request 256 MiB source-verification budget, mock integration credential privacy/principal binding, and capability-aware MCP advertising.
+- The latest standalone server builds and the synthetic fixture browser connects successfully. The earlier full source-hash and 33-member ZIP checks remain documented above.
+- Schema6 stores 0–5 star ratings and favorites, filters them before pagination, and keeps old recovery JSON compatible. Schema5 upgrades take a sidecar SQLite backup first. The schema6 recovery manifest roundtrip was added and its focused check passed.
+- The complete frontend gate is **131 tests / 389 assertions**, including the native metadata editor's rating/favorite payload behavior. The final browser and Docker bundles also include schema6 rating/favorite support.
+
+The user said to continue after explicit approval was requested for two scopes, but did not answer either approval question: network-enabled AI/Spoolman requests, and physical-source quarantine/moves/purge/cleanup on disposable fixtures. Those actions remain off or unsupported. The final local Docker image has rebuilt and passed its synthetic localhost checks. The last installable app is still the Phase 5 build; Community/unified desktop build/install/launch, remaining parity inventory closure, and independent release review remain.
+
+### Current parity verification (2026-10-12)
+- The full workspace test run now includes schema6 and recovery changes: Core 48, backup 4, recovery 17, runtime 59, server 23, server CLI 2, desktop/native 132 (one ignored), and all other workspace test groups pass. Strict owned-crate Clippy is clean.
+- The frontend check passes with 131 tests / 389 assertions. Desktop and browser web asset builds pass; the lazy 3D viewport bundle remains 557.81 kB minified.
+- The schema6 migration backs up schema5 SQLite to library.sqlite3.schema-v5.backup before adding rating and favorite columns. Existing recovery manifests without those fields deserialize with 0 and false defaults; new exports and raw backups preserve both values.
+- Browser behavior was exercised against the final schema6 Docker image: load 158 fixture models, set one model to 5 stars and Favorite, restart the service, then filter to exactly that persisted model. Authenticated MCP initializes and lists 59 tools; settings remain visible while network Generate/Spoolman Pull tools stay absent because the configured transport is disabled. The container runs as 10001 with a read-only root, mounted read-only sources/secrets, loopback-only port 60389, and a separate catalog volume. All 157 original fixture file hashes still match.
+Release gates remain: the explicit physical-source and opt-in provider-network questions are unanswered; some remaining parity inventory is not implemented; the unified Community desktop hasn't been rebuilt, installed or launched after these changes; cross-platform native validation and independent release review remain outstanding. Phase6 and subsequent local release work are still active.

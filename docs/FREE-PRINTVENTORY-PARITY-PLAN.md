@@ -33,6 +33,7 @@ Current GoggleLab baseline was checked against Community README, architecture, e
 | Thumbnail catalog, regeneration/purge, sorting and global search | 2 | Persistent thumbnails; sort by name/size/date; search and filters work across roots |
 | Tags/categories, designer, notes, source URLs, model license | 3 | Editable persistent fields; CRUD/filtering and tag management; accessible keyboard workflow |
 | Batch selection and metadata editing | 3 | Select visible/all-filtered scope is explicit; operation affects exactly selected models |
+| Star ratings (0–5) and favorites | 3 | Rating/favorite persist across restarts and backup/restore; global filtering and individual/batch editing work |
 | Print status and reprint history | 3 | Unprinted/Want/Queued/Printing/Printed/Failed; dated print records/notes; last/ever printed filters |
 | Parent/child relationships; folder and ZIP bundle grouping | 3 | Related parts remain grouped; relationships survive restart and source reconciliation |
 | Content-hash duplicate review and safe cleanup | 4 | Exact duplicates shown with previews; cleanup confirmed/recoverable; originals outside selected scope untouched |
@@ -203,4 +204,4 @@ The user explicitly approved moving the existing private library and slicer-hand
 
 ### Phase6 implementation checkpoint scope
 
-Shared protocol/runtime, schema5 gallery/capture recovery, authenticated HTTP/MCP mutations, browser metadata/filaments/history and MV3 capture are built and locally verified. Optional server settings remain off by default. Headless source roots stay operator-controlled and read-only unless explicitly granted. See [Phase6 contract](PHASE-6-SERVER-MCP-CAPTURE.md) and [installation guide](SERVER-INSTALL.md). Scans/jobs, viewer/bundle downloads, management/backup/restore, AI/Spoolman and 3MF transports still require completion and their gates; full Phase6 and final app installation are not claimed yet.
+Shared runtime, authenticated HTTP/MCP, headless scans and thumbnails, geometry/3MF, bundle downloads, browser management, backups/restores, ratings/favorites, and the MV3 capture inbox are locally built and verified. Schema6 adds rating/favorite defaults with a migration backup. See the [Phase6 contract](PHASE-6-SERVER-MCP-CAPTURE.md) and [installation guide](SERVER-INSTALL.md). Final parity and app installation are not yet claimed: physical-source trash/move/purge/cleanup and enabling AI/Spoolman network calls await the owner’s explicit answers; release builds, the final Docker rebuild, and independent review remain.
