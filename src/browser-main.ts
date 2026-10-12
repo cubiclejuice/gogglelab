@@ -730,11 +730,11 @@ async function showManagement(): Promise<void> {
   );
   document.body.append(dialog);
   dialog.showModal();
-  const roots = await client.rootSettings();
-  const handles = roots.filter((root) => root.access !== "readOnly");
+  const roots = await client.listRoots();
+  const handles = roots.filter((root) => root.access === "backupOnly" || root.access === "writable");
   const handle = document.createElement("select");
   handle.setAttribute("aria-label", "Operator storage handle");
-  for (const root of handles) handle.add(new Option(root.label, root.handleId));
+  for (const root of handles) handle.add(new Option(root.label, root.id));
   const fileName = document.createElement("input");
   fileName.value = "gogglelab-backup.zip";
   fileName.setAttribute("aria-label", "Backup or export filename");
@@ -742,7 +742,11 @@ async function showManagement(): Promise<void> {
   snapshot.placeholder = "Removal snapshot ID";
   const backupRoot = document.createElement("input");
   backupRoot.placeholder = "Backup catalog root ID";
-  const mappingHandle = handle.cloneNode(true) as HTMLSelectElement;
+  const mappingHandle = document.createElement("select");
+  mappingHandle.setAttribute("aria-label", "Writable restore target");
+  for (const root of roots.filter((root) => root.access === "writable")) {
+    mappingHandle.add(new Option(root.label, root.id));
+  }
   const targets = () => browserSelectionTargets(selectedModels.values());
   const plan = async (action: import("./lib/library-client").ManagementAction) => {
     message.textContent = "Planning…";
@@ -845,7 +849,7 @@ async function showManagement(): Promise<void> {
     const writable = roots.filter((root) => root.access === "writable");
     if (physical && writable.length) {
       const physicalHandle = document.createElement("select");
-      for (const root of writable) physicalHandle.add(new Option(root.label, root.handleId));
+      for (const root of writable) physicalHandle.add(new Option(root.label, root.id));
       const physicalName = document.createElement("input");
       physicalName.value = selected[0].displayName;
       controls.append(

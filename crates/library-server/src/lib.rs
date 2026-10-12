@@ -2468,9 +2468,10 @@ impl<
         if name == "backup_database" {
             return connected
                 && context.capabilities.contains(&Capability::Maintenance)
-                && context
-                    .capabilities
-                    .contains(&Capability::PhysicalSourceWrite);
+                && (context.capabilities.contains(&Capability::BackupWrite)
+                    || context
+                        .capabilities
+                        .contains(&Capability::PhysicalSourceWrite));
         }
         if matches!(name, "plan_management_action" | "execute_management_action") {
             return connected

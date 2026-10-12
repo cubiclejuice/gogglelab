@@ -263,7 +263,7 @@ export interface BrowserRootHandle {
   id: string;
   catalogRootId: string | null;
   label: string;
-  access: "readOnly" | "writable" | "inbox";
+  access: "readOnly" | "writable" | "backupOnly" | "inbox";
 }
 export interface BrowserScanStatus {
   running: boolean;
@@ -320,7 +320,7 @@ export interface IndexRootSettings {
   handleId: string;
   catalogRootId: string | null;
   label: string;
-  access: "readOnly" | "writable" | "inbox";
+  access: "readOnly" | "writable" | "backupOnly" | "inbox";
   enabled: boolean;
   lastScannedAt: string | null;
   scanIntervalMinutes: number;

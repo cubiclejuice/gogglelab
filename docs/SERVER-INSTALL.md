@@ -32,6 +32,22 @@ Create an operator-owned configuration directory outside the catalog. Use absolu
 
 Replace every example path with a real, deliberately selected directory. The configured model root is read-only by default; importing and catalog edits use the owned library. No browser or MCP request can expand the root allowlist.
 
+### Optional backup-only destination
+
+To enable consistent backups and selected exports over the browser/MCP API, create a dedicated directory outside the library and model roots, then add it as a `backupOnly` root and grant `backupWrite` alongside `maintenance`:
+
+```json
+{
+  "allowedRoots": [
+    {"id":"models","label":"Models","path":"/srv/models","access":"readOnly"},
+    {"id":"backups","label":"Backups","path":"/srv/gogglelab/backups","access":"backupOnly"}
+  ],
+  "capabilities": ["catalogRead","mediaRead","maintenance","backupWrite"]
+}
+```
+
+The backup directory must already exist and be writable by the service account. Mount it as a separate writable volume for Docker/NAS. The `backupOnly` handle supports new backup/export files and can be read as a restore source; it cannot be used for trash, moves, purge, indexing or model-source writes. Restoring mapped model roots still requires the separate writable-root capability. Backup/export operations use one-use plans and refuse to overwrite existing filenames.
+
 Start with an absolute config path:
 
 ```sh

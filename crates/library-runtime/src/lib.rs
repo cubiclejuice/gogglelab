@@ -585,21 +585,27 @@ impl LibraryRuntime {
         root_id: &str,
         required: RootAccess,
     ) -> Result<PathBuf, RuntimeError> {
-        let capability = match required {
-            RootAccess::ReadOnly | RootAccess::Inbox => Capability::CatalogRead,
-            RootAccess::Writable => Capability::PhysicalSourceWrite,
-        };
-        self.require(context, capability)?;
-        self.roots
+        let root = self
+            .roots
             .iter()
             .find(|root| root.handle.id == root_id && access_allows(root.handle.access, required))
-            .map(|root| root.path.clone())
             .ok_or_else(|| RuntimeError {
                 code: RuntimeErrorCode::Forbidden,
                 message: "Root handle is not admitted for this operation".into(),
                 retryable: false,
                 current_version: None,
-            })
+            })?;
+        match required {
+            RootAccess::ReadOnly | RootAccess::Inbox => {
+                self.require(context, Capability::CatalogRead)?;
+            }
+            RootAccess::Writable => self.require(context, Capability::PhysicalSourceWrite)?,
+            RootAccess::BackupOnly if root.handle.access == RootAccess::Writable => {
+                self.require(context, Capability::PhysicalSourceWrite)?;
+            }
+            RootAccess::BackupOnly => self.require_backup_write(context)?,
+        }
+        Ok(root.path.clone())
     }
 
     pub(crate) fn validate_scan_root(
@@ -732,6 +738,25 @@ impl LibraryRuntime {
             });
         }
         Ok(())
+    }
+
+    fn require_backup_write(&self, context: &RequestContext) -> Result<(), RuntimeError> {
+        let allowed = [Capability::BackupWrite, Capability::PhysicalSourceWrite]
+            .into_iter()
+            .any(|capability| {
+                self.capabilities.contains(&capability)
+                    && context.capabilities.contains(&capability)
+            });
+        if allowed {
+            Ok(())
+        } else {
+            Err(RuntimeError {
+                code: RuntimeErrorCode::Forbidden,
+                message: "Principal lacks backup write capability".into(),
+                retryable: false,
+                current_version: None,
+            })
+        }
     }
 
     fn require_upload_write(&self, context: &RequestContext) -> Result<(), RuntimeError> {
@@ -3162,11 +3187,19 @@ fn map_operator_catalog_roots(
     roots: &mut [AdmittedRoot],
     allow_create: bool,
 ) -> Result<(), RuntimeError> {
-    let mut catalog_roots = db.list_index_roots().map_err(runtime_library_error)?;
-    for root in roots
-        .iter_mut()
-        .filter(|root| root.handle.access != RootAccess::Inbox)
+    if roots
+        .iter()
+        .any(|root| root.handle.access == RootAccess::BackupOnly && root.catalog_root_id.is_some())
     {
+        return Err(invalid("Backup-only roots cannot map to catalog roots"));
+    }
+    let mut catalog_roots = db.list_index_roots().map_err(runtime_library_error)?;
+    for root in roots.iter_mut().filter(|root| {
+        !matches!(
+            root.handle.access,
+            RootAccess::Inbox | RootAccess::BackupOnly
+        )
+    }) {
         let mapped = if let Some(catalog_root_id) = root.catalog_root_id.as_deref() {
             catalog_roots
                 .iter()
@@ -3223,7 +3256,7 @@ fn validate_management_action(
             ..
         } => {
             validate_output_name(file_name)?;
-            runtime.admitted_root_path(context, destination_handle_id, RootAccess::Writable)?;
+            runtime.admitted_root_path(context, destination_handle_id, RootAccess::BackupOnly)?;
         }
         ManagementAction::RestoreBackup {
             source_handle_id,
@@ -3285,7 +3318,7 @@ fn validate_management_action(
             runtime.admitted_root_path(
                 context,
                 backup_destination_handle_id,
-                RootAccess::Writable,
+                RootAccess::BackupOnly,
             )?;
         }
         ManagementAction::CleanupOrphans => {}
@@ -3500,13 +3533,13 @@ fn execute_backup(
     expected_revision: u64,
 ) -> Result<ManagementResult, RuntimeError> {
     runtime.require(context, Capability::Maintenance)?;
-    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    runtime.require_backup_write(context)?;
     runtime.read_db(|_| Ok(()))?;
     let (_, destination) = admitted_file(
         runtime,
         context,
         handle_id,
-        RootAccess::Writable,
+        RootAccess::BackupOnly,
         file_name,
         false,
     )?;
@@ -3538,12 +3571,12 @@ fn execute_selection_export(
     expected_revision: u64,
 ) -> Result<ManagementResult, RuntimeError> {
     runtime.require(context, Capability::Maintenance)?;
-    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    runtime.require_backup_write(context)?;
     let (_, destination) = admitted_file(
         runtime,
         context,
         handle_id,
-        RootAccess::Writable,
+        RootAccess::BackupOnly,
         file_name,
         false,
     )?;
@@ -3720,7 +3753,10 @@ fn execute_restore(
 }
 
 fn access_allows(actual: RootAccess, required: RootAccess) -> bool {
-    actual == required || (actual == RootAccess::Writable && required == RootAccess::ReadOnly)
+    actual == required
+        || (actual == RootAccess::Writable
+            && matches!(required, RootAccess::ReadOnly | RootAccess::BackupOnly))
+        || (actual == RootAccess::BackupOnly && required == RootAccess::ReadOnly)
 }
 
 fn validate_plain_id(value: &str, label: &str) -> Result<(), RuntimeError> {
@@ -4666,6 +4702,124 @@ mod tests {
                 .unwrap(),
             source.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn backup_only_root_allows_backup_access_without_physical_source_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let backup = temp.path().join("backups");
+        fs::create_dir(&backup).unwrap();
+        let mut config = config(library);
+        config.local_catalog_root_access = false;
+        config.capabilities = BTreeSet::from([
+            Capability::CatalogRead,
+            serde_json::from_value(serde_json::json!("backupWrite")).unwrap(),
+        ]);
+        config.roots.push(RuntimeRootPolicy {
+            id: "backups".into(),
+            catalog_root_id: None,
+            label: "Backups".into(),
+            path: backup.clone(),
+            access: serde_json::from_value(serde_json::json!("backupOnly")).unwrap(),
+        });
+        let runtime = LibraryRuntime::open(config).unwrap();
+        let context = RequestContext {
+            principal_id: "backup-operator".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                serde_json::from_value(serde_json::json!("backupWrite")).unwrap(),
+            ]),
+            request_id: "backup-access".into(),
+        };
+
+        assert!(runtime
+            .root_handles(&context)
+            .unwrap()
+            .iter()
+            .all(|root| root.catalog_root_id.is_none()));
+        let admitted = runtime
+            .admitted_root_path(
+                &context,
+                "backups",
+                serde_json::from_value(serde_json::json!("backupOnly")).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(admitted, backup.canonicalize().unwrap());
+        assert_eq!(
+            runtime
+                .admitted_root_path(&context, "backups", RootAccess::ReadOnly)
+                .unwrap(),
+            backup.canonicalize().unwrap()
+        );
+        assert_eq!(
+            runtime
+                .admitted_root_path(&context, "backups", RootAccess::Writable)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+        assert!(!context
+            .capabilities
+            .contains(&Capability::PhysicalSourceWrite));
+    }
+
+    #[test]
+    fn backup_write_does_not_grant_backup_access_to_a_writable_source_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let mut config = config(library);
+        config.local_catalog_root_access = false;
+        config.capabilities = BTreeSet::from([Capability::CatalogRead, Capability::BackupWrite]);
+        config.roots.push(RuntimeRootPolicy {
+            id: "source".into(),
+            catalog_root_id: None,
+            label: "Writable source".into(),
+            path: source,
+            access: RootAccess::Writable,
+        });
+        let runtime = LibraryRuntime::open(config).unwrap();
+        let context = RequestContext {
+            principal_id: "backup-only".into(),
+            capabilities: BTreeSet::from([Capability::CatalogRead, Capability::BackupWrite]),
+            request_id: "source-root-denied".into(),
+        };
+
+        assert_eq!(
+            runtime
+                .admitted_root_path(&context, "source", RootAccess::BackupOnly)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+        assert_eq!(
+            runtime
+                .admitted_root_path(&context, "source", RootAccess::Writable)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+    }
+
+    #[test]
+    fn backup_only_root_cannot_map_to_an_indexed_catalog_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join("backups");
+        fs::create_dir(&backup).unwrap();
+        let mut config = config(temp.path().join("library"));
+        config.local_catalog_root_access = false;
+        config.capabilities = BTreeSet::from([Capability::CatalogRead, Capability::BackupWrite]);
+        config.roots.push(RuntimeRootPolicy {
+            id: "backups".into(),
+            catalog_root_id: Some("catalog-root".into()),
+            label: "Backups".into(),
+            path: backup,
+            access: RootAccess::BackupOnly,
+        });
+
+        assert!(LibraryRuntime::open(config).is_err());
     }
 
     #[test]
@@ -5671,6 +5825,81 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn backup_only_root_supports_backup_and_export_without_source_write_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let backups = temp.path().join("backups");
+        fs::create_dir(&backups).unwrap();
+        let mut runtime_config = config(library);
+        runtime_config.local_catalog_root_access = false;
+        runtime_config.capabilities = BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::Maintenance,
+            serde_json::from_value(serde_json::json!("backupWrite")).unwrap(),
+        ]);
+        runtime_config.roots.push(RuntimeRootPolicy {
+            id: "backups".into(),
+            catalog_root_id: None,
+            label: "Backups".into(),
+            path: backups.clone(),
+            access: serde_json::from_value(serde_json::json!("backupOnly")).unwrap(),
+        });
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.create_model("Backup-only model", None))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "backup-only".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::Maintenance,
+                serde_json::from_value(serde_json::json!("backupWrite")).unwrap(),
+            ]),
+            request_id: "backup-only-plan".into(),
+        };
+
+        let backup = runtime
+            .plan_action(
+                &context,
+                ManagementAction::CreateBackup {
+                    destination_handle_id: "backups".into(),
+                    file_name: "catalog.zip".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.execute_action(&context, &backup.token).unwrap(),
+            ManagementResult::BackupCreated { .. }
+        ));
+        assert!(backups.join("catalog.zip").is_file());
+
+        let export = runtime
+            .plan_action(
+                &context,
+                ManagementAction::ExportSelection {
+                    targets: vec![VersionedTarget {
+                        model_id: model.id,
+                        expected_version: model.metadata_version,
+                    }],
+                    destination_handle_id: "backups".into(),
+                    file_name: "selection.zip".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.execute_action(&context, &export.token).unwrap(),
+            ManagementResult::SelectionExported { models: 1, .. }
+        ));
+        assert!(backups.join("selection.zip").is_file());
+        assert!(!context
+            .capabilities
+            .contains(&Capability::PhysicalSourceWrite));
+        assert!(runtime
+            .admitted_root_path(&context, "backups", RootAccess::Writable)
+            .is_err());
     }
 
     #[test]

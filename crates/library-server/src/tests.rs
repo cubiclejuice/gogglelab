@@ -1590,6 +1590,15 @@ async fn protocol_adapter_pages_the_real_runtime_without_paths() {
         request_id: "maintenance-write".into(),
     };
     assert!(adapter.supports_tool(&maintenance_writer, "backup_database"));
+    let backup_only_writer = RequestContext {
+        principal_id: "backup-only-writer".into(),
+        capabilities: BTreeSet::from([Capability::Maintenance, Capability::BackupWrite]),
+        request_id: "backup-only-write".into(),
+    };
+    assert!(!backup_only_writer
+        .capabilities
+        .contains(&Capability::PhysicalSourceWrite));
+    assert!(adapter.supports_tool(&backup_only_writer, "backup_database"));
     assert!(adapter.supports_tool(&integration_writer, "integration_save_spoolman_config"));
     assert!(!adapter.supports_tool(&integration_writer, "sync_spoolman_filaments"));
     assert!(!adapter.supports_tool(&integration_writer, "generate_tags"));

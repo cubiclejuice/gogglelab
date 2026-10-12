@@ -18,6 +18,7 @@ pub enum Capability {
     Integration,
     Maintenance,
     PhysicalSourceWrite,
+    BackupWrite,
     HostPaths,
     HostSlicer,
 }
@@ -92,6 +93,7 @@ pub struct Page<T> {
 pub enum RootAccess {
     ReadOnly,
     Writable,
+    BackupOnly,
     Inbox,
 }
 
