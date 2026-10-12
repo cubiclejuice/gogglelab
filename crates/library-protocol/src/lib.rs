@@ -931,6 +931,34 @@ pub trait MetadataEngine: Send + Sync {
 
 pub trait TagEngine: Send + Sync {
     fn list_tags(&self, context: &RequestContext) -> Result<Vec<Tag>, RuntimeError>;
+    fn add_model_tags_by_name(
+        &self,
+        context: &RequestContext,
+        target: VersionedTarget,
+        names: Vec<String>,
+    ) -> Result<MutationVersion, RuntimeError> {
+        let _ = (context, target, names);
+        Err(RuntimeError {
+            code: RuntimeErrorCode::Unsupported,
+            message: "Model tag assignment is not supported by this host".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
+    fn remove_model_tags_by_name(
+        &self,
+        context: &RequestContext,
+        target: VersionedTarget,
+        names: Vec<String>,
+    ) -> Result<MutationVersion, RuntimeError> {
+        let _ = (context, target, names);
+        Err(RuntimeError {
+            code: RuntimeErrorCode::Unsupported,
+            message: "Model tag assignment is not supported by this host".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
     fn create_tag(
         &self,
         context: &RequestContext,

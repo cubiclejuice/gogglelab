@@ -2505,6 +2505,82 @@ impl LibraryDb {
         Ok(())
     }
 
+    pub fn add_model_tags_by_name(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        names: &[String],
+    ) -> Result<Model, LibraryError> {
+        let names = clean_model_tag_names(names)?;
+        let tx = self.conn.unchecked_transaction()?;
+        validate_active_model_version(&tx, model_id, expected_version)?;
+        let mut changed = false;
+        for name in names {
+            let tag_id = tx
+                .query_row("SELECT id FROM tags WHERE name=?1", params![name], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?;
+            let tag_id = if let Some(id) = tag_id {
+                id
+            } else {
+                let id = new_id("tag");
+                tx.execute(
+                    "INSERT INTO tags(id,name,category) VALUES(?1,?2,NULL)",
+                    params![id, name],
+                )?;
+                id
+            };
+            changed |= tx.execute(
+                "INSERT OR IGNORE INTO model_tags(model_id,tag_id) VALUES(?1,?2)",
+                params![model_id, tag_id],
+            )? > 0;
+        }
+        if changed {
+            tx.execute(
+                "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+                params![timestamp(), model_id],
+            )?;
+        }
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    pub fn remove_model_tags_by_name(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        names: &[String],
+    ) -> Result<Model, LibraryError> {
+        let names = clean_model_tag_names(names)?;
+        let tx = self.conn.unchecked_transaction()?;
+        validate_active_model_version(&tx, model_id, expected_version)?;
+        let mut changed = false;
+        for name in names {
+            let tag_id = tx
+                .query_row("SELECT id FROM tags WHERE name=?1", params![name], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?;
+            if let Some(tag_id) = tag_id {
+                changed |= tx.execute(
+                    "DELETE FROM model_tags WHERE model_id=?1 AND tag_id=?2",
+                    params![model_id, tag_id],
+                )? > 0;
+            }
+        }
+        if changed {
+            tx.execute(
+                "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+                params![timestamp(), model_id],
+            )?;
+        }
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
     pub fn apply_reviewed_tags(
         &self,
         targets: &[ReviewedTagTarget],
@@ -4338,6 +4414,26 @@ fn clean_tag_name(value: &str) -> Result<String, LibraryError> {
     clean_name(value, "Tag")
 }
 
+fn clean_model_tag_names(values: &[String]) -> Result<Vec<String>, LibraryError> {
+    if values.is_empty() || values.len() > 200 {
+        return Err(LibraryError::InvalidInput(
+            "Model tag count is outside its limit".into(),
+        ));
+    }
+    let mut names = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        let name = clean_tag_name(value)?;
+        if !seen.insert(name.to_lowercase()) {
+            return Err(LibraryError::InvalidInput(
+                "Model tag names contain duplicates".into(),
+            ));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
 fn timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5893,6 +5989,73 @@ mod tests {
                 1
             )
             .is_err());
+    }
+
+    #[test]
+    fn model_tag_name_mutations_are_atomic_versioned_and_keep_removed_tags() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Tagged model", None).unwrap();
+        let keep = db.create_tag("Keep", Some("Type")).unwrap();
+        let remove = db.create_tag("Remove", Some("Type")).unwrap();
+        let model = db
+            .update_model_metadata(
+                &model.id,
+                model.metadata_version,
+                &MetadataPatch {
+                    tags: Some(vec![keep.id.clone(), remove.id.clone()]),
+                    tag_mode: Some(TagMode::Replace),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+
+        let added = db
+            .add_model_tags_by_name(
+                &model.id,
+                model.metadata_version,
+                &["Keep".into(), "New tag".into()],
+            )
+            .unwrap();
+        assert_eq!(added.metadata_version, model.metadata_version + 1);
+        assert_eq!(added.tags, vec!["Keep", "New tag", "Remove"]);
+        assert!(db
+            .list_tags()
+            .unwrap()
+            .iter()
+            .any(|tag| tag.name == "New tag"));
+
+        let removed = db
+            .remove_model_tags_by_name(&model.id, added.metadata_version, &["remove".into()])
+            .unwrap();
+        assert_eq!(removed.metadata_version, added.metadata_version + 1);
+        assert_eq!(removed.tags, vec!["Keep", "New tag"]);
+        assert!(db
+            .list_tags()
+            .unwrap()
+            .iter()
+            .any(|tag| tag.id == remove.id));
+
+        let unchanged = db
+            .remove_model_tags_by_name(&model.id, removed.metadata_version, &["Remove".into()])
+            .unwrap();
+        assert_eq!(unchanged.metadata_version, removed.metadata_version);
+
+        assert!(db
+            .add_model_tags_by_name(&model.id, model.metadata_version, &["Stale tag".into()])
+            .is_err());
+        assert!(!db
+            .list_tags()
+            .unwrap()
+            .iter()
+            .any(|tag| tag.name == "Stale tag"));
+        assert!(db
+            .add_model_tags_by_name(
+                &model.id,
+                removed.metadata_version,
+                &["Dup".into(), "dup".into()]
+            )
+            .is_err());
+        assert!(!db.list_tags().unwrap().iter().any(|tag| tag.name == "Dup"));
     }
 
     #[test]

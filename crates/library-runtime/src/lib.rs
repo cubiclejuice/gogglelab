@@ -1640,6 +1640,38 @@ impl TagEngine for LibraryRuntime {
         })
     }
 
+    fn add_model_tags_by_name(
+        &self,
+        context: &RequestContext,
+        target: VersionedTarget,
+        names: Vec<String>,
+    ) -> Result<MutationVersion, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| {
+            db.add_model_tags_by_name(&target.model_id, target.expected_version, &names)
+        })
+        .map(|model| MutationVersion {
+            model_id: model.id,
+            metadata_version: model.metadata_version,
+        })
+    }
+
+    fn remove_model_tags_by_name(
+        &self,
+        context: &RequestContext,
+        target: VersionedTarget,
+        names: Vec<String>,
+    ) -> Result<MutationVersion, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| {
+            db.remove_model_tags_by_name(&target.model_id, target.expected_version, &names)
+        })
+        .map(|model| MutationVersion {
+            model_id: model.id,
+            metadata_version: model.metadata_version,
+        })
+    }
+
     fn create_tag(
         &self,
         context: &RequestContext,

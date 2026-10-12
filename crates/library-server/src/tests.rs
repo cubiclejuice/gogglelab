@@ -1428,7 +1428,14 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
     ] {
         assert!(!management["inputSchema"].to_string().contains(unsupported));
     }
-    for name in ["update_model", "save_filament", "log_print_event"] {
+    for name in [
+        "update_model",
+        "save_filament",
+        "log_print_event",
+        "add_model_tags",
+        "remove_model_tags",
+        "remove_model",
+    ] {
         let tool = tool_definitions()
             .into_iter()
             .find(|tool| tool["name"] == name)
@@ -2738,4 +2745,143 @@ async fn real_runtime_embedded_3mf_proposal_and_versioned_apply_work() {
         .await
         .unwrap();
     assert_eq!(applied.status(), StatusCode::OK);
+}
+
+#[test]
+fn protocol_adapter_adds_and_removes_model_tags_by_name_with_versions() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let model = runtime
+        .mutate_db(|db| db.create_model("MCP tag target", None))
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let writer = RequestContext {
+        principal_id: "tag-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "tag-write".into(),
+    };
+
+    assert!(adapter.supports_tool(&writer, "add_model_tags"));
+    assert!(adapter.supports_tool(&writer, "remove_model_tags"));
+    let added = adapter
+        .call_tool(
+            &writer,
+            "add_model_tags",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":model.metadata_version.to_string(),
+                "tags":["Mechanical","Decorative"]
+            }),
+        )
+        .unwrap();
+    let added_version: u64 = added["metadataVersion"].as_str().unwrap().parse().unwrap();
+    let current = adapter.get_model(&writer, &model.id).unwrap();
+    assert_eq!(current.metadata_version, added_version.to_string());
+    assert_eq!(current.tags, ["Decorative", "Mechanical"]);
+
+    let removed = adapter
+        .call_tool(
+            &writer,
+            "remove_model_tags",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":added_version.to_string(),
+                "tags":["mechanical"]
+            }),
+        )
+        .unwrap();
+    let removed_version: u64 = removed["metadataVersion"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let current = adapter.get_model(&writer, &model.id).unwrap();
+    assert_eq!(current.metadata_version, removed_version.to_string());
+    assert_eq!(current.tags, ["Decorative"]);
+    assert!(adapter
+        .list_tags(&writer)
+        .unwrap()
+        .iter()
+        .any(|tag| tag.name == "Mechanical"));
+
+    assert!(adapter
+        .call_tool(
+            &writer,
+            "add_model_tags",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":added_version.to_string(),
+                "tags":["Stale"]
+            }),
+        )
+        .is_err());
+    assert!(!adapter
+        .list_tags(&writer)
+        .unwrap()
+        .iter()
+        .any(|tag| tag.name == "Stale"));
+}
+
+#[test]
+fn protocol_adapter_remove_model_is_recoverable_and_requires_a_second_step() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let model = runtime
+        .mutate_db(|db| db.create_model("Recoverable MCP model", None))
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let writer = RequestContext {
+        principal_id: "catalog-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "remove-model".into(),
+    };
+
+    assert!(adapter.supports_tool(&writer, "remove_model"));
+    assert!(adapter
+        .call_tool(
+            &writer,
+            "remove_model",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":model.metadata_version.to_string(),
+                "confirm":false
+            }),
+        )
+        .is_err());
+    let plan = adapter
+        .call_tool(
+            &writer,
+            "remove_model",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":model.metadata_version.to_string(),
+                "confirm":true
+            }),
+        )
+        .unwrap();
+    let token = plan["token"].as_str().unwrap();
+    assert_eq!(adapter.get_model(&writer, &model.id).unwrap().id, model.id);
+
+    adapter
+        .call_tool(&writer, "execute_management_action", json!({"token":token}))
+        .unwrap();
+    let visible = adapter
+        .call_tool(
+            &writer,
+            "search_models",
+            json!({"query":"Recoverable MCP model","limit":100}),
+        )
+        .unwrap();
+    assert!(!visible.to_string().contains(&model.id));
+    assert!(adapter
+        .call_tool(&writer, "execute_management_action", json!({"token":token}))
+        .is_err());
 }

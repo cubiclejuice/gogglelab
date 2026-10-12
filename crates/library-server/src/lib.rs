@@ -1759,6 +1759,48 @@ impl<
                 };
                 return Ok(serde_json::json!({"affectedModels":count.to_string()}));
             }
+            "add_model_tags" | "remove_model_tags" => {
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                let names: Vec<String> = serde_json::from_value(
+                    arguments.get("tags").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let target = VersionedTarget {
+                    model_id,
+                    expected_version: tool_version(&arguments)?,
+                };
+                let result = if name == "add_model_tags" {
+                    self.inner.add_model_tags_by_name(context, target, names)
+                } else {
+                    self.inner.remove_model_tags_by_name(context, target, names)
+                }
+                .map_err(map_runtime_error)?;
+                return encoded!(WireMutation::from(result));
+            }
+            "remove_model" => {
+                if arguments.get("confirm").and_then(Value::as_bool) != Some(true) {
+                    return Err(invalid_tool());
+                }
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                let target = VersionedTarget {
+                    model_id,
+                    expected_version: tool_version(&arguments)?,
+                };
+                return encoded!(WireActionPlan::from(self.plan_management_action(
+                    context,
+                    ManagementAction::RecoverableRemove {
+                        targets: vec![target],
+                    },
+                )?));
+            }
             "backup_database" => {
                 let action = ManagementAction::CreateBackup {
                     destination_handle_id: arguments
@@ -2342,6 +2384,8 @@ impl<
                 | "backup_database"
                 | "rename_metadata"
                 | "delete_metadata"
+                | "add_model_tags"
+                | "remove_model_tags"
                 | "sync_spoolman_filaments"
                 | "generate_tags"
                 | "apply_tag_review"
@@ -2354,6 +2398,7 @@ impl<
                 | "get_model"
                 | "get_all_metadata"
                 | "get_library_stats"
+                | "remove_model"
                 | "list_parent_models"
                 | "list_designers"
                 | "list_licenses"
@@ -2405,6 +2450,9 @@ impl<
                 | "add_tag"
                 | "rename_tag"
                 | "delete_tag"
+                | "add_model_tags"
+                | "remove_model_tags"
+                | "remove_model"
                 | "save_filament"
                 | "delete_filament"
                 | "set_model_filaments"
@@ -3008,6 +3056,14 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             &["type", "oldName", "newName"],
         ),
         "delete_metadata" => (&["type", "name"], &["type", "name"]),
+        "add_model_tags" | "remove_model_tags" => (
+            &["modelId", "expectedVersion", "tags"],
+            &["modelId", "expectedVersion", "tags"],
+        ),
+        "remove_model" => (
+            &["modelId", "expectedVersion", "confirm"],
+            &["modelId", "expectedVersion", "confirm"],
+        ),
         "backup_database" => (
             &["destinationHandleId", "fileName"],
             &["destinationHandleId", "fileName"],
@@ -3135,6 +3191,16 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 && string_field_valid("newName")
         }
         "delete_metadata" => string_field_valid("type") && string_field_valid("name"),
+        "add_model_tags" | "remove_model_tags" => {
+            string_field_valid("modelId")
+                && string_field_valid("expectedVersion")
+                && object.get("tags").is_some_and(Value::is_array)
+        }
+        "remove_model" => {
+            string_field_valid("modelId")
+                && string_field_valid("expectedVersion")
+                && object.get("confirm").is_some_and(Value::is_boolean)
+        }
         "backup_database" => {
             string_field_valid("destinationHandleId") && string_field_valid("fileName")
         }
@@ -5629,6 +5695,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "integration_save_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["config","credentialUpdate"],"properties":{"config":{"type":"object"},"credentialUpdate":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"type":"string","enum":["keep","clear","setSession"]},"secret":{"type":["string","null"],"maxLength":16384}}}}}),
                 "rename_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","oldName","newName"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"oldName":{"type":"string","minLength":1,"maxLength":200},"newName":{"type":"string","minLength":1,"maxLength":200}}}),
                 "delete_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","name"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"name":{"type":"string","minLength":1,"maxLength":200}}}),
+                "add_model_tags"|"remove_model_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","tags"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"tags":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"string","minLength":1,"maxLength":256}}}}),
+                "remove_model" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"confirm":{"const":true}}}),
                 "backup_database" => serde_json::json!({"type":"object","additionalProperties":false,"required":["destinationHandleId","fileName"],"properties":{"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200}}}),
                 "integration_delete_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128}}}),
                 "generate_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId","targets"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128},"targets":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"object","required":["modelId","expectedVersion"]}}}}),
@@ -5692,7 +5760,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "set_default_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
                 "download_model" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
                 "delete_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
-                "remove_model"|"trash_file"|"undo_trash"|"move_files"|"restore_library" => serde_json::json!({
+                "trash_file"|"undo_trash"|"move_files"|"restore_library" => serde_json::json!({
                     "type":"object",
                     "properties":{"confirmationToken":{"type":"string","minLength":43,"maxLength":256}},
                     "required":["confirmationToken"]
