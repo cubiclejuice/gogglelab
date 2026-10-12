@@ -22,6 +22,7 @@ use crate::models::{
 };
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+const MAX_GLOBAL_METADATA_TARGETS: i64 = 50_000;
 pub const ROOT_FOLDER_ID: &str = "root";
 pub const MIN_SCAN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_SCAN_INTERVAL_MINUTES: u32 = 1_440;
@@ -2653,6 +2654,110 @@ impl LibraryDb {
         .into_iter()
         .next()
         .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    /// Renames one designer, license, or parent-model name atomically. Parent links
+    /// keep their stable model IDs when their referenced display name changes.
+    pub fn rename_metadata_value(
+        &self,
+        kind: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64, LibraryError> {
+        let (old_name, new_name, count_sql, update_sql) = match kind {
+            "designer" | "license" => {
+                let old_name = clean_optional(Some(old_name), 200)?
+                    .ok_or_else(|| LibraryError::InvalidInput("oldName is required".into()))?;
+                let new_name = clean_optional(Some(new_name), 200)?
+                    .ok_or_else(|| LibraryError::InvalidInput("newName is required".into()))?;
+                let column = if kind == "designer" {
+                    "designer"
+                } else {
+                    "model_license"
+                };
+                (
+                    old_name,
+                    new_name,
+                    format!("SELECT COUNT(*) FROM models WHERE deleted_at IS NULL AND {column}=?1"),
+                    format!("UPDATE models SET {column}=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE deleted_at IS NULL AND {column}=?3"),
+                )
+            }
+            "parentModel" => {
+                let old_name = clean_name(old_name, "Parent model")?;
+                let new_name = clean_name(new_name, "Parent model")?;
+                if old_name.len() > 200 || new_name.len() > 200 {
+                    return Err(LibraryError::InvalidInput(
+                        "Parent model name exceeds 200 characters".into(),
+                    ));
+                }
+                (
+                    old_name,
+                    new_name,
+                    "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL AND display_name=?1".into(),
+                    "UPDATE models SET display_name=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE deleted_at IS NULL AND display_name=?3".into(),
+                )
+            }
+            _ => {
+                return Err(LibraryError::InvalidInput(
+                    "Metadata kind must be designer, parentModel, or license".into(),
+                ))
+            }
+        };
+        if old_name == new_name {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let count: i64 = tx.query_row(&count_sql, params![old_name], |row| row.get(0))?;
+        if count > MAX_GLOBAL_METADATA_TARGETS {
+            return Err(LibraryError::InvalidInput(
+                "Global metadata rename exceeds 50000 models".into(),
+            ));
+        }
+        let changed = tx.execute(&update_sql, params![new_name, timestamp(), old_name])?;
+        tx.commit()?;
+        Ok(changed as u64)
+    }
+
+    /// Clears one designer, license, or parent-model reference atomically.
+    pub fn delete_metadata_value(&self, kind: &str, name: &str) -> Result<u64, LibraryError> {
+        let name = match kind {
+            "designer" | "license" => clean_optional(Some(name), 200)?
+                .ok_or_else(|| LibraryError::InvalidInput("name is required".into()))?,
+            "parentModel" => clean_name(name, "Parent model")?,
+            _ => {
+                return Err(LibraryError::InvalidInput(
+                    "Metadata kind must be designer, parentModel, or license".into(),
+                ))
+            }
+        };
+        let (count_sql, update_sql) = match kind {
+            "designer" => (
+                "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL AND designer=?1",
+                "UPDATE models SET designer=NULL,metadata_version=metadata_version+1,updated_at=?1 WHERE deleted_at IS NULL AND designer=?2",
+            ),
+            "license" => (
+                "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL AND model_license=?1",
+                "UPDATE models SET model_license=NULL,metadata_version=metadata_version+1,updated_at=?1 WHERE deleted_at IS NULL AND model_license=?2",
+            ),
+            "parentModel" => (
+                "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL AND parent_model_id IN
+                   (SELECT id FROM models WHERE deleted_at IS NULL AND display_name=?1)",
+                "UPDATE models SET parent_model_id=NULL,metadata_version=metadata_version+1,updated_at=?1
+                 WHERE deleted_at IS NULL AND parent_model_id IN
+                   (SELECT id FROM models WHERE deleted_at IS NULL AND display_name=?2)",
+            ),
+            _ => unreachable!("Metadata kind was validated above"),
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let count: i64 = tx.query_row(count_sql, params![name], |row| row.get(0))?;
+        if count > MAX_GLOBAL_METADATA_TARGETS {
+            return Err(LibraryError::InvalidInput(
+                "Global metadata delete exceeds 50000 models".into(),
+            ));
+        }
+        let changed = tx.execute(update_sql, params![timestamp(), name])?;
+        tx.commit()?;
+        Ok(changed as u64)
     }
 
     pub fn update_models_metadata(
@@ -5663,6 +5768,77 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.metadata.notes, None);
         assert_eq!(cleared.description, "");
+    }
+
+    #[test]
+    fn global_metadata_rename_and_delete_are_atomic_and_preserve_parent_identity() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let parent_a = db.create_model("Old parent", None).unwrap();
+        let parent_b = db.create_model("Old parent", None).unwrap();
+        let child = db.create_model("Child", None).unwrap();
+        let child = db
+            .update_model_metadata(
+                &child.id,
+                child.metadata_version,
+                &MetadataPatch {
+                    designer: Some("Old designer".into()),
+                    model_license: Some("Old license".into()),
+                    parent_model_id: Some(parent_a.id.clone()),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.rename_metadata_value("designer", "Old designer", "New designer")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.rename_metadata_value("license", "Old license", "New license")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.rename_metadata_value("parentModel", "Old parent", "New parent")
+                .unwrap(),
+            2
+        );
+        let renamed_parent = db.get_model(&parent_a.id).unwrap().unwrap();
+        assert_eq!(renamed_parent.display_name, "New parent");
+        assert_eq!(
+            db.get_model(&parent_b.id).unwrap().unwrap().display_name,
+            "New parent"
+        );
+        let child = db.get_model(&child.id).unwrap().unwrap();
+        assert_eq!(
+            child.metadata.parent_model_id.as_deref(),
+            Some(parent_a.id.as_str())
+        );
+        assert_eq!(child.metadata.designer.as_deref(), Some("New designer"));
+        assert_eq!(child.metadata.model_license.as_deref(), Some("New license"));
+        let prior_version = child.metadata_version;
+
+        assert_eq!(
+            db.delete_metadata_value("parentModel", "New parent")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.delete_metadata_value("designer", "New designer")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.delete_metadata_value("license", "New license").unwrap(),
+            1
+        );
+        let child = db.get_model(&child.id).unwrap().unwrap();
+        assert!(child.metadata.parent_model_id.is_none());
+        assert!(child.metadata.designer.is_none());
+        assert!(child.metadata.model_license.is_none());
+        assert!(child.metadata_version > prior_version);
+        assert!(db.rename_metadata_value("unknown", "x", "y").is_err());
     }
 
     #[test]

@@ -31,14 +31,14 @@ use library_protocol::{
     EmbeddedMetadataFields, EmbeddedMetadataProposal, EmbeddedMetadataSelection, Filament,
     FilamentEngine, FilamentInput, Folder, FolderEngine, GalleryEngine, GeometryEngine,
     GeometryLease, IndexRootSettings, IndexRootSettingsPatch, ManagementAction, ManagementEngine,
-    ManagementResult, MediaLease, MetadataEngine, MetadataPatch, ModelAvailability,
-    ModelFilamentAssignment, ModelGroupFilter, ModelQuery, ModelSort, MutationVersion, Page,
-    PageRequest, PrintAttempt, PrintAttemptBatchItem, PrintAttemptInput, PrintHistoryEngine,
-    PrintOutcome, PrintStatus, RequestContext, RestoreRootMapping, RootAccess, RootHandle,
-    RuntimeError, RuntimeErrorCode, RuntimeEvent, RuntimeInfo, RuntimeInfoEngine, RuntimeOwnership,
-    RuntimeStatus, RuntimeStatusEngine, ScanEngine, ScanStatus, SettingsEngine, SortDirection,
-    SourceLease, Tag, TagEngine, TagMode, ThumbnailDescriptor, UploadEngine, UploadIntent,
-    UploadToken, VersionedTarget, CAPTURE_ENVELOPE_VERSION, MAX_PAGE_LIMIT,
+    ManagementResult, MediaLease, MetadataEngine, MetadataPatch, MetadataValueKind,
+    ModelAvailability, ModelFilamentAssignment, ModelGroupFilter, ModelQuery, ModelSort,
+    MutationVersion, Page, PageRequest, PrintAttempt, PrintAttemptBatchItem, PrintAttemptInput,
+    PrintHistoryEngine, PrintOutcome, PrintStatus, RequestContext, RestoreRootMapping, RootAccess,
+    RootHandle, RuntimeError, RuntimeErrorCode, RuntimeEvent, RuntimeInfo, RuntimeInfoEngine,
+    RuntimeOwnership, RuntimeStatus, RuntimeStatusEngine, ScanEngine, ScanStatus, SettingsEngine,
+    SortDirection, SourceLease, Tag, TagEngine, TagMode, ThumbnailDescriptor, UploadEngine,
+    UploadIntent, UploadToken, VersionedTarget, CAPTURE_ENVELOPE_VERSION, MAX_PAGE_LIMIT,
 };
 use sha2::{Digest, Sha256};
 
@@ -1561,6 +1561,29 @@ impl CatalogEngine for LibraryRuntime {
 }
 
 impl MetadataEngine for LibraryRuntime {
+    fn rename_metadata_value(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| {
+            db.rename_metadata_value(metadata_value_kind_name(kind), old_name, new_name)
+        })
+    }
+
+    fn delete_metadata_value(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        name: &str,
+    ) -> Result<u64, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| db.delete_metadata_value(metadata_value_kind_name(kind), name))
+    }
+
     fn update_metadata(
         &self,
         context: &RequestContext,
@@ -1592,6 +1615,14 @@ impl MetadataEngine for LibraryRuntime {
         let patch = core_metadata_patch(patch);
         self.mutate_db(|db| db.bulk_update_metadata(&targets, &patch))
             .map(|models| models.into_iter().map(mutation_version).collect())
+    }
+}
+
+fn metadata_value_kind_name(kind: MetadataValueKind) -> &'static str {
+    match kind {
+        MetadataValueKind::Designer => "designer",
+        MetadataValueKind::ParentModel => "parentModel",
+        MetadataValueKind::License => "license",
     }
 }
 

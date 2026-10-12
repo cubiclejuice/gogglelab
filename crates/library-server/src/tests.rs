@@ -1433,10 +1433,16 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
     for name in [
         "get_model",
         "get_hash_status",
+        "calculate_missing_hashes",
         "check_files_exist",
         "refresh_hashes",
         "start_thumbnail_job",
         "get_models_missing_thumbnails",
+        "get_models_with_default_thumbnails",
+        "get_models_by_directory",
+        "rename_metadata",
+        "delete_metadata",
+        "backup_database",
         "integration_get_settings",
         "integration_save_spoolman_config",
         "integration_save_ai_provider",
@@ -1461,6 +1467,7 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
         "close_bundle_preview",
         "find_duplicates",
         "get_embedded_3mf_metadata",
+        "pull_3mf_metadata",
         "apply_embedded_3mf_metadata",
         "list_capture_items",
         "retry_capture",
@@ -1472,6 +1479,16 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
             .unwrap();
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
     }
+    assert!(super::validate_tool_shape(
+        "rename_metadata",
+        &json!({"type":"designer","oldName":"Old","newName":"New"}),
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape(
+        "get_models_by_directory",
+        &json!({"rootId":"admitted-root","directory":"parts/nested"}),
+    )
+    .is_ok());
     assert!(super::validate_tool_shape("get_model", &json!({"modelId":"model-1"})).is_ok());
     assert!(super::validate_tool_shape("get_model", &json!({"modelId":1})).is_err());
     assert!(super::validate_tool_shape("get_model", &json!({"modelId":"m","extra":true})).is_err());
@@ -1502,10 +1519,13 @@ async fn protocol_adapter_pages_the_real_runtime_without_paths() {
         temp.path().join("integrations.json"),
     ))
     .unwrap();
-    runtime
-        .mutate_db(|db| db.create_model("Runtime Cube", None).map(|_| ()))
+    let model = runtime
+        .mutate_db(|db| db.create_model("Runtime Cube", None))
         .unwrap();
-    let adapter = Arc::new(ProtocolEngineAdapter::new(runtime, HostMode::Headless));
+    let adapter = Arc::new(ProtocolEngineAdapter::new(
+        Arc::clone(&runtime),
+        HostMode::Headless,
+    ));
     let read_context = RequestContext {
         principal_id: "reader".into(),
         capabilities: BTreeSet::from([Capability::CatalogRead]),
@@ -1524,6 +1544,7 @@ async fn protocol_adapter_pages_the_real_runtime_without_paths() {
     assert!(adapter.supports_tool(&integration_reader, "integration_get_settings"));
     assert!(!adapter.supports_tool(&integration_reader, "generate_tags"));
     assert!(!adapter.supports_tool(&integration_reader, "sync_spoolman_filaments"));
+    assert!(!adapter.supports_tool(&integration_reader, "rename_metadata"));
     assert!(!adapter.supports_tool(&integration_reader, "integration_save_spoolman_config"));
     let integration_writer = RequestContext {
         principal_id: "integration-writer".into(),
@@ -1534,9 +1555,76 @@ async fn protocol_adapter_pages_the_real_runtime_without_paths() {
         ]),
         request_id: "integration-write".into(),
     };
+    assert!(adapter.supports_tool(&integration_writer, "rename_metadata"));
+    assert!(adapter.supports_tool(&integration_writer, "get_models_by_directory"));
+    assert!(adapter.supports_tool(&integration_writer, "get_models_with_default_thumbnails"));
+    assert!(adapter.supports_tool(&integration_writer, "pull_3mf_metadata"));
+    assert!(!adapter.supports_tool(&integration_writer, "backup_database"));
+    let maintenance_writer = RequestContext {
+        principal_id: "maintenance-writer".into(),
+        capabilities: BTreeSet::from([
+            Capability::CatalogWrite,
+            Capability::Maintenance,
+            Capability::PhysicalSourceWrite,
+        ]),
+        request_id: "maintenance-write".into(),
+    };
+    assert!(adapter.supports_tool(&maintenance_writer, "backup_database"));
     assert!(adapter.supports_tool(&integration_writer, "integration_save_spoolman_config"));
     assert!(!adapter.supports_tool(&integration_writer, "sync_spoolman_filaments"));
     assert!(!adapter.supports_tool(&integration_writer, "generate_tags"));
+    let updated = adapter
+        .update_metadata(
+            &integration_writer,
+            VersionedTarget {
+                model_id: model.id.clone(),
+                expected_version: model.metadata_version,
+            },
+            MetadataPatch {
+                designer: Some("Original designer".into()),
+                ..MetadataPatch::default()
+            },
+        )
+        .unwrap();
+    let rename = adapter
+        .call_tool(
+            &integration_writer,
+            "rename_metadata",
+            json!({"type":"designer","oldName":"Original designer","newName":"Renamed designer"}),
+        )
+        .unwrap();
+    assert_eq!(rename["affectedModels"], "1");
+    assert_eq!(
+        adapter
+            .get_model(&integration_writer, &model.id)
+            .unwrap()
+            .designer
+            .as_deref(),
+        Some("Renamed designer")
+    );
+    let delete = adapter
+        .call_tool(
+            &integration_writer,
+            "delete_metadata",
+            json!({"type":"designer","name":"Renamed designer"}),
+        )
+        .unwrap();
+    assert_eq!(delete["affectedModels"], "1");
+    assert_eq!(
+        adapter
+            .get_model(&integration_writer, &model.id)
+            .unwrap()
+            .designer,
+        None
+    );
+    assert!(adapter
+        .call_tool(
+            &integration_reader,
+            "search_models",
+            json!({"rootId":"not-a-live-path","sourceDirectory":"../secret"}),
+        )
+        .is_err());
+    assert!(updated.metadata_version > model.metadata_version);
     let app = router(adapter, security(8));
     let response = app
         .clone()

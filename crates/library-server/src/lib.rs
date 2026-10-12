@@ -31,12 +31,12 @@ use library_protocol::{
     IntegrationAiReviewStrategy, IntegrationAiSuggestionBatch, IntegrationCredentialUpdate,
     IntegrationEngine, IntegrationSettings, IntegrationSpoolmanConfig,
     IntegrationSpoolmanPullResult, LibraryEngine as ProtocolLibraryEngine, ManagementAction,
-    ManagementEngine, ManagementResult, MetadataEngine, MetadataPatch, ModelAvailability,
-    ModelFilamentAssignment, ModelGroupFilter, ModelQuery as ProtocolModelQuery, ModelSort,
-    ModelSourceStatus, MutationVersion, PageRequest, PrintAttempt, PrintAttemptBatchItem,
-    PrintAttemptInput, PrintHistoryEngine, PrintStatus, RootHandle, RuntimeError, RuntimeErrorCode,
-    ScanStatus, SettingsEngine, SortDirection, Tag, TagEngine, ThumbnailDescriptor, UploadIntent,
-    UploadToken, VersionedTarget,
+    ManagementEngine, ManagementResult, MetadataEngine, MetadataPatch, MetadataValueKind,
+    ModelAvailability, ModelFilamentAssignment, ModelGroupFilter, ModelQuery as ProtocolModelQuery,
+    ModelSort, ModelSourceStatus, MutationVersion, PageRequest, PrintAttempt,
+    PrintAttemptBatchItem, PrintAttemptInput, PrintHistoryEngine, PrintStatus, RootHandle,
+    RuntimeError, RuntimeErrorCode, ScanStatus, SettingsEngine, SortDirection, Tag, TagEngine,
+    ThumbnailDescriptor, UploadIntent, UploadToken, VersionedTarget,
 };
 pub use library_protocol::{Capability, RequestContext};
 pub use security::{AllowedAuthority, AllowedOrigin, SecurityConfig};
@@ -1084,6 +1084,35 @@ pub trait LibraryEngine: Send + Sync + 'static {
         t: VersionedTarget,
         p: MetadataPatch,
     ) -> Result<MutationVersion, EngineError>;
+    fn rename_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64, EngineError> {
+        let _ = (context, kind, old_name, new_name);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Global metadata rename is unavailable".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
+    fn delete_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        name: &str,
+    ) -> Result<u64, EngineError> {
+        let _ = (context, kind, name);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Global metadata delete is unavailable".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
     fn bulk_update_metadata(
         &self,
         c: &RequestContext,
@@ -1645,7 +1674,9 @@ impl<
                 .map_err(|_| invalid_tool())?;
                 return encoded!(self.check_model_sources(context, model_ids)?);
             }
-            "refresh_hashes" => return encoded!(self.start_scan(context, None)?),
+            "calculate_missing_hashes" | "refresh_hashes" => {
+                return encoded!(self.start_scan(context, None)?)
+            }
             "start_thumbnail_job" => {
                 let model_ids: Vec<String> = serde_json::from_value(
                     arguments
@@ -1660,20 +1691,100 @@ impl<
                     .unwrap_or(false);
                 return encoded!(self.start_thumbnail_job(context, model_ids, force)?);
             }
-            "get_models_missing_thumbnails" => {
+            "get_models_missing_thumbnails" | "get_models_with_default_thumbnails" => {
                 let limit = arguments
                     .get("limit")
                     .and_then(Value::as_u64)
                     .and_then(|value| u16::try_from(value).ok())
                     .unwrap_or(50);
+                let thumbnail_mode = if name == "get_models_missing_thumbnails" {
+                    "missing"
+                } else {
+                    "default"
+                };
                 return encoded!(self.list_models(
                     context,
                     arguments.get("cursor").and_then(Value::as_str),
                     limit,
                     ProtocolModelQuery {
-                        thumbnail_mode: Some("missing".into()),
+                        thumbnail_mode: Some(thumbnail_mode.into()),
                         ..ProtocolModelQuery::default()
                     }
+                )?);
+            }
+            "get_models_by_directory" => {
+                let directory = arguments
+                    .get("directory")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let root_id = arguments
+                    .get("rootId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(50)
+                    .min(MAX_PAGE_SIZE);
+                return encoded!(self.list_models(
+                    context,
+                    arguments.get("cursor").and_then(Value::as_str),
+                    limit,
+                    ProtocolModelQuery {
+                        root_id: Some(root_id.to_owned()),
+                        source_directory: Some(directory.to_owned()),
+                        ..ProtocolModelQuery::default()
+                    }
+                )?);
+            }
+            "rename_metadata" | "delete_metadata" => {
+                let is_rename = name == "rename_metadata";
+                let kind: MetadataValueKind = serde_json::from_value(
+                    arguments.get("type").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let value_name = arguments
+                    .get(if is_rename { "oldName" } else { "name" })
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let count = if is_rename {
+                    let new_name = arguments
+                        .get("newName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?;
+                    self.rename_metadata_global(context, kind, value_name, new_name)?
+                } else {
+                    self.delete_metadata_global(context, kind, value_name)?
+                };
+                return Ok(serde_json::json!({"affectedModels":count.to_string()}));
+            }
+            "backup_database" => {
+                let action = ManagementAction::CreateBackup {
+                    destination_handle_id: arguments
+                        .get("destinationHandleId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned(),
+                    file_name: arguments
+                        .get("fileName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned(),
+                };
+                return encoded!(WireActionPlan::from(
+                    self.plan_management_action(context, action)?
+                ));
+            }
+            "pull_3mf_metadata" => {
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(self.read_embedded_metadata(
+                    context,
+                    model_id,
+                    arguments.get("expectedHash").and_then(Value::as_str),
                 )?);
             }
             "plan_management_action" => {
@@ -2223,8 +2334,14 @@ impl<
                 | "get_hash_status"
                 | "check_files_exist"
                 | "refresh_hashes"
+                | "calculate_missing_hashes"
                 | "start_thumbnail_job"
                 | "get_models_missing_thumbnails"
+                | "get_models_with_default_thumbnails"
+                | "get_models_by_directory"
+                | "backup_database"
+                | "rename_metadata"
+                | "delete_metadata"
                 | "sync_spoolman_filaments"
                 | "generate_tags"
                 | "apply_tag_review"
@@ -2272,6 +2389,7 @@ impl<
                 | "close_bundle_preview"
                 | "find_duplicates"
                 | "get_embedded_3mf_metadata"
+                | "pull_3mf_metadata"
                 | "apply_embedded_3mf_metadata"
                 | "list_capture_items"
                 | "retry_capture"
@@ -2294,9 +2412,18 @@ impl<
                 | "log_print_events_batch"
                 | "delete_print_event"
                 | "update_catalog_settings"
+                | "rename_metadata"
+                | "delete_metadata"
                 | "apply_embedded_3mf_metadata"
                 | "retry_capture"
         );
+        if name == "backup_database" {
+            return connected
+                && context.capabilities.contains(&Capability::Maintenance)
+                && context
+                    .capabilities
+                    .contains(&Capability::PhysicalSourceWrite);
+        }
         if matches!(name, "plan_management_action" | "execute_management_action") {
             return connected
                 && (context.capabilities.contains(&Capability::CatalogWrite)
@@ -2345,7 +2472,11 @@ impl<
         }
         let required = if matches!(
             name,
-            "scan_directory" | "cancel_scan" | "update_index_root_settings" | "refresh_hashes"
+            "scan_directory"
+                | "cancel_scan"
+                | "update_index_root_settings"
+                | "refresh_hashes"
+                | "calculate_missing_hashes"
         ) {
             &Capability::Scan
         } else if matches!(
@@ -2474,6 +2605,27 @@ impl<
     ) -> Result<MutationVersion, EngineError> {
         self.inner
             .update_metadata(c, t, p)
+            .map_err(map_runtime_error)
+    }
+    fn rename_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64, EngineError> {
+        self.inner
+            .rename_metadata_value(context, kind, old_name, new_name)
+            .map_err(map_runtime_error)
+    }
+    fn delete_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        name: &str,
+    ) -> Result<u64, EngineError> {
+        self.inner
+            .delete_metadata_value(context, kind, name)
             .map_err(map_runtime_error)
     }
     fn bulk_update_metadata(
@@ -2841,9 +2993,25 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         ),
         "discard_tag_review" => (&["reviewToken"], &["reviewToken"]),
         "get_hash_status" | "refresh_hashes" => (&[], &[]),
+        "calculate_missing_hashes" => (&[], &[]),
         "check_files_exist" => (&["modelIds"], &["modelIds"]),
         "start_thumbnail_job" => (&["modelIds", "force"], &["modelIds"]),
-        "get_models_missing_thumbnails" => (&["cursor", "limit"], &[]),
+        "get_models_missing_thumbnails" | "get_models_with_default_thumbnails" => {
+            (&["cursor", "limit"], &[])
+        }
+        "get_models_by_directory" => (
+            &["rootId", "directory", "cursor", "limit"],
+            &["rootId", "directory"],
+        ),
+        "rename_metadata" => (
+            &["type", "oldName", "newName"],
+            &["type", "oldName", "newName"],
+        ),
+        "delete_metadata" => (&["type", "name"], &["type", "name"]),
+        "backup_database" => (
+            &["destinationHandleId", "fileName"],
+            &["destinationHandleId", "fileName"],
+        ),
         "plan_management_action" => (&["action"], &["action"]),
         "execute_management_action" => (&["token"], &["token"]),
         "get_index_root_settings" | "get_catalog_settings" => (&[], &[]),
@@ -2859,7 +3027,9 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         }
         "get_model_geometry" => (&["modelId", "expectedHash", "plateId"], &["modelId"]),
         "find_duplicates" => (&["modelIds"], &["modelIds"]),
-        "get_embedded_3mf_metadata" => (&["modelId", "expectedHash"], &["modelId"]),
+        "get_embedded_3mf_metadata" | "pull_3mf_metadata" => {
+            (&["modelId", "expectedHash"], &["modelId"])
+        }
         "apply_embedded_3mf_metadata" => (
             &[
                 "modelId",
@@ -2950,8 +3120,23 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             object.get("modelIds").is_some_and(Value::is_array)
                 && object.get("force").is_none_or(Value::is_boolean)
         }
-        "get_models_missing_thumbnails" => {
+        "get_models_missing_thumbnails" | "get_models_with_default_thumbnails" => {
             string_field_valid("cursor") && object.get("limit").is_none_or(Value::is_u64)
+        }
+        "get_models_by_directory" => {
+            string_field_valid("rootId")
+                && string_field_valid("directory")
+                && string_field_valid("cursor")
+                && object.get("limit").is_none_or(Value::is_u64)
+        }
+        "rename_metadata" => {
+            string_field_valid("type")
+                && string_field_valid("oldName")
+                && string_field_valid("newName")
+        }
+        "delete_metadata" => string_field_valid("type") && string_field_valid("name"),
+        "backup_database" => {
+            string_field_valid("destinationHandleId") && string_field_valid("fileName")
         }
         "plan_management_action" => object.get("action").is_some_and(Value::is_object),
         "execute_management_action" => string_field_valid("token"),
@@ -2970,7 +3155,7 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 && object.get("plateId").is_none_or(Value::is_u64)
         }
         "find_duplicates" => object.get("modelIds").is_some_and(Value::is_array),
-        "get_embedded_3mf_metadata" => {
+        "get_embedded_3mf_metadata" | "pull_3mf_metadata" => {
             string_field_valid("modelId") && string_field_valid("expectedHash")
         }
         "apply_embedded_3mf_metadata" => {
@@ -3659,6 +3844,9 @@ pub fn openapi_document() -> Value {
                 ,{"name":"sourceKind","in":"query","schema":{"type":"string","maxLength":64}}
                 ,{"name":"group","in":"query","schema":{"type":"string","enum":["standalone","bundle","archive"]}}
                 ,{"name":"thumbnailMode","in":"query","schema":{"type":"string","enum":["missing","default","custom"]}}
+                ,{"name":"sourceDirectory","in":"query","schema":{"type":"string","maxLength":1024,"description":"Relative directory prefix within rootId"}}
+                ,{"name":"minimumRating","in":"query","schema":{"type":"integer","minimum":0,"maximum":5}}
+                ,{"name":"favorite","in":"query","schema":{"type":"boolean"}}
             ],"responses":{"200":{"description":"Revision-bound model page"},"409":{"description":"Cursor revision is stale"}}}},
             "/api/v1/models/{modelId}":{"get":{"responses":{"200":{"description":"Path-free model detail"},"404":{"description":"Unknown model"}}}},
             "/api/v1/catalog/stats":{"get":{"responses":{"200":{"description":"Catalog totals with decimal-string counters and bytes"}}}},
@@ -5372,7 +5560,11 @@ pub fn tool_names() -> &'static [&'static str] {
         "get_all_metadata",
         "update_model",
         "update_models_batch",
+        "rename_metadata",
+        "delete_metadata",
+        "get_models_by_directory",
         "get_models_missing_thumbnails",
+        "get_models_with_default_thumbnails",
         "start_thumbnail_job",
         "get_thumbnails",
         "set_thumbnail",
@@ -5382,9 +5574,11 @@ pub fn tool_names() -> &'static [&'static str] {
         "find_duplicates",
         "get_model_geometry",
         "get_hash_status",
+        "calculate_missing_hashes",
         "refresh_hashes",
         "check_files_exist",
         "get_embedded_3mf_metadata",
+        "pull_3mf_metadata",
         "apply_embedded_3mf_metadata",
         "generate_tags",
         "apply_tag_review",
@@ -5398,6 +5592,7 @@ pub fn tool_names() -> &'static [&'static str] {
         "move_files",
         "export_library",
         "backup_library",
+        "backup_database",
         "restore_library",
         "list_slicers",
         "open_in_slicer",
@@ -5432,14 +5627,18 @@ pub fn tool_definitions() -> Vec<Value> {
                 "integration_get_settings"|"sync_spoolman_filaments" => serde_json::json!({"type":"object","additionalProperties":false}),
                 "integration_save_spoolman_config" => serde_json::json!({"type":"object","additionalProperties":false,"required":["config"],"properties":{"config":{"type":["object","null"]}}}),
                 "integration_save_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["config","credentialUpdate"],"properties":{"config":{"type":"object"},"credentialUpdate":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"type":"string","enum":["keep","clear","setSession"]},"secret":{"type":["string","null"],"maxLength":16384}}}}}),
+                "rename_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","oldName","newName"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"oldName":{"type":"string","minLength":1,"maxLength":200},"newName":{"type":"string","minLength":1,"maxLength":200}}}),
+                "delete_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","name"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"name":{"type":"string","minLength":1,"maxLength":200}}}),
+                "backup_database" => serde_json::json!({"type":"object","additionalProperties":false,"required":["destinationHandleId","fileName"],"properties":{"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200}}}),
                 "integration_delete_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128}}}),
                 "generate_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId","targets"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128},"targets":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"object","required":["modelId","expectedVersion"]}}}}),
                 "apply_tag_review" => serde_json::json!({"type":"object","additionalProperties":false,"required":["reviewToken","decisions","strategy"],"properties":{"reviewToken":{"type":"string","minLength":1,"maxLength":128},"decisions":{"type":"array","minItems":1,"maxItems":50},"strategy":{"type":"string","enum":["append","replace","merge"]}}}),
                 "discard_tag_review" => serde_json::json!({"type":"object","additionalProperties":false,"required":["reviewToken"],"properties":{"reviewToken":{"type":"string","minLength":1,"maxLength":128}}}),
-                "get_hash_status"|"refresh_hashes" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "get_hash_status"|"calculate_missing_hashes"|"refresh_hashes" => serde_json::json!({"type":"object","additionalProperties":false}),
                 "check_files_exist" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelIds"],"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128}}}}),
                 "start_thumbnail_job" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelIds"],"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128}},"force":{"type":"boolean"}}}),
-                "get_models_missing_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
+                "get_models_missing_thumbnails"|"get_models_with_default_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
+                "get_models_by_directory" => serde_json::json!({"type":"object","additionalProperties":false,"required":["rootId","directory"],"properties":{"rootId":{"type":"string","minLength":1,"maxLength":128},"directory":{"type":"string","maxLength":1024},"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
                 "plan_management_action" => serde_json::json!({
                     "type":"object","additionalProperties":false,"required":["action"],
                     "properties":{"action":{"oneOf":[
@@ -5466,7 +5665,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "get_bundle_preview_geometry"|"download_bundle"|"close_bundle_preview" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"token":{"type":"string","minLength":1,"maxLength":256}},"required":["token"]}),
                 "get_model_geometry" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"plateId":{"type":"integer","minimum":0,"maximum":4294967295_u64}},"required":["modelId"]}),
                 "find_duplicates" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":50000,"items":{"type":"string","minLength":1,"maxLength":128}}},"required":["modelIds"]}),
-                "get_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
+                "get_embedded_3mf_metadata"|"pull_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
                 "apply_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"expectedSourceHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"selection":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":"boolean"},"sourceUrl":{"type":"boolean"},"notes":{"type":"boolean"},"modelLicense":{"type":"boolean"}}}},"required":["modelId","expectedVersion","expectedSourceHash","selection"]}),
                 "list_capture_items" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
                 "retry_capture" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"itemId":{"type":"string","minLength":1,"maxLength":128},"envelope":{"type":"object"},"uploads":{"type":"array","maxItems":10000,"items":{"type":"object","required":["id","itemId","captureId","expiresAt","libraryEpoch"]}}},"required":["itemId","envelope","uploads"]}),

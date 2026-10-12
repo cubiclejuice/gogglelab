@@ -639,6 +639,14 @@ pub enum TagMode {
     Merge,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataValueKind {
+    Designer,
+    ParentModel,
+    License,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionedTarget {
@@ -893,6 +901,19 @@ pub trait CatalogEngine: Send + Sync {
 }
 
 pub trait MetadataEngine: Send + Sync {
+    fn rename_metadata_value(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64, RuntimeError>;
+    fn delete_metadata_value(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        name: &str,
+    ) -> Result<u64, RuntimeError>;
     fn update_metadata(
         &self,
         context: &RequestContext,
