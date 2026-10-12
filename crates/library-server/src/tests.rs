@@ -1415,6 +1415,19 @@ fn openapi_advertises_the_connected_catalog_scan_bundle_and_capture_contracts() 
 
 #[test]
 fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guards() {
+    let management = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "plan_management_action")
+        .unwrap();
+    for unsupported in [
+        "quarantineLooseSource",
+        "undoQuarantine",
+        "moveLooseSource",
+        "purgeCatalog",
+        "cleanupOrphans",
+    ] {
+        assert!(!management["inputSchema"].to_string().contains(unsupported));
+    }
     for name in ["update_model", "save_filament", "log_print_event"] {
         let tool = tool_definitions()
             .into_iter()

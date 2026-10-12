@@ -5647,11 +5647,6 @@ pub fn tool_definitions() -> Vec<Value> {
                         {"type":"object","additionalProperties":false,"required":["kind","destinationHandleId","fileName"],"properties":{"kind":{"const":"createBackup"},"destinationHandleId":{"type":"string"},"fileName":{"type":"string"}}},
                         {"type":"object","additionalProperties":false,"required":["kind","sourceHandleId","fileName","rootMappings"],"properties":{"kind":{"const":"restoreBackup"},"sourceHandleId":{"type":"string"},"fileName":{"type":"string"},"rootMappings":{"type":"array","maxItems":256}}},
                         {"type":"object","additionalProperties":false,"required":["kind","targets","destinationHandleId","fileName"],"properties":{"kind":{"const":"exportSelection"},"targets":{"type":"array","maxItems":50000},"destinationHandleId":{"type":"string"},"fileName":{"type":"string"}}},
-                        {"type":"object","additionalProperties":false,"required":["kind","target"],"properties":{"kind":{"const":"quarantineLooseSource"},"target":{"type":"object"}}},
-                        {"type":"object","additionalProperties":false,"required":["kind","snapshotId"],"properties":{"kind":{"const":"undoQuarantine"},"snapshotId":{"type":"string"}}},
-                        {"type":"object","additionalProperties":false,"required":["kind","target","destinationHandleId","fileName"],"properties":{"kind":{"const":"moveLooseSource"},"target":{"type":"object"},"destinationHandleId":{"type":"string"},"fileName":{"type":"string"}}},
-                        {"type":"object","additionalProperties":false,"required":["kind","backupDestinationHandleId","backupFileName"],"properties":{"kind":{"const":"purgeCatalog"},"backupDestinationHandleId":{"type":"string"},"backupFileName":{"type":"string"}}},
-                        {"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"cleanupOrphans"}}}
                     ]}}
                 }),
                 "execute_management_action" => serde_json::json!({"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}),

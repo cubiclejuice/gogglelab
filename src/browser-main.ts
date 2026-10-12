@@ -836,52 +836,58 @@ async function showManagement(): Promise<void> {
         }),
     ),
   );
-  const selected = [...selectedModels.values()];
-  const physical =
-    selected.length === 1 && selected[0].sourceKind === "indexed" && !selected[0].archiveMember
-      ? browserSelectionTargets(selected)[0]
-      : null;
-  const writable = roots.filter((root) => root.access === "writable");
-  if (physical && writable.length) {
-    const physicalHandle = document.createElement("select");
-    for (const root of writable) physicalHandle.add(new Option(root.label, root.handleId));
-    const physicalName = document.createElement("input");
-    physicalName.value = selected[0].displayName;
+  if (capabilities?.features.trashSource) {
+    const selected = [...selectedModels.values()];
+    const physical =
+      selected.length === 1 && selected[0].sourceKind === "indexed" && !selected[0].archiveMember
+        ? browserSelectionTargets(selected)[0]
+        : null;
+    const writable = roots.filter((root) => root.access === "writable");
+    if (physical && writable.length) {
+      const physicalHandle = document.createElement("select");
+      for (const root of writable) physicalHandle.add(new Option(root.label, root.handleId));
+      const physicalName = document.createElement("input");
+      physicalName.value = selected[0].displayName;
+      controls.append(
+        actionButton(
+          "Plan quarantine source",
+          () => void plan({ kind: "quarantineLooseSource", target: physical }),
+        ),
+        physicalHandle,
+        physicalName,
+        actionButton(
+          "Plan move source",
+          () =>
+            void plan({
+              kind: "moveLooseSource",
+              target: physical,
+              destinationHandleId: physicalHandle.value,
+              fileName: physicalName.value,
+            }),
+        ),
+      );
+    }
     controls.append(
       actionButton(
-        "Plan quarantine source",
-        () => void plan({ kind: "quarantineLooseSource", target: physical }),
+        "Plan undo quarantine",
+        () => void plan({ kind: "undoQuarantine", snapshotId: snapshot.value }),
       ),
-      physicalHandle,
-      physicalName,
       actionButton(
-        "Plan move source",
+        "Plan catalog purge with backup",
         () =>
           void plan({
-            kind: "moveLooseSource",
-            target: physical,
-            destinationHandleId: physicalHandle.value,
-            fileName: physicalName.value,
+            kind: "purgeCatalog",
+            backupDestinationHandleId: handle.value,
+            backupFileName: fileName.value,
           }),
       ),
+      actionButton("Plan orphan cleanup", () => void plan({ kind: "cleanupOrphans" })),
     );
+  } else {
+    const notice = document.createElement("p");
+    notice.textContent = "Physical source actions are disabled on this host.";
+    controls.append(notice);
   }
-  controls.append(
-    actionButton(
-      "Plan undo quarantine",
-      () => void plan({ kind: "undoQuarantine", snapshotId: snapshot.value }),
-    ),
-    actionButton(
-      "Plan catalog purge with backup",
-      () =>
-        void plan({
-          kind: "purgeCatalog",
-          backupDestinationHandleId: handle.value,
-          backupFileName: fileName.value,
-        }),
-    ),
-    actionButton("Plan orphan cleanup", () => void plan({ kind: "cleanupOrphans" })),
-  );
   dialog.addEventListener("close", () => dialog.remove(), { once: true });
 }
 

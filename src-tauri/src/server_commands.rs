@@ -168,7 +168,6 @@ fn desktop_capabilities() -> BTreeSet<Capability> {
         Capability::Scan,
         Capability::Integration,
         Capability::Maintenance,
-        Capability::PhysicalSourceWrite,
         Capability::HostPaths,
         Capability::HostSlicer,
     ])
@@ -199,5 +198,13 @@ mod tests {
         assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:3745"));
         assert_eq!(status.mcp_url.as_deref(), Some("http://127.0.0.1:3745/mcp"));
         assert!(!status.base_url.unwrap().contains('@'));
+    }
+
+    #[test]
+    fn desktop_server_does_not_grant_remote_physical_source_writes_by_default() {
+        let capabilities = desktop_capabilities();
+        assert!(capabilities.contains(&Capability::CatalogRead));
+        assert!(capabilities.contains(&Capability::CatalogWrite));
+        assert!(!capabilities.contains(&Capability::PhysicalSourceWrite));
     }
 }

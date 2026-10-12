@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-10
-Status: phases 1–5 implemented and locally built/verified; phase 6 in progress. Native window capture and cross-platform release verification remain outstanding.
+Status: phases 1–5 implemented and locally built/verified; phase 6 in progress. The owner approved opt-in LAN access through the documented authenticated HTTPS proxy path, with localhost as the default. Native window capture and cross-platform release verification remain outstanding.
 
 ## Decision
 
@@ -204,4 +204,4 @@ The user explicitly approved moving the existing private library and slicer-hand
 
 ### Phase6 implementation checkpoint scope
 
-Shared runtime, authenticated HTTP/MCP, headless scans and thumbnails, geometry/3MF, bundle downloads, browser management, backups/restores, ratings/favorites, and the MV3 capture inbox are locally built and verified. Schema6 adds rating/favorite defaults with a migration backup. See the [Phase6 contract](PHASE-6-SERVER-MCP-CAPTURE.md) and [installation guide](SERVER-INSTALL.md). Final parity and app installation are not yet claimed: physical-source trash/move/purge/cleanup and enabling AI/Spoolman network calls await the owner’s explicit answers; release builds, the final Docker rebuild, and independent review remain.
+Shared runtime, authenticated HTTP/MCP, headless scans and thumbnails, geometry/3MF, bundle downloads, browser management, backups/restores, ratings/favorites, and the MV3 capture inbox are locally built and verified. Schema6 adds rating/favorite defaults with a migration backup. The MCP adapter now declares all 49 pinned Printventory tool names alongside GoggleLab additions; the live localhost fixture advertises only capability-authorized tools. See the [Phase6 contract](PHASE-6-SERVER-MCP-CAPTURE.md) and [installation guide](SERVER-INSTALL.md). Final parity and app installation are not yet claimed: physical-source mutation tools remain gated pending explicit owner approval, and remote AI/Spoolman calls remain disabled until a separate user-controlled network opt-in is implemented. Release builds and independent review remain.
