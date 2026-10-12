@@ -289,6 +289,8 @@ Seven pinned Printventory names are still absent from the live tool list: `gener
 
 Standalone operators can opt into backup/export writes with `BackupWrite` and an admitted `backupOnly` root. This root is excluded from catalog scanning and indexing, can serve as a restore source, and cannot satisfy writable-source requests. Existing `PhysicalSourceWrite` configurations retain their prior backup behavior. The refreshed Docker fixture exercised `backup_database` and selected export with `BackupWrite` and no physical-source capability.
 
+An independent review found that nested paths could violate that separation even though the backup root was not mapped as a scan root. Runtime admission now rejects canonical `backupOnly` paths that overlap any other admitted root or the library root, in either containment direction, before acquiring the catalog lock or opening the database. Parent segments such as `..` are resolved during preflight, and missing library-root tails are preserved for comparison. Regression tests cover both root-overlap directions, disjoint and overlapping parent-segment paths, and rejection before database creation.
+
 ### Unified app build checkpoint (2026-10-12)
 
 Pro commit `f94f2b1` pins Free core commit `3de230f`. `CARGO_NET_OFFLINE=true bun run build` and `CARGO_NET_OFFLINE=true RUST_TEST_THREADS=1 bun run check:pro` pass. The generated macOS bundle is ARM64, has identifier `com.sonicparke.stl-handoff`, passes `codesign --verify --deep --strict`, and contains the `server-web` assets. Its executable SHA-256 is `e51034274e0cc0c74cab9e374de4c89545a35b0ead07d9dd7a45dae5a7c6ec4c`. It was not installed or launched: the identifier matches the existing app, and startup uses that app's `app_data_dir()/library`; a separate isolated runtime profile is needed for safe visual launch verification.
@@ -299,4 +301,4 @@ Pro commit `f94f2b1` pins Free core commit `3de230f`. `CARGO_NET_OFFLINE=true bu
 
 The pinned Pro regression gate was rerun after the Community package build. `CARGO_NET_OFFLINE=true RUST_TEST_THREADS=1 bun run check:pro` passed, including 44 frontend tests / 1,198 assertions, 29 Pro tests, 27 license tests, one issuer test, 10 CLI tests, and the web builds. Clippy completed successfully; the existing unused `LicenseState::is_enabled` warning remains.
 
-Cross-platform native checks and independent release review remain open. The current account usage limit prevented obtaining an independent subagent review during this continuation.
+Cross-platform native checks remain open. An independent Phase 6 review found and drove the backup-root overlap fix recorded above; final review after the refreshed Community/Pro/Docker builds remains.

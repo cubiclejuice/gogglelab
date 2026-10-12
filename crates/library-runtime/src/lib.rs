@@ -322,13 +322,22 @@ impl LibraryRuntime {
         if config.roots.len() > MAX_ADMITTED_ROOTS {
             return Err(invalid("Too many admitted roots"));
         }
-        let ownership = CatalogLock::acquire(&config.library_root)?;
         let mut roots = admit_roots(config.roots)?;
+        if roots
+            .iter()
+            .any(|root| root.handle.access == RootAccess::BackupOnly)
+        {
+            validate_backup_root_separation(&roots, &config.library_root)?;
+        }
+        let ownership = CatalogLock::acquire(&config.library_root)?;
         let (db, root) = if config.local_catalog_root_access {
-            (None, prepare_lazy_desktop_root(&config.library_root)?)
+            let root = prepare_lazy_desktop_root(&config.library_root)?;
+            validate_backup_root_separation(&roots, &root)?;
+            (None, root)
         } else {
             let db = LibraryDb::open(&config.library_root).map_err(runtime_library_error)?;
             let root = db.root().to_path_buf();
+            validate_backup_root_separation(&roots, &root)?;
             cleanup_runtime_orphans(&root)?;
             map_operator_catalog_roots(
                 &db,
@@ -3168,6 +3177,16 @@ fn admit_roots(policies: Vec<RuntimeRootPolicy>) -> Result<Vec<AdmittedRoot>, Ru
         if !paths.insert(path.clone()) {
             return Err(invalid("Duplicate admitted root path"));
         }
+        if (policy.access == RootAccess::BackupOnly
+            || roots
+                .iter()
+                .any(|root: &AdmittedRoot| root.handle.access == RootAccess::BackupOnly))
+            && roots.iter().any(|root| paths_overlap(&root.path, &path))
+        {
+            return Err(invalid(
+                "Backup-only roots must not overlap other admitted roots",
+            ));
+        }
         roots.push(AdmittedRoot {
             handle: RootHandle {
                 id: policy.id,
@@ -3180,6 +3199,69 @@ fn admit_roots(policies: Vec<RuntimeRootPolicy>) -> Result<Vec<AdmittedRoot>, Ru
         });
     }
     Ok(roots)
+}
+
+fn validate_backup_root_separation(
+    roots: &[AdmittedRoot],
+    library_root: &Path,
+) -> Result<(), RuntimeError> {
+    let library_root = canonical_path_allow_missing_tail(library_root)?;
+    if roots.iter().any(|root| {
+        root.handle.access == RootAccess::BackupOnly && paths_overlap(&root.path, &library_root)
+    }) {
+        return Err(invalid(
+            "Backup-only roots must not overlap the library root",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_path_allow_missing_tail(path: &Path) -> Result<PathBuf, RuntimeError> {
+    if !path.is_absolute() {
+        return Err(invalid(
+            "Library root must be absolute when using a backup-only root",
+        ));
+    }
+
+    let mut canonical = PathBuf::new();
+    let mut missing_tail = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => canonical.push(prefix.as_os_str()),
+            std::path::Component::RootDir => canonical.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                canonical.pop();
+                if missing_tail {
+                    match fs::symlink_metadata(&canonical) {
+                        Ok(_) => {
+                            canonical = canonical.canonicalize().map_err(|_| io_error())?;
+                            missing_tail = false;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => return Err(io_error()),
+                    }
+                }
+            }
+            std::path::Component::Normal(name) => {
+                canonical.push(name);
+                if !missing_tail {
+                    match fs::symlink_metadata(&canonical) {
+                        Ok(_) => canonical = canonical.canonicalize().map_err(|_| io_error())?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            missing_tail = true;
+                        }
+                        Err(_) => return Err(io_error()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 fn map_operator_catalog_roots(
@@ -4820,6 +4902,119 @@ mod tests {
         });
 
         assert!(LibraryRuntime::open(config).is_err());
+    }
+
+    #[test]
+    fn backup_only_root_cannot_overlap_a_scannable_root() {
+        for backup_is_child in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let backup = if backup_is_child {
+                source.join("backups")
+            } else {
+                temp.path().join("backups")
+            };
+            let models = if backup_is_child {
+                source.clone()
+            } else {
+                backup.join("models")
+            };
+            fs::create_dir_all(&backup).unwrap();
+            fs::create_dir_all(&models).unwrap();
+
+            let mut config = config(temp.path().join("library"));
+            config.roots.extend([
+                RuntimeRootPolicy {
+                    id: "models".into(),
+                    catalog_root_id: None,
+                    label: "Models".into(),
+                    path: models,
+                    access: RootAccess::ReadOnly,
+                },
+                RuntimeRootPolicy {
+                    id: "backups".into(),
+                    catalog_root_id: None,
+                    label: "Backups".into(),
+                    path: backup,
+                    access: RootAccess::BackupOnly,
+                },
+            ]);
+
+            assert!(LibraryRuntime::open(config).is_err());
+        }
+    }
+
+    #[test]
+    fn backup_only_root_cannot_overlap_the_library_root() {
+        for backup_is_child in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let (library, backup) = if backup_is_child {
+                let library = temp.path().join("library");
+                (library.clone(), library.join("backups"))
+            } else {
+                let backup = temp.path().join("backups");
+                (backup.join("library"), backup)
+            };
+            fs::create_dir_all(&backup).unwrap();
+            let models = temp.path().join("models");
+            fs::create_dir(&models).unwrap();
+
+            let mut config = config(library.clone());
+            config.local_catalog_root_access = false;
+            config.capabilities = BTreeSet::from([Capability::CatalogRead, Capability::Scan]);
+            config.roots.extend([
+                RuntimeRootPolicy {
+                    id: "models".into(),
+                    catalog_root_id: None,
+                    label: "Models".into(),
+                    path: models,
+                    access: RootAccess::ReadOnly,
+                },
+                RuntimeRootPolicy {
+                    id: "backups".into(),
+                    catalog_root_id: None,
+                    label: "Backups".into(),
+                    path: backup,
+                    access: RootAccess::BackupOnly,
+                },
+            ]);
+
+            assert!(LibraryRuntime::open(config).is_err());
+            assert!(!library.join("library.sqlite3").exists());
+            let db = LibraryDb::open(&library).unwrap();
+            assert!(db.list_index_roots().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn backup_preflight_normalizes_parent_segments_without_false_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join("backups");
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&backup).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+        let mut disjoint = config(unrelated.join("..").join("library"));
+        disjoint.roots.push(RuntimeRootPolicy {
+            id: "backups".into(),
+            catalog_root_id: None,
+            label: "Backups".into(),
+            path: backup.clone(),
+            access: RootAccess::BackupOnly,
+        });
+        assert!(LibraryRuntime::open(disjoint).is_ok());
+
+        let nested = backup.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut overlapping = config(nested.join("..").join("library"));
+        overlapping.roots.push(RuntimeRootPolicy {
+            id: "backups".into(),
+            catalog_root_id: None,
+            label: "Backups".into(),
+            path: backup.clone(),
+            access: RootAccess::BackupOnly,
+        });
+        assert!(LibraryRuntime::open(overlapping).is_err());
+        assert!(!backup.join("library").exists());
     }
 
     #[test]

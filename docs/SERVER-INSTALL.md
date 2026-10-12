@@ -46,7 +46,7 @@ To enable consistent backups and selected exports over the browser/MCP API, crea
 }
 ```
 
-The backup directory must already exist and be writable by the service account. Mount it as a separate writable volume for Docker/NAS. The `backupOnly` handle supports new backup/export files and can be read as a restore source; it cannot be used for trash, moves, purge, indexing or model-source writes. Restoring mapped model roots still requires the separate writable-root capability. Backup/export operations use one-use plans and refuse to overwrite existing filenames.
+The backup directory must already exist and be writable by the service account. Mount it as a separate writable volume for Docker/NAS. Before acquiring the catalog lock or opening the database, runtime admission resolves canonical paths and rejects a `backupOnly` root that contains or is contained by the library root or any other admitted root, so recursive scans cannot enter the backup destination. Parent segments such as `..` are resolved, and a not-yet-created library path is checked before files are created. The `backupOnly` handle supports new backup/export files and can be read as a restore source; it cannot be used for trash, moves, purge, indexing or model-source writes. Restoring mapped model roots still requires the separate writable-root capability. Backup/export operations use one-use plans and refuse to overwrite existing filenames.
 
 Start with an absolute config path:
 
