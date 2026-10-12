@@ -378,7 +378,9 @@ fn hash_file(path: &Path, limit: u64) -> Result<(u64, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library_core::{CapturePageInput, CaptureReceiptInput, FilamentInput, LibraryDb};
+    use library_core::{
+        CapturePageInput, CaptureReceiptInput, FilamentInput, LibraryDb, MetadataPatch,
+    };
     #[test]
     fn backup_round_trip_preserves_database_and_assets() {
         let temp = tempfile::tempdir().unwrap();
@@ -404,6 +406,17 @@ mod tests {
             std::slice::from_ref(&filament.id),
         )
         .unwrap();
+        let current_model = db.get_model(&model.id).unwrap().unwrap();
+        db.update_model_metadata(
+            &model.id,
+            current_model.metadata_version,
+            &MetadataPatch {
+                rating: Some(4),
+                favorite: Some(true),
+                ..MetadataPatch::default()
+            },
+        )
+        .unwrap();
         let capture = db
             .create_or_get_capture_receipt(&CaptureReceiptInput {
                 item_id: "backup-capture".into(),
@@ -421,6 +434,17 @@ mod tests {
             })
             .unwrap();
         drop(db);
+        let recovery = library_recovery::inspect_library(&root).unwrap();
+        let organization = recovery
+            .models
+            .iter()
+            .find(|item| item.id == model.id)
+            .unwrap()
+            .organization
+            .as_ref()
+            .unwrap();
+        assert_eq!(organization.rating, 4);
+        assert!(organization.favorite);
         let backup = temp.path().join("backup.zip");
         let result = create_backup(&root, &backup).unwrap();
         assert!(result.files >= 2);
@@ -431,6 +455,23 @@ mod tests {
         assert_eq!(
             restored.get_model(&model.id).unwrap().unwrap().filament_ids,
             std::slice::from_ref(&filament.id)
+        );
+        assert_eq!(
+            restored
+                .get_model(&model.id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .rating,
+            4
+        );
+        assert!(
+            restored
+                .get_model(&model.id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .favorite
         );
         assert_eq!(
             restored.get_filament(&filament.id).unwrap().unwrap().name,

@@ -569,7 +569,7 @@ fn schema_v3_recovery_preserves_metadata_history_archive_refs_and_categories() {
 }
 
 #[test]
-fn schema_v5_recovery_preserves_filaments_gallery_capture_and_unknown_history_ids() {
+fn schema_v6_recovery_preserves_filaments_gallery_capture_ratings_and_history_ids() {
     use library_core::{
         CapturePageInput, CaptureReceiptInput, FilamentInput, LibraryDb, PrintAttemptInput,
         PrintOutcome, SpoolmanFilamentRecord, SpoolmanSpoolRecord,
@@ -660,6 +660,17 @@ fn schema_v5_recovery_preserves_filaments_gallery_capture_and_unknown_history_id
         })
         .unwrap();
     let bookmark_id = capture.page_model_id.unwrap();
+    let current = db.get_model(&model.id).unwrap().unwrap();
+    db.update_model_metadata(
+        &model.id,
+        current.metadata_version,
+        &library_core::MetadataPatch {
+            rating: Some(3),
+            favorite: Some(true),
+            ..library_core::MetadataPatch::default()
+        },
+    )
+    .unwrap();
     drop(db);
 
     let preview = b"gallery thumbnail";
@@ -674,7 +685,7 @@ fn schema_v5_recovery_preserves_filaments_gallery_capture_and_unknown_history_id
     drop(conn);
 
     let manifest = inspect_library(&root).unwrap();
-    assert_eq!(manifest.library_schema_version, 5);
+    assert_eq!(manifest.library_schema_version, 6);
     assert_eq!(manifest.filament_sources.len(), 1);
     assert_eq!(manifest.filaments.len(), 3);
     assert_eq!(manifest.captures.len(), 1);
@@ -698,6 +709,9 @@ fn schema_v5_recovery_preserves_filaments_gallery_capture_and_unknown_history_id
         .iter()
         .find(|item| item.id == model.id)
         .unwrap();
+    let organization = recovered.organization.as_ref().unwrap();
+    assert_eq!(organization.rating, 3);
+    assert!(organization.favorite);
     assert_eq!(
         recovered.filament_ids,
         [manual.id.clone(), spool.id.clone()]
@@ -712,7 +726,7 @@ fn schema_v5_recovery_preserves_filaments_gallery_capture_and_unknown_history_id
     let selected_capture = export_library_zip(
         &root,
         std::slice::from_ref(&bookmark_id),
-        &tmp.path().join("capture-v5.zip"),
+        &tmp.path().join("capture-v6.zip"),
     )
     .unwrap();
     assert_eq!(selected_capture.captures.len(), 1);

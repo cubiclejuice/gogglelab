@@ -79,6 +79,10 @@ pub struct ModelPageQuery {
     pub duplicates_only: bool,
     pub source_kind: Option<String>,
     pub group: Option<ModelGroupFilter>,
+    pub thumbnail_mode: Option<String>,
+    pub source_directory: Option<String>,
+    pub minimum_rating: Option<u8>,
+    pub favorite: Option<bool>,
 }
 
 impl Default for ModelPageQuery {
@@ -101,6 +105,10 @@ impl Default for ModelPageQuery {
             duplicates_only: false,
             source_kind: None,
             group: None,
+            thumbnail_mode: None,
+            source_directory: None,
+            minimum_rating: None,
+            favorite: None,
         }
     }
 }
@@ -201,6 +209,7 @@ pub enum PrintStatus {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ModelMetadata {
     pub designer: Option<String>,
     pub source_url: Option<String>,
@@ -210,6 +219,8 @@ pub struct ModelMetadata {
     pub parent_model_id: Option<String>,
     pub last_printed_at: Option<String>,
     pub print_count: u64,
+    pub rating: u8,
+    pub favorite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +241,8 @@ pub struct MetadataPatch {
     pub tag_mode: Option<TagMode>,
     pub folder_id: Option<String>,
     pub parent_model_id: Option<String>,
+    pub rating: Option<u8>,
+    pub favorite: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +318,12 @@ pub struct PrintAttempt {
     pub outcome: PrintOutcome,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrintAttemptBatchItem {
+    pub model_id: String,
+    pub input: PrintAttemptInput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -442,6 +461,42 @@ pub struct CaptureSummary {
 pub struct DuplicateGroup {
     pub content_hash: String,
     pub models: Vec<Model>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogHashCounts {
+    pub total: u64,
+    pub hashed: u64,
+    pub unhashed: u64,
+    pub bookmarks: u64,
+    pub missing: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogStats {
+    pub total_models: u64,
+    pub available_models: u64,
+    pub missing_models: u64,
+    pub bookmarks: u64,
+    pub total_bytes: u64,
+    pub bundle_count: u64,
+    pub duplicate_group_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogFacetValue {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogFacets {
+    pub designers: Vec<String>,
+    pub licenses: Vec<String>,
+    pub categories: Vec<String>,
+    pub parents: Vec<CatalogFacetValue>,
+    pub folder_ids: Vec<String>,
+    pub root_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

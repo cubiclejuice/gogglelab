@@ -10,17 +10,18 @@ use uuid::Uuid;
 
 use crate::error::{io, LibraryError};
 use crate::models::{
-    CaptureDownloadRecord, CaptureReceipt, CaptureReceiptInput, CaptureSummary, CatalogSettings,
-    DuplicateGroup, Filament, FilamentInput, FilamentOrigin, FilamentResourceKind,
-    FilamentSyncSummary, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, MetadataPatch,
-    Model, ModelFilamentAssignment, ModelGroupFilter, ModelMetadata, ModelPageQuery, ModelSort,
-    PrintAttempt, PrintAttemptInput, PrintOutcome, PrintStatus, RemovalResult, RemovedModel,
-    ResolvedModelSource, ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel,
-    SortDirection, SourceRef, SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag,
-    TagMode, ThumbnailCacheEntry, ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
+    CaptureDownloadRecord, CaptureReceipt, CaptureReceiptInput, CaptureSummary, CatalogFacetValue,
+    CatalogFacets, CatalogSettings, CatalogStats, DuplicateGroup, Filament, FilamentInput,
+    FilamentOrigin, FilamentResourceKind, FilamentSyncSummary, Folder, ImportResult, IndexRoot,
+    IndexedSourceMetadata, MetadataPatch, Model, ModelFilamentAssignment, ModelGroupFilter,
+    ModelMetadata, ModelPageQuery, ModelSort, PrintAttempt, PrintAttemptBatchItem,
+    PrintAttemptInput, PrintOutcome, PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource,
+    ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel, SortDirection, SourceRef,
+    SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry,
+    ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 pub const ROOT_FOLDER_ID: &str = "root";
 pub const MIN_SCAN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_SCAN_INTERVAL_MINUTES: u32 = 1_440;
@@ -116,20 +117,28 @@ impl LibraryDb {
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
+            conn.execute_batch(MIGRATE_V5_TO_V6)?;
         } else if version == 2 {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
+            conn.execute_batch(MIGRATE_V5_TO_V6)?;
         } else if version == 3 {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
+            conn.execute_batch(MIGRATE_V5_TO_V6)?;
         } else if version == 4 {
             create_migration_backup(&conn, &root, version)?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
+            conn.execute_batch(MIGRATE_V5_TO_V6)?;
+        } else if version == 5 {
+            create_migration_backup(&conn, &root, version)?;
+            conn.execute_batch(MIGRATE_V5_TO_V6)?;
         }
         conn.execute_batch(ENSURE_CATALOG_SETTINGS)?;
+        conn.execute_batch(ENSURE_PRINT_BATCH_RECEIPTS)?;
         Ok(Self { conn, root })
     }
 
@@ -218,6 +227,34 @@ impl LibraryDb {
                 "model page request is invalid".into(),
             ));
         }
+        if query
+            .thumbnail_mode
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "missing" | "default" | "custom"))
+        {
+            return Err(LibraryError::InvalidInput(
+                "Thumbnail filter is invalid".into(),
+            ));
+        }
+        if let Some(directory) = query.source_directory.as_deref() {
+            if query.root_id.is_none()
+                || directory.len() > 1024
+                || directory.contains(['\\', '\0'])
+                || (!directory.is_empty()
+                    && directory
+                        .split('/')
+                        .any(|part| part.is_empty() || matches!(part, "." | "..")))
+            {
+                return Err(LibraryError::InvalidInput(
+                    "Source directory must be relative to a selected root".into(),
+                ));
+            }
+        }
+        if query.minimum_rating.is_some_and(|rating| rating > 5) {
+            return Err(LibraryError::InvalidInput(
+                "Minimum rating must be between 0 and 5".into(),
+            ));
+        }
         let search = query
             .search
             .as_deref()
@@ -279,6 +316,20 @@ impl LibraryDb {
              AND (?15 IS NULL OR (?15=1 AND m.bundle_id IS NULL AND m.source_archive_member IS NULL)
                   OR (?15=2 AND m.bundle_id IS NOT NULL)
                   OR (?15=3 AND m.source_archive_member IS NOT NULL))
+             AND (?19 IS NULL
+                  OR (?19='missing' AND NOT EXISTS (SELECT 1 FROM thumbnails tf
+                       WHERE tf.model_id=m.id AND (tf.is_custom=1 OR tf.source_content_hash IS NULL
+                       OR tf.source_content_hash=COALESCE(r.blob_hash,d.content_hash))))
+                  OR (?19 IN ('default','custom') AND
+                       (SELECT tf.is_custom FROM thumbnails tf WHERE tf.model_id=m.id
+                        AND (tf.is_custom=1 OR tf.source_content_hash IS NULL
+                        OR tf.source_content_hash=COALESCE(r.blob_hash,d.content_hash))
+                        ORDER BY tf.is_active DESC,tf.is_custom DESC,tf.ordinal,tf.id LIMIT 1)
+                       =CASE WHEN ?19='custom' THEN 1 ELSE 0 END))
+             AND (?20 IS NULL OR (m.source_kind='indexed'
+                  AND (?20='' OR substr(m.source_path,1,length(?20)+1)=?20||'/')))
+             AND (?21 IS NULL OR m.rating>=?21)
+             AND (?22 IS NULL OR m.favorite=?22)
              AND (?16 IS NULL OR {sort_expression}{comparison}{cursor_expression}
                   OR ({sort_expression}={cursor_expression} AND m.id{comparison}?17))
              ORDER BY {sort_expression} {direction},m.id {direction} LIMIT ?18"
@@ -302,7 +353,11 @@ impl LibraryDb {
                 group,
                 after_sort_value,
                 after_id,
-                i64::from(limit) + 1
+                i64::from(limit) + 1,
+                query.thumbnail_mode.as_deref(),
+                query.source_directory.as_deref(),
+                query.minimum_rating.map(i64::from),
+                query.favorite.map(i64::from)
             ],
             model_from_row,
         )?;
@@ -376,6 +431,120 @@ impl LibraryDb {
                 })
             })
             .collect())
+    }
+
+    pub fn catalog_hash_counts(&self) -> Result<crate::models::CatalogHashCounts, LibraryError> {
+        self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(COALESCE(r.blob_hash,d.content_hash) IS NOT NULL),0),
+                    COALESCE(SUM(m.catalog_kind!='bookmark' AND COALESCE(r.blob_hash,d.content_hash) IS NULL),0),
+                    COALESCE(SUM(m.catalog_kind='bookmark'),0),
+                    COALESCE(SUM(m.source_missing=1),0)
+             FROM models m LEFT JOIN revisions r ON r.id=m.current_revision_id
+             LEFT JOIN indexed_model_data d ON d.model_id=m.id WHERE m.deleted_at IS NULL",
+            [], |row| {
+                let count = |index: usize| -> rusqlite::Result<u64> {
+                    let value: i64 = row.get(index)?;
+                    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+                };
+                Ok(crate::models::CatalogHashCounts { total: count(0)?, hashed: count(1)?,
+                    unhashed: count(2)?, bookmarks: count(3)?, missing: count(4)? })
+            },
+        ).map_err(LibraryError::from)
+    }
+
+    pub fn catalog_stats(&self) -> Result<CatalogStats, LibraryError> {
+        let (total, available, missing, bookmarks, bytes): (i64, i64, i64, i64, i64) =
+            self.conn.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(catalog_kind='file' AND source_missing=0),0),
+                        COALESCE(SUM(catalog_kind='file' AND source_missing=1),0),
+                        COALESCE(SUM(catalog_kind='bookmark'),0),
+                        COALESCE(SUM(CASE WHEN catalog_kind='file' THEN COALESCE(r.bytes,d.bytes,0) ELSE 0 END),0)
+                 FROM models m
+                 LEFT JOIN revisions r ON r.id=m.current_revision_id
+                 LEFT JOIN indexed_model_data d ON d.model_id=m.id
+                 WHERE m.deleted_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )?;
+        let bundle_count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT bundle_id) FROM models
+             WHERE deleted_at IS NULL AND bundle_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let duplicate_group_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT COALESCE(r.blob_hash,d.content_hash) hash
+                 FROM models m
+                 LEFT JOIN revisions r ON r.id=m.current_revision_id
+                 LEFT JOIN indexed_model_data d ON d.model_id=m.id
+                 WHERE m.deleted_at IS NULL AND COALESCE(r.blob_hash,d.content_hash) IS NOT NULL
+                 GROUP BY hash HAVING COUNT(*)>1)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(CatalogStats {
+            total_models: total as u64,
+            available_models: available as u64,
+            missing_models: missing as u64,
+            bookmarks: bookmarks as u64,
+            total_bytes: bytes as u64,
+            bundle_count: bundle_count as u64,
+            duplicate_group_count: duplicate_group_count as u64,
+        })
+    }
+
+    pub fn catalog_facets(&self) -> Result<CatalogFacets, LibraryError> {
+        fn strings(conn: &Connection, sql: &str) -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect()
+        }
+        let designers = strings(
+            &self.conn,
+            "SELECT DISTINCT designer FROM models WHERE deleted_at IS NULL AND designer IS NOT NULL
+             ORDER BY lower(designer) LIMIT 5000",
+        )?;
+        let licenses = strings(
+            &self.conn,
+            "SELECT DISTINCT model_license FROM models WHERE deleted_at IS NULL AND model_license IS NOT NULL
+             ORDER BY lower(model_license) LIMIT 5000",
+        )?;
+        let categories = strings(
+            &self.conn,
+            "SELECT DISTINCT category FROM tags WHERE category IS NOT NULL
+             ORDER BY lower(category) LIMIT 5000",
+        )?;
+        let folder_ids = strings(
+            &self.conn,
+            "SELECT id FROM folders ORDER BY lower(name),id LIMIT 5000",
+        )?;
+        let root_ids = strings(
+            &self.conn,
+            "SELECT id FROM index_roots ORDER BY id LIMIT 5000",
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id,display_name FROM models WHERE deleted_at IS NULL
+             ORDER BY lower(display_name),id LIMIT 5000",
+        )?;
+        let parents = stmt
+            .query_map([], |row| {
+                Ok(CatalogFacetValue {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CatalogFacets {
+            designers,
+            licenses,
+            categories,
+            parents,
+            folder_ids,
+            root_ids,
+        })
     }
 
     pub fn remove_models_recoverably(
@@ -957,6 +1126,149 @@ impl LibraryDb {
         tx.execute("DELETE FROM index_roots WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn remap_restored_index_roots(
+        &self,
+        mappings: &[(String, String, PathBuf, bool)],
+    ) -> Result<(), LibraryError> {
+        let mut backup_ids = HashSet::new();
+        let mut target_ids = HashSet::new();
+        let mut paths = Vec::new();
+        for (backup_id, target_id, path, _) in mappings {
+            if !backup_ids.insert(backup_id.clone()) || !target_ids.insert(target_id.clone()) {
+                return Err(LibraryError::InvalidInput(
+                    "restore root mapping is duplicated".into(),
+                ));
+            }
+            let path = canonical_directory(path)?;
+            if paths
+                .iter()
+                .any(|existing: &PathBuf| path.starts_with(existing) || existing.starts_with(&path))
+            {
+                return Err(LibraryError::InvalidInput(
+                    "restore root mappings overlap".into(),
+                ));
+            }
+            paths.push(path);
+        }
+        self.conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let result = (|| {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("UPDATE index_roots SET enabled=0", [])?;
+            for ((backup_id, target_id, _, enabled), path) in mappings.iter().zip(&paths) {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM index_roots WHERE id=?1)",
+                    params![backup_id],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(LibraryError::IndexRootNotFound(backup_id.clone()));
+                }
+                if backup_id != target_id {
+                    let target_exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM index_roots WHERE id=?1)",
+                        params![target_id],
+                        |row| row.get(0),
+                    )?;
+                    if target_exists {
+                        let displaced = new_id("unmapped-root");
+                        tx.execute(
+                            "UPDATE models SET source_root_id=?1 WHERE source_root_id=?2",
+                            params![displaced, target_id],
+                        )?;
+                        tx.execute(
+                            "UPDATE bundles SET source_root_id=?1 WHERE source_root_id=?2",
+                            params![displaced, target_id],
+                        )?;
+                        tx.execute(
+                            "UPDATE index_roots SET id=?1,enabled=0 WHERE id=?2",
+                            params![displaced, target_id],
+                        )?;
+                    }
+                    tx.execute(
+                        "UPDATE models SET source_root_id=?1 WHERE source_root_id=?2",
+                        params![target_id, backup_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE bundles SET source_root_id=?1 WHERE source_root_id=?2",
+                        params![target_id, backup_id],
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE index_roots SET id=?1,path=?2,enabled=?3 WHERE id=?4",
+                    params![target_id, path.to_string_lossy(), enabled, backup_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        self.conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        result?;
+        let violation: Option<String> = self
+            .conn
+            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+            .optional()?;
+        if violation.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "restore root mapping violates catalog links".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn move_loose_indexed_model(
+        &self,
+        model_id: &str,
+        expected_version: u64,
+        destination_root_id: &str,
+        destination_relative_path: &Path,
+        modified_at: u64,
+    ) -> Result<Model, LibraryError> {
+        let relative = validated_relative_path(destination_relative_path)?;
+        let modified_at = i64::try_from(modified_at)
+            .map_err(|_| LibraryError::InvalidInput("modified time is out of range".into()))?;
+        self.get_index_root(destination_root_id)?
+            .ok_or_else(|| LibraryError::IndexRootNotFound(destination_root_id.into()))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let row: Option<(i64, String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT metadata_version,source_kind,source_archive_member,deleted_at
+                 FROM models WHERE id=?1",
+                params![model_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((actual, source_kind, archive_member, deleted_at)) = row else {
+            return Err(LibraryError::ModelNotFound(model_id.into()));
+        };
+        if actual as u64 != expected_version {
+            return Err(LibraryError::MetadataConflict {
+                model_id: model_id.into(),
+                expected: expected_version,
+                actual: actual as u64,
+            });
+        }
+        if deleted_at.is_some() || source_kind != "indexed" || archive_member.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "only active loose indexed models can be moved".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE models SET source_root_id=?1,source_path=?2,source_missing=0,
+                    source_modified_at=?3,metadata_version=metadata_version+1,updated_at=?4
+             WHERE id=?5",
+            params![
+                destination_root_id,
+                relative,
+                modified_at,
+                timestamp(),
+                model_id
+            ],
+        )?;
+        tx.commit()?;
+        self.get_model(model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
     }
 
     pub fn indexed_source_metadata(
@@ -1902,6 +2214,17 @@ impl LibraryDb {
                 ));
             }
         }
+        let unchanged: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thumbnails
+             WHERE model_id=?1 AND is_custom=0 AND relative_path=?2
+               AND content_hash=?3 AND source_content_hash=?4)",
+            params![model_id, relative, content_hash, source_content_hash],
+            |row| row.get(0),
+        )?;
+        if unchanged {
+            tx.commit()?;
+            return Ok(());
+        }
         tx.execute(
             "DELETE FROM thumbnails WHERE model_id = ?1 AND is_custom = 0",
             params![model_id],
@@ -2409,6 +2732,93 @@ impl LibraryDb {
         tx.commit()?;
         self.get_print_attempt(&id)?
             .ok_or_else(|| LibraryError::InvalidInput("print attempt missing".into()))
+    }
+
+    pub fn create_print_attempts_idempotent(
+        &self,
+        idempotency_key: &str,
+        items: &[PrintAttemptBatchItem],
+    ) -> Result<Vec<PrintAttempt>, LibraryError> {
+        validate_plain_capture_id(idempotency_key, "print batch idempotency key")?;
+        if items.is_empty() || items.len() > 10_000 {
+            return Err(LibraryError::InvalidInput(
+                "print attempt batch count is invalid".into(),
+            ));
+        }
+        for item in items {
+            validate_print_attempt(&item.input)?;
+        }
+        let payload = serde_json::to_vec(items)
+            .map_err(|_| LibraryError::InvalidInput("print batch payload is invalid".into()))?;
+        let payload_hash = format!("{:x}", Sha256::digest(&payload));
+        if let Some((stored_hash, attempt_ids_json)) = self
+            .conn
+            .query_row(
+                "SELECT payload_hash,attempt_ids_json FROM print_batch_receipts
+                 WHERE idempotency_key=?1",
+                params![idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_hash != payload_hash {
+                return Err(LibraryError::IdempotencyConflict(idempotency_key.into()));
+            }
+            let ids: Vec<String> = serde_json::from_str(&attempt_ids_json)
+                .map_err(|_| LibraryError::InvalidInput("print batch receipt is corrupt".into()))?;
+            return ids
+                .into_iter()
+                .map(|id| {
+                    self.get_print_attempt(&id)?.ok_or_else(|| {
+                        LibraryError::InvalidInput("print batch receipt target is missing".into())
+                    })
+                })
+                .collect();
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut affected = BTreeSet::new();
+        for item in items {
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM models WHERE id=?1 AND deleted_at IS NULL)",
+                params![item.model_id],
+                |row| row.get(0),
+            )?;
+            if !active {
+                return Err(LibraryError::ModelNotFound(item.model_id.clone()));
+            }
+            affected.insert(item.model_id.clone());
+        }
+        let now = timestamp();
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let id = new_id("print");
+            write_print_attempt(&tx, &id, &item.model_id, &item.input, &now, true)?;
+            ids.push(id);
+        }
+        for model_id in affected {
+            recompute_print_summary(&tx, &model_id)?;
+        }
+        tx.execute(
+            "INSERT INTO print_batch_receipts
+             (idempotency_key,payload_hash,attempt_ids_json,created_at) VALUES(?1,?2,?3,?4)",
+            params![
+                idempotency_key,
+                payload_hash,
+                serde_json::to_string(&ids).map_err(|_| LibraryError::InvalidInput(
+                    "print batch receipt could not be encoded".into()
+                ))?,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        ids.into_iter()
+            .map(|id| {
+                self.get_print_attempt(&id)?.ok_or_else(|| {
+                    LibraryError::InvalidInput("created print attempt is missing".into())
+                })
+            })
+            .collect()
     }
     pub fn list_print_attempts(&self, model_id: &str) -> Result<Vec<PrintAttempt>, LibraryError> {
         let mut stmt=self.conn.prepare("SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at FROM print_attempts WHERE model_id=?1 ORDER BY printed_at DESC,id DESC")?;
@@ -3288,7 +3698,7 @@ const MODEL_SELECT: &str = "SELECT m.id, m.display_name, m.description, m.folder
              ORDER BY t.is_active DESC, t.is_custom DESC, t.ordinal, t.id LIMIT 1),
             m.designer, m.source_url, m.notes, m.model_license, m.print_status,
             m.parent_model_id, m.last_printed_at, m.print_count, m.bundle_id,
-            m.source_archive_member,m.catalog_kind
+            m.source_archive_member,m.catalog_kind,m.rating,m.favorite
      FROM models m
      LEFT JOIN revisions r ON r.id = m.current_revision_id
      LEFT JOIN blobs b ON b.hash = r.blob_hash
@@ -3347,7 +3757,9 @@ CREATE TABLE models (
     parent_model_id TEXT,
     last_printed_at TEXT, print_count INTEGER NOT NULL DEFAULT 0,
     bundle_id TEXT,
-    catalog_kind TEXT NOT NULL DEFAULT 'file' CHECK(catalog_kind IN ('file','bookmark'))
+    catalog_kind TEXT NOT NULL DEFAULT 'file' CHECK(catalog_kind IN ('file','bookmark')),
+    rating INTEGER NOT NULL DEFAULT 0 CHECK(rating BETWEEN 0 AND 5),
+    favorite INTEGER NOT NULL DEFAULT 0 CHECK(favorite IN (0,1))
 );
 CREATE INDEX models_folder_idx ON models(folder_id, deleted_at, created_at, id);
 CREATE TABLE revisions (
@@ -3604,6 +4016,14 @@ PRAGMA user_version=5;
 COMMIT;
 "#;
 
+const MIGRATE_V5_TO_V6: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE models ADD COLUMN rating INTEGER NOT NULL DEFAULT 0 CHECK(rating BETWEEN 0 AND 5);
+ALTER TABLE models ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0 CHECK(favorite IN (0,1));
+PRAGMA user_version=6;
+COMMIT;
+"#;
+
 const ENSURE_CATALOG_SETTINGS: &str = r#"
 CREATE TABLE IF NOT EXISTS catalog_settings (
     id TEXT PRIMARY KEY CHECK(id = 'local'),
@@ -3619,6 +4039,15 @@ CREATE TABLE IF NOT EXISTS catalog_settings (
 INSERT OR IGNORE INTO catalog_settings
     (id, thumbnail_size, thumbnail_background, thumbnail_concurrency, scan_batch_size)
 VALUES ('local', 256, '#12171F', 2, 128);
+"#;
+
+const ENSURE_PRINT_BATCH_RECEIPTS: &str = r#"
+CREATE TABLE IF NOT EXISTS print_batch_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    attempt_ids_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 "#;
 
 fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
@@ -3652,6 +4081,9 @@ fn model_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
             parent_model_id: row.get(23)?,
             last_printed_at: row.get(24)?,
             print_count: row.get::<_, i64>(25)? as u64,
+            rating: u8::try_from(row.get::<_, i64>(29)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            favorite: row.get(30)?,
         },
         bundle_id: row.get(26)?,
         source_archive_member: row.get(27)?,
@@ -4672,6 +5104,11 @@ fn print_outcome_value(value: &PrintOutcome) -> &'static str {
     }
 }
 fn validate_metadata_patch(p: &MetadataPatch) -> Result<(), LibraryError> {
+    if p.rating.is_some_and(|rating| rating > 5) {
+        return Err(LibraryError::InvalidInput(
+            "rating must be between 0 and 5".into(),
+        ));
+    }
     clean_optional(p.designer.as_deref(), 200)?;
     clean_optional(p.source_url.as_deref(), 2048)?;
     clean_optional(p.notes.as_deref(), 20_000)?;
@@ -4758,7 +5195,7 @@ fn apply_metadata_patch(
             Some(v.to_owned())
         }
     });
-    tx.execute("UPDATE models SET designer=CASE WHEN ?1 THEN ?2 ELSE designer END,source_url=CASE WHEN ?3 THEN ?4 ELSE source_url END,notes=CASE WHEN ?5 THEN ?6 ELSE notes END,description=CASE WHEN ?5 THEN COALESCE(?6,'') ELSE description END,model_license=CASE WHEN ?7 THEN ?8 ELSE model_license END,print_status=COALESCE(?9,print_status),folder_id=COALESCE(?10,folder_id),parent_model_id=CASE WHEN ?11 THEN ?12 ELSE parent_model_id END,metadata_version=metadata_version+1,updated_at=?13 WHERE id=?14",params![patch.designer.is_some(),designer,patch.source_url.is_some(),source_url,patch.notes.is_some(),notes,patch.model_license.is_some(),license,patch.print_status.as_ref().map(print_status_value),patch.folder_id,patch.parent_model_id.is_some(),parent.flatten(),timestamp(),model_id])?;
+    tx.execute("UPDATE models SET designer=CASE WHEN ?1 THEN ?2 ELSE designer END,source_url=CASE WHEN ?3 THEN ?4 ELSE source_url END,notes=CASE WHEN ?5 THEN ?6 ELSE notes END,description=CASE WHEN ?5 THEN COALESCE(?6,'') ELSE description END,model_license=CASE WHEN ?7 THEN ?8 ELSE model_license END,print_status=COALESCE(?9,print_status),folder_id=COALESCE(?10,folder_id),parent_model_id=CASE WHEN ?11 THEN ?12 ELSE parent_model_id END,rating=COALESCE(?13,rating),favorite=COALESCE(?14,favorite),metadata_version=metadata_version+1,updated_at=?15 WHERE id=?16",params![patch.designer.is_some(),designer,patch.source_url.is_some(),source_url,patch.notes.is_some(),notes,patch.model_license.is_some(),license,patch.print_status.as_ref().map(print_status_value),patch.folder_id,patch.parent_model_id.is_some(),parent.flatten(),patch.rating.map(i64::from),patch.favorite.map(i64::from),timestamp(),model_id])?;
     if let Some(tags) = &patch.tags {
         for id in tags {
             let ok: bool = tx.query_row(
@@ -5229,6 +5666,117 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_filters_use_active_preview_and_filter_before_cursor_limit() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let default = db.create_model("Alpha default", None).unwrap();
+        let custom = db.create_model("Beta custom", None).unwrap();
+        let missing = db.create_model("Gamma missing", None).unwrap();
+        let stale = db.create_model("Delta stale", None).unwrap();
+        for (id, model, is_custom, active, source_hash) in [
+            ("default", &default, 0, 1, None),
+            ("custom-fallback", &custom, 0, 0, None),
+            ("custom", &custom, 1, 1, None),
+            ("stale", &stale, 0, 1, Some("no-longer-current")),
+        ] {
+            db.conn.execute(
+                "INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash,ordinal,is_active) VALUES(?1,?2,'thumbnails/fixture.png',?3,?4,?5,0,?6)",
+                params![id, model.id, "0".repeat(64), is_custom, source_hash, active],
+            ).unwrap();
+        }
+        for (mode, expected) in [("default", &default.id), ("custom", &custom.id)] {
+            let query = ModelPageQuery {
+                thumbnail_mode: Some(mode.into()),
+                sort: ModelSort::Name,
+                ..ModelPageQuery::default()
+            };
+            let (models, more) = db.list_models_page(&query, None, None, 1).unwrap();
+            assert_eq!(models[0].id, *expected);
+            assert!(!more);
+        }
+        let query = ModelPageQuery {
+            thumbnail_mode: Some("missing".into()),
+            sort: ModelSort::Name,
+            ..ModelPageQuery::default()
+        };
+        let (first, more) = db.list_models_page(&query, None, None, 1).unwrap();
+        assert_eq!(first[0].id, stale.id);
+        assert!(more);
+        let (second, more) = db
+            .list_models_page(&query, Some("delta stale"), Some(&stale.id), 1)
+            .unwrap();
+        assert_eq!(second[0].id, missing.id);
+        assert!(!more);
+        assert!(db
+            .list_models_page(
+                &ModelPageQuery {
+                    thumbnail_mode: Some("invalid".into()),
+                    ..ModelPageQuery::default()
+                },
+                None,
+                None,
+                1
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn source_directory_filter_is_root_relative_and_applied_before_keyset_limits() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let root = db
+            .add_index_root(std::env::temp_dir(), 60, 1024 * 1024)
+            .unwrap();
+        let entries = [
+            ("A in parts", "Parts/a.stl"),
+            ("B nested in parts", "Parts/Nested/b.stl"),
+            ("C outside parts", "Parts-old/c.stl"),
+        ];
+        let mut models = Vec::new();
+        for (name, relative) in entries {
+            let model = db.create_model(name, None).unwrap();
+            db.conn.execute(
+                "UPDATE models SET source_kind='indexed',source_root_id=?1,source_path=?2,source_missing=0 WHERE id=?3",
+                params![root.id, relative, model.id],
+            ).unwrap();
+            models.push(db.get_model(&model.id).unwrap().unwrap());
+        }
+        let query = ModelPageQuery {
+            root_id: Some(root.id),
+            source_directory: Some("Parts".into()),
+            sort: ModelSort::Name,
+            ..ModelPageQuery::default()
+        };
+        let (first, has_more) = db.list_models_page(&query, None, None, 1).unwrap();
+        assert_eq!(first[0].id, models[0].id);
+        assert!(has_more);
+        let (second, has_more) = db
+            .list_models_page(&query, Some("a in parts"), Some(&first[0].id), 1)
+            .unwrap();
+        assert_eq!(second[0].id, models[1].id);
+        assert!(!has_more);
+
+        for (root_id, source_directory) in [
+            (None, Some("Parts".to_owned())),
+            (
+                Some(models[0].source_root_id.clone().unwrap()),
+                Some("../outside".to_owned()),
+            ),
+        ] {
+            assert!(db
+                .list_models_page(
+                    &ModelPageQuery {
+                        root_id,
+                        source_directory,
+                        ..ModelPageQuery::default()
+                    },
+                    None,
+                    None,
+                    10
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
     fn paged_catalog_filters_are_applied_before_keyset_limits() {
         let db = LibraryDb::open_in_memory().unwrap();
         let a = db.create_model("Alpha", None).unwrap();
@@ -5322,6 +5870,16 @@ mod tests {
             .unwrap();
         assert!(more);
         assert_eq!(bundled[0].display_name, "Gamma");
+        let stats = db.catalog_stats().unwrap();
+        assert_eq!(stats.total_models, 3);
+        assert_eq!(stats.available_models, 3);
+        assert_eq!(stats.bundle_count, 1);
+        let facets = db.catalog_facets().unwrap();
+        assert_eq!(facets.designers, ["Designer"]);
+        assert_eq!(facets.licenses, ["CC0"]);
+        assert_eq!(facets.categories, ["Type"]);
+        assert_eq!(facets.parents.len(), 3);
+        assert!(facets.folder_ids.iter().any(|id| id == ROOT_FOLDER_ID));
     }
 
     #[test]
@@ -5996,6 +6554,68 @@ mod tests {
     }
 
     #[test]
+    fn print_attempt_batches_are_atomic_and_idempotent_without_storing_payloads() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let first = db.create_model("First", None).unwrap();
+        let second = db.create_model("Second", None).unwrap();
+        let input = PrintAttemptInput {
+            printed_at: "2026-10-11T12:00:00Z".into(),
+            quantity: 2,
+            notes: "private batch note".into(),
+            filament_ids: vec![],
+            outcome: PrintOutcome::Printed,
+        };
+        let invalid = vec![
+            PrintAttemptBatchItem {
+                model_id: first.id.clone(),
+                input: input.clone(),
+            },
+            PrintAttemptBatchItem {
+                model_id: "missing".into(),
+                input: input.clone(),
+            },
+        ];
+        assert!(db
+            .create_print_attempts_idempotent("batch-invalid", &invalid)
+            .is_err());
+        assert!(db.list_print_attempts(&first.id).unwrap().is_empty());
+
+        let items = vec![
+            PrintAttemptBatchItem {
+                model_id: first.id.clone(),
+                input: input.clone(),
+            },
+            PrintAttemptBatchItem {
+                model_id: second.id.clone(),
+                input,
+            },
+        ];
+        let created = db
+            .create_print_attempts_idempotent("batch-1", &items)
+            .unwrap();
+        let replayed = db
+            .create_print_attempts_idempotent("batch-1", &items)
+            .unwrap();
+        assert_eq!(created, replayed);
+        assert_eq!(db.list_print_attempts(&first.id).unwrap().len(), 1);
+        assert_eq!(db.list_print_attempts(&second.id).unwrap().len(), 1);
+        let mut changed = items;
+        changed[0].input.quantity = 3;
+        assert!(db
+            .create_print_attempts_idempotent("batch-1", &changed)
+            .is_err());
+        let receipt: String = db
+            .conn
+            .query_row(
+                "SELECT attempt_ids_json FROM print_batch_receipts WHERE idempotency_key='batch-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!receipt.contains("private batch note"));
+    }
+
+    #[test]
     fn management_duplicates_removal_restore_and_custom_previews_are_scoped_and_versioned() {
         let root = temp_root("management-core");
         let sources = temp_root("management-core-source");
@@ -6224,6 +6844,31 @@ mod tests {
             relative,
         )
         .unwrap();
+        let first_id: String = db
+            .conn
+            .query_row(
+                "SELECT id FROM thumbnails WHERE model_id=?1 AND is_custom=0",
+                [&model.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.set_thumbnail_for_source_and_settings(
+            &model.id,
+            model.content_hash.as_deref().unwrap(),
+            &current,
+            &png_hash,
+            relative,
+        )
+        .unwrap();
+        let repeated_id: String = db
+            .conn
+            .query_row(
+                "SELECT id FROM thumbnails WHERE model_id=?1 AND is_custom=0",
+                [&model.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repeated_id, first_id);
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(source_dir);
     }
@@ -6658,6 +7303,7 @@ mod tests {
              CREATE INDEX thumbnails_model_idx ON thumbnails(model_id,is_custom);
              ALTER TABLE models DROP COLUMN catalog_kind;
              DROP TABLE model_filaments; DROP TABLE filaments; DROP TABLE filament_sources;
+             ALTER TABLE models DROP COLUMN favorite; ALTER TABLE models DROP COLUMN rating;
              PRAGMA user_version=3;",
         )
         .unwrap();
@@ -6668,7 +7314,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let backup = root.join("library.sqlite3.schema-v3.backup");
         assert!(backup.is_file());
         let backup_conn = Connection::open(backup).unwrap();
@@ -6692,6 +7338,7 @@ mod tests {
              ALTER TABLE thumbnails DROP COLUMN ordinal;
              CREATE INDEX thumbnails_model_idx ON thumbnails(model_id,is_custom);
              ALTER TABLE models DROP COLUMN catalog_kind;
+             ALTER TABLE models DROP COLUMN favorite; ALTER TABLE models DROP COLUMN rating;
              INSERT INTO models(id,display_name,description,folder_id,metadata_version,created_at,updated_at)
                VALUES('gallery-model','Gallery','', 'root',1,'1','1');
              INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash)
@@ -6718,11 +7365,92 @@ mod tests {
         );
         let backup = root.join("library.sqlite3.schema-v4.backup");
         assert!(backup.is_file());
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
         let version: i64 = Connection::open(backup)
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v5_migration_backs_up_and_adds_rating_and_favorite_defaults() {
+        let root = temp_root("schema-v5-rating");
+        fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE models DROP COLUMN favorite;
+             ALTER TABLE models DROP COLUMN rating;
+             INSERT INTO models(id,display_name,description,folder_id,metadata_version,created_at,updated_at)
+             VALUES('legacy-model','Legacy','', 'root',1,'1','1');
+             PRAGMA user_version=5;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.get_model("legacy-model").unwrap().unwrap();
+        assert_eq!(model.metadata.rating, 0);
+        assert!(!model.metadata.favorite);
+        let backup = root.join("library.sqlite3.schema-v5.backup");
+        assert!(backup.is_file());
+        let backup_version: i64 = Connection::open(backup)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, 5);
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        drop(db);
+
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.get_model("legacy-model").unwrap().unwrap();
+        let updated = db
+            .update_model_metadata(
+                &model.id,
+                model.metadata_version,
+                &MetadataPatch {
+                    rating: Some(5),
+                    favorite: Some(true),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.metadata.rating, 5);
+        assert!(updated.metadata.favorite);
+        let (filtered, _) = db
+            .list_models_page(
+                &ModelPageQuery {
+                    minimum_rating: Some(5),
+                    favorite: Some(true),
+                    ..ModelPageQuery::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, model.id);
+        assert!(db
+            .update_model_metadata(
+                &updated.id,
+                updated.metadata_version,
+                &MetadataPatch {
+                    rating: Some(6),
+                    ..MetadataPatch::default()
+                },
+            )
+            .is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7293,6 +8021,59 @@ mod tests {
         assert_eq!(db.list_models(None, None).unwrap().len(), 1);
         let _ = fs::remove_dir_all(library_root);
         let _ = fs::remove_dir_all(offline_location);
+    }
+
+    #[test]
+    fn restored_root_mapping_rewrites_links_and_disables_unmapped_roots() {
+        let temp = temp_root("restore-root-map");
+        let old = temp.join("old");
+        let new = temp.join("new");
+        let other = temp.join("other");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(old.join("part.stl"), vec![0_u8; 84]).unwrap();
+        let db = LibraryDb::open(temp.join("library")).unwrap();
+        let root = db.add_index_root(&old, 60, 1024).unwrap();
+        let unmapped = db.add_index_root(&other, 60, 1024).unwrap();
+        db.record_scan_entries(
+            &root.id,
+            &[ScannedModel {
+                relative_path: "part.stl".into(),
+                content_hash: hash(1),
+                bytes: 84,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: None,
+                archive_member: None,
+                outer_fingerprint: None,
+            }],
+        )
+        .unwrap();
+        db.remap_restored_index_roots(&[(
+            root.id.clone(),
+            "operator-root".into(),
+            new.canonicalize().unwrap(),
+            true,
+        )])
+        .unwrap();
+        let roots = db.list_index_roots().unwrap();
+        let mapped = roots
+            .iter()
+            .find(|root| root.id == "operator-root")
+            .unwrap();
+        assert_eq!(mapped.path, new.canonicalize().unwrap());
+        assert!(mapped.enabled);
+        assert!(
+            !roots
+                .iter()
+                .find(|root| root.id == unmapped.id)
+                .unwrap()
+                .enabled
+        );
+        let model = db.list_models(None, None).unwrap().remove(0);
+        assert_eq!(model.source_root_id.as_deref(), Some("operator-root"));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

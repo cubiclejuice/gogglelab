@@ -10,35 +10,46 @@ use std::time::{Duration, SystemTime};
 use library_core::{
     CaptureDownloadInput as CoreCaptureDownload, CapturePageInput as CoreCapturePage,
     CaptureReceipt as CoreCaptureReceipt, CaptureReceiptInput as CoreCaptureReceiptInput,
-    CaptureSummary as CoreCaptureSummary, Filament as CoreFilament,
-    FilamentInput as CoreFilamentInput, Folder as CoreFolder, LibraryDb, LibraryError,
-    MetadataPatch as CoreMetadataPatch, Model,
+    CaptureSummary as CoreCaptureSummary, CatalogFacets as CoreCatalogFacets,
+    CatalogSettings as CoreCatalogSettings, CatalogStats as CoreCatalogStats,
+    Filament as CoreFilament, FilamentInput as CoreFilamentInput, Folder as CoreFolder, LibraryDb,
+    LibraryError, MetadataPatch as CoreMetadataPatch, Model,
     ModelFilamentAssignment as CoreModelFilamentAssignment,
     ModelGroupFilter as CoreModelGroupFilter, ModelPageQuery as CoreModelPageQuery,
     ModelSort as CoreModelSort, PrintAttempt as CorePrintAttempt,
-    PrintAttemptInput as CorePrintAttemptInput, PrintOutcome as CorePrintOutcome,
-    PrintStatus as CorePrintStatus, SortDirection as CoreSortDirection, TagMode as CoreTagMode,
+    PrintAttemptBatchItem as CorePrintAttemptBatchItem, PrintAttemptInput as CorePrintAttemptInput,
+    PrintOutcome as CorePrintOutcome, PrintStatus as CorePrintStatus,
+    SortDirection as CoreSortDirection, TagMode as CoreTagMode,
     VersionedTarget as CoreVersionedTarget,
 };
 use library_protocol::{
-    BundleEngine, BundlePreviewSummary, Capability, CaptureDownloadResult, CaptureDownloadStatus,
-    CaptureEngine, CaptureEnvelope, CaptureImportResult, CaptureItemStatus, CaptureSummary,
-    CatalogEngine, CatalogModel, ContentEngine, ContentLease, DownloadEngine, Filament,
-    FilamentEngine, FilamentInput, Folder, FolderEngine, GalleryEngine, MediaLease, MetadataEngine,
-    MetadataPatch, ModelAvailability, ModelFilamentAssignment, ModelGroupFilter, ModelQuery,
-    ModelSort, MutationVersion, Page, PageRequest, PrintAttempt, PrintAttemptInput,
-    PrintHistoryEngine, PrintOutcome, PrintStatus, RequestContext, RootAccess, RootHandle,
+    ActionPlan, ActionTargetSnapshot, BundleEngine, BundlePreviewSummary, Capability,
+    CaptureDownloadResult, CaptureDownloadStatus, CaptureEngine, CaptureEnvelope,
+    CaptureImportResult, CaptureItemStatus, CaptureSummary, CatalogEngine, CatalogFacetValue,
+    CatalogFacets, CatalogModel, CatalogSettings, CatalogStats, ContentEngine, ContentKind,
+    ContentLease, DownloadEngine, DuplicateEngine, DuplicateGroup, EmbeddedMetadataEngine,
+    EmbeddedMetadataFields, EmbeddedMetadataProposal, EmbeddedMetadataSelection, Filament,
+    FilamentEngine, FilamentInput, Folder, FolderEngine, GalleryEngine, GeometryEngine,
+    GeometryLease, IndexRootSettings, IndexRootSettingsPatch, ManagementAction, ManagementEngine,
+    ManagementResult, MediaLease, MetadataEngine, MetadataPatch, ModelAvailability,
+    ModelFilamentAssignment, ModelGroupFilter, ModelQuery, ModelSort, MutationVersion, Page,
+    PageRequest, PrintAttempt, PrintAttemptBatchItem, PrintAttemptInput, PrintHistoryEngine,
+    PrintOutcome, PrintStatus, RequestContext, RestoreRootMapping, RootAccess, RootHandle,
     RuntimeError, RuntimeErrorCode, RuntimeEvent, RuntimeInfo, RuntimeInfoEngine, RuntimeOwnership,
-    RuntimeStatus, RuntimeStatusEngine, ScanEngine, ScanStatus, SortDirection, SourceLease, Tag,
-    TagEngine, TagMode, ThumbnailDescriptor, UploadEngine, UploadIntent, UploadToken,
-    VersionedTarget, CAPTURE_ENVELOPE_VERSION, MAX_PAGE_LIMIT,
+    RuntimeStatus, RuntimeStatusEngine, ScanEngine, ScanStatus, SettingsEngine, SortDirection,
+    SourceLease, Tag, TagEngine, TagMode, ThumbnailDescriptor, UploadEngine, UploadIntent,
+    UploadToken, VersionedTarget, CAPTURE_ENVELOPE_VERSION, MAX_PAGE_LIMIT,
 };
 use sha2::{Digest, Sha256};
 
 pub mod archives;
 pub mod bundles;
+pub mod catalog_jobs;
+pub mod embedded;
+pub mod geometry;
 pub mod images;
 pub mod integration_state;
+pub mod integrations;
 pub mod scanner;
 pub mod thumbnails;
 
@@ -47,6 +58,8 @@ const MAX_CURSORS: usize = 256;
 const MAX_EVENTS: usize = 1024;
 const MAX_LEASES: usize = 256;
 const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_OWNED_TEMP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_UPLOAD_TEMP_BYTES: u64 = 512 * 1024 * 1024;
 
 type EpochInvalidator = Arc<dyn Fn(u64) + Send + Sync>;
 type ScanCompletedHook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -206,6 +219,8 @@ struct ContentLeaseEntry {
     path: PathBuf,
     expires: SystemTime,
     principal_id: String,
+    remove_on_drop: bool,
+    source_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -216,6 +231,57 @@ struct UploadEntry {
     sha256: String,
     bytes: u64,
     principal_id: String,
+}
+
+#[derive(Clone, Copy)]
+struct TempResourceLimits {
+    owned_bytes: u64,
+    upload_bytes: u64,
+    bundle_builds: usize,
+}
+
+impl Default for TempResourceLimits {
+    fn default() -> Self {
+        Self {
+            owned_bytes: DEFAULT_OWNED_TEMP_BYTES,
+            upload_bytes: DEFAULT_UPLOAD_TEMP_BYTES,
+            bundle_builds: 1,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TempResourceState {
+    owned_bytes: u64,
+    reserved_owned_bytes: u64,
+    staged_upload_bytes: u64,
+    reserved_upload_bytes: u64,
+    active_bundle_builds: usize,
+}
+
+#[derive(Clone)]
+struct PlannedAction {
+    action: ManagementAction,
+    principal_id: String,
+    expires: SystemTime,
+    library_epoch: u64,
+    catalog_revision: u64,
+    targets: Vec<ActionTargetSnapshot>,
+    input_fingerprint: Option<(u64, String)>,
+}
+
+#[derive(Clone, Copy)]
+enum ReservationKind {
+    Bundle,
+    Owned,
+    Upload,
+}
+
+struct TempReservation<'a> {
+    runtime: &'a LibraryRuntime,
+    kind: ReservationKind,
+    bytes: u64,
+    committed: bool,
 }
 
 pub struct LibraryRuntime {
@@ -240,6 +306,9 @@ pub struct LibraryRuntime {
     uploads: Mutex<HashMap<String, UploadEntry>>,
     scan: Arc<scanner::ScanControl>,
     bundle_previews: bundles::BundlePreviewStore,
+    temp_limits: Mutex<TempResourceLimits>,
+    temp_resources: Mutex<TempResourceState>,
+    actions: Mutex<HashMap<String, PlannedAction>>,
     self_weak: OnceLock<Weak<LibraryRuntime>>,
 }
 
@@ -260,7 +329,12 @@ impl LibraryRuntime {
         } else {
             let db = LibraryDb::open(&config.library_root).map_err(runtime_library_error)?;
             let root = db.root().to_path_buf();
-            map_operator_catalog_roots(&db, &mut roots)?;
+            cleanup_runtime_orphans(&root)?;
+            map_operator_catalog_roots(
+                &db,
+                &mut roots,
+                config.capabilities.contains(&Capability::Scan),
+            )?;
             (Some(db), root)
         };
         let runtime = Arc::new(Self {
@@ -285,12 +359,26 @@ impl LibraryRuntime {
             uploads: Mutex::new(HashMap::new()),
             scan: Arc::new(scanner::ScanControl::new()),
             bundle_previews: bundles::BundlePreviewStore::default(),
+            temp_limits: Mutex::new(TempResourceLimits::default()),
+            temp_resources: Mutex::new(TempResourceState::default()),
+            actions: Mutex::new(HashMap::new()),
             self_weak: OnceLock::new(),
         });
         runtime
             .self_weak
             .set(Arc::downgrade(&runtime))
             .map_err(|_| internal("Runtime self reference could not be initialized"))?;
+        if !runtime.local_catalog_root_access
+            && runtime.capability_enabled(Capability::Scan)
+            && runtime.capability_enabled(Capability::MediaWrite)
+        {
+            let weak = Arc::downgrade(&runtime);
+            runtime.register_scan_completed_hook(Arc::new(move |root_id| {
+                if let Some(runtime) = weak.upgrade() {
+                    render_default_thumbnails_for_root(&runtime, root_id);
+                }
+            }));
+        }
         Ok(runtime)
     }
 
@@ -316,6 +404,10 @@ impl LibraryRuntime {
     pub fn root_handles(&self, context: &RequestContext) -> Result<Vec<RootHandle>, RuntimeError> {
         self.require(context, Capability::CatalogRead)?;
         Ok(self.roots.iter().map(|root| root.handle.clone()).collect())
+    }
+
+    pub(crate) fn capability_enabled(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
     }
 
     pub fn register_epoch_invalidator(&self, callback: Arc<dyn Fn(u64) + Send + Sync>) {
@@ -434,7 +526,9 @@ impl LibraryRuntime {
             return Err(maintenance_error());
         }
         if guard.is_none() {
-            *guard = Some(LibraryDb::open(&self.root).map_err(runtime_library_error)?);
+            let db = LibraryDb::open(&self.root).map_err(runtime_library_error)?;
+            cleanup_runtime_orphans(&self.root)?;
+            *guard = Some(db);
         }
         operation(guard.as_ref().unwrap()).map_err(runtime_library_error)
     }
@@ -451,11 +545,11 @@ impl LibraryRuntime {
             return Err(E::from(maintenance_error()));
         }
         if guard.is_none() {
-            *guard = Some(
-                LibraryDb::open(&self.root)
-                    .map_err(runtime_library_error)
-                    .map_err(E::from)?,
-            );
+            let db = LibraryDb::open(&self.root)
+                .map_err(runtime_library_error)
+                .map_err(E::from)?;
+            cleanup_runtime_orphans(&self.root).map_err(E::from)?;
+            *guard = Some(db);
         }
         let db = guard.as_ref().unwrap();
         let before = db.total_changes();
@@ -573,6 +667,57 @@ impl LibraryRuntime {
         }
     }
 
+    pub(crate) fn verified_model_source_bytes(
+        &self,
+        model: &Model,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let (source, root_limit) = self.read_db(|db| {
+            let root_limit = if model.source_kind == "indexed" {
+                let root_id = model.source_root_id.as_deref().ok_or_else(|| {
+                    LibraryError::InvalidInput("Indexed model has no source root".into())
+                })?;
+                Some(
+                    db.list_index_roots()?
+                        .into_iter()
+                        .find(|root| root.id == root_id)
+                        .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.into()))?
+                        .max_file_bytes,
+                )
+            } else {
+                None
+            };
+            Ok((db.resolve_model_source_ref(&model.id)?, root_limit))
+        })?;
+        self.validate_indexed_source_admission(model, &source)?;
+        if root_limit.is_some_and(|limit| source.bytes > limit)
+            || source.bytes > library_core::MAX_INDEXED_FILE_BYTES
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Unsupported,
+                message: "Model source exceeds its admitted file limit".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        if let Some(member) = source.archive_member.as_deref() {
+            let temporary = archives::extract_member_to_temporary(
+                &self.root,
+                &source.outer_path,
+                member,
+                source
+                    .outer_fingerprint
+                    .as_deref()
+                    .ok_or_else(|| internal("Archive model has no source fingerprint"))?,
+                &source.content_hash,
+                source.bytes,
+            )
+            .map_err(|_| stale("Archive model source changed"))?;
+            read_verified_content(temporary.path(), source.bytes, &source.content_hash)
+        } else {
+            read_verified_content(&source.outer_path, source.bytes, &source.content_hash)
+        }
+    }
+
     fn require(
         &self,
         context: &RequestContext,
@@ -608,17 +753,156 @@ impl LibraryRuntime {
         }
     }
 
+    fn reserve_temp(
+        &self,
+        kind: ReservationKind,
+        bytes: u64,
+    ) -> Result<TempReservation<'_>, RuntimeError> {
+        let limits = *self.temp_limits.lock().unwrap();
+        let mut state = self.temp_resources.lock().unwrap();
+        match kind {
+            ReservationKind::Bundle => {
+                if state.active_bundle_builds >= limits.bundle_builds
+                    || state
+                        .owned_bytes
+                        .checked_add(state.reserved_owned_bytes)
+                        .and_then(|value| value.checked_add(bytes))
+                        .is_none_or(|value| value > limits.owned_bytes)
+                {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Busy,
+                        message: "Bundle archive temporary storage is full".into(),
+                        retryable: true,
+                        current_version: None,
+                    });
+                }
+                state.reserved_owned_bytes += bytes;
+                state.active_bundle_builds += 1;
+            }
+            ReservationKind::Owned => {
+                if state
+                    .owned_bytes
+                    .checked_add(state.reserved_owned_bytes)
+                    .and_then(|value| value.checked_add(bytes))
+                    .is_none_or(|value| value > limits.owned_bytes)
+                {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Busy,
+                        message: "Generated content temporary storage is full".into(),
+                        retryable: true,
+                        current_version: None,
+                    });
+                }
+                state.reserved_owned_bytes += bytes;
+            }
+            ReservationKind::Upload => {
+                if state
+                    .staged_upload_bytes
+                    .checked_add(state.reserved_upload_bytes)
+                    .and_then(|value| value.checked_add(bytes))
+                    .is_none_or(|value| value > limits.upload_bytes)
+                {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Busy,
+                        message: "Upload temporary storage is full".into(),
+                        retryable: true,
+                        current_version: None,
+                    });
+                }
+                state.reserved_upload_bytes += bytes;
+            }
+        }
+        Ok(TempReservation {
+            runtime: self,
+            kind,
+            bytes,
+            committed: false,
+        })
+    }
+
+    fn release_owned_bytes(&self, bytes: u64) {
+        let mut state = self.temp_resources.lock().unwrap();
+        state.owned_bytes = state.owned_bytes.saturating_sub(bytes);
+    }
+
+    fn release_upload_bytes(&self, bytes: u64) {
+        let mut state = self.temp_resources.lock().unwrap();
+        state.staged_upload_bytes = state.staged_upload_bytes.saturating_sub(bytes);
+    }
+
+    fn cleanup_upload(&self, upload: &UploadEntry) {
+        let _ = fs::remove_file(&upload.path);
+        self.release_upload_bytes(upload.bytes);
+    }
+
+    fn prune_uploads(
+        &self,
+        uploads: &mut HashMap<String, UploadEntry>,
+        now: SystemTime,
+        epoch: u64,
+    ) {
+        uploads.retain(|_, upload| {
+            let keep = upload.expires > now && upload.token.library_epoch == epoch;
+            if !keep {
+                self.cleanup_upload(upload);
+            }
+            keep
+        });
+    }
+
+    fn cleanup_content_lease(&self, lease: &ContentLeaseEntry) {
+        if lease.remove_on_drop {
+            let _ = fs::remove_file(&lease.path);
+            self.release_owned_bytes(lease.descriptor.bytes);
+        }
+    }
+
+    fn prune_content_leases(
+        &self,
+        leases: &mut HashMap<String, ContentLeaseEntry>,
+        now: SystemTime,
+        epoch: u64,
+    ) {
+        leases.retain(|_, lease| {
+            let keep = lease.expires > now && lease.descriptor.library_epoch == epoch;
+            if !keep {
+                self.cleanup_content_lease(lease);
+            }
+            keep
+        });
+    }
+
+    #[cfg(test)]
+    fn set_temp_limits_for_test(&self, owned_bytes: u64, upload_bytes: u64) {
+        let state = self.temp_resources.lock().unwrap();
+        assert_eq!(state.owned_bytes, 0);
+        assert_eq!(state.reserved_owned_bytes, 0);
+        assert_eq!(state.staged_upload_bytes, 0);
+        assert_eq!(state.reserved_upload_bytes, 0);
+        drop(state);
+        *self.temp_limits.lock().unwrap() = TempResourceLimits {
+            owned_bytes,
+            upload_bytes,
+            bundle_builds: 1,
+        };
+    }
+
     fn advance_epoch(&self) -> u64 {
         let epoch = self.library_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.record_mutation("libraryReplaced", Vec::new());
         self.cursors.lock().unwrap().clear();
         self.capture_cursors.lock().unwrap().clear();
-        self.leases.lock().unwrap().clear();
+        self.actions.lock().unwrap().clear();
+        let leases = std::mem::take(&mut *self.leases.lock().unwrap());
+        for lease in leases.into_values() {
+            self.cleanup_content_lease(&lease);
+        }
         self.bundle_previews.invalidate_all();
         let uploads = std::mem::take(&mut *self.uploads.lock().unwrap());
         for upload in uploads.into_values() {
             let _ = fs::remove_file(upload.path);
         }
+        self.temp_resources.lock().unwrap().staged_upload_bytes = 0;
         for callback in self.invalidators.lock().unwrap().iter() {
             callback(epoch);
         }
@@ -641,6 +925,91 @@ impl LibraryRuntime {
     }
 }
 
+impl TempReservation<'_> {
+    fn commit(mut self, actual_bytes: u64) -> Result<(), RuntimeError> {
+        let limits = *self.runtime.temp_limits.lock().unwrap();
+        let mut state = self.runtime.temp_resources.lock().unwrap();
+        match self.kind {
+            ReservationKind::Bundle => {
+                state.reserved_owned_bytes = state.reserved_owned_bytes.saturating_sub(self.bytes);
+                state.active_bundle_builds = state.active_bundle_builds.saturating_sub(1);
+                self.committed = true;
+                if state
+                    .owned_bytes
+                    .checked_add(actual_bytes)
+                    .is_none_or(|value| value > limits.owned_bytes)
+                {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Busy,
+                        message: "Bundle archive temporary storage is full".into(),
+                        retryable: true,
+                        current_version: None,
+                    });
+                }
+                state.owned_bytes += actual_bytes;
+            }
+            ReservationKind::Owned => {
+                state.reserved_owned_bytes = state.reserved_owned_bytes.saturating_sub(self.bytes);
+                self.committed = true;
+                if state
+                    .owned_bytes
+                    .checked_add(actual_bytes)
+                    .is_none_or(|value| value > limits.owned_bytes)
+                {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Busy,
+                        message: "Generated content temporary storage is full".into(),
+                        retryable: true,
+                        current_version: None,
+                    });
+                }
+                state.owned_bytes += actual_bytes;
+            }
+            ReservationKind::Upload => {
+                state.reserved_upload_bytes =
+                    state.reserved_upload_bytes.saturating_sub(self.bytes);
+                self.committed = true;
+                if state
+                    .staged_upload_bytes
+                    .checked_add(actual_bytes)
+                    .is_none_or(|value| value > limits.upload_bytes)
+                {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Busy,
+                        message: "Upload temporary storage is full".into(),
+                        retryable: true,
+                        current_version: None,
+                    });
+                }
+                state.staged_upload_bytes += actual_bytes;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TempReservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut state = self.runtime.temp_resources.lock().unwrap();
+        match self.kind {
+            ReservationKind::Bundle => {
+                state.reserved_owned_bytes = state.reserved_owned_bytes.saturating_sub(self.bytes);
+                state.active_bundle_builds = state.active_bundle_builds.saturating_sub(1);
+            }
+            ReservationKind::Owned => {
+                state.reserved_owned_bytes = state.reserved_owned_bytes.saturating_sub(self.bytes);
+            }
+            ReservationKind::Upload => {
+                state.reserved_upload_bytes =
+                    state.reserved_upload_bytes.saturating_sub(self.bytes);
+            }
+        }
+    }
+}
+
 fn prepare_lazy_desktop_root(path: &Path) -> Result<PathBuf, RuntimeError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -653,6 +1022,55 @@ fn prepare_lazy_desktop_root(path: &Path) -> Result<PathBuf, RuntimeError> {
         Err(_) => return Err(io_error()),
     }
     path.canonicalize().map_err(|_| io_error())
+}
+
+fn cleanup_runtime_orphans(root: &Path) -> Result<(), RuntimeError> {
+    for (relative, prefix, suffix) in [
+        ("staging/bundle-downloads", "bundle-", ".zip"),
+        ("staging/geometry", "geometry-", ".stl2"),
+    ] {
+        let directory = root.join(relative);
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(io_error()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || directory.canonicalize().map_err(|_| io_error())? != directory
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Runtime temporary namespace is unsafe".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        for (index, entry) in fs::read_dir(&directory)
+            .map_err(|_| io_error())?
+            .enumerate()
+        {
+            if index >= 10_000 {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Busy,
+                    message: "Runtime temporary namespace has too many entries".into(),
+                    retryable: true,
+                    current_version: None,
+                });
+            }
+            let entry = entry.map_err(|_| io_error())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(prefix) || !name.ends_with(suffix) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| io_error())?;
+            if metadata.is_file() && !metadata.file_type().is_symlink() {
+                fs::remove_file(entry.path()).map_err(|_| io_error())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl RuntimeInfoEngine for LibraryRuntime {
@@ -672,7 +1090,379 @@ impl RuntimeInfoEngine for LibraryRuntime {
     }
 }
 
+impl SettingsEngine for LibraryRuntime {
+    fn list_index_root_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Vec<IndexRootSettings>, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        let catalog = self.read_db(|db| db.list_index_roots())?;
+        Ok(self
+            .roots
+            .iter()
+            .filter_map(|admitted| {
+                let catalog_root_id = admitted.catalog_root_id.as_ref()?;
+                let root = catalog.iter().find(|root| &root.id == catalog_root_id)?;
+                (root.path == admitted.path).then(|| IndexRootSettings {
+                    handle_id: admitted.handle.id.clone(),
+                    catalog_root_id: root.id.clone(),
+                    label: admitted.handle.label.clone(),
+                    access: admitted.handle.access,
+                    enabled: root.enabled,
+                    last_scanned_at: root.last_scanned_at.clone(),
+                    scan_interval_minutes: root.scan_interval_minutes,
+                    max_file_bytes: root.max_file_bytes,
+                    scan_zip: root.scan_zip,
+                })
+            })
+            .collect())
+    }
+
+    fn update_index_root_settings(
+        &self,
+        context: &RequestContext,
+        handle_id: &str,
+        patch: IndexRootSettingsPatch,
+    ) -> Result<IndexRootSettings, RuntimeError> {
+        self.require(context, Capability::Scan)?;
+        let admitted = self
+            .roots
+            .iter()
+            .find(|root| root.handle.id == handle_id)
+            .ok_or_else(|| RuntimeError {
+                code: RuntimeErrorCode::Forbidden,
+                message: "Root handle is not admitted".into(),
+                retryable: false,
+                current_version: None,
+            })?;
+        let catalog_root_id = admitted
+            .catalog_root_id
+            .as_deref()
+            .ok_or_else(|| RuntimeError {
+                code: RuntimeErrorCode::Forbidden,
+                message: "Root handle is not a catalog root".into(),
+                retryable: false,
+                current_version: None,
+            })?;
+        let updated = self.mutate_db(|db| {
+            let existing = db
+                .list_index_roots()?
+                .into_iter()
+                .find(|root| root.id == catalog_root_id && root.path == admitted.path)
+                .ok_or_else(|| LibraryError::IndexRootNotFound(catalog_root_id.into()))?;
+            db.update_index_root(&library_core::IndexRoot {
+                enabled: patch.enabled,
+                scan_interval_minutes: patch.scan_interval_minutes,
+                max_file_bytes: patch.max_file_bytes,
+                scan_zip: patch.scan_zip,
+                ..existing
+            })
+        })?;
+        Ok(IndexRootSettings {
+            handle_id: admitted.handle.id.clone(),
+            catalog_root_id: updated.id,
+            label: admitted.handle.label.clone(),
+            access: admitted.handle.access,
+            enabled: updated.enabled,
+            last_scanned_at: updated.last_scanned_at,
+            scan_interval_minutes: updated.scan_interval_minutes,
+            max_file_bytes: updated.max_file_bytes,
+            scan_zip: updated.scan_zip,
+        })
+    }
+
+    fn get_catalog_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<CatalogSettings, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.get_catalog_settings())
+            .map(catalog_settings)
+    }
+
+    fn update_catalog_settings(
+        &self,
+        context: &RequestContext,
+        settings: CatalogSettings,
+    ) -> Result<CatalogSettings, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let settings = CoreCatalogSettings {
+            thumbnail_size: settings.thumbnail_size,
+            thumbnail_background: settings.thumbnail_background,
+            thumbnail_concurrency: settings.thumbnail_concurrency,
+            scan_batch_size: settings.scan_batch_size,
+        };
+        self.mutate_db(|db| db.update_catalog_settings(&settings))
+            .map(catalog_settings)
+    }
+}
+
+impl ManagementEngine for LibraryRuntime {
+    fn plan_action(
+        &self,
+        context: &RequestContext,
+        action: ManagementAction,
+    ) -> Result<ActionPlan, RuntimeError> {
+        let action_kind = match &action {
+            ManagementAction::RecoverableRemove { .. } => {
+                self.require(context, Capability::CatalogWrite)?;
+                "recoverableRemove"
+            }
+            ManagementAction::RestoreRemoval { .. } => {
+                self.require(context, Capability::CatalogWrite)?;
+                "restoreRemoval"
+            }
+            ManagementAction::CreateBackup { .. } => {
+                self.require(context, Capability::Maintenance)?;
+                "createBackup"
+            }
+            ManagementAction::RestoreBackup { .. } => {
+                self.require(context, Capability::Maintenance)?;
+                "restoreBackup"
+            }
+            ManagementAction::ExportSelection { .. } => {
+                self.require(context, Capability::Maintenance)?;
+                "exportSelection"
+            }
+            ManagementAction::QuarantineLooseSource { .. } => {
+                return Err(unsupported_physical_management())
+            }
+            ManagementAction::UndoQuarantine { .. } => {
+                return Err(unsupported_physical_management())
+            }
+            ManagementAction::MoveLooseSource { .. } => {
+                return Err(unsupported_physical_management())
+            }
+            ManagementAction::PurgeCatalog { .. } => return Err(unsupported_physical_management()),
+            ManagementAction::CleanupOrphans => return Err(unsupported_physical_management()),
+        };
+        let target_requests = match &action {
+            ManagementAction::RecoverableRemove { targets }
+            | ManagementAction::ExportSelection { targets, .. } => targets.as_slice(),
+            ManagementAction::QuarantineLooseSource { target }
+            | ManagementAction::MoveLooseSource { target, .. } => std::slice::from_ref(target),
+            _ => &[],
+        };
+        if target_requests.len() > 50_000 {
+            return Err(invalid("Management target count exceeds its limit"));
+        }
+        let targets = self.read_db(|db| {
+            target_requests
+                .iter()
+                .map(|target| {
+                    let model = db
+                        .get_model(&target.model_id)?
+                        .ok_or_else(|| LibraryError::ModelNotFound(target.model_id.clone()))?;
+                    if model.metadata_version != target.expected_version {
+                        return Err(LibraryError::MetadataConflict {
+                            model_id: target.model_id.clone(),
+                            expected: target.expected_version,
+                            actual: model.metadata_version,
+                        });
+                    }
+                    Ok(ActionTargetSnapshot {
+                        model_id: model.id,
+                        metadata_version: model.metadata_version,
+                        content_hash: model.content_hash,
+                    })
+                })
+                .collect::<Result<Vec<_>, LibraryError>>()
+        })?;
+        validate_management_action(self, context, &action)?;
+        let input_fingerprint = if let ManagementAction::RestoreBackup {
+            source_handle_id,
+            file_name,
+            ..
+        } = &action
+        {
+            let (_, source) = admitted_file(
+                self,
+                context,
+                source_handle_id,
+                RootAccess::Inbox,
+                file_name,
+                true,
+            )
+            .or_else(|_| {
+                admitted_file(
+                    self,
+                    context,
+                    source_handle_id,
+                    RootAccess::ReadOnly,
+                    file_name,
+                    true,
+                )
+            })?;
+            Some(hash_management_file(
+                &source,
+                8 * 1024 * 1024 * 1024 + 16 * 1024 * 1024,
+            )?)
+        } else {
+            None
+        };
+        let expires = SystemTime::now() + Duration::from_secs(5 * 60);
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let library_epoch = self.library_epoch();
+        let catalog_revision = self.catalog_revision();
+        let mut actions = self.actions.lock().unwrap();
+        actions.retain(|_, action| action.expires > SystemTime::now());
+        if actions.len() >= 64 {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Management plan limit reached".into(),
+                retryable: true,
+                current_version: None,
+            });
+        }
+        actions.insert(
+            token.clone(),
+            PlannedAction {
+                action,
+                principal_id: context.principal_id.clone(),
+                expires,
+                library_epoch,
+                catalog_revision,
+                targets: targets.clone(),
+                input_fingerprint: input_fingerprint.clone(),
+            },
+        );
+        Ok(ActionPlan {
+            token,
+            action_kind: action_kind.into(),
+            expires_at: format_system_time(expires)?,
+            library_epoch,
+            catalog_revision,
+            targets,
+            impact: vec![
+                "The action will be rejected if the catalog changes before execution".into(),
+            ],
+            input_bytes: input_fingerprint.as_ref().map(|value| value.0),
+            input_sha256: input_fingerprint.map(|value| value.1),
+        })
+    }
+
+    fn execute_action(
+        &self,
+        context: &RequestContext,
+        token: &str,
+    ) -> Result<ManagementResult, RuntimeError> {
+        let mut actions = self.actions.lock().unwrap();
+        let planned = actions
+            .get(token)
+            .cloned()
+            .ok_or_else(|| stale("Management plan is unknown or already used"))?;
+        if planned.principal_id != context.principal_id {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Forbidden,
+                message: "Management plan belongs to another principal".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        actions.remove(token);
+        drop(actions);
+        if planned.expires <= SystemTime::now()
+            || planned.library_epoch != self.library_epoch()
+            || planned.catalog_revision != self.catalog_revision()
+        {
+            return Err(stale("Management plan is stale"));
+        }
+        revalidate_action_targets(self, &planned.targets)?;
+        match planned.action {
+            ManagementAction::RecoverableRemove { targets } => {
+                self.require(context, Capability::CatalogWrite)?;
+                let targets = targets
+                    .into_iter()
+                    .map(|target| CoreVersionedTarget {
+                        model_id: target.model_id,
+                        expected_version: target.expected_version,
+                    })
+                    .collect::<Vec<_>>();
+                let result = self.mutate_db(|db| db.remove_models_recoverably(&targets))?;
+                Ok(ManagementResult::Removed {
+                    snapshot_id: result.snapshot_id,
+                    removed_ids: result.removed_ids,
+                })
+            }
+            ManagementAction::RestoreRemoval { snapshot_id } => {
+                self.require(context, Capability::CatalogWrite)?;
+                let models = self.mutate_db(|db| db.restore_removal(&snapshot_id))?;
+                Ok(ManagementResult::RestoredRemoval {
+                    models: models.into_iter().map(mutation_version).collect(),
+                })
+            }
+            ManagementAction::CreateBackup {
+                destination_handle_id,
+                file_name,
+            } => execute_backup(
+                self,
+                context,
+                &destination_handle_id,
+                &file_name,
+                planned.library_epoch,
+                planned.catalog_revision,
+            ),
+            ManagementAction::ExportSelection {
+                targets,
+                destination_handle_id,
+                file_name,
+            } => execute_selection_export(
+                self,
+                context,
+                &targets,
+                &destination_handle_id,
+                &file_name,
+                planned.library_epoch,
+                planned.catalog_revision,
+            ),
+            ManagementAction::RestoreBackup {
+                source_handle_id,
+                file_name,
+                root_mappings,
+            } => execute_restore(
+                self,
+                context,
+                RestoreExecution {
+                    source_handle_id: &source_handle_id,
+                    file_name: &file_name,
+                    root_mappings: &root_mappings,
+                    expected_input: planned
+                        .input_fingerprint
+                        .as_ref()
+                        .ok_or_else(|| internal("Restore plan lost its input fingerprint"))?,
+                    expected_epoch: planned.library_epoch,
+                    expected_revision: planned.catalog_revision,
+                },
+            ),
+            ManagementAction::QuarantineLooseSource { .. }
+            | ManagementAction::UndoQuarantine { .. }
+            | ManagementAction::MoveLooseSource { .. }
+            | ManagementAction::PurgeCatalog { .. }
+            | ManagementAction::CleanupOrphans => Err(unsupported_physical_management()),
+        }
+    }
+}
+
 impl CatalogEngine for LibraryRuntime {
+    fn get_model(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+    ) -> Result<CatalogModel, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| {
+            let model = db
+                .get_model(model_id)?
+                .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))?;
+            let thumbnail_id = db
+                .list_thumbnail_gallery(model_id)?
+                .into_iter()
+                .find(|thumbnail| thumbnail.is_active)
+                .map(|thumbnail| thumbnail.id);
+            Ok(catalog_model(model, thumbnail_id))
+        })
+    }
+
     fn list_models(
         &self,
         context: &RequestContext,
@@ -757,6 +1547,16 @@ impl CatalogEngine for LibraryRuntime {
             next_cursor,
             snapshot_revision: revision,
         })
+    }
+
+    fn catalog_stats(&self, context: &RequestContext) -> Result<CatalogStats, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.catalog_stats()).map(catalog_stats)
+    }
+
+    fn catalog_facets(&self, context: &RequestContext) -> Result<CatalogFacets, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.catalog_facets()).map(catalog_facets)
     }
 }
 
@@ -960,6 +1760,24 @@ impl FilamentEngine for LibraryRuntime {
 }
 
 impl PrintHistoryEngine for LibraryRuntime {
+    fn create_print_attempts(
+        &self,
+        context: &RequestContext,
+        idempotency_key: &str,
+        items: Vec<PrintAttemptBatchItem>,
+    ) -> Result<Vec<PrintAttempt>, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let items = items
+            .into_iter()
+            .map(|item| CorePrintAttemptBatchItem {
+                model_id: item.model_id,
+                input: core_print_attempt_input(item.input),
+            })
+            .collect::<Vec<_>>();
+        self.mutate_db(|db| db.create_print_attempts_idempotent(idempotency_key, &items))
+            .map(|attempts| attempts.into_iter().map(print_attempt).collect())
+    }
+
     fn list_print_attempts(
         &self,
         context: &RequestContext,
@@ -1161,6 +1979,272 @@ impl BundleEngine for LibraryRuntime {
         self.require(context, Capability::MediaRead)?;
         self.bundle_previews.close(&context.principal_id, token)
     }
+
+    fn issue_bundle_download(
+        &self,
+        context: &RequestContext,
+        preview_token: &str,
+    ) -> Result<ContentLease, RuntimeError> {
+        self.require(context, Capability::MediaRead)?;
+        let _io = self.begin_borrowed_io()?;
+        let bundle_id = self.bundle_previews.bundle_id_for_download(
+            self,
+            &context.principal_id,
+            preview_token,
+        )?;
+        {
+            let mut leases = self.leases.lock().unwrap();
+            self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
+            if let Some(existing) = leases.values().find(|lease| {
+                lease.principal_id == context.principal_id
+                    && lease.source_token.as_deref() == Some(preview_token)
+                    && lease.descriptor.kind == ContentKind::BundleArchive
+            }) {
+                return Ok(existing.descriptor.clone());
+            }
+        }
+        let estimate = bundles::bundle_archive_estimated_bytes(self, &bundle_id)?;
+        let reservation = self.reserve_temp(ReservationKind::Bundle, estimate)?;
+        let archive = bundles::create_bundle_archive(self, &bundle_id)?;
+        let expires = SystemTime::now() + LEASE_TTL;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let descriptor = ContentLease {
+            id: id.clone(),
+            kind: ContentKind::BundleArchive,
+            file_name: format!("bundle-{bundle_id}.zip"),
+            mime: "application/zip".into(),
+            bytes: archive.bytes,
+            sha256: archive.sha256,
+            library_epoch: self.library_epoch(),
+            expires_at: format_system_time(expires)?,
+        };
+        if let Err(error) = reservation.commit(archive.bytes) {
+            let _ = fs::remove_file(&archive.path);
+            return Err(error);
+        }
+        let mut leases = self.leases.lock().unwrap();
+        self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
+        if leases.len() >= MAX_LEASES {
+            let _ = fs::remove_file(&archive.path);
+            self.release_owned_bytes(archive.bytes);
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Content lease limit reached".into(),
+                retryable: true,
+                current_version: None,
+            });
+        }
+        leases.insert(
+            id,
+            ContentLeaseEntry {
+                descriptor: descriptor.clone(),
+                path: archive.path,
+                expires,
+                principal_id: context.principal_id.clone(),
+                remove_on_drop: true,
+                source_token: Some(preview_token.to_owned()),
+            },
+        );
+        Ok(descriptor)
+    }
+}
+
+impl GeometryEngine for LibraryRuntime {
+    fn issue_model_geometry(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+        plate_id: Option<u32>,
+    ) -> Result<GeometryLease, RuntimeError> {
+        self.require(context, Capability::MediaRead)?;
+        let _io = self.begin_borrowed_io()?;
+        let model = self
+            .read_db(|db| db.get_model(model_id))?
+            .ok_or_else(|| RuntimeError {
+                code: RuntimeErrorCode::NotFound,
+                message: "Model was not found".into(),
+                retryable: false,
+                current_version: None,
+            })?;
+        if expected_hash.is_some_and(|hash| model.content_hash.as_deref() != Some(hash)) {
+            return Err(stale("Model source hash changed"));
+        }
+        let reservation = self.reserve_temp(ReservationKind::Owned, 128 * 1024 * 1024)?;
+        let prepared = geometry::prepare_model_geometry(self, &model, plate_id)?;
+        let expires = SystemTime::now() + LEASE_TTL;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let content = ContentLease {
+            id: id.clone(),
+            kind: ContentKind::Geometry,
+            file_name: format!("model-{model_id}.stl2"),
+            mime: "application/vnd.gogglelab.geometry".into(),
+            bytes: prepared.bytes,
+            sha256: prepared.sha256,
+            library_epoch: self.library_epoch(),
+            expires_at: format_system_time(expires)?,
+        };
+        if let Err(error) = reservation.commit(prepared.bytes) {
+            let _ = fs::remove_file(&prepared.path);
+            return Err(error);
+        }
+        let mut leases = self.leases.lock().unwrap();
+        self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
+        if leases.len() >= MAX_LEASES {
+            let _ = fs::remove_file(&prepared.path);
+            self.release_owned_bytes(prepared.bytes);
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Content lease limit reached".into(),
+                retryable: true,
+                current_version: None,
+            });
+        }
+        leases.insert(
+            id,
+            ContentLeaseEntry {
+                descriptor: content.clone(),
+                path: prepared.path,
+                expires,
+                principal_id: context.principal_id.clone(),
+                remove_on_drop: true,
+                source_token: None,
+            },
+        );
+        Ok(GeometryLease {
+            content,
+            packet_format: "stl2".into(),
+            packet_version: 2,
+            model_format: prepared.model_format,
+            triangle_count: prepared.triangle_count,
+            plates: prepared.plates,
+            parts: prepared.parts,
+            materials: prepared.materials,
+            embedded_filaments: prepared.embedded_filaments,
+            part_warning: prepared.part_warning,
+            plate_warning: prepared.plate_warning,
+        })
+    }
+}
+
+impl DuplicateEngine for LibraryRuntime {
+    fn duplicate_groups(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+    ) -> Result<Vec<DuplicateGroup>, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| {
+            db.duplicate_groups(&model_ids)?
+                .into_iter()
+                .map(|group| {
+                    let models = group
+                        .models
+                        .into_iter()
+                        .map(|model| {
+                            let thumbnail_id = db
+                                .list_thumbnail_gallery(&model.id)?
+                                .into_iter()
+                                .find(|thumbnail| thumbnail.is_active)
+                                .map(|thumbnail| thumbnail.id);
+                            Ok(catalog_model(model, thumbnail_id))
+                        })
+                        .collect::<Result<Vec<_>, LibraryError>>()?;
+                    Ok(DuplicateGroup {
+                        content_hash: group.content_hash,
+                        models,
+                    })
+                })
+                .collect::<Result<Vec<_>, LibraryError>>()
+        })
+    }
+}
+
+impl EmbeddedMetadataEngine for LibraryRuntime {
+    fn read_embedded_metadata(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<EmbeddedMetadataProposal, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        let _io = self.begin_borrowed_io()?;
+        let model = self
+            .read_db(|db| db.get_model(model_id))?
+            .ok_or_else(|| RuntimeError {
+                code: RuntimeErrorCode::NotFound,
+                message: "Model was not found".into(),
+                retryable: false,
+                current_version: None,
+            })?;
+        let source_hash = model
+            .content_hash
+            .clone()
+            .ok_or_else(|| invalid("Model has no source content"))?;
+        if expected_hash.is_some_and(|hash| hash != source_hash) {
+            return Err(stale("Model source hash changed"));
+        }
+        let parsed = embedded::read_metadata(self, &model)?;
+        Ok(EmbeddedMetadataProposal {
+            model_id: model.id,
+            source_hash,
+            current: EmbeddedMetadataFields {
+                designer: model.metadata.designer,
+                source_url: model.metadata.source_url,
+                notes: model.metadata.notes,
+                model_license: model.metadata.model_license,
+            },
+            embedded: parsed.fields,
+            embedded_filaments: parsed.filaments,
+        })
+    }
+
+    fn apply_embedded_metadata(
+        &self,
+        context: &RequestContext,
+        target: VersionedTarget,
+        expected_source_hash: &str,
+        selection: EmbeddedMetadataSelection,
+    ) -> Result<MutationVersion, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        if !selection.designer
+            && !selection.source_url
+            && !selection.notes
+            && !selection.model_license
+        {
+            return Err(invalid("Embedded metadata selection is empty"));
+        }
+        let _io = self.begin_borrowed_io()?;
+        let model = self
+            .read_db(|db| db.get_model(&target.model_id))?
+            .ok_or_else(|| RuntimeError {
+                code: RuntimeErrorCode::NotFound,
+                message: "Model was not found".into(),
+                retryable: false,
+                current_version: None,
+            })?;
+        if model.content_hash.as_deref() != Some(expected_source_hash) {
+            return Err(stale("Model source hash changed"));
+        }
+        let embedded = embedded::read_metadata(self, &model)?.fields;
+        let patch = CoreMetadataPatch {
+            designer: selection
+                .designer
+                .then(|| embedded.designer.unwrap_or_default()),
+            source_url: selection
+                .source_url
+                .then(|| embedded.source_url.unwrap_or_default()),
+            notes: selection.notes.then(|| embedded.notes.unwrap_or_default()),
+            model_license: selection
+                .model_license
+                .then(|| embedded.model_license.unwrap_or_default()),
+            ..CoreMetadataPatch::default()
+        };
+        self.mutate_db(|db| {
+            db.update_model_metadata(&target.model_id, target.expected_version, &patch)
+        })
+        .map(mutation_version)
+    }
 }
 
 impl GalleryEngine for LibraryRuntime {
@@ -1255,7 +2339,7 @@ impl GalleryEngine for LibraryRuntime {
             });
         }
         if let Some(upload) = uploads.remove(upload_token) {
-            let _ = fs::remove_file(upload.path);
+            self.cleanup_upload(&upload);
         }
         Ok(model.metadata_version)
     }
@@ -1316,6 +2400,7 @@ impl GalleryEngine for LibraryRuntime {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let descriptor = MediaLease {
             id: id.clone(),
+            kind: ContentKind::Thumbnail,
             file_name: format!("thumbnail-{thumbnail_id}.png"),
             mime: "image/png".into(),
             bytes: metadata.len(),
@@ -1326,10 +2411,12 @@ impl GalleryEngine for LibraryRuntime {
         let mut leases = self.leases.lock().unwrap();
         let epoch = self.library_epoch();
         let now = SystemTime::now();
-        leases.retain(|_, lease| lease.expires > now && lease.descriptor.library_epoch == epoch);
+        self.prune_content_leases(&mut leases, now, epoch);
         if leases.len() >= MAX_LEASES {
             if let Some(oldest) = leases.keys().next().cloned() {
-                leases.remove(&oldest);
+                if let Some(removed) = leases.remove(&oldest) {
+                    self.cleanup_content_lease(&removed);
+                }
             }
         }
         leases.insert(
@@ -1339,6 +2426,8 @@ impl GalleryEngine for LibraryRuntime {
                 path,
                 expires,
                 principal_id: context.principal_id.clone(),
+                remove_on_drop: false,
+                source_token: None,
             },
         );
         Ok(descriptor)
@@ -1355,6 +2444,19 @@ impl UploadEngine for LibraryRuntime {
         self.require_upload_write(context)?;
         validate_upload_intent(&intent)?;
         let _io = self.begin_borrowed_io()?;
+        {
+            let mut uploads = self.uploads.lock().unwrap();
+            self.prune_uploads(&mut uploads, SystemTime::now(), self.library_epoch());
+            if uploads.len() >= MAX_LEASES {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Busy,
+                    message: "Upload staging limit reached".into(),
+                    retryable: true,
+                    current_version: None,
+                });
+            }
+        }
+        let reservation = self.reserve_temp(ReservationKind::Upload, intent.bytes)?;
         self.read_db(|_| Ok(()))?;
         let staging = self.root.join("staging");
         let metadata = fs::symlink_metadata(&staging).map_err(|_| io_error())?;
@@ -1416,13 +2518,7 @@ impl UploadEngine for LibraryRuntime {
         let mut uploads = self.uploads.lock().unwrap();
         let now = SystemTime::now();
         let epoch = self.library_epoch();
-        uploads.retain(|_, upload| {
-            let keep = upload.expires > now && upload.token.library_epoch == epoch;
-            if !keep {
-                let _ = fs::remove_file(&upload.path);
-            }
-            keep
-        });
+        self.prune_uploads(&mut uploads, now, epoch);
         if uploads.len() >= MAX_LEASES {
             let _ = fs::remove_file(&path);
             return Err(RuntimeError {
@@ -1431,6 +2527,10 @@ impl UploadEngine for LibraryRuntime {
                 retryable: true,
                 current_version: None,
             });
+        }
+        if let Err(error) = reservation.commit(intent.bytes) {
+            let _ = fs::remove_file(&path);
+            return Err(error);
         }
         uploads.insert(
             id,
@@ -1465,7 +2565,7 @@ impl UploadEngine for LibraryRuntime {
             });
         }
         if let Some(upload) = uploads.remove(upload_token) {
-            let _ = fs::remove_file(upload.path);
+            self.cleanup_upload(&upload);
         }
         Ok(())
     }
@@ -1533,6 +2633,7 @@ impl DownloadEngine for LibraryRuntime {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let descriptor = SourceLease {
             id: id.clone(),
+            kind: ContentKind::Model,
             file_name,
             mime: if model
                 .format
@@ -1551,10 +2652,12 @@ impl DownloadEngine for LibraryRuntime {
         let mut leases = self.leases.lock().unwrap();
         let epoch = self.library_epoch();
         let now = SystemTime::now();
-        leases.retain(|_, lease| lease.expires > now && lease.descriptor.library_epoch == epoch);
+        self.prune_content_leases(&mut leases, now, epoch);
         if leases.len() >= MAX_LEASES {
             if let Some(oldest) = leases.keys().next().cloned() {
-                leases.remove(&oldest);
+                if let Some(removed) = leases.remove(&oldest) {
+                    self.cleanup_content_lease(&removed);
+                }
             }
         }
         leases.insert(
@@ -1564,6 +2667,8 @@ impl DownloadEngine for LibraryRuntime {
                 path,
                 expires,
                 principal_id: context.principal_id.clone(),
+                remove_on_drop: false,
+                source_token: None,
             },
         );
         Ok(descriptor)
@@ -1579,10 +2684,11 @@ impl ContentEngine for LibraryRuntime {
         self.require(context, Capability::MediaRead)?;
         let _io = self.begin_borrowed_io()?;
         let entry = self.admitted_content_entry(context, lease_id)?;
-        verify_content_file(
+        verify_leased_file(
             &entry.path,
             entry.descriptor.bytes,
             &entry.descriptor.sha256,
+            content_limit(entry.descriptor.kind),
         )?;
         Ok(entry.descriptor)
     }
@@ -1596,12 +2702,22 @@ impl ContentEngine for LibraryRuntime {
         self.require(context, Capability::MediaRead)?;
         let _io = self.begin_borrowed_io()?;
         let entry = self.admitted_content_entry(context, lease_id)?;
-        let bytes = read_verified_content(
-            &entry.path,
-            entry.descriptor.bytes,
-            &entry.descriptor.sha256,
-        )?;
-        sink.write_all(&bytes).map_err(|_| io_error())?;
+        if entry.descriptor.kind == ContentKind::BundleArchive {
+            stream_verified_file(
+                &entry.path,
+                entry.descriptor.bytes,
+                &entry.descriptor.sha256,
+                content_limit(entry.descriptor.kind),
+                sink,
+            )?;
+        } else {
+            let bytes = read_verified_content(
+                &entry.path,
+                entry.descriptor.bytes,
+                &entry.descriptor.sha256,
+            )?;
+            sink.write_all(&bytes).map_err(|_| io_error())?;
+        }
         Ok(())
     }
 }
@@ -1630,7 +2746,9 @@ impl LibraryRuntime {
         if entry.expires <= SystemTime::now()
             || entry.descriptor.library_epoch != self.library_epoch()
         {
-            self.leases.lock().unwrap().remove(lease_id);
+            if let Some(removed) = self.leases.lock().unwrap().remove(lease_id) {
+                self.cleanup_content_lease(&removed);
+            }
             return Err(stale("Content lease is stale"));
         }
         Ok(entry)
@@ -1833,8 +2951,9 @@ impl CaptureEngine for LibraryRuntime {
                             None,
                         )
                     })?;
-                    if let Some(upload) = self.uploads.lock().unwrap().remove(&upload.token.id) {
-                        let _ = fs::remove_file(upload.path);
+                    let removed = self.uploads.lock().unwrap().remove(&upload.token.id);
+                    if let Some(upload) = removed {
+                        self.cleanup_upload(&upload);
                     }
                 }
                 Err(_) => {
@@ -1889,6 +3008,23 @@ impl Drop for RuntimeIoGuard {
     fn drop(&mut self) {
         let mut lifecycle = self.runtime.lifecycle.lock().unwrap();
         lifecycle.active_io = lifecycle.active_io.saturating_sub(1);
+    }
+}
+
+impl Drop for LibraryRuntime {
+    fn drop(&mut self) {
+        if let Ok(leases) = self.leases.get_mut() {
+            for lease in leases.drain().map(|(_, lease)| lease) {
+                if lease.remove_on_drop {
+                    let _ = fs::remove_file(lease.path);
+                }
+            }
+        }
+        if let Ok(uploads) = self.uploads.get_mut() {
+            for upload in uploads.drain().map(|(_, upload)| upload) {
+                let _ = fs::remove_file(upload.path);
+            }
+        }
     }
 }
 
@@ -1961,6 +3097,7 @@ fn admit_roots(policies: Vec<RuntimeRootPolicy>) -> Result<Vec<AdmittedRoot>, Ru
 fn map_operator_catalog_roots(
     db: &LibraryDb,
     roots: &mut [AdmittedRoot],
+    allow_create: bool,
 ) -> Result<(), RuntimeError> {
     let mut catalog_roots = db.list_index_roots().map_err(runtime_library_error)?;
     for root in roots
@@ -1984,17 +3121,539 @@ fn map_operator_catalog_roots(
             .cloned()
         {
             existing
-        } else {
+        } else if allow_create {
             let created = db
                 .add_index_root(&root.path, 60, 50 * 1024 * 1024)
                 .map_err(runtime_library_error)?;
             catalog_roots.push(created.clone());
             created
+        } else {
+            continue;
         };
         root.catalog_root_id = Some(mapped.id.clone());
         root.handle.catalog_root_id = Some(mapped.id);
     }
     Ok(())
+}
+
+fn validate_management_action(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    action: &ManagementAction,
+) -> Result<(), RuntimeError> {
+    match action {
+        ManagementAction::RecoverableRemove { targets } => {
+            if targets.is_empty() {
+                return Err(invalid("Removal requires at least one model"));
+            }
+        }
+        ManagementAction::RestoreRemoval { snapshot_id } => {
+            validate_plain_id_text(snapshot_id, "Removal snapshot")?;
+        }
+        ManagementAction::CreateBackup {
+            destination_handle_id,
+            file_name,
+        }
+        | ManagementAction::ExportSelection {
+            destination_handle_id,
+            file_name,
+            ..
+        } => {
+            validate_output_name(file_name)?;
+            runtime.admitted_root_path(context, destination_handle_id, RootAccess::Writable)?;
+        }
+        ManagementAction::RestoreBackup {
+            source_handle_id,
+            file_name,
+            root_mappings,
+        } => {
+            runtime.require(context, Capability::CatalogRead)?;
+            validate_output_name(file_name)?;
+            if runtime
+                .admitted_root_path(context, source_handle_id, RootAccess::Inbox)
+                .or_else(|_| {
+                    runtime.admitted_root_path(context, source_handle_id, RootAccess::ReadOnly)
+                })
+                .is_err()
+            {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Forbidden,
+                    message: "Restore source handle is not admitted".into(),
+                    retryable: false,
+                    current_version: None,
+                });
+            }
+            let mut backup_ids = BTreeSet::new();
+            let mut handles = BTreeSet::new();
+            for mapping in root_mappings {
+                validate_plain_id_text(&mapping.backup_catalog_root_id, "Backup catalog root")?;
+                if !backup_ids.insert(&mapping.backup_catalog_root_id)
+                    || !handles.insert(&mapping.operator_handle_id)
+                {
+                    return Err(invalid("Restore root mapping is duplicated"));
+                }
+                runtime.admitted_root_path(
+                    context,
+                    &mapping.operator_handle_id,
+                    RootAccess::ReadOnly,
+                )?;
+            }
+        }
+        ManagementAction::QuarantineLooseSource { target } => {
+            validate_physical_model_action(runtime, context, &target.model_id)?;
+        }
+        ManagementAction::UndoQuarantine { snapshot_id } => {
+            validate_plain_id_text(snapshot_id, "Quarantine snapshot")?;
+        }
+        ManagementAction::MoveLooseSource {
+            target,
+            destination_handle_id,
+            file_name,
+        } => {
+            validate_output_name(file_name)?;
+            validate_physical_model_action(runtime, context, &target.model_id)?;
+            runtime.admitted_root_path(context, destination_handle_id, RootAccess::Writable)?;
+        }
+        ManagementAction::PurgeCatalog {
+            backup_destination_handle_id,
+            backup_file_name,
+        } => {
+            validate_output_name(backup_file_name)?;
+            runtime.admitted_root_path(
+                context,
+                backup_destination_handle_id,
+                RootAccess::Writable,
+            )?;
+        }
+        ManagementAction::CleanupOrphans => {}
+    }
+    Ok(())
+}
+
+fn validate_physical_model_action(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    model_id: &str,
+) -> Result<(), RuntimeError> {
+    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    let model = runtime
+        .read_db(|db| db.get_model(model_id))?
+        .ok_or_else(|| RuntimeError {
+            code: RuntimeErrorCode::NotFound,
+            message: "Model was not found".into(),
+            retryable: false,
+            current_version: None,
+        })?;
+    if model.source_kind != "indexed" || model.source_archive_member.is_some() {
+        return Err(invalid("Physical action requires a loose indexed model"));
+    }
+    let root_id = model
+        .source_root_id
+        .as_deref()
+        .ok_or_else(|| invalid("Indexed model has no source root"))?;
+    let admitted = runtime
+        .roots
+        .iter()
+        .find(|root| {
+            root.catalog_root_id.as_deref() == Some(root_id)
+                && root.handle.access == RootAccess::Writable
+        })
+        .ok_or_else(|| RuntimeError {
+            code: RuntimeErrorCode::Forbidden,
+            message: "Model source root is not admitted for writes".into(),
+            retryable: false,
+            current_version: None,
+        })?;
+    if admitted.path.canonicalize().map_err(|_| io_error())? != admitted.path {
+        return Err(stale("Model source root identity changed"));
+    }
+    Ok(())
+}
+
+fn revalidate_action_targets(
+    runtime: &LibraryRuntime,
+    targets: &[ActionTargetSnapshot],
+) -> Result<(), RuntimeError> {
+    runtime.read_db(|db| {
+        for target in targets {
+            let model = db
+                .get_model(&target.model_id)?
+                .ok_or_else(|| LibraryError::ModelNotFound(target.model_id.clone()))?;
+            if model.metadata_version != target.metadata_version {
+                return Err(LibraryError::MetadataConflict {
+                    model_id: target.model_id.clone(),
+                    expected: target.metadata_version,
+                    actual: model.metadata_version,
+                });
+            }
+            if model.content_hash != target.content_hash {
+                return Err(LibraryError::SourceChanged);
+            }
+        }
+        Ok(())
+    })
+}
+
+fn validate_plain_id_text(value: &str, label: &str) -> Result<(), RuntimeError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
+    {
+        return Err(invalid(&format!("{label} is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_output_name(value: &str) -> Result<(), RuntimeError> {
+    if value.is_empty()
+        || value.len() > 200
+        || value == "."
+        || value == ".."
+        || value.contains(['/', '\\', '\0'])
+        || value.chars().any(char::is_control)
+    {
+        return Err(invalid("Management file name is invalid"));
+    }
+    Ok(())
+}
+
+fn admitted_file(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    handle_id: &str,
+    required: RootAccess,
+    file_name: &str,
+    must_exist: bool,
+) -> Result<(PathBuf, PathBuf), RuntimeError> {
+    validate_output_name(file_name)?;
+    let root = runtime.admitted_root_path(context, handle_id, required)?;
+    if root.canonicalize().map_err(|_| io_error())? != root {
+        return Err(stale("Operator root identity changed"));
+    }
+    let path = root.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if must_exist && metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) if must_exist => return Err(invalid("Management source is not a regular file")),
+        Ok(_) => return Err(invalid("Management destination already exists")),
+        Err(error) if !must_exist && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) if must_exist => return Err(io_error()),
+        Err(_) => return Err(io_error()),
+    }
+    Ok((root, path))
+}
+
+fn recheck_management_plan(
+    runtime: &LibraryRuntime,
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<(), RuntimeError> {
+    if runtime.library_epoch() != expected_epoch || runtime.catalog_revision() != expected_revision
+    {
+        return Err(stale("Management plan changed before exclusive execution"));
+    }
+    Ok(())
+}
+
+fn hash_management_file(path: &Path, max_bytes: u64) -> Result<(u64, String), RuntimeError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(invalid("Management source file is unsafe or too large"));
+    }
+    let mut file = File::open(path).map_err(|_| io_error())?;
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| io_error())?;
+        if count == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("Management source size overflowed"))?;
+        if bytes > metadata.len() || bytes > max_bytes {
+            return Err(stale("Management source file changed"));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if bytes != metadata.len() {
+        return Err(stale("Management source file changed"));
+    }
+    Ok((bytes, format!("{:x}", digest.finalize())))
+}
+
+fn copy_verified_management_file(
+    source: &Path,
+    destination: &Path,
+    expected: &(u64, String),
+) -> Result<(), RuntimeError> {
+    let metadata = fs::symlink_metadata(source).map_err(|_| io_error())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected.0 {
+        return Err(stale("Restore backup changed after planning"));
+    }
+    let mut input = File::open(source).map_err(|_| io_error())?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|_| io_error())?;
+    let result = (|| {
+        let mut digest = Sha256::new();
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = input.read(&mut buffer).map_err(|_| io_error())?;
+            if count == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(count as u64)
+                .ok_or_else(|| stale("Restore backup size overflowed"))?;
+            if copied > expected.0 {
+                return Err(stale("Restore backup changed after planning"));
+            }
+            digest.update(&buffer[..count]);
+            output.write_all(&buffer[..count]).map_err(|_| io_error())?;
+        }
+        if copied != expected.0 || format!("{:x}", digest.finalize()) != expected.1 {
+            return Err(stale("Restore backup changed after planning"));
+        }
+        output.sync_all().map_err(|_| io_error())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn execute_backup(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    handle_id: &str,
+    file_name: &str,
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<ManagementResult, RuntimeError> {
+    runtime.require(context, Capability::Maintenance)?;
+    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    runtime.read_db(|_| Ok(()))?;
+    let (_, destination) = admitted_file(
+        runtime,
+        context,
+        handle_id,
+        RootAccess::Writable,
+        file_name,
+        false,
+    )?;
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
+    let _guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let result = library_backup::create_backup(&runtime.root, &destination)
+        .map_err(|_| invalid("Library backup could not be created"))?;
+    Ok(ManagementResult::BackupCreated {
+        destination_handle_id: handle_id.into(),
+        file_name: file_name.into(),
+        files: result.files,
+        bytes: result.bytes,
+        sha256: result.sha256,
+    })
+}
+
+fn execute_selection_export(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    targets: &[VersionedTarget],
+    handle_id: &str,
+    file_name: &str,
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<ManagementResult, RuntimeError> {
+    runtime.require(context, Capability::Maintenance)?;
+    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    let (_, destination) = admitted_file(
+        runtime,
+        context,
+        handle_id,
+        RootAccess::Writable,
+        file_name,
+        false,
+    )?;
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
+    let _guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let ids = targets
+        .iter()
+        .map(|target| target.model_id.clone())
+        .collect::<Vec<_>>();
+    let manifest = library_recovery::export_library_zip(&runtime.root, &ids, &destination)
+        .map_err(|_| invalid("Recovery export could not be created"))?;
+    let bytes = fs::symlink_metadata(&destination)
+        .map_err(|_| io_error())?
+        .len();
+    Ok(ManagementResult::SelectionExported {
+        destination_handle_id: handle_id.into(),
+        file_name: file_name.into(),
+        models: manifest.models.len(),
+        bytes,
+    })
+}
+
+struct RestoreExecution<'a> {
+    source_handle_id: &'a str,
+    file_name: &'a str,
+    root_mappings: &'a [RestoreRootMapping],
+    expected_input: &'a (u64, String),
+    expected_epoch: u64,
+    expected_revision: u64,
+}
+
+fn execute_restore(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    execution: RestoreExecution<'_>,
+) -> Result<ManagementResult, RuntimeError> {
+    runtime.require(context, Capability::Maintenance)?;
+    let (_, source) = admitted_file(
+        runtime,
+        context,
+        execution.source_handle_id,
+        RootAccess::Inbox,
+        execution.file_name,
+        true,
+    )
+    .or_else(|_| {
+        admitted_file(
+            runtime,
+            context,
+            execution.source_handle_id,
+            RootAccess::ReadOnly,
+            execution.file_name,
+            true,
+        )
+    })?;
+    let floor = runtime.read_db(|db| db.max_metadata_version())?;
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
+    let mut guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(
+        runtime,
+        execution.expected_epoch,
+        execution.expected_revision,
+    )?;
+    let root = runtime.root.clone();
+    let parent = root
+        .parent()
+        .ok_or_else(|| invalid("Library root has no stable parent"))?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let stable_source = parent.join(format!(".gogglelab-restore-input-{suffix}.zip"));
+    copy_verified_management_file(&source, &stable_source, execution.expected_input)?;
+    let staged = parent.join(format!(".gogglelab-restore-{suffix}"));
+    let previous = parent.join(format!("library.previous-{suffix}"));
+    let previous_backup = parent.join(format!("library.previous-{suffix}.zip"));
+    let result = (|| {
+        library_backup::restore_backup_to_staging(&stable_source, &staged)
+            .map_err(|_| invalid("Backup could not be restored to staging"))?;
+        let staged_db = LibraryDb::open(&staged).map_err(runtime_library_error)?;
+        let mappings = execution
+            .root_mappings
+            .iter()
+            .map(|mapping| {
+                let admitted = runtime
+                    .roots
+                    .iter()
+                    .find(|root| root.handle.id == mapping.operator_handle_id)
+                    .ok_or_else(|| invalid("Restore operator root is not admitted"))?;
+                let target_id = admitted
+                    .catalog_root_id
+                    .clone()
+                    .ok_or_else(|| invalid("Restore operator root has no catalog identity"))?;
+                if admitted.path.canonicalize().map_err(|_| io_error())? != admitted.path {
+                    return Err(stale("Restore operator root identity changed"));
+                }
+                Ok((
+                    mapping.backup_catalog_root_id.clone(),
+                    target_id,
+                    admitted.path.clone(),
+                    mapping.enabled,
+                ))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        staged_db
+            .remap_restored_index_roots(&mappings)
+            .map_err(runtime_library_error)?;
+        staged_db
+            .bump_all_metadata_versions_above(floor)
+            .map_err(runtime_library_error)?;
+        let models = staged_db
+            .list_models(None, None)
+            .map_err(runtime_library_error)?
+            .len();
+        drop(staged_db);
+        library_backup::create_backup(&root, &previous_backup)
+            .map_err(|_| invalid("Pre-restore backup could not be created"))?;
+        let epoch = guard.invalidate();
+        fs::rename(&root, &previous).map_err(|_| io_error())?;
+        if let Err(error) = fs::rename(&staged, &root) {
+            if fs::rename(&previous, &root).is_err() {
+                guard.remain_armed();
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Library replacement and rollback both failed".into(),
+                    retryable: false,
+                    current_version: None,
+                });
+            }
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Io,
+                message: format!("Library replacement failed: {error}"),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        if LibraryDb::open(&root)
+            .and_then(|db| db.list_models(None, None).map(|_| ()))
+            .is_err()
+        {
+            let failed = parent.join(format!(".gogglelab-failed-{suffix}"));
+            if fs::rename(&root, &failed).is_err() || fs::rename(&previous, &root).is_err() {
+                guard.remain_armed();
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Restored Library failed validation and rollback failed".into(),
+                    retryable: false,
+                    current_version: None,
+                });
+            }
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Restored Library failed validation; previous Library recovered".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        Ok(ManagementResult::BackupRestored {
+            models,
+            library_epoch: epoch,
+        })
+    })();
+    if result.is_err() && staged.exists() {
+        let _ = fs::remove_dir_all(&staged);
+    }
+    let _ = fs::remove_file(stable_source);
+    result
 }
 
 fn access_allows(actual: RootAccess, required: RootAccess) -> bool {
@@ -2036,6 +3695,12 @@ fn runtime_library_error(error: LibraryError) -> RuntimeError {
             message: "Stored version changed".into(),
             retryable: true,
             current_version: Some(actual),
+        },
+        LibraryError::IdempotencyConflict(_) => RuntimeError {
+            code: RuntimeErrorCode::Conflict,
+            message: "Idempotency key conflicts with another payload".into(),
+            retryable: false,
+            current_version: None,
         },
         LibraryError::ModelNotFound(_)
         | LibraryError::FolderNotFound(_)
@@ -2088,6 +3753,8 @@ fn core_metadata_patch(patch: MetadataPatch) -> CoreMetadataPatch {
         }),
         folder_id: patch.folder_id,
         parent_model_id: patch.parent_model_id,
+        rating: patch.rating,
+        favorite: patch.favorite,
     }
 }
 
@@ -2123,6 +3790,10 @@ fn core_model_query(query: &ModelQuery) -> CoreModelPageQuery {
         source_missing: query.source_missing,
         duplicates_only: query.duplicates_only,
         source_kind: query.source_kind.clone(),
+        thumbnail_mode: query.thumbnail_mode.clone(),
+        source_directory: query.source_directory.clone(),
+        minimum_rating: query.minimum_rating,
+        favorite: query.favorite,
         group: query.group.map(|group| match group {
             ModelGroupFilter::Standalone => CoreModelGroupFilter::Standalone,
             ModelGroupFilter::Bundle => CoreModelGroupFilter::Bundle,
@@ -2250,6 +3921,16 @@ fn catalog_model(model: Model, thumbnail_id: Option<String>) -> CatalogModel {
         tags: model.tags,
         filament_ids: model.filament_ids,
         source_kind: model.source_kind,
+        root_id: model.source_root_id,
+        bundle_id: model.bundle_id,
+        archive_member: model.source_archive_member.is_some(),
+        parent_model_id: model.metadata.parent_model_id.clone(),
+        created_at: model.created_at,
+        updated_at: model.updated_at,
+        last_printed_at: model.metadata.last_printed_at.clone(),
+        print_count: model.metadata.print_count,
+        rating: model.metadata.rating,
+        favorite: model.metadata.favorite,
         availability,
         catalog_kind: model.catalog_kind,
         thumbnail_id,
@@ -2258,6 +3939,45 @@ fn catalog_model(model: Model, thumbnail_id: Option<String>) -> CatalogModel {
         notes: model.metadata.notes,
         model_license: model.metadata.model_license,
         print_status: print_status.into(),
+    }
+}
+
+fn catalog_stats(stats: CoreCatalogStats) -> CatalogStats {
+    CatalogStats {
+        total_models: stats.total_models,
+        available_models: stats.available_models,
+        missing_models: stats.missing_models,
+        bookmarks: stats.bookmarks,
+        total_bytes: stats.total_bytes,
+        bundle_count: stats.bundle_count,
+        duplicate_group_count: stats.duplicate_group_count,
+    }
+}
+
+fn catalog_settings(settings: CoreCatalogSettings) -> CatalogSettings {
+    CatalogSettings {
+        thumbnail_size: settings.thumbnail_size,
+        thumbnail_background: settings.thumbnail_background,
+        thumbnail_concurrency: settings.thumbnail_concurrency,
+        scan_batch_size: settings.scan_batch_size,
+    }
+}
+
+fn catalog_facets(facets: CoreCatalogFacets) -> CatalogFacets {
+    CatalogFacets {
+        designers: facets.designers,
+        licenses: facets.licenses,
+        categories: facets.categories,
+        parents: facets
+            .parents
+            .into_iter()
+            .map(|value| CatalogFacetValue {
+                id: value.id,
+                label: value.label,
+            })
+            .collect(),
+        folder_ids: facets.folder_ids,
+        root_ids: facets.root_ids,
     }
 }
 
@@ -2321,6 +4041,8 @@ fn scan_status(status: scanner::LibraryScanStatus, reveal_paths: bool) -> ScanSt
         roots_completed: status.roots_completed,
         files_visited: status.files_visited,
         files_indexed: status.files_indexed,
+        thumbnails_total: status.thumbnails_total,
+        thumbnails_completed: status.thumbnails_completed,
         errors: if reveal_paths {
             status.errors
         } else {
@@ -2331,6 +4053,102 @@ fn scan_status(status: scanner::LibraryScanStatus, reveal_paths: bool) -> ScanSt
                 .collect()
         },
     }
+}
+
+fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &str) {
+    let models = match runtime.read_db(|db| db.list_models(None, None)) {
+        Ok(models) if models.len() <= 200_000 => models
+            .into_iter()
+            .filter(|model| {
+                model.source_root_id.as_deref() == Some(root_id)
+                    && !model.source_missing
+                    && model.content_hash.is_some()
+            })
+            .collect::<Vec<_>>(),
+        Ok(_) => {
+            runtime
+                .scan_control()
+                .error("Thumbnail job exceeds its model limit".into());
+            return;
+        }
+        Err(error) => {
+            runtime.scan_control().error(format!(
+                "Thumbnail job could not read catalog: {}",
+                error.message
+            ));
+            return;
+        }
+    };
+    runtime.scan_control().set_job_kind("thumbnails");
+    runtime.scan_control().set_thumbnail_progress(models.len());
+    for model in models {
+        if runtime.scan_control().cancelled() {
+            break;
+        }
+        let result = (|| {
+            if runtime
+                .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            let settings = runtime.read_db(|db| db.get_catalog_settings())?;
+            let content_hash = model
+                .content_hash
+                .as_deref()
+                .ok_or_else(|| invalid("Thumbnail model has no content hash"))?;
+            let bytes = runtime.verified_model_source_bytes(&model)?;
+            let staging = runtime.root.join("staging");
+            let staging_metadata = fs::symlink_metadata(&staging).map_err(|_| io_error())?;
+            if staging_metadata.file_type().is_symlink()
+                || !staging_metadata.is_dir()
+                || staging.canonicalize().map_err(|_| io_error())? != staging
+            {
+                return Err(invalid("Thumbnail staging namespace is unsafe"));
+            }
+            let temporary = staging.join(format!(
+                "thumbnail-source-{}.part",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let render = (|| {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
+                    .map_err(|_| io_error())?;
+                file.write_all(&bytes).map_err(|_| io_error())?;
+                file.sync_all().map_err(|_| io_error())?;
+                let artifact = thumbnails::ensure_thumbnail(
+                    &runtime.root,
+                    &temporary,
+                    content_hash,
+                    bytes.len() as u64,
+                    &settings,
+                    false,
+                )
+                .map_err(|_| invalid("Thumbnail render failed"))?;
+                runtime.mutate_db(|db| {
+                    db.set_thumbnail_for_source_and_settings(
+                        &model.id,
+                        content_hash,
+                        &settings,
+                        &artifact.png_hash,
+                        &artifact.relative_path,
+                    )
+                })?;
+                Ok(())
+            })();
+            let _ = fs::remove_file(temporary);
+            render
+        })();
+        if let Err(error) = result {
+            runtime
+                .scan_control()
+                .error(format!("Thumbnail {}: {}", model.id, error.message));
+        }
+        runtime.scan_control().thumbnail_completed();
+    }
+    runtime.scan_control().set_job_kind("scan");
 }
 
 fn scan_error(message: String) -> RuntimeError {
@@ -2408,6 +4226,74 @@ fn verify_content_file(
     read_verified_content(path, expected_bytes, expected_hash).map(|_| ())
 }
 
+fn content_limit(kind: ContentKind) -> u64 {
+    match kind {
+        ContentKind::Thumbnail => 4 * 1024 * 1024,
+        ContentKind::Model => library_core::MAX_INDEXED_FILE_BYTES,
+        ContentKind::Geometry => 128 * 1024 * 1024,
+        ContentKind::BundleArchive => 4 * 1024 * 1024 * 1024,
+    }
+}
+
+fn verify_leased_file(
+    path: &Path,
+    expected_bytes: u64,
+    expected_hash: &str,
+    max_bytes: u64,
+) -> Result<(), RuntimeError> {
+    stream_verified_file(
+        path,
+        expected_bytes,
+        expected_hash,
+        max_bytes,
+        &mut std::io::sink(),
+    )
+}
+
+fn stream_verified_file(
+    path: &Path,
+    expected_bytes: u64,
+    expected_hash: &str,
+    max_bytes: u64,
+    sink: &mut dyn Write,
+) -> Result<(), RuntimeError> {
+    if expected_bytes > max_bytes {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Unsupported,
+            message: "Content exceeds its lease type limit".into(),
+            retryable: false,
+            current_version: None,
+        });
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_bytes
+    {
+        return Err(stale("Leased content file changed"));
+    }
+    let mut file = File::open(path).map_err(|_| io_error())?;
+    let mut digest = Sha256::new();
+    let mut read = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| io_error())?;
+        if count == 0 {
+            break;
+        }
+        read = read
+            .checked_add(count as u64)
+            .ok_or_else(|| stale("Leased content size overflowed"))?;
+        if read > expected_bytes {
+            return Err(stale("Leased content size changed"));
+        }
+        digest.update(&buffer[..count]);
+        sink.write_all(&buffer[..count]).map_err(|_| io_error())?;
+    }
+    if read != expected_bytes || format!("{:x}", digest.finalize()) != expected_hash {
+        return Err(stale("Leased content bytes changed"));
+    }
+    Ok(())
+}
+
 fn read_verified_content(
     path: &Path,
     expected_bytes: u64,
@@ -2444,6 +4330,15 @@ fn invalid(message: &str) -> RuntimeError {
     RuntimeError {
         code: RuntimeErrorCode::InvalidInput,
         message: message.into(),
+        retryable: false,
+        current_version: None,
+    }
+}
+
+fn unsupported_physical_management() -> RuntimeError {
+    RuntimeError {
+        code: RuntimeErrorCode::Unsupported,
+        message: "Physical source management requires explicit host authorization".into(),
         retryable: false,
         current_version: None,
     }
@@ -2524,6 +4419,25 @@ mod tests {
         }
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes
+    }
+
+    fn metadata_3mf() -> Vec<u8> {
+        let model = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+<metadata name="Designer">Embedded Designer</metadata>
+<metadata name="Description">Embedded notes</metadata>
+<metadata name="License">CC0</metadata>
+<metadata name="Source">https://example.test/source</metadata>
+<resources><object id="1" type="model"><mesh><vertices>
+<vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>
+</vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources>
+<build><item objectid="1"/></build></model>"#;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive
+            .start_file("3D/3dmodel.model", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(model.as_bytes()).unwrap();
+        archive.finish().unwrap().into_inner()
     }
 
     #[test]
@@ -2775,6 +4689,146 @@ mod tests {
     }
 
     #[test]
+    fn readonly_headless_startup_does_not_create_or_scan_catalog_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let file = source.join("part.stl");
+        let bytes = triangle_stl(0.0);
+        fs::write(&file, &bytes).unwrap();
+        let runtime = LibraryRuntime::open(RuntimeConfig {
+            library_root: temp.path().join("library"),
+            integration_settings_path: temp.path().join("integrations.json"),
+            roots: vec![RuntimeRootPolicy {
+                id: "readonly".into(),
+                catalog_root_id: None,
+                label: "Read only".into(),
+                path: source,
+                access: RootAccess::ReadOnly,
+            }],
+            capabilities: BTreeSet::from([Capability::CatalogRead, Capability::MediaRead]),
+            local_catalog_root_access: false,
+        })
+        .unwrap();
+        scanner::start_background_scanner(&runtime);
+        assert!(!runtime.scan_control().status().running);
+        assert!(runtime
+            .read_db(|db| db.list_index_roots())
+            .unwrap()
+            .is_empty());
+        assert_eq!(fs::read(file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn opaque_root_and_catalog_settings_round_trip_with_capability_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let runtime = LibraryRuntime::open(RuntimeConfig {
+            library_root: temp.path().join("library"),
+            integration_settings_path: temp.path().join("integrations.json"),
+            roots: vec![RuntimeRootPolicy {
+                id: "models".into(),
+                catalog_root_id: None,
+                label: "Models".into(),
+                path: source,
+                access: RootAccess::ReadOnly,
+            }],
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::CatalogWrite,
+                Capability::Scan,
+                Capability::MediaWrite,
+            ]),
+            local_catalog_root_access: false,
+        })
+        .unwrap();
+        let context = RequestContext {
+            principal_id: "operator".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::CatalogWrite,
+                Capability::Scan,
+            ]),
+            request_id: "settings".into(),
+        };
+        let root = runtime
+            .list_index_root_settings(&context)
+            .unwrap()
+            .remove(0);
+        let updated = runtime
+            .update_index_root_settings(
+                &context,
+                &root.handle_id,
+                IndexRootSettingsPatch {
+                    enabled: false,
+                    scan_interval_minutes: 30,
+                    max_file_bytes: 20 * 1024 * 1024,
+                    scan_zip: true,
+                },
+            )
+            .unwrap();
+        assert!(!updated.enabled);
+        assert!(updated.scan_zip);
+        assert_eq!(updated.catalog_root_id, root.catalog_root_id);
+        let mut settings = runtime.get_catalog_settings(&context).unwrap();
+        settings.thumbnail_size = 128;
+        settings.thumbnail_background = "#FFFFFF".into();
+        assert_eq!(
+            runtime
+                .update_catalog_settings(&context, settings.clone())
+                .unwrap(),
+            settings
+        );
+    }
+
+    #[test]
+    fn headless_completed_scan_persists_default_thumbnail_without_source_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let file = source.join("part.stl");
+        let bytes = triangle_stl(0.0);
+        fs::write(&file, &bytes).unwrap();
+        let runtime = LibraryRuntime::open(RuntimeConfig {
+            library_root: temp.path().join("library"),
+            integration_settings_path: temp.path().join("integrations.json"),
+            roots: vec![RuntimeRootPolicy {
+                id: "models".into(),
+                catalog_root_id: None,
+                label: "Models".into(),
+                path: source,
+                access: RootAccess::ReadOnly,
+            }],
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::MediaRead,
+                Capability::MediaWrite,
+                Capability::Scan,
+            ]),
+            local_catalog_root_access: false,
+        })
+        .unwrap();
+        let root = runtime
+            .read_db(|db| db.list_index_roots())
+            .unwrap()
+            .remove(0);
+        scanner::scan_root(&runtime, &root).unwrap();
+        let model = runtime
+            .read_db(|db| db.list_models(None, None))
+            .unwrap()
+            .remove(0);
+        assert!(runtime
+            .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))
+            .unwrap()
+            .is_some());
+        assert_eq!(fs::read(file).unwrap(), bytes);
+        let status = runtime.scan_control().status();
+        assert_eq!(status.thumbnails_total, 1);
+        assert_eq!(status.thumbnails_completed, 1);
+    }
+
+    #[test]
     fn remote_scan_status_redacts_host_paths_without_explicit_path_capability() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
@@ -2865,6 +4919,297 @@ mod tests {
                 .code,
             RuntimeErrorCode::Stale
         );
+    }
+
+    #[test]
+    fn bundle_download_includes_all_thirty_three_members_and_epoch_cleans_owned_zip() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let mut model_ids = Vec::new();
+        for index in 0..33 {
+            let model = runtime
+                .mutate_db(|db| {
+                    db.import_file(&source, None, Some(&format!("Part {index:02}")))
+                        .map(|value| value.model)
+                })
+                .unwrap();
+            model_ids.push(model.id);
+        }
+        let bundle_id = runtime
+            .mutate_db(|db| db.create_bundle(&model_ids))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "bundle-download".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "bundle-download".into(),
+        };
+        let preview = runtime
+            .prepare_bundle_preview(&context, &bundle_id)
+            .unwrap();
+        assert_eq!(preview.member_count, 33);
+        assert_eq!(preview.previewed_count, 32);
+        assert_eq!(preview.omitted_count, 1);
+        let lease = runtime
+            .issue_bundle_download(&context, &preview.token)
+            .unwrap();
+        assert_eq!(lease.kind, ContentKind::BundleArchive);
+        let managed_path = runtime
+            .read_db(|db| db.resolve_model_source_ref(&model_ids[0]))
+            .unwrap()
+            .outer_path;
+        fs::write(&managed_path, triangle_stl(9.0)).unwrap();
+        let reused = runtime
+            .issue_bundle_download(&context, &preview.token)
+            .unwrap();
+        assert_eq!(reused.id, lease.id);
+        let owned_path = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(&lease.id)
+            .unwrap()
+            .path
+            .clone();
+        let mut archive_bytes = Vec::new();
+        runtime
+            .stream_content(&context, &lease.id, &mut archive_bytes)
+            .unwrap();
+        assert_eq!(
+            zip::ZipArchive::new(std::io::Cursor::new(archive_bytes))
+                .unwrap()
+                .len(),
+            33
+        );
+        assert_eq!(
+            fs::read_dir(runtime.root.join("staging/bundle-downloads"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let other = RequestContext {
+            principal_id: "other".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "other".into(),
+        };
+        assert_eq!(
+            runtime
+                .describe_content(&other, &lease.id)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+        let maintenance = runtime.begin_maintenance().unwrap();
+        maintenance.invalidate();
+        drop(maintenance);
+        assert!(!owned_path.exists());
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+    }
+
+    #[test]
+    fn model_geometry_uses_stl2_lease_and_rejects_stale_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, Some("00"), None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        let geometry = runtime
+            .issue_model_geometry(&context, &model.id, model.content_hash.as_deref(), None)
+            .unwrap();
+        let owned_path = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(&geometry.content.id)
+            .unwrap()
+            .path
+            .clone();
+        assert_eq!(geometry.content.kind, ContentKind::Geometry);
+        assert_eq!(geometry.packet_format, "stl2");
+        assert_eq!(geometry.packet_version, 2);
+        assert_eq!(geometry.triangle_count, 1);
+        assert_eq!(geometry.plates.len(), 1);
+        let mut packet = Vec::new();
+        runtime
+            .stream_content(&context, &geometry.content.id, &mut packet)
+            .unwrap();
+        assert_eq!(&packet[..4], b"STL2");
+        assert_eq!(u32::from_le_bytes(packet[8..12].try_into().unwrap()), 1);
+        drop(runtime);
+        assert!(!owned_path.exists());
+    }
+
+    #[test]
+    fn first_database_use_prunes_only_known_runtime_orphans() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let runtime = LibraryRuntime::open(config(root.clone())).unwrap();
+        runtime.read_db(|db| db.list_models(None, None)).unwrap();
+        let bundle_dir = root.join("staging/bundle-downloads");
+        let geometry_dir = root.join("staging/geometry");
+        fs::create_dir(&bundle_dir).unwrap();
+        fs::create_dir(&geometry_dir).unwrap();
+        fs::write(bundle_dir.join("bundle-orphan.zip"), b"orphan").unwrap();
+        fs::write(geometry_dir.join("geometry-orphan.stl2"), b"orphan").unwrap();
+        fs::write(bundle_dir.join("operator-note.txt"), b"preserve").unwrap();
+        drop(runtime);
+
+        let reopened = LibraryRuntime::open(config(root)).unwrap();
+        reopened.read_db(|db| db.list_models(None, None)).unwrap();
+        assert!(!bundle_dir.join("bundle-orphan.zip").exists());
+        assert!(!geometry_dir.join("geometry-orphan.stl2").exists());
+        assert!(bundle_dir.join("operator-note.txt").exists());
+    }
+
+    #[test]
+    fn bundle_download_source_tamper_removes_partial_owned_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let first = runtime
+            .mutate_db(|db| {
+                db.import_file(&source, None, Some("First"))
+                    .map(|value| value.model)
+            })
+            .unwrap();
+        let second = runtime
+            .mutate_db(|db| {
+                db.import_file(&source, None, Some("Second"))
+                    .map(|value| value.model)
+            })
+            .unwrap();
+        let bundle_id = runtime
+            .mutate_db(|db| db.create_bundle(&[first.id.clone(), second.id]))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "tamper".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "tamper".into(),
+        };
+        let preview = runtime
+            .prepare_bundle_preview(&context, &bundle_id)
+            .unwrap();
+        let managed_path = runtime
+            .read_db(|db| db.resolve_model_source_ref(&first.id))
+            .unwrap()
+            .outer_path;
+        fs::write(&managed_path, triangle_stl(5.0)).unwrap();
+        assert_eq!(
+            runtime
+                .issue_bundle_download(&context, &preview.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        let namespace = runtime.root.join("staging/bundle-downloads");
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_download_quota_refuses_before_file_creation_and_releases_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let bundle_id = runtime
+            .mutate_db(|db| db.create_bundle(&[model.id]))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "quota".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "quota".into(),
+        };
+        let preview = runtime
+            .prepare_bundle_preview(&context, &bundle_id)
+            .unwrap();
+        runtime.set_temp_limits_for_test(1, 1024);
+        assert_eq!(
+            runtime
+                .issue_bundle_download(&context, &preview.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        assert!(!runtime.root.join("staging/bundle-downloads").exists());
+        let resources = runtime.temp_resources.lock().unwrap();
+        assert_eq!(resources.reserved_owned_bytes, 0);
+        assert_eq!(resources.active_bundle_builds, 0);
+    }
+
+    #[test]
+    fn embedded_3mf_metadata_requires_explicit_field_selection_and_source_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("metadata.3mf");
+        fs::write(&source, metadata_3mf()).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "metadata".into(),
+            capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+            request_id: "metadata".into(),
+        };
+        assert_eq!(
+            runtime
+                .read_embedded_metadata(&context, &model.id, Some("00"))
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        let proposal = runtime
+            .read_embedded_metadata(&context, &model.id, model.content_hash.as_deref())
+            .unwrap();
+        assert_eq!(
+            proposal.embedded.designer.as_deref(),
+            Some("Embedded Designer")
+        );
+        assert_eq!(proposal.embedded.notes.as_deref(), Some("Embedded notes"));
+        let changed = runtime
+            .apply_embedded_metadata(
+                &context,
+                VersionedTarget {
+                    model_id: model.id.clone(),
+                    expected_version: model.metadata_version,
+                },
+                model.content_hash.as_deref().unwrap(),
+                EmbeddedMetadataSelection {
+                    designer: true,
+                    notes: true,
+                    ..EmbeddedMetadataSelection::default()
+                },
+            )
+            .unwrap();
+        let stored = runtime
+            .read_db(|db| db.get_model(&model.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.metadata_version, stored.metadata_version);
+        assert_eq!(
+            stored.metadata.designer.as_deref(),
+            Some("Embedded Designer")
+        );
+        assert_eq!(stored.metadata.notes.as_deref(), Some("Embedded notes"));
+        assert!(stored.metadata.model_license.is_none());
     }
 
     #[test]
@@ -3014,6 +5359,255 @@ mod tests {
         assert!(changed
             .iter()
             .all(|model| model.metadata_version == first.metadata_version + 1));
+    }
+
+    #[test]
+    fn parent_metadata_empty_string_clears_and_omission_preserves() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let parent = runtime
+            .mutate_db(|db| db.create_model("Parent", None))
+            .unwrap();
+        let child = runtime
+            .mutate_db(|db| db.create_model("Child", None))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "editor".into(),
+            capabilities: BTreeSet::from([Capability::CatalogWrite]),
+            request_id: "parent".into(),
+        };
+        let set = runtime
+            .update_metadata(
+                &context,
+                VersionedTarget {
+                    model_id: child.id.clone(),
+                    expected_version: child.metadata_version,
+                },
+                MetadataPatch {
+                    parent_model_id: Some(parent.id.clone()),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        let preserved = runtime
+            .update_metadata(
+                &context,
+                VersionedTarget {
+                    model_id: child.id.clone(),
+                    expected_version: set.metadata_version,
+                },
+                MetadataPatch {
+                    notes: Some("updated".into()),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .read_db(|db| db.get_model(&child.id))
+                .unwrap()
+                .unwrap()
+                .metadata
+                .parent_model_id,
+            Some(parent.id)
+        );
+        runtime
+            .update_metadata(
+                &context,
+                VersionedTarget {
+                    model_id: child.id.clone(),
+                    expected_version: preserved.metadata_version,
+                },
+                MetadataPatch {
+                    parent_model_id: Some(String::new()),
+                    ..MetadataPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(runtime
+            .read_db(|db| db.get_model(&child.id))
+            .unwrap()
+            .unwrap()
+            .metadata
+            .parent_model_id
+            .is_none());
+    }
+
+    #[test]
+    fn management_remove_restore_tokens_are_versioned_one_use_and_principal_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.create_model("Managed", None))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "manager".into(),
+            capabilities: BTreeSet::from([Capability::CatalogWrite]),
+            request_id: "remove".into(),
+        };
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::RecoverableRemove {
+                    targets: vec![VersionedTarget {
+                        model_id: model.id.clone(),
+                        expected_version: model.metadata_version,
+                    }],
+                },
+            )
+            .unwrap();
+        let other = RequestContext {
+            principal_id: "other".into(),
+            capabilities: context.capabilities.clone(),
+            request_id: "other".into(),
+        };
+        assert_eq!(
+            runtime
+                .execute_action(&other, &plan.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+        let removed = runtime.execute_action(&context, &plan.token).unwrap();
+        let snapshot_id = match removed {
+            ManagementResult::Removed { snapshot_id, .. } => snapshot_id,
+            _ => panic!("unexpected management result"),
+        };
+        assert_eq!(
+            runtime
+                .execute_action(&context, &plan.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        let restore = runtime
+            .plan_action(
+                &context,
+                ManagementAction::RestoreRemoval {
+                    snapshot_id: snapshot_id.clone(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.execute_action(&context, &restore.token).unwrap(),
+            ManagementResult::RestoredRemoval { .. }
+        ));
+        assert!(runtime
+            .read_db(|db| db.get_model(&model.id))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn management_backup_export_and_restore_use_only_admitted_handle_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let transfer = temp.path().join("transfer");
+        fs::create_dir(&transfer).unwrap();
+        let mut runtime_config = config(temp.path().join("library"));
+        runtime_config.roots.push(RuntimeRootPolicy {
+            id: "transfer".into(),
+            catalog_root_id: None,
+            label: "Transfer".into(),
+            path: transfer.clone(),
+            access: RootAccess::Writable,
+        });
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        let first = runtime
+            .mutate_db(|db| db.create_model("First", None))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "manager".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::Maintenance,
+                Capability::PhysicalSourceWrite,
+            ]),
+            request_id: "backup".into(),
+        };
+        let backup = runtime
+            .plan_action(
+                &context,
+                ManagementAction::CreateBackup {
+                    destination_handle_id: "transfer".into(),
+                    file_name: "backup.zip".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.execute_action(&context, &backup.token).unwrap(),
+            ManagementResult::BackupCreated { .. }
+        ));
+        assert!(transfer.join("backup.zip").is_file());
+        let export = runtime
+            .plan_action(
+                &context,
+                ManagementAction::ExportSelection {
+                    targets: vec![VersionedTarget {
+                        model_id: first.id.clone(),
+                        expected_version: first.metadata_version,
+                    }],
+                    destination_handle_id: "transfer".into(),
+                    file_name: "selection.zip".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.execute_action(&context, &export.token).unwrap(),
+            ManagementResult::SelectionExported { models: 1, .. }
+        ));
+        runtime
+            .mutate_db(|db| db.create_model("Later", None))
+            .unwrap();
+        let changed_restore = runtime
+            .plan_action(
+                &context,
+                ManagementAction::RestoreBackup {
+                    source_handle_id: "transfer".into(),
+                    file_name: "backup.zip".into(),
+                    root_mappings: vec![],
+                },
+            )
+            .unwrap();
+        let backup_bytes = fs::read(transfer.join("backup.zip")).unwrap();
+        let mut changed_bytes = backup_bytes.clone();
+        changed_bytes.push(0);
+        fs::write(transfer.join("backup.zip"), changed_bytes).unwrap();
+        assert_eq!(
+            runtime
+                .execute_action(&context, &changed_restore.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        assert_eq!(
+            runtime
+                .read_db(|db| db.list_models(None, None))
+                .unwrap()
+                .len(),
+            2
+        );
+        fs::write(transfer.join("backup.zip"), backup_bytes).unwrap();
+        let restore = runtime
+            .plan_action(
+                &context,
+                ManagementAction::RestoreBackup {
+                    source_handle_id: "transfer".into(),
+                    file_name: "backup.zip".into(),
+                    root_mappings: vec![],
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.execute_action(&context, &restore.token).unwrap(),
+            ManagementResult::BackupRestored { models: 1, .. }
+        ));
+        assert_eq!(
+            runtime
+                .read_db(|db| db.list_models(None, None))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3384,6 +5978,13 @@ mod tests {
                 .code,
             RuntimeErrorCode::Forbidden
         );
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, Some(&hash), None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
         drop(runtime);
         let desktop = LibraryRuntime::open(config(library.clone())).unwrap();
         assert!(desktop
@@ -3500,6 +6101,7 @@ mod tests {
 
         let authorized =
             LibraryRuntime::open(config(temp.path().join("writable-library"))).unwrap();
+        authorized.set_temp_limits_for_test(256 * 1024 * 1024, bytes.len() as u64 + 1);
         let token = authorized
             .stage_upload(&context, intent, &mut bytes.as_slice())
             .unwrap();
@@ -3512,7 +6114,37 @@ mod tests {
             .path
             .clone();
         assert_eq!(fs::read(&staged_path).unwrap(), bytes);
+        let second_intent = UploadIntent {
+            item_id: "second".into(),
+            capture_id: "second".into(),
+            file_name: "second.png".into(),
+            bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        assert_eq!(
+            authorized
+                .stage_upload(&context, second_intent, &mut bytes.as_slice())
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        assert_eq!(
+            fs::read_dir(authorized.root.join("staging"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("upload-"))
+                .count(),
+            1
+        );
         authorized.discard_upload(&context, &token.id).unwrap();
         assert!(!staged_path.exists());
+        assert_eq!(
+            authorized
+                .temp_resources
+                .lock()
+                .unwrap()
+                .staged_upload_bytes,
+            0
+        );
     }
 }

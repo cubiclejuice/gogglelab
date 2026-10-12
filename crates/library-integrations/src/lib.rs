@@ -125,6 +125,60 @@ pub struct SuggestedTag {
     pub confidence: Option<f32>,
 }
 
+/// Injectable network boundary used by the shared runtime. Tests install a mock; production hosts
+/// may install the HTTP implementation only when integrations are explicitly enabled.
+pub trait IntegrationTransport: Send + Sync {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+    fn pull_spoolman(&self, config: &SpoolmanConfig) -> Result<SpoolmanSnapshot, String>;
+    fn suggest_tags(
+        &self,
+        config: &ProviderConfig,
+        credential: Option<&str>,
+        input: &SuggestionInput,
+    ) -> Result<Vec<SuggestedTag>, String>;
+}
+
+#[derive(Default)]
+pub struct DisabledIntegrationTransport;
+
+impl IntegrationTransport for DisabledIntegrationTransport {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+    fn pull_spoolman(&self, _config: &SpoolmanConfig) -> Result<SpoolmanSnapshot, String> {
+        Err("Integration network transport is not enabled".into())
+    }
+
+    fn suggest_tags(
+        &self,
+        _config: &ProviderConfig,
+        _credential: Option<&str>,
+        _input: &SuggestionInput,
+    ) -> Result<Vec<SuggestedTag>, String> {
+        Err("Integration network transport is not enabled".into())
+    }
+}
+
+#[derive(Default)]
+pub struct HttpIntegrationTransport;
+
+impl IntegrationTransport for HttpIntegrationTransport {
+    fn pull_spoolman(&self, config: &SpoolmanConfig) -> Result<SpoolmanSnapshot, String> {
+        pull_spoolman(config)
+    }
+
+    fn suggest_tags(
+        &self,
+        config: &ProviderConfig,
+        credential: Option<&str>,
+        input: &SuggestionInput,
+    ) -> Result<Vec<SuggestedTag>, String> {
+        suggest_tags(config, credential, input)
+    }
+}
+
 pub fn pull_spoolman(config: &SpoolmanConfig) -> Result<SpoolmanSnapshot, String> {
     validate_spoolman_config(config)?;
     let endpoint = AdmittedEndpoint::new(

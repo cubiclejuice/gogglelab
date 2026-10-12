@@ -129,6 +129,9 @@ impl ScanControl {
 }
 
 pub fn start_background_scanner(runtime: &Arc<LibraryRuntime>) {
+    if !runtime.capability_enabled(library_protocol::Capability::Scan) {
+        return;
+    }
     let weak = Arc::downgrade(runtime);
     let error_state = weak.clone();
     if let Err(error) = thread::Builder::new()

@@ -2,17 +2,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use library_core::{LibraryError, Model, ResolvedModelSource};
+use library_core::Model;
 use library_protocol::{
-    BundlePreviewMember, BundlePreviewSummary, ContentLease, RequestContext, RuntimeError,
-    RuntimeErrorCode,
+    BundlePreviewMember, BundlePreviewSummary, ContentKind, ContentLease, RequestContext,
+    RuntimeError, RuntimeErrorCode,
 };
 use sha2::{Digest, Sha256};
 
-use crate::{archives, format_system_time, LibraryRuntime};
+use crate::{format_system_time, LibraryRuntime};
 
 const MAX_PREVIEW_MEMBERS: usize = 32;
 const MAX_PREVIEW_TRIANGLES: u32 = 2_000_000;
@@ -21,6 +22,14 @@ const MAX_CONCURRENT_PREPARATIONS: usize = 2;
 const MAX_GEOMETRY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SINGLE_GEOMETRY_BYTES: usize = 16 + MAX_PREVIEW_TRIANGLES as usize * 9 * 4;
 const PREVIEW_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_BUNDLE_DOWNLOAD_MEMBERS: usize = 10_000;
+const MAX_BUNDLE_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+pub(crate) struct BundleArchive {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct SnapshotMember {
@@ -191,6 +200,7 @@ impl BundlePreviewStore {
         let prepared = self.admit(runtime, principal_id, token)?;
         Ok(ContentLease {
             id: prepared.summary.token.clone(),
+            kind: ContentKind::Geometry,
             file_name: format!("bundle-{}.stl2", prepared.summary.bundle_id),
             mime: "application/vnd.gogglelab.geometry".into(),
             bytes: prepared.summary.geometry_bytes,
@@ -224,6 +234,15 @@ impl BundlePreviewStore {
             state.retained_bytes = state.retained_bytes.saturating_sub(removed.geometry.len());
         }
         Ok(())
+    }
+
+    pub(crate) fn bundle_id_for_download(
+        &self,
+        runtime: &LibraryRuntime,
+        principal_id: &str,
+        token: &str,
+    ) -> Result<String, RuntimeError> {
+        Ok(self.admit(runtime, principal_id, token)?.summary.bundle_id)
     }
 
     fn reserve(&self, epoch: u64) -> Result<PreviewReservation<'_>, RuntimeError> {
@@ -285,6 +304,171 @@ impl BundlePreviewStore {
     }
 }
 
+pub(crate) fn create_bundle_archive(
+    runtime: &LibraryRuntime,
+    bundle_id: &str,
+) -> Result<BundleArchive, RuntimeError> {
+    let models = runtime.read_db(|db| db.list_bundle_models(bundle_id))?;
+    if models.is_empty() || models.len() > MAX_BUNDLE_DOWNLOAD_MEMBERS {
+        return Err(invalid(
+            "Bundle download member count is outside the supported range",
+        ));
+    }
+    let total = models
+        .iter()
+        .try_fold(0_u64, |total, model| total.checked_add(model.bytes))
+        .ok_or_else(|| invalid("Bundle download size overflowed"))?;
+    let archive_overhead = (models.len() as u64)
+        .checked_mul(1024)
+        .ok_or_else(|| invalid("Bundle archive overhead overflowed"))?;
+    if total
+        .checked_add(archive_overhead)
+        .is_none_or(|bytes| bytes > MAX_BUNDLE_DOWNLOAD_BYTES)
+    {
+        return Err(invalid("Bundle download exceeds the 4 GiB limit"));
+    }
+    let snapshot = snapshot(&models)?;
+    let revision = runtime.catalog_revision();
+    let namespace = owned_bundle_namespace(runtime.host_library_root())?;
+    let path = namespace.join(format!("bundle-{}.zip", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| io_error())?;
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (index, model) in models.iter().enumerate() {
+            let bytes = load_source_bytes(runtime, model)?;
+            let name = format!("{index:04}-{}", sanitized_name(model));
+            archive.start_file(name, options).map_err(|_| io_error())?;
+            archive.write_all(&bytes).map_err(|_| io_error())?;
+        }
+        let file = archive.finish().map_err(|_| io_error())?;
+        file.sync_all().map_err(|_| io_error())?;
+        validate_snapshot(runtime, bundle_id, &snapshot, revision)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|_| io_error())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_BUNDLE_DOWNLOAD_BYTES
+        {
+            return Err(invalid("Generated bundle archive exceeds its owned limit"));
+        }
+        Ok(BundleArchive {
+            path: path.clone(),
+            bytes: metadata.len(),
+            sha256: hash_file(&path, metadata.len())?,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&path);
+    }
+    result
+}
+
+pub(crate) fn bundle_archive_estimated_bytes(
+    runtime: &LibraryRuntime,
+    bundle_id: &str,
+) -> Result<u64, RuntimeError> {
+    let models = runtime.read_db(|db| db.list_bundle_models(bundle_id))?;
+    if models.is_empty() || models.len() > MAX_BUNDLE_DOWNLOAD_MEMBERS {
+        return Err(invalid(
+            "Bundle download member count is outside the supported range",
+        ));
+    }
+    let total = models
+        .iter()
+        .try_fold(0_u64, |total, model| total.checked_add(model.bytes))
+        .ok_or_else(|| invalid("Bundle download size overflowed"))?;
+    let overhead = (models.len() as u64)
+        .checked_mul(1024)
+        .ok_or_else(|| invalid("Bundle archive overhead overflowed"))?;
+    total
+        .checked_add(overhead)
+        .filter(|bytes| *bytes <= MAX_BUNDLE_DOWNLOAD_BYTES)
+        .ok_or_else(|| invalid("Bundle download exceeds the 4 GiB limit"))
+}
+
+fn owned_bundle_namespace(library_root: &Path) -> Result<PathBuf, RuntimeError> {
+    let staging = library_root.join("staging");
+    let metadata = fs::symlink_metadata(&staging).map_err(|_| io_error())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || staging.canonicalize().map_err(|_| io_error())? != staging
+    {
+        return Err(invalid("Bundle staging namespace is unsafe"));
+    }
+    let namespace = staging.join("bundle-downloads");
+    match fs::symlink_metadata(&namespace) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(invalid("Bundle download namespace is unsafe"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&namespace).map_err(|_| io_error())?;
+        }
+        Err(_) => return Err(io_error()),
+    }
+    if namespace.canonicalize().map_err(|_| io_error())? != namespace {
+        return Err(invalid("Bundle download namespace identity changed"));
+    }
+    Ok(namespace)
+}
+
+fn load_source_bytes(runtime: &LibraryRuntime, model: &Model) -> Result<Vec<u8>, RuntimeError> {
+    runtime.verified_model_source_bytes(model)
+}
+
+fn sanitized_name(model: &Model) -> String {
+    let raw = model
+        .source_archive_member
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name()?.to_str())
+        .or(model.original_name.as_deref())
+        .unwrap_or("model.stl");
+    let sanitized = raw
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() || matches!(sanitized.as_str(), "." | "..") {
+        "model.stl".into()
+    } else {
+        sanitized
+    }
+}
+
+fn hash_file(path: &Path, expected_bytes: u64) -> Result<String, RuntimeError> {
+    let mut file = fs::File::open(path).map_err(|_| io_error())?;
+    let mut digest = Sha256::new();
+    let mut read = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| io_error())?;
+        if count == 0 {
+            break;
+        }
+        read = read
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("Bundle archive size overflowed"))?;
+        if read > expected_bytes {
+            return Err(stale("Generated bundle archive changed"));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if read != expected_bytes {
+        return Err(stale("Generated bundle archive changed"));
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn snapshot(models: &[Model]) -> Result<Vec<SnapshotMember>, RuntimeError> {
     models
         .iter()
@@ -333,78 +517,8 @@ fn load_model(
     runtime: &LibraryRuntime,
     model: &Model,
 ) -> Result<stl_core::ParsedStl, RuntimeError> {
-    let (source, root_limit) = runtime.read_db(|db| {
-        let root_limit = if model.source_kind == "indexed" {
-            let root_id = model.source_root_id.as_deref().ok_or_else(|| {
-                LibraryError::InvalidInput("Indexed bundle member has no source root".into())
-            })?;
-            Some(
-                db.list_index_roots()?
-                    .into_iter()
-                    .find(|root| root.id == root_id)
-                    .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.into()))?
-                    .max_file_bytes,
-            )
-        } else {
-            None
-        };
-        Ok((db.resolve_model_source_ref(&model.id)?, root_limit))
-    })?;
-    runtime.validate_indexed_source_admission(model, &source)?;
-    if root_limit.is_some_and(|limit| source.bytes > limit)
-        || source.bytes > library_core::MAX_INDEXED_FILE_BYTES
-    {
-        return Err(invalid("Bundle member exceeds its admitted source limit"));
-    }
-    let bytes = source_bytes(runtime.host_library_root(), &source)?;
+    let bytes = runtime.verified_model_source_bytes(model)?;
     stl_core::parse_model(&bytes).map_err(|_| invalid("Bundle member could not be parsed"))
-}
-
-fn source_bytes(
-    library_root: &Path,
-    source: &ResolvedModelSource,
-) -> Result<Vec<u8>, RuntimeError> {
-    if let Some(member) = source.archive_member.as_deref() {
-        let temporary = archives::extract_member_to_temporary(
-            library_root,
-            &source.outer_path,
-            member,
-            source
-                .outer_fingerprint
-                .as_deref()
-                .ok_or_else(|| invalid("Archive bundle member has no fingerprint"))?,
-            &source.content_hash,
-            source.bytes,
-        )
-        .map_err(|_| stale("Archive bundle member changed"))?;
-        read_verified_file(temporary.path(), source.bytes, &source.content_hash)
-    } else {
-        read_verified_file(&source.outer_path, source.bytes, &source.content_hash)
-    }
-}
-
-fn read_verified_file(
-    path: &Path,
-    expected_bytes: u64,
-    expected_hash: &str,
-) -> Result<Vec<u8>, RuntimeError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_bytes
-    {
-        return Err(stale("Bundle member source changed"));
-    }
-    let mut file = fs::File::open(path).map_err(|_| io_error())?;
-    let mut bytes = Vec::with_capacity(expected_bytes as usize);
-    Read::by_ref(&mut file)
-        .take(expected_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| io_error())?;
-    if bytes.len() as u64 != expected_bytes
-        || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
-    {
-        return Err(stale("Bundle member source bytes changed"));
-    }
-    Ok(bytes)
 }
 
 fn layout_offsets(

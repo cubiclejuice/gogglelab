@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 
 pub const MANIFEST_VERSION: u32 = 1;
-pub const LIBRARY_SCHEMA_VERSION: u32 = 5;
+pub const LIBRARY_SCHEMA_VERSION: u32 = 6;
 pub const MAX_COLORWAY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -124,6 +124,8 @@ pub struct RecoveryManifest {
     pub filaments: Vec<RecoveryFilament>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<RecoveryCaptureItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub print_batch_receipts: Vec<RecoveryPrintBatchReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +187,10 @@ pub struct RecoveryOrganization {
     pub last_printed_at: Option<String>,
     pub print_count: u64,
     pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub rating: u8,
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +204,14 @@ pub struct RecoveryPrintAttempt {
     pub filament_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPrintBatchReceipt {
+    pub idempotency_key: String,
+    pub payload_hash: String,
+    pub attempt_ids: Vec<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +535,23 @@ fn select_models(manifest: &mut RecoveryManifest, ids: &[String]) -> Result<(), 
                 .iter()
                 .filter_map(|download| download.model_id.as_ref())
                 .any(|id| selected.contains(id))
+    });
+    let selected_attempt_ids = manifest
+        .models
+        .iter()
+        .flat_map(|model| {
+            model
+                .print_attempts
+                .iter()
+                .map(|attempt| attempt.id.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    manifest.print_batch_receipts.retain(|receipt| {
+        !receipt.attempt_ids.is_empty()
+            && receipt
+                .attempt_ids
+                .iter()
+                .all(|id| selected_attempt_ids.contains(id.as_str()))
     });
     manifest
         .model_tags
@@ -904,8 +935,29 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         return Err(invalid("Duplicate bundle identity"));
     }
 
+    let mut print_batch_receipts = Vec::new();
     if schema_version >= 3 {
-        let rows=collect_rows(conn,"SELECT id,designer,source_url,notes,model_license,print_status,parent_model_id,last_printed_at,print_count,bundle_id FROM models ORDER BY id",|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,i64>(8)?,row.get::<_,Option<String>>(9)?)))?;
+        let organization_query = if schema_version >= 6 {
+            "SELECT id,designer,source_url,notes,model_license,print_status,parent_model_id,last_printed_at,print_count,bundle_id,rating,favorite FROM models ORDER BY id"
+        } else {
+            "SELECT id,designer,source_url,notes,model_license,print_status,parent_model_id,last_printed_at,print_count,bundle_id,0,0 FROM models ORDER BY id"
+        };
+        let rows = collect_rows(conn, organization_query, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })?;
         for (
             id,
             designer,
@@ -917,6 +969,8 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             last_printed_at,
             print_count,
             bundle_id,
+            rating,
+            favorite,
         ) in rows
         {
             if !matches!(
@@ -932,6 +986,8 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 || bundle_id
                     .as_deref()
                     .is_some_and(|id| !bundle_ids.contains(id))
+                || !(0..=5).contains(&rating)
+                || !matches!(favorite, 0 | 1)
             {
                 return Err(invalid("Model organization metadata is invalid"));
             }
@@ -948,6 +1004,8 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 last_printed_at,
                 print_count: print_count as u64,
                 bundle_id,
+                rating: rating as u8,
+                favorite: favorite == 1,
             });
         }
 
@@ -963,11 +1021,9 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 .or_default()
                 .push((ordinal, filament));
         }
-        let attempt_ids: BTreeSet<_> = attempts.iter().map(|row| row.0.as_str()).collect();
+        let attempt_ids: BTreeSet<String> = attempts.iter().map(|row| row.0.clone()).collect();
         if attempt_ids.len() != attempts.len()
-            || filaments
-                .keys()
-                .any(|id| !attempt_ids.contains(id.as_str()))
+            || filaments.keys().any(|id| !attempt_ids.contains(id))
         {
             return Err(invalid("A filament references an unknown print attempt"));
         }
@@ -1012,6 +1068,44 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 created_at,
                 updated_at,
             });
+        }
+        let has_receipts: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='print_batch_receipts')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_receipts {
+            let rows = collect_rows(
+                conn,
+                "SELECT idempotency_key,payload_hash,attempt_ids_json,created_at
+                 FROM print_batch_receipts ORDER BY idempotency_key",
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+            for (idempotency_key, payload_hash, attempt_ids_json, created_at) in rows {
+                let ids: Vec<String> = serde_json::from_str(&attempt_ids_json)?;
+                if invalid_capture_id(&idempotency_key)
+                    || invalid_sha256(&payload_hash)
+                    || !valid_rfc3339(&created_at)
+                    || ids.is_empty()
+                    || ids.len() > 10_000
+                    || ids.iter().any(|id| !attempt_ids.contains(id))
+                {
+                    return Err(invalid("Print batch receipt metadata is invalid"));
+                }
+                print_batch_receipts.push(RecoveryPrintBatchReceipt {
+                    idempotency_key,
+                    payload_hash,
+                    attempt_ids: ids,
+                    created_at,
+                });
+            }
         }
     }
 
@@ -1789,6 +1883,7 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         filament_sources,
         filaments,
         captures,
+        print_batch_receipts,
     })
 }
 

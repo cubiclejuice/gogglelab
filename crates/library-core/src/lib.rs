@@ -9,12 +9,13 @@ pub use db::{
 pub use error::LibraryError;
 pub use models::{
     CaptureDownloadInput, CaptureDownloadRecord, CapturePageInput, CaptureReceipt,
-    CaptureReceiptInput, CaptureSummary, CatalogSettings, DuplicateGroup, Filament, FilamentInput,
-    FilamentOrigin, FilamentResourceKind, FilamentSyncSummary, Folder, ImportResult, IndexRoot,
-    IndexedSourceMetadata, MetadataPatch, Model, ModelFilamentAssignment, ModelGroupFilter,
-    ModelMetadata, ModelPageQuery, ModelSort, PrintAttempt, PrintAttemptInput, PrintOutcome,
-    PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource, ReviewedTag,
-    ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel, SortDirection, SourceRef,
+    CaptureReceiptInput, CaptureSummary, CatalogFacetValue, CatalogFacets, CatalogSettings,
+    CatalogStats, DuplicateGroup, Filament, FilamentInput, FilamentOrigin, FilamentResourceKind,
+    FilamentSyncSummary, Folder, ImportResult, IndexRoot, IndexedSourceMetadata, MetadataPatch,
+    Model, ModelFilamentAssignment, ModelGroupFilter, ModelMetadata, ModelPageQuery, ModelSort,
+    PrintAttempt, PrintAttemptBatchItem, PrintAttemptInput, PrintOutcome, PrintStatus,
+    RemovalResult, RemovedModel, ResolvedModelSource, ReviewedTag, ReviewedTagStrategy,
+    ReviewedTagTarget, ScanReconcile, ScannedModel, SortDirection, SourceRef,
     SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry,
     ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
 };

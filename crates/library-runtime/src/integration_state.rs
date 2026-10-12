@@ -215,6 +215,7 @@ struct SettingsFile {
 
 pub struct StoredReview {
     pub token: String,
+    pub principal_id: String,
     pub epoch: u64,
     pub library_generation: u64,
     pub created_at: SystemTime,

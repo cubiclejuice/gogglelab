@@ -106,6 +106,38 @@ pub struct RootHandle {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct IndexRootSettings {
+    pub handle_id: String,
+    pub catalog_root_id: String,
+    pub label: String,
+    pub access: RootAccess,
+    pub enabled: bool,
+    pub last_scanned_at: Option<String>,
+    pub scan_interval_minutes: u32,
+    pub max_file_bytes: u64,
+    pub scan_zip: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexRootSettingsPatch {
+    pub enabled: bool,
+    pub scan_interval_minutes: u32,
+    pub max_file_bytes: u64,
+    pub scan_zip: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSettings {
+    pub thumbnail_size: u32,
+    pub thumbnail_background: String,
+    pub thumbnail_concurrency: u32,
+    pub scan_batch_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeOwnership {
     pub lock_identity: String,
     pub exclusive: bool,
@@ -125,12 +157,22 @@ pub struct RuntimeInfo {
 #[serde(rename_all = "camelCase")]
 pub struct ContentLease {
     pub id: String,
+    pub kind: ContentKind,
     pub file_name: String,
     pub mime: String,
     pub bytes: u64,
     pub sha256: String,
     pub library_epoch: u64,
     pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContentKind {
+    Thumbnail,
+    Model,
+    Geometry,
+    BundleArchive,
 }
 
 pub type SourceLease = ContentLease;
@@ -266,6 +308,244 @@ pub struct BundlePreviewSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct GeometryPlate {
+    pub id: u32,
+    pub name: String,
+    pub triangle_start: u32,
+    pub triangle_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeometryPart {
+    pub id: String,
+    pub name: String,
+    pub triangle_start: u32,
+    pub triangle_count: u32,
+    pub material_id: Option<String>,
+    pub filament_slot: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeometryMaterial {
+    pub id: String,
+    pub name: Option<String>,
+    pub color: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedFilament {
+    pub slot: u32,
+    pub name: Option<String>,
+    pub material: Option<String>,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeometryLease {
+    pub content: ContentLease,
+    pub packet_format: String,
+    pub packet_version: u32,
+    pub model_format: String,
+    pub triangle_count: u32,
+    pub plates: Vec<GeometryPlate>,
+    pub parts: Vec<GeometryPart>,
+    pub materials: Vec<GeometryMaterial>,
+    pub embedded_filaments: Vec<EmbeddedFilament>,
+    pub part_warning: Option<String>,
+    pub plate_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    pub content_hash: String,
+    pub models: Vec<CatalogModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogStats {
+    pub total_models: u64,
+    pub available_models: u64,
+    pub missing_models: u64,
+    pub bookmarks: u64,
+    pub total_bytes: u64,
+    pub bundle_count: u64,
+    pub duplicate_group_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogFacetValue {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogFacets {
+    pub designers: Vec<String>,
+    pub licenses: Vec<String>,
+    pub categories: Vec<String>,
+    pub parents: Vec<CatalogFacetValue>,
+    pub folder_ids: Vec<String>,
+    pub root_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedMetadataFields {
+    pub designer: Option<String>,
+    pub source_url: Option<String>,
+    pub notes: Option<String>,
+    pub model_license: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedMetadataProposal {
+    pub model_id: String,
+    pub source_hash: String,
+    pub current: EmbeddedMetadataFields,
+    pub embedded: EmbeddedMetadataFields,
+    pub embedded_filaments: Vec<EmbeddedFilament>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedMetadataSelection {
+    pub designer: bool,
+    pub source_url: bool,
+    pub notes: bool,
+    pub model_license: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreRootMapping {
+    pub backup_catalog_root_id: String,
+    pub operator_handle_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ManagementAction {
+    RecoverableRemove {
+        targets: Vec<VersionedTarget>,
+    },
+    RestoreRemoval {
+        snapshot_id: String,
+    },
+    CreateBackup {
+        destination_handle_id: String,
+        file_name: String,
+    },
+    RestoreBackup {
+        source_handle_id: String,
+        file_name: String,
+        root_mappings: Vec<RestoreRootMapping>,
+    },
+    ExportSelection {
+        targets: Vec<VersionedTarget>,
+        destination_handle_id: String,
+        file_name: String,
+    },
+    QuarantineLooseSource {
+        target: VersionedTarget,
+    },
+    UndoQuarantine {
+        snapshot_id: String,
+    },
+    MoveLooseSource {
+        target: VersionedTarget,
+        destination_handle_id: String,
+        file_name: String,
+    },
+    PurgeCatalog {
+        backup_destination_handle_id: String,
+        backup_file_name: String,
+    },
+    CleanupOrphans,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionTargetSnapshot {
+    pub model_id: String,
+    pub metadata_version: u64,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionPlan {
+    pub token: String,
+    pub action_kind: String,
+    pub expires_at: String,
+    pub library_epoch: u64,
+    pub catalog_revision: u64,
+    pub targets: Vec<ActionTargetSnapshot>,
+    pub impact: Vec<String>,
+    pub input_bytes: Option<u64>,
+    pub input_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ManagementResult {
+    Removed {
+        snapshot_id: String,
+        removed_ids: Vec<String>,
+    },
+    RestoredRemoval {
+        models: Vec<MutationVersion>,
+    },
+    BackupCreated {
+        destination_handle_id: String,
+        file_name: String,
+        files: usize,
+        bytes: u64,
+        sha256: String,
+    },
+    BackupRestored {
+        models: usize,
+        library_epoch: u64,
+    },
+    SelectionExported {
+        destination_handle_id: String,
+        file_name: String,
+        models: usize,
+        bytes: u64,
+    },
+    Quarantined {
+        snapshot_id: String,
+        model_id: String,
+    },
+    QuarantineUndone {
+        model: MutationVersion,
+    },
+    Moved {
+        model: MutationVersion,
+    },
+    Purged {
+        backup_destination_handle_id: String,
+        backup_file_name: String,
+        library_epoch: u64,
+    },
+    CleanupCompleted {
+        files: u64,
+        bytes: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ThumbnailDescriptor {
     pub thumbnail_id: String,
     pub model_id: String,
@@ -298,6 +578,14 @@ pub struct CatalogModel {
     pub tags: Vec<String>,
     pub filament_ids: Vec<String>,
     pub source_kind: String,
+    pub root_id: Option<String>,
+    pub bundle_id: Option<String>,
+    pub archive_member: bool,
+    pub parent_model_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_printed_at: Option<String>,
+    pub print_count: u64,
     pub availability: ModelAvailability,
     pub catalog_kind: String,
     pub thumbnail_id: Option<String>,
@@ -306,6 +594,8 @@ pub struct CatalogModel {
     pub notes: Option<String>,
     pub model_license: Option<String>,
     pub print_status: String,
+    pub rating: u8,
+    pub favorite: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,6 +658,8 @@ pub struct MetadataPatch {
     pub tag_mode: Option<TagMode>,
     pub folder_id: Option<String>,
     pub parent_model_id: Option<String>,
+    pub rating: Option<u8>,
+    pub favorite: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -463,6 +755,13 @@ pub struct PrintAttempt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PrintAttemptBatchItem {
+    pub model_id: String,
+    pub input: PrintAttemptInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelQuery {
     pub folder_id: Option<String>,
     pub search: Option<String>,
@@ -481,6 +780,10 @@ pub struct ModelQuery {
     pub duplicates_only: bool,
     pub source_kind: Option<String>,
     pub group: Option<ModelGroupFilter>,
+    pub thumbnail_mode: Option<String>,
+    pub source_directory: Option<String>,
+    pub minimum_rating: Option<u8>,
+    pub favorite: Option<bool>,
 }
 
 impl Default for ModelQuery {
@@ -503,6 +806,10 @@ impl Default for ModelQuery {
             duplicates_only: false,
             source_kind: None,
             group: None,
+            thumbnail_mode: None,
+            source_directory: None,
+            minimum_rating: None,
+            favorite: None,
         }
     }
 }
@@ -535,6 +842,8 @@ pub struct ScanStatus {
     pub roots_completed: usize,
     pub files_visited: usize,
     pub files_indexed: usize,
+    pub thumbnails_total: usize,
+    pub thumbnails_completed: usize,
     pub errors: Vec<String>,
 }
 
@@ -542,13 +851,45 @@ pub trait RuntimeInfoEngine: Send + Sync {
     fn runtime_info(&self, context: &RequestContext) -> Result<RuntimeInfo, RuntimeError>;
 }
 
+pub trait SettingsEngine: Send + Sync {
+    fn list_index_root_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Vec<IndexRootSettings>, RuntimeError>;
+    fn update_index_root_settings(
+        &self,
+        context: &RequestContext,
+        handle_id: &str,
+        patch: IndexRootSettingsPatch,
+    ) -> Result<IndexRootSettings, RuntimeError>;
+    fn get_catalog_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<CatalogSettings, RuntimeError>;
+    fn update_catalog_settings(
+        &self,
+        context: &RequestContext,
+        settings: CatalogSettings,
+    ) -> Result<CatalogSettings, RuntimeError>;
+}
+
 pub trait CatalogEngine: Send + Sync {
+    fn get_model(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+    ) -> Result<CatalogModel, RuntimeError>;
+
     fn list_models(
         &self,
         context: &RequestContext,
         query: ModelQuery,
         page: PageRequest,
     ) -> Result<Page<CatalogModel>, RuntimeError>;
+
+    fn catalog_stats(&self, context: &RequestContext) -> Result<CatalogStats, RuntimeError>;
+
+    fn catalog_facets(&self, context: &RequestContext) -> Result<CatalogFacets, RuntimeError>;
 }
 
 pub trait MetadataEngine: Send + Sync {
@@ -640,6 +981,13 @@ pub trait FilamentEngine: Send + Sync {
 }
 
 pub trait PrintHistoryEngine: Send + Sync {
+    fn create_print_attempts(
+        &self,
+        context: &RequestContext,
+        idempotency_key: &str,
+        items: Vec<PrintAttemptBatchItem>,
+    ) -> Result<Vec<PrintAttempt>, RuntimeError>;
+
     fn list_print_attempts(
         &self,
         context: &RequestContext,
@@ -748,6 +1096,59 @@ pub trait BundleEngine: Send + Sync {
         context: &RequestContext,
         token: &str,
     ) -> Result<(), RuntimeError>;
+    fn issue_bundle_download(
+        &self,
+        context: &RequestContext,
+        preview_token: &str,
+    ) -> Result<ContentLease, RuntimeError>;
+}
+
+pub trait GeometryEngine: Send + Sync {
+    fn issue_model_geometry(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+        plate_id: Option<u32>,
+    ) -> Result<GeometryLease, RuntimeError>;
+}
+
+pub trait DuplicateEngine: Send + Sync {
+    fn duplicate_groups(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+    ) -> Result<Vec<DuplicateGroup>, RuntimeError>;
+}
+
+pub trait EmbeddedMetadataEngine: Send + Sync {
+    fn read_embedded_metadata(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<EmbeddedMetadataProposal, RuntimeError>;
+
+    fn apply_embedded_metadata(
+        &self,
+        context: &RequestContext,
+        target: VersionedTarget,
+        expected_source_hash: &str,
+        selection: EmbeddedMetadataSelection,
+    ) -> Result<MutationVersion, RuntimeError>;
+}
+
+pub trait ManagementEngine: Send + Sync {
+    fn plan_action(
+        &self,
+        context: &RequestContext,
+        action: ManagementAction,
+    ) -> Result<ActionPlan, RuntimeError>;
+    fn execute_action(
+        &self,
+        context: &RequestContext,
+        token: &str,
+    ) -> Result<ManagementResult, RuntimeError>;
 }
 
 pub trait CaptureEngine: Send + Sync {
@@ -810,6 +1211,208 @@ pub trait DownloadEngine: Send + Sync {
     ) -> Result<SourceLease, RuntimeError>;
 }
 
+// Shared integration transport contract. Secrets are accepted only in mutation inputs and are
+// never present in settings or review outputs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntegrationEndpointScope {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntegrationProviderKind {
+    OpenaiCompatible,
+    Anthropic,
+    Gemini,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntegrationStructuredOutputMode {
+    JsonSchema,
+    JsonObject,
+    PlainJson,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntegrationCategorySharing {
+    #[default]
+    Local,
+    Provider,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationSpoolmanConfig {
+    pub base_url: String,
+    pub endpoint_scope: IntegrationEndpointScope,
+    pub page_size: u16,
+    pub timeout_seconds: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProviderConfig {
+    pub id: String,
+    pub label: String,
+    pub kind: IntegrationProviderKind,
+    pub base_url: Option<String>,
+    pub endpoint_scope: IntegrationEndpointScope,
+    pub model: String,
+    pub credential_storage: String,
+    pub has_credential: bool,
+    pub max_tags: u8,
+    pub detail: String,
+    pub category_mode: String,
+    pub concurrency: u8,
+    pub timeout_seconds: u16,
+    pub structured_output: IntegrationStructuredOutputMode,
+    #[serde(default)]
+    pub category_sharing: IntegrationCategorySharing,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntegrationCredentialUpdate {
+    pub action: String,
+    pub secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationSettings {
+    pub spoolman: Option<IntegrationSpoolmanConfig>,
+    pub ai_providers: Vec<AiProviderConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationSpoolmanPullResult {
+    pub filaments_received: usize,
+    pub spools_received: usize,
+    pub filaments_upserted: usize,
+    pub spools_upserted: usize,
+    pub removed_locally: usize,
+    pub last_successful_pull_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationAiSuggestion {
+    pub suggestion_id: String,
+    pub name: String,
+    pub category: Option<String>,
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationAiExistingTag {
+    pub name: String,
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationAiSuggestionTarget {
+    pub model_id: String,
+    pub expected_version: u64,
+    pub display_name: String,
+    pub existing_tags: Vec<IntegrationAiExistingTag>,
+    pub suggestions: Vec<IntegrationAiSuggestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationAiSuggestionFailure {
+    pub model_id: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationAiSuggestionBatch {
+    pub review_token: String,
+    pub provider_id: String,
+    pub model: String,
+    pub category_sharing: IntegrationCategorySharing,
+    pub targets: Vec<IntegrationAiSuggestionTarget>,
+    pub failures: Vec<IntegrationAiSuggestionFailure>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntegrationAiReviewAction {
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntegrationAiReviewStrategy {
+    Append,
+    Replace,
+    Merge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationAiReviewDecision {
+    pub model_id: String,
+    pub action: IntegrationAiReviewAction,
+    pub accepted_suggestion_ids: Vec<String>,
+}
+
+pub trait IntegrationEngine: Send + Sync {
+    fn integration_network_enabled(&self, context: &RequestContext) -> bool;
+    fn integration_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<IntegrationSettings, RuntimeError>;
+    fn save_spoolman_config(
+        &self,
+        context: &RequestContext,
+        config: Option<IntegrationSpoolmanConfig>,
+    ) -> Result<IntegrationSettings, RuntimeError>;
+    fn pull_spoolman(
+        &self,
+        context: &RequestContext,
+    ) -> Result<IntegrationSpoolmanPullResult, RuntimeError>;
+    fn save_ai_provider(
+        &self,
+        context: &RequestContext,
+        config: AiProviderConfig,
+        credential: IntegrationCredentialUpdate,
+    ) -> Result<AiProviderConfig, RuntimeError>;
+    fn delete_ai_provider(
+        &self,
+        context: &RequestContext,
+        provider_id: &str,
+    ) -> Result<(), RuntimeError>;
+    fn suggest_ai_tags(
+        &self,
+        context: &RequestContext,
+        provider_id: &str,
+        targets: Vec<VersionedTarget>,
+    ) -> Result<IntegrationAiSuggestionBatch, RuntimeError>;
+    fn apply_ai_review(
+        &self,
+        context: &RequestContext,
+        review_token: &str,
+        decisions: Vec<IntegrationAiReviewDecision>,
+        strategy: IntegrationAiReviewStrategy,
+    ) -> Result<Vec<MutationVersion>, RuntimeError>;
+    fn discard_ai_review(
+        &self,
+        context: &RequestContext,
+        review_token: &str,
+    ) -> Result<(), RuntimeError>;
+}
+
 pub trait LibraryEngine:
     RuntimeInfoEngine
     + CatalogEngine
@@ -866,4 +1469,49 @@ mod tests {
         assert!(context_fields.get("token").is_none());
         assert!(context_fields.get("secret").is_none());
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HashStatus {
+    pub model_count: String,
+    pub hashed_count: String,
+    pub unhashed_count: String,
+    pub bookmark_count: String,
+    pub missing_count: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceState {
+    Available,
+    Bookmark,
+    Unhashed,
+    Missing,
+    Changed,
+    Unadmitted,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSourceStatus {
+    pub model_id: String,
+    pub stored_hash: Option<String>,
+    pub state: SourceState,
+}
+
+pub trait CatalogJobEngine: Send + Sync {
+    fn catalog_hash_status(&self, context: &RequestContext) -> Result<HashStatus, RuntimeError>;
+    fn check_model_sources(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+    ) -> Result<Vec<ModelSourceStatus>, RuntimeError>;
+    fn start_thumbnail_job(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+        force: bool,
+    ) -> Result<ScanStatus, RuntimeError>;
 }

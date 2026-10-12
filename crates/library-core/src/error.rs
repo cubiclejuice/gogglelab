@@ -40,6 +40,8 @@ pub enum LibraryError {
         expected: u64,
         actual: u64,
     },
+    #[error("idempotency key conflicts with another payload: {0}")]
+    IdempotencyConflict(String),
     #[error("unsupported library format: {0}")]
     UnsupportedFormat(String),
     #[error("invalid library input: {0}")]
