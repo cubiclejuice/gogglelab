@@ -40,7 +40,7 @@ GoggleLab imports a queue file explicitly. Matching model files are admitted as 
 
 - At most 500 queue items.
 - Each stored envelope is at most 64 KiB.
-- Only STL and 3MF download records are associated.
+- STL, 3MF, OBJ, and ZIP downloads from an attributed supported model page are queued. OBJ and ZIP remain metadata-only attachments until a supported explicit import is available; the extension never fabricates model bytes or enables an OBJ parser.
 - Stable item and capture IDs make service-worker retries idempotent.
 - Failed downloads remain visible and retryable; successful records are immutable.
 - Queue-full, malformed, unsupported, and conflicting captures fail visibly instead of evicting an unrelated item.

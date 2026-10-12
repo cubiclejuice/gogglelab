@@ -6,7 +6,7 @@ import {
   partitionBundleGroups,
   removalTargets,
 } from "./library-management";
-import { isCurrentBundleRequest } from "./library-bundle-dialog";
+import { isCurrentBundleRequest, showNativeBundleHandoff } from "./library-bundle-dialog";
 
 const model = (id, overrides = {}) => ({
   id,
@@ -51,4 +51,9 @@ test("stale bundle geometry responses cannot replace a superseding preview", () 
   expect(isCurrentBundleRequest("new-token", "old-token")).toBe(false);
   expect(isCurrentBundleRequest("new-token", "new-token")).toBe(true);
   expect(isCurrentBundleRequest(null, "old-token")).toBe(false);
+});
+
+test("remote bundle download mode hides the native-only slicer handoff", () => {
+  expect(showNativeBundleHandoff(true)).toBe(false);
+  expect(showNativeBundleHandoff(false)).toBe(true);
 });

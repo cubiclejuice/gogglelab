@@ -36,6 +36,20 @@ test("batch metadata payload includes only explicitly applied fields and preserv
   expect(patch.notes).toBeUndefined();
 });
 
+test("ratings and favorite changes are versioned metadata fields for single and batch edits", () => {
+  expect(
+    buildMetadataPatch(
+      { rating: "5", favorite: "true" },
+      new Set(["rating", "favorite"]),
+      [],
+      "merge",
+    ),
+  ).toEqual({ rating: 5, favorite: true });
+  expect(() => buildMetadataPatch({ rating: "6" }, new Set(["rating"]), [], "merge")).toThrow(
+    "Rating must be a whole number from 0 to 5.",
+  );
+});
+
 test("bulk targets snapshot IDs and optimistic versions without duplicating the patch", () => {
   expect(versionedMetadataTargets([model("a", 3), model("b", 8)], ["b", "a"])).toEqual([
     { model_id: "a", expected_version: 3 },

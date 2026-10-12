@@ -1,8 +1,13 @@
-import type { BundlePreviewSummary, DecodedGeometry, GeometryStats, SlicerApp } from "./ipc";
+import type { BundlePreviewSummary, GeometryStats, SlicerApp } from "./ipc";
+import type { DecodedGeometry } from "./geometry-wire";
 import { Viewport } from "./viewport";
 
 export function isCurrentBundleRequest(currentToken: string | null, requestToken: string): boolean {
   return currentToken === requestToken;
+}
+
+export function showNativeBundleHandoff(remoteDownloadAvailable: boolean): boolean {
+  return !remoteDownloadAvailable;
 }
 
 export class LibraryBundleDialog {
@@ -17,6 +22,7 @@ export class LibraryBundleDialog {
   });
   onClosePreview: (token: string) => Promise<void> = async () => {};
   onHandoff: (bundleId: string, slicerId: string, token: string) => Promise<void> = async () => {};
+  onRemoteDownload: ((token: string, bundleId: string) => Promise<void>) | null = null;
 
   constructor(container: HTMLElement) {
     this.dialog = document.createElement("dialog");
@@ -90,7 +96,15 @@ export class LibraryBundleDialog {
     );
     retry.hidden = true;
     handoff.disabled = !slicers.length;
-    actions.append(retry, slicer, handoff);
+    actions.append(retry);
+    if (showNativeBundleHandoff(Boolean(this.onRemoteDownload))) actions.append(slicer, handoff);
+    if (this.onRemoteDownload) {
+      const download = this.button(
+        "Download full bundle ZIP",
+        () => void this.runRemoteDownload(summary.token, summary.bundleId, download),
+      );
+      actions.append(download);
+    }
     this.dialog.append(header, stats, notice, this.error, canvas, grid, actions);
     if (!this.dialog.open) this.dialog.showModal();
     this.viewport?.dispose();
@@ -162,6 +176,24 @@ export class LibraryBundleDialog {
       if (this.error) {
         this.error.textContent = `Could not send the bundle: ${String((error as { message?: unknown })?.message ?? error)}`;
       }
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  private async runRemoteDownload(
+    token: string,
+    bundleId: string,
+    button: HTMLButtonElement,
+  ): Promise<void> {
+    if (!this.onRemoteDownload) return;
+    button.disabled = true;
+    try {
+      await this.onRemoteDownload(token, bundleId);
+      if (this.error) this.error.textContent = "Bundle download started.";
+    } catch (error) {
+      if (this.error)
+        this.error.textContent = `Could not download the bundle: ${String((error as { message?: unknown })?.message ?? error)}`;
     } finally {
       button.disabled = false;
     }

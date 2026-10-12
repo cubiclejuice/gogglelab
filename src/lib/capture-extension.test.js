@@ -9,6 +9,7 @@ import {
   createCaptureStore,
   downloadPageUrl,
   MAX_QUEUE,
+  queueableDownloadName,
   trustedControlSender,
 } from "../../browser-extension/capture-state.js";
 import { createInboxWriter } from "../../browser-extension/inbox.js";
@@ -136,6 +137,22 @@ test("download creation snapshots supported referrer before Chrome supplies the 
   expect((await store.downloadPage({ id: 12, filename: "/Downloads/final-part.stl" })).title).toBe(
     "Captured before download",
   );
+});
+
+test("supported-page OBJ and ZIP attachments retain metadata while filenames alone authorize nothing", async () => {
+  expect(["part.stl", "part.3mf", "source.obj", "bundle.zip"].every(queueableDownloadName)).toBe(
+    true,
+  );
+  expect(queueableDownloadName("notes.pdf")).toBe(false);
+  const storage = storageFixture();
+  const store = createCaptureStore(storage, async () => {});
+  const source = page("https://www.printables.com/model/654-attachments", "Attachment model");
+  await store.savePage(source);
+  await store.rememberDownload({ id: 20, referrer: source.url, filename: "" });
+  expect((await store.downloadPage({ id: 20, filename: "/Downloads/source.zip" })).title).toBe(
+    "Attachment model",
+  );
+  expect(await store.downloadPage({ id: 21, filename: "/private/arbitrary.obj" })).toBeNull();
 });
 
 test("ambiguous supported download attribution fails instead of inventing a page", () => {

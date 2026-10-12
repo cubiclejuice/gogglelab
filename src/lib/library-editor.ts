@@ -40,6 +40,13 @@ export function buildMetadataPatch(
     patch.tags = [...tagIds];
     patch.tag_mode = tagMode;
   }
+  if (appliedFields.has("rating")) {
+    const rating = Number(values.rating);
+    if (!Number.isInteger(rating) || rating < 0 || rating > 5)
+      throw new Error("Rating must be a whole number from 0 to 5.");
+    patch.rating = rating;
+  }
+  if (appliedFields.has("favorite")) patch.favorite = values.favorite === "true";
   return patch;
 }
 
@@ -193,6 +200,15 @@ export class LibraryMetadataEditor {
     }
     parent.value = metadata?.parent_model_id ?? "";
     addField("parent_model_id", "Parent model", parent);
+    const rating = text(String(metadata?.rating ?? 0), "number");
+    rating.min = "0";
+    rating.max = "5";
+    rating.step = "1";
+    addField("rating", "Rating (0–5 stars)", rating);
+    const favorite = document.createElement("input");
+    favorite.type = "checkbox";
+    favorite.checked = metadata?.favorite ?? false;
+    addField("favorite", "Favorite", favorite);
 
     const tagGroup = document.createElement("fieldset");
     tagGroup.className = "library-editor-tags";
@@ -246,7 +262,12 @@ export class LibraryMetadataEditor {
       }
       if (!batch || applyTags?.checked) fields.add("tags");
       const raw = Object.fromEntries(
-        Object.entries(values).map(([key, input]) => [key, input.value]),
+        Object.entries(values).map(([key, input]) => [
+          key,
+          input instanceof HTMLInputElement && input.type === "checkbox"
+            ? String(input.checked)
+            : input.value,
+        ]),
       );
       const patch = buildMetadataPatch(
         raw,

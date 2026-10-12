@@ -5,6 +5,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { decodeFusionPreview, type FusionPreviewSource } from "./fusion-preview";
+import {
+  decodeGeometryBuffer,
+  normalizeArrayBuffer as toArrayBuffer,
+  type DecodedGeometry,
+} from "./geometry-wire";
 
 export type StlFormat = "binary" | "ascii" | "3mf" | "step" | "f3d";
 
@@ -180,42 +185,8 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** Geometry buffer v2 magic bytes, in file order — see spec §2. */
-const MAGIC = 0x324c5453; // the LE u32 whose bytes spell "STL2"
-
-export interface DecodedGeometry {
-  triangleCount: number;
-  /** Non-indexed positions, length = 9 * triangleCount. */
-  positions: Float32Array;
-}
-
-/**
- * `invoke()` for a command returning `tauri::ipc::Response` does not
- * reliably resolve to a real `ArrayBuffer` instance across platforms/IPC
- * transports (observed in practice: a plain `number[]`, caught by manual
- * testing in the built app -- `new DataView()` on it threw "Expected
- * ArrayBuffer for the first argument", something no Rust-side unit test
- * could have caught since it's purely a frontend marshaling question).
- * Normalizing through Uint8Array first accepts whatever shape actually
- * comes back.
- */
-function toArrayBuffer(raw: ArrayBuffer | Uint8Array | number[]): ArrayBuffer {
-  if (raw instanceof ArrayBuffer) return raw;
-  const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-}
-
-export function decodeGeometryBuffer(raw: ArrayBuffer | Uint8Array | number[]): DecodedGeometry {
-  const buf = toArrayBuffer(raw);
-  const head = new DataView(buf);
-  const magic = head.getUint32(0, true);
-  if (magic !== MAGIC) {
-    throw new Error(`bad geometry buffer magic: 0x${magic.toString(16)}`);
-  }
-  const triangleCount = head.getUint32(8, true);
-  const positions = new Float32Array(buf, 16, triangleCount * 9);
-  return { triangleCount, positions };
-}
+export { decodeGeometryBuffer };
+export type { DecodedGeometry } from "./geometry-wire";
 
 export interface Printer {
   id: string;
@@ -558,6 +529,8 @@ export interface CoreMetadata {
   parent_model_id?: string | null;
   last_printed_at?: string | null;
   print_count: number;
+  rating?: number;
+  favorite?: boolean;
 }
 
 export interface LibraryTag {
@@ -576,6 +549,8 @@ export interface MetadataPatch {
   tag_mode?: "replace" | "merge";
   folder_id?: string;
   parent_model_id?: string;
+  rating?: number;
+  favorite?: boolean;
 }
 
 export interface VersionedModelTarget {

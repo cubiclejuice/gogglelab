@@ -10,6 +10,10 @@ export function trustedControlSender(sender, runtimeId, extensionRoot) {
     typeof sender.url === "string" && sender.url.startsWith(extensionRoot);
 }
 
+export function queueableDownloadName(value) {
+  return typeof value === "string" && /\.(stl|3mf|obj|zip)$/i.test(value);
+}
+
 export function downloadPageUrl(item) {
   const urls = [item?.referrer, item?.url, item?.finalUrl]
     .filter(supportedPage)

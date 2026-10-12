@@ -1,6 +1,6 @@
 import { basename, canonicalPage, stableId, supportedPage } from "./shared-module.js";
 import { writeInbox } from "./inbox.js";
-import { createCaptureStore, trustedControlSender } from "./capture-state.js";
+import { createCaptureStore, queueableDownloadName, trustedControlSender } from "./capture-state.js";
 
 const captureStore = createCaptureStore(chrome.storage.local, writeInbox);
 
@@ -98,7 +98,7 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (delta.state?.current !== "complete") return;
   void (async () => {
     const [item] = await chrome.downloads.search({ id: delta.id });
-    if (!item || !/\.(stl|3mf)$/i.test(item.filename || "")) return;
+    if (!item || !queueableDownloadName(item.filename)) return;
     const attributed = await captureStore.downloadPage(item);
     if (!attributed) return;
     const page = sanitizePage(attributed, attributed.url);

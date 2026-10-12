@@ -27,6 +27,8 @@ export interface BrowserModel {
   displayName: string;
   folderId: string;
   metadataVersion: string;
+  rating: number;
+  favorite: boolean;
   bytes: string;
   format: string | null;
   contentHash: string | null;
@@ -41,12 +43,47 @@ export interface BrowserModel {
   notes: string | null;
   modelLicense: string | null;
   printStatus: string;
+  bundleId: string | null;
+  sourceRootId: string | null;
+  archiveMember: boolean;
+  parentModelId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  lastPrintedAt: string | null;
+  printCount: string;
 }
 
 export interface CursorPage<T> {
   items: T[];
   nextCursor: string | null;
   snapshotRevision: string;
+}
+
+export interface BrowserModelQuery {
+  limit?: number;
+  cursor?: string;
+  query?: string;
+  folderId?: string;
+  sort?: "name" | "size" | "date";
+  direction?: "asc" | "desc";
+  tagId?: string;
+  category?: string;
+  designer?: string;
+  modelLicense?: string;
+  printStatus?: PrintStatus;
+  everPrinted?: boolean;
+  bundleId?: string;
+  rootId?: string;
+  sourceDirectory?: string;
+  filamentId?: string;
+  sourceMissing?: boolean;
+  duplicatesOnly?: boolean;
+  sourceKind?: "managed" | "indexed";
+  group?: "standalone" | "bundle" | "archive";
+  thumbnailMode?: "missing" | "default" | "custom";
+  minimumRating?: number;
+  favorite?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface ThumbnailDescriptor {
@@ -62,12 +99,59 @@ export interface ThumbnailDescriptor {
 
 export interface ContentLease {
   id: string;
+  kind: "thumbnail" | "model" | "geometry" | "bundleArchive";
   fileName: string;
   mime: string;
   bytes: string;
   sha256: string;
   libraryEpoch: string;
   expiresAt: string;
+}
+export interface BrowserGeometryLease {
+  content: ContentLease;
+  packetFormat: "stl2";
+  packetVersion: 2;
+  modelFormat: string;
+  triangleCount: number;
+  plates: Array<{ id: number; name: string; triangleStart: number; triangleCount: number }>;
+  parts: Array<{
+    id: string;
+    name: string;
+    triangleStart: number;
+    triangleCount: number;
+    materialId: string | null;
+    filamentSlot: number | null;
+  }>;
+  materials: Array<{ id: string; name: string | null; color: string | null; source: string }>;
+  embeddedFilaments: Array<{
+    slot: number;
+    name: string | null;
+    material: string | null;
+    color: string;
+  }>;
+  partWarning: string | null;
+  plateWarning: string | null;
+}
+export interface EmbeddedMetadataProposal {
+  modelId: string;
+  sourceHash: string;
+  current: {
+    designer: string | null;
+    sourceUrl: string | null;
+    notes: string | null;
+    modelLicense: string | null;
+  };
+  embedded: {
+    designer: string | null;
+    sourceUrl: string | null;
+    notes: string | null;
+    modelLicense: string | null;
+  };
+  embeddedFilaments: BrowserGeometryLease["embeddedFilaments"];
+}
+export interface DuplicateGroup {
+  contentHash: string;
+  models: BrowserModel[];
 }
 
 export type PrintStatus = "unprinted" | "want" | "queued" | "printing" | "printed" | "failed";
@@ -85,6 +169,8 @@ export interface BrowserMetadataPatch {
   tagMode?: "replace" | "merge";
   folderId?: string;
   parentModelId?: string;
+  rating?: number;
+  favorite?: boolean;
 }
 export interface MutationVersion {
   modelId: string;
@@ -173,6 +259,194 @@ export interface CaptureImportResult {
     errorCode?: string | null;
   }>;
 }
+export interface BrowserRootHandle {
+  id: string;
+  catalogRootId: string | null;
+  label: string;
+  access: "readOnly" | "writable" | "inbox";
+}
+export interface BrowserScanStatus {
+  running: boolean;
+  cancelling: boolean;
+  jobKind: string | null;
+  currentRootId: string | null;
+  rootsTotal: number;
+  rootsCompleted: number;
+  filesVisited: number;
+  filesIndexed: number;
+  errors: string[];
+  thumbnailsTotal: number;
+  thumbnailsCompleted: number;
+}
+export interface CaptureSummary {
+  itemId: string;
+  createdAt: string;
+  status: CaptureImportResult["status"];
+  pageModelId: string | null;
+  title: string;
+  url: string;
+  downloadCount: number;
+  failedCount: number;
+  needsFileCount: number;
+}
+export interface BrowserBundlePreview {
+  token: string;
+  bundleId: string;
+  memberCount: number;
+  previewedCount: number;
+  omittedCount: number;
+  triangleCount: number;
+  layout: "combined" | "grid";
+  members: Array<{
+    modelId: string;
+    displayName: string;
+    triangleCount: number;
+    offset: [number, number, number];
+  }>;
+  notice: string | null;
+  geometryBytes: string;
+  geometrySha256: string;
+  libraryEpoch: string;
+}
+export interface CatalogFacets {
+  designers: string[];
+  licenses: string[];
+  categories: string[];
+  parents: Array<{ id: string; label: string }>;
+  folderIds: string[];
+  rootIds: string[];
+}
+export interface IndexRootSettings {
+  handleId: string;
+  catalogRootId: string | null;
+  label: string;
+  access: "readOnly" | "writable" | "inbox";
+  enabled: boolean;
+  lastScannedAt: string | null;
+  scanIntervalMinutes: number;
+  maxFileBytes: string;
+  scanZip: boolean;
+}
+export interface BrowserCatalogSettings {
+  thumbnailSize: 128 | 256 | 512;
+  thumbnailBackground: string;
+  thumbnailConcurrency: 1 | 2;
+  scanBatchSize: number;
+}
+export type ManagementAction =
+  | { kind: "recoverableRemove"; targets: VersionedTarget[] }
+  | { kind: "restoreRemoval"; snapshotId: string }
+  | { kind: "createBackup"; destinationHandleId: string; fileName: string }
+  | {
+      kind: "restoreBackup";
+      sourceHandleId: string;
+      fileName: string;
+      rootMappings: Array<{
+        backupCatalogRootId: string;
+        operatorHandleId: string;
+        enabled: boolean;
+      }>;
+    }
+  | {
+      kind: "exportSelection";
+      targets: VersionedTarget[];
+      destinationHandleId: string;
+      fileName: string;
+    }
+  | { kind: "quarantineLooseSource"; target: VersionedTarget }
+  | { kind: "undoQuarantine"; snapshotId: string }
+  | {
+      kind: "moveLooseSource";
+      target: VersionedTarget;
+      destinationHandleId: string;
+      fileName: string;
+    }
+  | { kind: "purgeCatalog"; backupDestinationHandleId: string; backupFileName: string }
+  | { kind: "cleanupOrphans" };
+export interface ActionPlan {
+  token: string;
+  actionKind: string;
+  expiresAt: string;
+  libraryEpoch: string;
+  catalogRevision: string;
+  targets: Array<{ modelId: string; metadataVersion: string; contentHash: string | null }>;
+  impact: string[];
+}
+export type ManagementResult =
+  | { kind: "removed"; snapshotId: string; removedIds: string[] }
+  | { kind: "restoredRemoval"; models: MutationVersion[] }
+  | {
+      kind: "backupCreated";
+      destinationHandleId: string;
+      fileName: string;
+      files: number;
+      bytes: string;
+      sha256: string;
+    }
+  | { kind: "backupRestored"; models: number; libraryEpoch: string }
+  | {
+      kind: "selectionExported";
+      destinationHandleId: string;
+      fileName: string;
+      models: number;
+      bytes: string;
+    }
+  | { kind: "quarantined"; snapshotId: string; modelId: string }
+  | { kind: "quarantineUndone"; model: MutationVersion }
+  | { kind: "moved"; model: MutationVersion }
+  | {
+      kind: "purged";
+      backupDestinationHandleId: string;
+      backupFileName: string;
+      libraryEpoch: string;
+    }
+  | { kind: "cleanupCompleted"; files: string; bytes: string };
+export interface SpoolmanConfig {
+  baseUrl: string;
+  endpointScope: "local" | "remote";
+  pageSize: number;
+  timeoutSeconds: number;
+}
+export interface AiProviderConfig {
+  id: string;
+  label: string;
+  kind: "openaiCompatible" | "anthropic" | "gemini";
+  baseUrl: string | null;
+  endpointScope: "local" | "remote";
+  model: string;
+  credentialStorage: "none" | "session";
+  hasCredential: boolean;
+  maxTags: number;
+  detail: "brief" | "balanced" | "detailed";
+  categoryMode: "none" | "existingOnly" | "allowNew";
+  concurrency: number;
+  timeoutSeconds: number;
+  structuredOutput: "jsonSchema" | "jsonObject" | "plainJson";
+  categorySharing: "local" | "provider";
+}
+export interface IntegrationSettings {
+  spoolman: SpoolmanConfig | null;
+  aiProviders: AiProviderConfig[];
+}
+export interface AiSuggestionBatch {
+  reviewToken: string;
+  providerId: string;
+  model: string;
+  categorySharing: "local" | "provider";
+  targets: Array<{
+    modelId: string;
+    expectedVersion: string;
+    displayName: string;
+    existingTags: Array<{ name: string; category: string | null }>;
+    suggestions: Array<{
+      suggestionId: string;
+      name: string;
+      category: string | null;
+      confidence: number | null;
+    }>;
+  }>;
+  failures: Array<{ modelId: string; code: string; message: string }>;
+}
 
 export interface LibraryEvent {
   sequence: string;
@@ -238,15 +512,62 @@ export interface LibraryClient {
   openApi(signal?: AbortSignal): Promise<{ paths: Record<string, unknown> }>;
   capabilities(signal?: AbortSignal): Promise<HostCapabilities>;
   status(signal?: AbortSignal): Promise<Record<string, unknown>>;
-  listModels(options?: {
-    limit?: number;
-    cursor?: string;
-    query?: string;
-    folderId?: string;
-    sort?: "name" | "size" | "date";
-    direction?: "asc" | "desc";
-    signal?: AbortSignal;
-  }): Promise<CursorPage<BrowserModel>>;
+  catalogFacets(signal?: AbortSignal): Promise<CatalogFacets>;
+  rootSettings(signal?: AbortSignal): Promise<IndexRootSettings[]>;
+  updateRootSettings(
+    handleId: string,
+    settings: Pick<
+      IndexRootSettings,
+      "enabled" | "scanIntervalMinutes" | "maxFileBytes" | "scanZip"
+    >,
+    signal?: AbortSignal,
+  ): Promise<IndexRootSettings>;
+  catalogSettings(signal?: AbortSignal): Promise<BrowserCatalogSettings>;
+  updateCatalogSettings(
+    settings: BrowserCatalogSettings,
+    signal?: AbortSignal,
+  ): Promise<BrowserCatalogSettings>;
+  planManagementAction(action: ManagementAction, signal?: AbortSignal): Promise<ActionPlan>;
+  executeManagementAction(token: string, signal?: AbortSignal): Promise<ManagementResult>;
+  integrationSettings(signal?: AbortSignal): Promise<IntegrationSettings>;
+  saveSpoolmanConfig(
+    config: SpoolmanConfig | null,
+    signal?: AbortSignal,
+  ): Promise<IntegrationSettings>;
+  pullSpoolman(signal?: AbortSignal): Promise<Record<string, unknown>>;
+  saveAiProvider(
+    config: AiProviderConfig,
+    credentialUpdate: { action: "keep" | "clear" | "setSession"; secret?: string },
+    signal?: AbortSignal,
+  ): Promise<AiProviderConfig>;
+  deleteAiProvider(providerId: string, signal?: AbortSignal): Promise<void>;
+  suggestAiTags(
+    providerId: string,
+    targets: VersionedTarget[],
+    signal?: AbortSignal,
+  ): Promise<AiSuggestionBatch>;
+  applyAiReview(
+    reviewToken: string,
+    decisions: Array<{
+      modelId: string;
+      action: "accept" | "reject";
+      acceptedSuggestionIds: string[];
+    }>,
+    strategy: "append" | "replace" | "merge",
+    signal?: AbortSignal,
+  ): Promise<MutationVersion[]>;
+  discardAiReview(reviewToken: string, signal?: AbortSignal): Promise<void>;
+  listRoots(signal?: AbortSignal): Promise<BrowserRootHandle[]>;
+  scanStatus(signal?: AbortSignal): Promise<BrowserScanStatus>;
+  startScan(rootId?: string | null, signal?: AbortSignal): Promise<BrowserScanStatus>;
+  cancelScan(signal?: AbortSignal): Promise<BrowserScanStatus>;
+  startThumbnailJob(
+    modelIds: string[],
+    force: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserScanStatus>;
+  listModels(options?: BrowserModelQuery): Promise<CursorPage<BrowserModel>>;
+  getModel(modelId: string, signal?: AbortSignal): Promise<BrowserModel>;
   listThumbnails(modelId: string, signal?: AbortSignal): Promise<ThumbnailDescriptor[]>;
   addThumbnail(
     modelId: string,
@@ -298,6 +619,13 @@ export interface LibraryClient {
   ): Promise<BrowserTag>;
   deleteTag(tagId: string, signal?: AbortSignal): Promise<void>;
   listFolders(signal?: AbortSignal): Promise<BrowserFolder[]>;
+  createFolder(
+    name: string,
+    parentId?: string | null,
+    signal?: AbortSignal,
+  ): Promise<BrowserFolder>;
+  renameFolder(folderId: string, name: string, signal?: AbortSignal): Promise<BrowserFolder>;
+  deleteFolder(folderId: string, signal?: AbortSignal): Promise<void>;
   listFilaments(includeUnavailable?: boolean, signal?: AbortSignal): Promise<BrowserFilament[]>;
   createFilament(input: BrowserFilamentInput, signal?: AbortSignal): Promise<BrowserFilament>;
   updateFilament(
@@ -327,6 +655,11 @@ export interface LibraryClient {
     signal?: AbortSignal,
   ): Promise<BrowserPrintAttempt>;
   deleteHistory(attemptId: string, signal?: AbortSignal): Promise<void>;
+  createHistoryBatch(
+    idempotencyKey: string,
+    items: Array<{ modelId: string; input: BrowserPrintAttemptInput }>,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrintAttempt[]>;
   events(signal: AbortSignal, lastEventId?: string): AsyncGenerator<LibraryEvent>;
   stageCaptureUpload(
     intent: {
@@ -344,6 +677,35 @@ export interface LibraryClient {
     uploads: UploadToken[],
     signal?: AbortSignal,
   ): Promise<CaptureImportResult>;
+  listCaptures(options?: {
+    limit?: number;
+    cursor?: string;
+    signal?: AbortSignal;
+  }): Promise<CursorPage<CaptureSummary>>;
+  prepareBundle(bundleId: string, signal?: AbortSignal): Promise<BrowserBundlePreview>;
+  readBundleGeometry(token: string, signal?: AbortSignal): Promise<ArrayBuffer>;
+  closeBundle(token: string, signal?: AbortSignal): Promise<void>;
+  issueBundleDownload(token: string, signal?: AbortSignal): Promise<ContentLease>;
+  issueModelGeometry(
+    modelId: string,
+    expectedHash?: string | null,
+    plateId?: number | null,
+    signal?: AbortSignal,
+  ): Promise<BrowserGeometryLease>;
+  contentResponse(leaseId: string, signal?: AbortSignal): Promise<Response>;
+  duplicateGroups(modelIds: string[], signal?: AbortSignal): Promise<DuplicateGroup[]>;
+  embeddedMetadata(
+    modelId: string,
+    expectedHash?: string | null,
+    signal?: AbortSignal,
+  ): Promise<EmbeddedMetadataProposal>;
+  applyEmbeddedMetadata(
+    modelId: string,
+    expectedVersion: string,
+    expectedSourceHash: string,
+    selection: { designer: boolean; sourceUrl: boolean; notes: boolean; modelLicense: boolean },
+    signal?: AbortSignal,
+  ): Promise<MutationVersion>;
 }
 
 export class HttpLibraryClient implements LibraryClient {
@@ -384,25 +746,188 @@ export class HttpLibraryClient implements LibraryClient {
   status(signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.json("/api/v1/status", { signal });
   }
+  catalogFacets(signal?: AbortSignal): Promise<CatalogFacets> {
+    return this.json("/api/v1/catalog/facets", { signal });
+  }
+  rootSettings(signal?: AbortSignal): Promise<IndexRootSettings[]> {
+    return this.json("/api/v1/settings/roots", { signal });
+  }
+  updateRootSettings(
+    handleId: string,
+    settings: Pick<
+      IndexRootSettings,
+      "enabled" | "scanIntervalMinutes" | "maxFileBytes" | "scanZip"
+    >,
+    signal?: AbortSignal,
+  ): Promise<IndexRootSettings> {
+    return this.json(`/api/v1/settings/roots/${segment(handleId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+      signal,
+    });
+  }
+  catalogSettings(signal?: AbortSignal): Promise<BrowserCatalogSettings> {
+    return this.json("/api/v1/settings/catalog", { signal });
+  }
+  updateCatalogSettings(
+    settings: BrowserCatalogSettings,
+    signal?: AbortSignal,
+  ): Promise<BrowserCatalogSettings> {
+    return this.json("/api/v1/settings/catalog", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+      signal,
+    });
+  }
+  planManagementAction(action: ManagementAction, signal?: AbortSignal): Promise<ActionPlan> {
+    return this.json("/api/v1/management/actions/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(action),
+      signal,
+    });
+  }
+  executeManagementAction(token: string, signal?: AbortSignal): Promise<ManagementResult> {
+    return this.json("/api/v1/management/actions/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+      signal,
+    });
+  }
+  integrationSettings(signal?: AbortSignal): Promise<IntegrationSettings> {
+    return this.json("/api/v1/integrations/settings", { signal });
+  }
+  saveSpoolmanConfig(
+    config: SpoolmanConfig | null,
+    signal?: AbortSignal,
+  ): Promise<IntegrationSettings> {
+    return this.json("/api/v1/integrations/spoolman", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config }),
+      signal,
+    });
+  }
+  pullSpoolman(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.json("/api/v1/integrations/spoolman/pull", { method: "POST", signal });
+  }
+  saveAiProvider(
+    config: AiProviderConfig,
+    credentialUpdate: { action: "keep" | "clear" | "setSession"; secret?: string },
+    signal?: AbortSignal,
+  ): Promise<AiProviderConfig> {
+    return this.json(`/api/v1/integrations/ai/providers/${segment(config.id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config, credentialUpdate }),
+      signal,
+    });
+  }
+  deleteAiProvider(providerId: string, signal?: AbortSignal): Promise<void> {
+    return this.json(`/api/v1/integrations/ai/providers/${segment(providerId)}`, {
+      method: "DELETE",
+      signal,
+    });
+  }
+  suggestAiTags(
+    providerId: string,
+    targets: VersionedTarget[],
+    signal?: AbortSignal,
+  ): Promise<AiSuggestionBatch> {
+    return this.json("/api/v1/integrations/ai/suggestions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerId, targets }),
+      signal,
+    });
+  }
+  applyAiReview(
+    reviewToken: string,
+    decisions: Array<{
+      modelId: string;
+      action: "accept" | "reject";
+      acceptedSuggestionIds: string[];
+    }>,
+    strategy: "append" | "replace" | "merge",
+    signal?: AbortSignal,
+  ): Promise<MutationVersion[]> {
+    return this.json(`/api/v1/integrations/ai/reviews/${segment(reviewToken)}/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decisions, strategy }),
+      signal,
+    });
+  }
+  discardAiReview(reviewToken: string, signal?: AbortSignal): Promise<void> {
+    return this.json(`/api/v1/integrations/ai/reviews/${segment(reviewToken)}`, {
+      method: "DELETE",
+      signal,
+    });
+  }
+  listRoots(signal?: AbortSignal): Promise<BrowserRootHandle[]> {
+    return this.json("/api/v1/roots", { signal });
+  }
+  scanStatus(signal?: AbortSignal): Promise<BrowserScanStatus> {
+    return this.json("/api/v1/scan", { signal });
+  }
+  startScan(rootId: string | null = null, signal?: AbortSignal): Promise<BrowserScanStatus> {
+    return this.json("/api/v1/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rootId }),
+      signal,
+    });
+  }
+  cancelScan(signal?: AbortSignal): Promise<BrowserScanStatus> {
+    return this.json("/api/v1/scan", { method: "DELETE", signal });
+  }
+  startThumbnailJob(
+    modelIds: string[],
+    force: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserScanStatus> {
+    return this.json("/api/v1/thumbnails/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ modelIds, force }),
+      signal,
+    });
+  }
 
-  listModels(
-    options: {
-      limit?: number;
-      cursor?: string;
-      query?: string;
-      folderId?: string;
-      sort?: "name" | "size" | "date";
-      direction?: "asc" | "desc";
-      signal?: AbortSignal;
-    } = {},
-  ): Promise<CursorPage<BrowserModel>> {
+  listModels(options: BrowserModelQuery = {}): Promise<CursorPage<BrowserModel>> {
     const query = new URLSearchParams({ limit: String(options.limit ?? 50) });
     if (options.cursor) query.set("cursor", options.cursor);
     if (options.query) query.set("query", options.query);
     if (options.folderId) query.set("folderId", options.folderId);
     if (options.sort) query.set("sort", options.sort);
     if (options.direction) query.set("direction", options.direction);
+    if (options.tagId) query.set("tagId", options.tagId);
+    if (options.category) query.set("category", options.category);
+    if (options.designer) query.set("designer", options.designer);
+    if (options.modelLicense) query.set("modelLicense", options.modelLicense);
+    if (options.printStatus) query.set("printStatus", options.printStatus);
+    if (options.everPrinted !== undefined) query.set("everPrinted", String(options.everPrinted));
+    if (options.bundleId) query.set("bundleId", options.bundleId);
+    if (options.rootId) query.set("rootId", options.rootId);
+    if (options.sourceDirectory) query.set("sourceDirectory", options.sourceDirectory);
+    if (options.minimumRating !== undefined)
+      query.set("minimumRating", String(options.minimumRating));
+    if (options.favorite !== undefined) query.set("favorite", String(options.favorite));
+    if (options.filamentId) query.set("filamentId", options.filamentId);
+    if (options.sourceMissing !== undefined)
+      query.set("sourceMissing", String(options.sourceMissing));
+    if (options.duplicatesOnly !== undefined)
+      query.set("duplicatesOnly", String(options.duplicatesOnly));
+    if (options.sourceKind) query.set("sourceKind", options.sourceKind);
+    if (options.group) query.set("group", options.group);
+    if (options.thumbnailMode) query.set("thumbnailMode", options.thumbnailMode);
     return this.json(`/api/v1/models?${query}`, { signal: options.signal });
+  }
+  getModel(modelId: string, signal?: AbortSignal): Promise<BrowserModel> {
+    return this.json(`/api/v1/models/${segment(modelId)}`, { signal });
   }
 
   listThumbnails(modelId: string, signal?: AbortSignal): Promise<ThumbnailDescriptor[]> {
@@ -545,6 +1070,29 @@ export class HttpLibraryClient implements LibraryClient {
   listFolders(signal?: AbortSignal): Promise<BrowserFolder[]> {
     return this.json("/api/v1/folders", { signal });
   }
+  createFolder(
+    name: string,
+    parentId: string | null = null,
+    signal?: AbortSignal,
+  ): Promise<BrowserFolder> {
+    return this.json("/api/v1/folders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, parentId }),
+      signal,
+    });
+  }
+  renameFolder(folderId: string, name: string, signal?: AbortSignal): Promise<BrowserFolder> {
+    return this.json(`/api/v1/folders/${segment(folderId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+      signal,
+    });
+  }
+  deleteFolder(folderId: string, signal?: AbortSignal): Promise<void> {
+    return this.json(`/api/v1/folders/${segment(folderId)}`, { method: "DELETE", signal });
+  }
   listFilaments(includeUnavailable = true, signal?: AbortSignal): Promise<BrowserFilament[]> {
     return this.json(`/api/v1/filaments?includeUnavailable=${includeUnavailable}`, { signal });
   }
@@ -622,6 +1170,18 @@ export class HttpLibraryClient implements LibraryClient {
   deleteHistory(attemptId: string, signal?: AbortSignal): Promise<void> {
     return this.json(`/api/v1/history/${segment(attemptId)}`, { method: "DELETE", signal });
   }
+  createHistoryBatch(
+    idempotencyKey: string,
+    items: Array<{ modelId: string; input: BrowserPrintAttemptInput }>,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrintAttempt[]> {
+    return this.json("/api/v1/history/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotencyKey, items }),
+      signal,
+    });
+  }
 
   async *events(signal: AbortSignal, lastEventId?: string): AsyncGenerator<LibraryEvent> {
     const headers: Record<string, string> = { Accept: "text/event-stream" };
@@ -673,6 +1233,84 @@ export class HttpLibraryClient implements LibraryClient {
       method: "POST",
       body: JSON.stringify({ envelope, uploads }),
       headers: { "Content-Type": "application/json" },
+      signal,
+    });
+  }
+  listCaptures(
+    options: { limit?: number; cursor?: string; signal?: AbortSignal } = {},
+  ): Promise<CursorPage<CaptureSummary>> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 50) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    return this.json(`/api/v1/captures?${query}`, { signal: options.signal });
+  }
+  prepareBundle(bundleId: string, signal?: AbortSignal): Promise<BrowserBundlePreview> {
+    return this.json(`/api/v1/bundles/${segment(bundleId)}/preview`, { method: "POST", signal });
+  }
+  async readBundleGeometry(token: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+    const response = await this.fetch(`/api/v1/bundle-previews/${segment(token)}/geometry`, {
+      signal,
+    });
+    return response.arrayBuffer();
+  }
+  closeBundle(token: string, signal?: AbortSignal): Promise<void> {
+    return this.json(`/api/v1/bundle-previews/${segment(token)}`, {
+      method: "DELETE",
+      signal,
+    });
+  }
+  issueBundleDownload(token: string, signal?: AbortSignal): Promise<ContentLease> {
+    return this.json(`/api/v1/bundle-previews/${segment(token)}/download-lease`, {
+      method: "POST",
+      signal,
+    });
+  }
+  issueModelGeometry(
+    modelId: string,
+    expectedHash?: string | null,
+    plateId?: number | null,
+    signal?: AbortSignal,
+  ): Promise<BrowserGeometryLease> {
+    return this.json(`/api/v1/models/${segment(modelId)}/geometry-lease`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedHash: expectedHash || null, plateId: plateId ?? null }),
+      signal,
+    });
+  }
+  contentResponse(leaseId: string, signal?: AbortSignal): Promise<Response> {
+    return this.fetch(`/api/v1/content/${segment(leaseId)}`, { signal });
+  }
+  duplicateGroups(modelIds: string[], signal?: AbortSignal): Promise<DuplicateGroup[]> {
+    return this.json("/api/v1/duplicates/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ modelIds }),
+      signal,
+    });
+  }
+  embeddedMetadata(
+    modelId: string,
+    expectedHash?: string | null,
+    signal?: AbortSignal,
+  ): Promise<EmbeddedMetadataProposal> {
+    return this.json(`/api/v1/models/${segment(modelId)}/embedded-metadata/proposal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedHash: expectedHash || null }),
+      signal,
+    });
+  }
+  applyEmbeddedMetadata(
+    modelId: string,
+    expectedVersion: string,
+    expectedSourceHash: string,
+    selection: { designer: boolean; sourceUrl: boolean; notes: boolean; modelLicense: boolean },
+    signal?: AbortSignal,
+  ): Promise<MutationVersion> {
+    return this.json(`/api/v1/models/${segment(modelId)}/embedded-metadata/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, expectedSourceHash, selection }),
       signal,
     });
   }

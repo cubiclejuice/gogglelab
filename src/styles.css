@@ -1718,6 +1718,24 @@ dialog::backdrop {
 .browser-capture-import {
   flex-wrap: wrap;
 }
+.browser-scan-panel {
+  padding: var(--space-2) var(--space-4);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--hairline);
+}
+.browser-scan-panel[hidden] {
+  display: none;
+}
+.browser-toolbar {
+  flex-wrap: wrap;
+}
+.browser-toolbar select,
+.browser-toolbar label {
+  min-width: 0;
+  max-width: 180px;
+}
 .browser-capture-import[hidden],
 [data-browser-capability][hidden] {
   display: none;
@@ -1752,12 +1770,42 @@ dialog::backdrop {
   align-content: start;
   gap: var(--space-3);
 }
+.browser-model-grid[data-view="list"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.browser-model-grid[data-view="list"] .browser-model-card {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(0, 2fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+}
+.browser-model-grid[data-view="detailed"] {
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+.browser-load-more {
+  justify-self: center;
+  margin: 0 0 var(--space-4);
+}
 .browser-model-card {
   min-width: 0;
   padding: var(--space-3);
   border: 1px solid var(--hairline);
   border-radius: 6px;
   background: var(--button);
+}
+.browser-card-preview {
+  height: 128px;
+  margin: calc(-1 * var(--space-3)) calc(-1 * var(--space-3)) var(--space-3);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: var(--viewport);
+  color: var(--muted);
+}
+.browser-card-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 .browser-model-card h2,
 .browser-model-card p {
@@ -1777,6 +1825,43 @@ dialog::backdrop {
   border-radius: 8px;
   background: var(--sheet);
   color: var(--text);
+}
+.browser-catalog-manager {
+  width: min(900px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: var(--space-4);
+  background: var(--sheet);
+  color: var(--text);
+}
+.browser-catalog-manager section {
+  margin-block: var(--space-3);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: var(--space-2);
+}
+.browser-catalog-manager section h3 {
+  grid-column: 1 / -1;
+}
+.browser-catalog-manager section > div {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: var(--space-2);
+}
+.browser-catalog-manager > div > article {
+  padding: var(--space-2);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--hairline);
+}
+.browser-catalog-manager > div > article span {
+  color: var(--muted);
+}
+.browser-catalog-manager > div > article .btn {
+  grid-column: 2;
+  grid-row: 1 / 3;
 }
 .browser-metadata-dialog {
   width: min(620px, calc(100vw - 32px));

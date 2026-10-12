@@ -21,6 +21,7 @@ export class LibraryAiDialog {
   private invoker: HTMLElement | null = null;
   private requestRevision = 0;
   private selectedProviderId: string | null = null;
+  private networkAvailability = { ai: true, spoolman: true };
   onSaveSpoolman: (config: SpoolmanConfig | null) => Promise<void> = async () => {};
   onPullSpoolman: () => Promise<string> = async () => "";
   onSaveProvider: (
@@ -53,7 +54,12 @@ export class LibraryAiDialog {
     container.append(this.dialog);
   }
 
-  show(settings: IntegrationSettings, models: LibraryModel[], invoker?: HTMLElement): void {
+  show(
+    settings: IntegrationSettings,
+    models: LibraryModel[],
+    invoker?: HTMLElement,
+    networkAvailability = { ai: true, spoolman: true },
+  ): void {
     this.requestRevision += 1;
     const previousToken = this.review?.reviewToken;
     this.review = null;
@@ -65,6 +71,7 @@ export class LibraryAiDialog {
       this.selectedProviderId = null;
     }
     this.selectedProviderId ??= settings.aiProviders[0]?.id ?? null;
+    this.networkAvailability = networkAvailability;
     this.invoker =
       invoker ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     this.render(settings, models);
@@ -84,12 +91,16 @@ export class LibraryAiDialog {
     const error = document.createElement("div");
     error.className = "library-editor-error";
     error.setAttribute("role", "alert");
-    const spool = this.spoolmanSection(settings.spoolman, error);
-    const ai = this.aiSection(settings, models, error);
+    const spool = this.spoolmanSection(settings.spoolman, error, this.networkAvailability.spoolman);
+    const ai = this.aiSection(settings, models, error, this.networkAvailability.ai);
     this.dialog.append(header, error, spool, ai);
   }
 
-  private spoolmanSection(config: SpoolmanConfig | null, error: HTMLElement): HTMLElement {
+  private spoolmanSection(
+    config: SpoolmanConfig | null,
+    error: HTMLElement,
+    networkEnabled: boolean,
+  ): HTMLElement {
     const section = document.createElement("section");
     const title = document.createElement("h3");
     title.textContent = "Spoolman explicit pull";
@@ -120,6 +131,14 @@ export class LibraryAiDialog {
           error.textContent = await this.onPullSpoolman();
         }),
     );
+    pull.disabled = !networkEnabled;
+    if (!networkEnabled) {
+      const notice = document.createElement("p");
+      notice.setAttribute("role", "status");
+      notice.textContent = "Spoolman network pulls are disabled on this host.";
+      section.append(title, notice, url, scope, page, timeout, save, pull);
+      return section;
+    }
     section.append(title, url, scope, page, timeout, save, pull);
     return section;
   }
@@ -128,6 +147,7 @@ export class LibraryAiDialog {
     settings: IntegrationSettings,
     models: LibraryModel[],
     error: HTMLElement,
+    networkEnabled: boolean,
   ): HTMLElement {
     const section = document.createElement("section");
     const title = document.createElement("h3");
@@ -280,6 +300,13 @@ export class LibraryAiDialog {
       "Generate suggestions for selected models",
       () => void this.generateReview(id.value, models, section, strategy, error, generate),
     );
+    generate.disabled = !networkEnabled;
+    if (!networkEnabled) {
+      const notice = document.createElement("p");
+      notice.setAttribute("role", "status");
+      notice.textContent = "AI provider requests are disabled on this host.";
+      section.append(notice);
+    }
     section.append(
       title,
       disclosure,
