@@ -12,8 +12,9 @@ use library_core::{
     CaptureReceipt as CoreCaptureReceipt, CaptureReceiptInput as CoreCaptureReceiptInput,
     CaptureSummary as CoreCaptureSummary, CatalogFacets as CoreCatalogFacets,
     CatalogSettings as CoreCatalogSettings, CatalogStats as CoreCatalogStats,
-    Filament as CoreFilament, FilamentInput as CoreFilamentInput, Folder as CoreFolder, LibraryDb,
-    LibraryError, MetadataPatch as CoreMetadataPatch, Model,
+    Filament as CoreFilament, FilamentInput as CoreFilamentInput,
+    FilamentOrigin as CoreFilamentOrigin, Folder as CoreFolder, LibraryDb, LibraryError,
+    MetadataPatch as CoreMetadataPatch, Model,
     ModelFilamentAssignment as CoreModelFilamentAssignment,
     ModelGroupFilter as CoreModelGroupFilter, ModelPageQuery as CoreModelPageQuery,
     ModelSort as CoreModelSort, PrintAttempt as CorePrintAttempt,
@@ -1258,6 +1259,11 @@ impl ManagementEngine for LibraryRuntime {
                 self.require(context, Capability::Maintenance)?;
                 "exportSelection"
             }
+            ManagementAction::ExportLibraryJson { .. } => {
+                self.require(context, Capability::Maintenance)?;
+                self.require(context, Capability::BackupWrite)?;
+                "exportLibrary"
+            }
             ManagementAction::QuarantineLooseSource { .. } => {
                 return Err(unsupported_physical_management())
             }
@@ -1449,6 +1455,17 @@ impl ManagementEngine for LibraryRuntime {
                 planned.library_epoch,
                 planned.catalog_revision,
             ),
+            ManagementAction::ExportLibraryJson {
+                destination_handle_id,
+                file_name,
+            } => execute_library_export(
+                self,
+                context,
+                &destination_handle_id,
+                &file_name,
+                planned.library_epoch,
+                planned.catalog_revision,
+            ),
             ManagementAction::RestoreBackup {
                 source_handle_id,
                 file_name,
@@ -1474,6 +1491,24 @@ impl ManagementEngine for LibraryRuntime {
             | ManagementAction::PurgeCatalog { .. }
             | ManagementAction::CleanupOrphans => Err(unsupported_physical_management()),
         }
+    }
+
+    fn plan_library_export(
+        &self,
+        context: &RequestContext,
+        dest_path: Option<&str>,
+    ) -> Result<ActionPlan, RuntimeError> {
+        self.require(context, Capability::Maintenance)?;
+        self.require(context, Capability::BackupWrite)?;
+        let (destination_handle_id, file_name) =
+            resolve_library_export_destination(self, context, dest_path)?;
+        self.plan_action(
+            context,
+            ManagementAction::ExportLibraryJson {
+                destination_handle_id,
+                file_name,
+            },
+        )
     }
 }
 
@@ -3340,6 +3375,20 @@ fn validate_management_action(
             validate_output_name(file_name)?;
             runtime.admitted_root_path(context, destination_handle_id, RootAccess::BackupOnly)?;
         }
+        ManagementAction::ExportLibraryJson {
+            destination_handle_id,
+            file_name,
+        } => {
+            validate_output_name(file_name)?;
+            admitted_file(
+                runtime,
+                context,
+                destination_handle_id,
+                RootAccess::BackupOnly,
+                file_name,
+                false,
+            )?;
+        }
         ManagementAction::RestoreBackup {
             source_handle_id,
             file_name,
@@ -3683,6 +3732,276 @@ fn execute_selection_export(
         file_name: file_name.into(),
         models: manifest.models.len(),
         bytes,
+    })
+}
+
+fn resolve_library_export_destination(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    dest_path: Option<&str>,
+) -> Result<(String, String), RuntimeError> {
+    let roots = runtime
+        .roots
+        .iter()
+        .filter(|root| root.handle.access == RootAccess::BackupOnly)
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Forbidden,
+            message: "A backup-only destination is required for library export".into(),
+            retryable: false,
+            current_version: None,
+        });
+    }
+
+    let destination = dest_path.map(str::trim).filter(|value| !value.is_empty());
+    let (root, file_name) = match destination {
+        None => {
+            if roots.len() != 1 {
+                return Err(invalid(
+                    "destPath is required when multiple backup-only roots are configured",
+                ));
+            }
+            let timestamp = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| internal("Export timestamp is invalid"))?
+                .as_millis();
+            (
+                roots[0],
+                format!(
+                    "printventory-library-{timestamp}-{}.json",
+                    uuid::Uuid::new_v4().simple()
+                ),
+            )
+        }
+        Some(value) if Path::new(value).is_absolute() => {
+            let requested = Path::new(value);
+            let file_name = requested
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| invalid("destPath must name a JSON file"))?;
+            let parent = requested
+                .parent()
+                .ok_or_else(|| invalid("destPath must be a file inside a backup root"))?
+                .canonicalize()
+                .map_err(|_| io_error())?;
+            let root = roots
+                .iter()
+                .copied()
+                .find(|root| root.path == parent)
+                .ok_or_else(|| RuntimeError {
+                    code: RuntimeErrorCode::Forbidden,
+                    message: "destPath must be directly inside an admitted backup-only root".into(),
+                    retryable: false,
+                    current_version: None,
+                })?;
+            (root, file_name.to_owned())
+        }
+        Some(value) if value.contains('/') => {
+            let (handle_id, file_name) = value
+                .split_once('/')
+                .ok_or_else(|| invalid("destPath is invalid"))?;
+            if file_name.contains('/') || file_name.contains('\\') {
+                return Err(invalid(
+                    "destPath must name a file directly under a backup root",
+                ));
+            }
+            let root = roots
+                .iter()
+                .copied()
+                .find(|root| root.handle.id == handle_id)
+                .ok_or_else(|| RuntimeError {
+                    code: RuntimeErrorCode::Forbidden,
+                    message: "destPath backup handle is not admitted".into(),
+                    retryable: false,
+                    current_version: None,
+                })?;
+            (root, file_name.to_owned())
+        }
+        Some(value) => {
+            if roots.len() != 1 {
+                return Err(invalid(
+                    "destPath must include a backup handle when multiple backup-only roots are configured",
+                ));
+            }
+            (roots[0], value.to_owned())
+        }
+    };
+
+    validate_output_name(&file_name)?;
+    runtime.admitted_root_path(context, &root.handle.id, RootAccess::BackupOnly)?;
+    Ok((root.handle.id.clone(), file_name))
+}
+
+fn export_filament_value(filament: &CoreFilament) -> serde_json::Value {
+    let source = match &filament.origin {
+        CoreFilamentOrigin::Manual => "manual",
+        CoreFilamentOrigin::Spoolman => "spoolman",
+    };
+    serde_json::json!({
+        "name": filament.name,
+        "vendor": filament.brand,
+        "material": filament.material,
+        "color_hex": filament.color,
+        "diameter": null,
+        "spoolman_id": filament.external_id,
+        "source": source
+    })
+}
+
+fn export_filaments(
+    filament_ids: &[String],
+    filaments: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, LibraryError> {
+    filament_ids
+        .iter()
+        .map(|id| {
+            filaments.get(id).cloned().ok_or_else(|| {
+                LibraryError::InvalidInput(
+                    "Library JSON export cannot preserve an unresolved filament reference".into(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn export_print_status(status: &CorePrintStatus) -> &'static str {
+    match status {
+        CorePrintStatus::Unprinted => "unprinted",
+        CorePrintStatus::Want => "want",
+        CorePrintStatus::Queued => "queued",
+        CorePrintStatus::Printing => "printing",
+        CorePrintStatus::Printed => "printed",
+        CorePrintStatus::Failed => "failed",
+    }
+}
+
+fn export_print_outcome(outcome: &CorePrintOutcome) -> &'static str {
+    match outcome {
+        CorePrintOutcome::Printed => "printed",
+        CorePrintOutcome::Failed => "failed",
+    }
+}
+
+fn build_library_export_value(
+    db: &LibraryDb,
+    export_date: &str,
+) -> Result<(serde_json::Value, usize), LibraryError> {
+    let models = db.list_models(None, None)?;
+    let model_count = models.len();
+    let filaments = db
+        .list_filaments(true)?
+        .into_iter()
+        .map(|filament| (filament.id.clone(), export_filament_value(&filament)))
+        .collect::<HashMap<_, _>>();
+    let mut exported_models = Vec::with_capacity(model_count);
+
+    for model in models {
+        let mut print_events = Vec::new();
+        for attempt in db.list_print_attempts(&model.id)? {
+            let attempt_filaments = export_filaments(&attempt.filament_ids, &filaments)?;
+            print_events.push(serde_json::json!({
+                "printed_at": attempt.printed_at,
+                "outcome": export_print_outcome(&attempt.outcome),
+                "quantity": attempt.quantity,
+                "notes": attempt.notes,
+                "created_at": attempt.created_at,
+                "printer_nickname": null,
+                "printer_manufacturer": null,
+                "printer_model": null,
+                "printer_type": null,
+                "filaments": attempt_filaments,
+                "parts": []
+            }));
+        }
+        let model_filaments = export_filaments(&model.filament_ids, &filaments)?;
+        let file_path = model
+            .source_path
+            .as_deref()
+            .or(model.storage_path.as_deref())
+            .unwrap_or_default();
+        let print_status = export_print_status(&model.metadata.print_status);
+        exported_models.push(serde_json::json!({
+            "filePath": file_path,
+            "fileName": model.original_name.as_deref().unwrap_or(&model.display_name),
+            "designer": model.metadata.designer,
+            "source": model.metadata.source_url,
+            "notes": model.metadata.notes,
+            "printed": model.metadata.print_count > 0 || print_status == "printed",
+            "print_status": print_status,
+            "print_count": model.metadata.print_count,
+            "last_printed_at": model.metadata.last_printed_at,
+            "parentModel": model.metadata.parent_model_id,
+            "license": model.metadata.model_license,
+            "rating": model.metadata.rating,
+            "favorite": model.metadata.favorite,
+            "tags": model.tags,
+            "filaments": model_filaments,
+            "printEvents": print_events
+        }));
+    }
+
+    Ok((
+        serde_json::json!({
+            "version": "1.0",
+            "exportDate": export_date,
+            "printers": [],
+            "parts": [],
+            "slicers": [],
+            "models": exported_models
+        }),
+        model_count,
+    ))
+}
+
+fn execute_library_export(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    destination_handle_id: &str,
+    file_name: &str,
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<ManagementResult, RuntimeError> {
+    runtime.require(context, Capability::Maintenance)?;
+    runtime.require(context, Capability::BackupWrite)?;
+    let (_, destination) = admitted_file(
+        runtime,
+        context,
+        destination_handle_id,
+        RootAccess::BackupOnly,
+        file_name,
+        false,
+    )?;
+    let export_date = format_system_time(SystemTime::now())?;
+    let (export, models) = runtime.read_db(|db| build_library_export_value(db, &export_date))?;
+    let bytes = serde_json::to_vec_pretty(&export)
+        .map_err(|_| internal("Library JSON export could not be encoded"))?;
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
+    let _guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|_| invalid("Library export destination already exists or is unavailable"))?;
+    let write_result = output
+        .write_all(&bytes)
+        .and_then(|()| output.sync_all())
+        .map_err(|_| io_error());
+    drop(output);
+    if write_result.is_err() {
+        let _ = fs::remove_file(&destination);
+    }
+    write_result?;
+    Ok(ManagementResult::LibraryExported {
+        destination_handle_id: destination_handle_id.into(),
+        file_name: file_name.into(),
+        models,
+        bytes: bytes.len() as u64,
     })
 }
 
@@ -4577,6 +4896,29 @@ mod tests {
             .unwrap()
             .join("runtime-fixture-integrations.json");
         RuntimeConfig::desktop(root, settings)
+    }
+
+    #[test]
+    fn library_json_export_fails_closed_for_unresolved_print_filament_ids() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Legacy filament model", None).unwrap();
+        db.create_print_attempt(
+            &model.id,
+            &library_core::PrintAttemptInput {
+                printed_at: "2026-10-10T12:00:00Z".into(),
+                quantity: 1,
+                notes: String::new(),
+                filament_ids: vec!["legacy-unknown".into()],
+                outcome: library_core::PrintOutcome::Printed,
+            },
+        )
+        .unwrap();
+
+        let error = build_library_export_value(&db, "2026-10-12T00:00:00Z").unwrap_err();
+        assert!(matches!(
+            error,
+            LibraryError::InvalidInput(message) if message.contains("unresolved filament")
+        ));
     }
 
     fn triangle_stl(x: f32) -> Vec<u8> {

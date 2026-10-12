@@ -687,6 +687,15 @@ fn wire_management_result(value: ManagementResult) -> Value {
             "kind":"selectionExported","destinationHandleId":destination_handle_id,
             "fileName":file_name,"models":models,"bytes":bytes.to_string()
         }),
+        ManagementResult::LibraryExported {
+            destination_handle_id,
+            file_name,
+            models,
+            bytes,
+        } => serde_json::json!({
+            "kind":"libraryExported","destinationHandleId":destination_handle_id,
+            "fileName":file_name,"models":models,"bytes":bytes.to_string()
+        }),
         ManagementResult::Quarantined {
             snapshot_id,
             model_id,
@@ -1260,6 +1269,19 @@ pub trait LibraryEngine: Send + Sync + 'static {
         c: &RequestContext,
         action: ManagementAction,
     ) -> Result<ActionPlan, EngineError>;
+    fn plan_library_export(
+        &self,
+        c: &RequestContext,
+        dest_path: Option<&str>,
+    ) -> Result<ActionPlan, EngineError> {
+        let _ = (c, dest_path);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Library JSON export is unavailable".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
     fn execute_management_action(
         &self,
         c: &RequestContext,
@@ -1816,6 +1838,16 @@ impl<
                 };
                 return encoded!(WireActionPlan::from(
                     self.plan_management_action(context, action)?
+                ));
+            }
+            "export_library" => {
+                return encoded!(WireActionPlan::from(
+                    self.inner
+                        .plan_library_export(
+                            context,
+                            arguments.get("destPath").and_then(Value::as_str),
+                        )
+                        .map_err(map_runtime_error)?,
                 ));
             }
             "pull_3mf_metadata" => {
@@ -2382,6 +2414,7 @@ impl<
                 | "get_models_with_default_thumbnails"
                 | "get_models_by_directory"
                 | "backup_database"
+                | "export_library"
                 | "rename_metadata"
                 | "delete_metadata"
                 | "add_model_tags"
@@ -2472,6 +2505,11 @@ impl<
                     || context
                         .capabilities
                         .contains(&Capability::PhysicalSourceWrite));
+        }
+        if name == "export_library" {
+            return connected
+                && context.capabilities.contains(&Capability::Maintenance)
+                && context.capabilities.contains(&Capability::BackupWrite);
         }
         if matches!(name, "plan_management_action" | "execute_management_action") {
             return connected
@@ -2984,6 +3022,15 @@ impl<
     ) -> Result<ActionPlan, EngineError> {
         self.inner.plan_action(c, action).map_err(map_runtime_error)
     }
+    fn plan_library_export(
+        &self,
+        c: &RequestContext,
+        dest_path: Option<&str>,
+    ) -> Result<ActionPlan, EngineError> {
+        self.inner
+            .plan_library_export(c, dest_path)
+            .map_err(map_runtime_error)
+    }
     fn execute_management_action(
         &self,
         c: &RequestContext,
@@ -3069,6 +3116,7 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             &["destinationHandleId", "fileName"],
             &["destinationHandleId", "fileName"],
         ),
+        "export_library" => (&["destPath"], &[]),
         "plan_management_action" => (&["action"], &["action"]),
         "execute_management_action" => (&["token"], &["token"]),
         "get_index_root_settings" | "get_catalog_settings" => (&[], &[]),
@@ -3205,6 +3253,7 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         "backup_database" => {
             string_field_valid("destinationHandleId") && string_field_valid("fileName")
         }
+        "export_library" => string_field_valid("destPath"),
         "plan_management_action" => object.get("action").is_some_and(Value::is_object),
         "execute_management_action" => string_field_valid("token"),
         "update_index_root_settings" => {
@@ -5699,6 +5748,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "add_model_tags"|"remove_model_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","tags"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"tags":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"string","minLength":1,"maxLength":256}}}}),
                 "remove_model" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"confirm":{"const":true}}}),
                 "backup_database" => serde_json::json!({"type":"object","additionalProperties":false,"required":["destinationHandleId","fileName"],"properties":{"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200}}}),
+                "export_library" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"destPath":{"type":"string","maxLength":1024}}}),
                 "integration_delete_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128}}}),
                 "generate_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId","targets"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128},"targets":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"object","required":["modelId","expectedVersion"]}}}}),
                 "apply_tag_review" => serde_json::json!({"type":"object","additionalProperties":false,"required":["reviewToken","decisions","strategy"],"properties":{"reviewToken":{"type":"string","minLength":1,"maxLength":128},"decisions":{"type":"array","minItems":1,"maxItems":50},"strategy":{"type":"string","enum":["append","replace","merge"]}}}),
@@ -5770,7 +5820,11 @@ pub fn tool_definitions() -> Vec<Value> {
             };
             serde_json::json!({
                 "name": name,
-                "description": format!("GoggleLab {} operation", name.replace('_', " ")),
+                "description": if *name == "export_library" {
+                    "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned()
+                } else {
+                    format!("GoggleLab {} operation", name.replace('_', " "))
+                },
                 "inputSchema": input_schema
             })
         })

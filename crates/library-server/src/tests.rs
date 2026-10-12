@@ -1447,6 +1447,25 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
     }
     assert!(super::validate_tool_shape("update_model", &json!({"target":{},"patch":{}})).is_ok());
     assert!(super::validate_tool_shape("update_model", &json!({"target":{}})).is_err());
+    let export = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "export_library")
+        .unwrap();
+    assert_eq!(export["inputSchema"]["additionalProperties"], false);
+    assert!(export["description"]
+        .as_str()
+        .unwrap()
+        .contains("without thumbnails"));
+    assert!(super::validate_tool_shape("export_library", &json!({})).is_ok());
+    assert!(
+        super::validate_tool_shape("export_library", &json!({"destPath":"backup.json"})).is_ok()
+    );
+    assert!(super::validate_tool_shape("export_library", &json!({"destPath":42})).is_err());
+    assert!(super::validate_tool_shape(
+        "export_library",
+        &json!({"destPath":"backup.json","extra":true})
+    )
+    .is_err());
     assert!(
         super::validate_tool_shape("save_filament", &json!({"input":{},"extra":true})).is_err()
     );
@@ -1599,6 +1618,7 @@ async fn protocol_adapter_pages_the_real_runtime_without_paths() {
         .capabilities
         .contains(&Capability::PhysicalSourceWrite));
     assert!(adapter.supports_tool(&backup_only_writer, "backup_database"));
+    assert!(adapter.supports_tool(&backup_only_writer, "export_library"));
     assert!(adapter.supports_tool(&integration_writer, "integration_save_spoolman_config"));
     assert!(!adapter.supports_tool(&integration_writer, "sync_spoolman_filaments"));
     assert!(!adapter.supports_tool(&integration_writer, "generate_tags"));
@@ -2893,4 +2913,93 @@ fn protocol_adapter_remove_model_is_recoverable_and_requires_a_second_step() {
     assert!(adapter
         .call_tool(&writer, "execute_management_action", json!({"token":token}))
         .is_err());
+}
+
+#[test]
+fn export_library_tool_plans_json_only_inside_backup_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("library");
+    let backups = temp.path().join("backups");
+    std::fs::create_dir(&backups).unwrap();
+    let mut config = library_runtime::RuntimeConfig::desktop(
+        library.clone(),
+        temp.path().join("integrations.json"),
+    );
+    config.capabilities.insert(Capability::BackupWrite);
+    config.roots.push(library_runtime::RuntimeRootPolicy {
+        id: "backups".into(),
+        catalog_root_id: None,
+        label: "Backups".into(),
+        path: backups.clone(),
+        access: library_protocol::RootAccess::BackupOnly,
+    });
+    let runtime = library_runtime::LibraryRuntime::open(config).unwrap();
+    let model = runtime
+        .mutate_db(|db| db.create_model("JSON export model", None))
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let context = RequestContext {
+        principal_id: "backup-only-writer".into(),
+        capabilities: BTreeSet::from([Capability::Maintenance, Capability::BackupWrite]),
+        request_id: "export-library-json".into(),
+    };
+
+    assert!(adapter.supports_tool(&context, "export_library"));
+    let plan = adapter
+        .call_tool(
+            &context,
+            "export_library",
+            json!({"destPath":"backups/library.json"}),
+        )
+        .unwrap();
+    assert_eq!(plan["actionKind"], "exportLibrary");
+    let result = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(result["kind"], "libraryExported");
+    assert_eq!(result["destinationHandleId"], "backups");
+    assert_eq!(result["fileName"], "library.json");
+
+    let output_path = backups.join("library.json");
+    let before = std::fs::read(&output_path).unwrap();
+    let exported: Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(exported["version"], "1.0");
+    assert_eq!(exported["models"].as_array().unwrap().len(), 1);
+    assert_eq!(exported["models"][0]["fileName"], "JSON export model");
+    assert!(exported["models"][0]["favorite"].is_boolean());
+    assert!(exported["models"][0]["printEvents"].is_array());
+    assert!(exported["models"][0].get("thumbnail").is_none());
+    assert!(!result.to_string().contains(temp.path().to_str().unwrap()));
+
+    let raced = adapter
+        .call_tool(
+            &context,
+            "export_library",
+            json!({"destPath":"backups/race.json"}),
+        )
+        .unwrap();
+    let raced_path = backups.join("race.json");
+    std::fs::write(&raced_path, b"keep existing file").unwrap();
+    assert!(adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":raced["token"]}),
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&output_path).unwrap(), before);
+    assert_eq!(std::fs::read(&raced_path).unwrap(), b"keep existing file");
+    assert!(!library.join("library.json").exists());
+    assert!(adapter
+        .call_tool(
+            &context,
+            "export_library",
+            json!({"destPath":"../escape.json"})
+        )
+        .is_err());
+    assert_eq!(model.display_name, "JSON export model");
 }

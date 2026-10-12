@@ -458,6 +458,10 @@ pub enum ManagementAction {
         destination_handle_id: String,
         file_name: String,
     },
+    ExportLibraryJson {
+        destination_handle_id: String,
+        file_name: String,
+    },
     QuarantineLooseSource {
         target: VersionedTarget,
     },
@@ -520,6 +524,12 @@ pub enum ManagementResult {
         library_epoch: u64,
     },
     SelectionExported {
+        destination_handle_id: String,
+        file_name: String,
+        models: usize,
+        bytes: u64,
+    },
+    LibraryExported {
         destination_handle_id: String,
         file_name: String,
         models: usize,
@@ -1200,6 +1210,20 @@ pub trait ManagementEngine: Send + Sync {
         context: &RequestContext,
         token: &str,
     ) -> Result<ManagementResult, RuntimeError>;
+
+    fn plan_library_export(
+        &self,
+        context: &RequestContext,
+        dest_path: Option<&str>,
+    ) -> Result<ActionPlan, RuntimeError> {
+        let _ = (context, dest_path);
+        Err(RuntimeError {
+            code: RuntimeErrorCode::Unsupported,
+            message: "Library JSON export is unavailable".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
 }
 
 pub trait CaptureEngine: Send + Sync {
