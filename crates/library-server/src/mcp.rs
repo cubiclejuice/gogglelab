@@ -163,7 +163,7 @@ pub async fn post<E: LibraryEngine>(
     let id = object.get("id").cloned();
     if id
         .as_ref()
-        .is_some_and(|value| value.is_array() || value.is_object())
+        .is_some_and(|value| value.is_array() || value.is_object() || value.is_boolean())
     {
         return rpc_http(
             StatusCode::BAD_REQUEST,
@@ -311,14 +311,25 @@ pub async fn post<E: LibraryEngine>(
                 {
                     rpc_error(id, -32602, "Thumbnail image is invalid or oversized")
                 } else {
-                    match state.engine.call_tool(&context, name, arguments) {
-                        Ok(value) => rpc_result(
+                    let engine = std::sync::Arc::clone(&state.engine);
+                    let call_context = context.clone();
+                    let call_name = name.to_owned();
+                    match tokio::task::spawn_blocking(move || {
+                        engine.call_tool(&call_context, &call_name, arguments)
+                    })
+                    .await
+                    {
+                        Ok(Ok(value)) => rpc_result(
                             id,
                             json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
                         ),
-                        Err(error) => rpc_result(
+                        Ok(Err(error)) => rpc_result(
                             id,
                             json!({"isError":true,"content":[{"type":"text","text":error.message}],"structuredContent":{"error":{"code":error.code,"retryable":error.retryable}}}),
+                        ),
+                        Err(_) => rpc_result(
+                            id,
+                            json!({"isError":true,"content":[{"type":"text","text":"Tool execution stopped unexpectedly"}],"structuredContent":{"error":{"code":"internal","retryable":true}}}),
                         ),
                     }
                 }

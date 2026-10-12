@@ -437,6 +437,7 @@ fn ai_suggest_tags_impl(
     let token = new_review_token(&mut inner, &provider_id);
     inner.reviews.push_back(StoredReview {
         token: token.clone(),
+        principal_id: "native".into(),
         epoch,
         library_generation: generation,
         created_at: SystemTime::now(),
@@ -485,6 +486,9 @@ fn apply_review_impl(
         .position(|review| review.token == review_token)
         .ok_or_else(|| integration_error("AI review token is expired, replayed, or unknown"))?;
     let review = &inner.reviews[index];
+    if review.principal_id != "native" {
+        return Err(integration_error("AI review belongs to another principal"));
+    }
     if review.epoch != inner.epoch || review.library_generation != library.management_generation() {
         inner.reviews.remove(index);
         return Err(integration_error("AI review became stale"));
@@ -582,6 +586,9 @@ pub fn ai_discard_tag_review(
         .iter()
         .position(|review| review.token == review_token)
         .ok_or_else(|| integration_error("AI review token is expired, replayed, or unknown"))?;
+    if inner.reviews[index].principal_id != "native" {
+        return Err(integration_error("AI review belongs to another principal"));
+    }
     inner.reviews.remove(index);
     Ok(())
 }
@@ -926,6 +933,7 @@ mod tests {
     fn explicit_decisions_cannot_cross_review_targets_or_suggestions() {
         let review = StoredReview {
             token: "token".into(),
+            principal_id: "native".into(),
             epoch: 1,
             library_generation: 1,
             created_at: SystemTime::now(),

@@ -112,9 +112,22 @@ async fn main() -> Result<(), String> {
             "Server token and integration settings must be outside the Library catalog".into(),
         );
     }
+    let web_overlaps_private_path = [
+        &config.library,
+        &config.token_file,
+        &config.integration_settings,
+        &arguments.config,
+    ]
+    .into_iter()
+    .chain(config.allowed_roots.iter().map(|root| &root.path))
+    .any(|private| paths_overlap(&config.web, private));
+    if web_overlaps_private_path {
+        return Err("Browser asset directory overlaps private server storage".into());
+    }
+    let integration_settings_path = config.integration_settings.clone();
     let runtime = LibraryRuntime::open(RuntimeConfig {
         library_root: config.library,
-        integration_settings_path: config.integration_settings,
+        integration_settings_path: integration_settings_path.clone(),
         local_catalog_root_access: false,
         roots: config
             .allowed_roots
@@ -130,6 +143,16 @@ async fn main() -> Result<(), String> {
         capabilities: config.capabilities.clone(),
     })
     .map_err(|error| error.to_string())?;
+    runtime
+        .install_shared_state(Arc::new(
+            library_runtime::integration_state::IntegrationState::load(integration_settings_path)?,
+        ))
+        .map_err(|error| error.to_string())?;
+    runtime
+        .install_shared_state(Arc::new(
+            library_runtime::integrations::RuntimeIntegrationTransport::default(),
+        ))
+        .map_err(|error| error.to_string())?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|_| "Server loopback address is unavailable")?;
@@ -173,7 +196,10 @@ async fn main() -> Result<(), String> {
         .unwrap_or_else(|| format!("http://{address}"));
     let bearer_token = library_server::load_or_create_bearer_secret(&config.token_file)?;
     let app = library_server::router_with_static(
-        Arc::new(ProtocolEngineAdapter::new(runtime, HostMode::Headless)),
+        Arc::new(ProtocolEngineAdapter::new(
+            Arc::clone(&runtime),
+            HostMode::Headless,
+        )),
         SecurityConfig {
             bearer_token,
             allowed_hosts: hosts
@@ -194,12 +220,23 @@ async fn main() -> Result<(), String> {
         },
         &config.web,
     )?;
+    library_runtime::scanner::start_background_scanner(&runtime);
     let server = library_server::start_listener(listener, app).await?;
     println!("GoggleLab server listening; public URL: {display_url}");
     tokio::signal::ctrl_c()
         .await
         .map_err(|_| "Shutdown signal failed")?;
     server.stop().await
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    if left.starts_with(right) || right.starts_with(left) {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left.starts_with(&right) || right.starts_with(&left),
+        _ => false,
+    }
 }
 
 fn read_config(path: &Path) -> Result<OperatorConfig, String> {
@@ -339,5 +376,13 @@ mod tests {
             NetworkExposure::TlsProxy
         )
         .is_err());
+    }
+
+    #[test]
+    fn web_assets_must_not_overlap_private_storage() {
+        let base = Path::new("/srv/gogglelab");
+        assert!(paths_overlap(base, &base.join("server-token")));
+        assert!(paths_overlap(&base.join("web"), base));
+        assert!(!paths_overlap(&base.join("web"), Path::new("/srv/catalog")));
     }
 }
