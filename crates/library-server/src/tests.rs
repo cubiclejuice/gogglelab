@@ -3711,6 +3711,64 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
 }
 
 #[test]
+fn search_models_accepts_search_designer_and_print_state_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let models = runtime
+        .mutate_db(|db| {
+            Ok(vec![
+                db.create_model("Designer match printed", None)?,
+                db.create_model("Designer match failed", None)?,
+                db.create_model("Other designer printed", None)?,
+            ])
+        })
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let writer = RequestContext {
+        principal_id: "search-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "search-pinned-filters".into(),
+    };
+    for (model, designer, print_status) in [
+        (&models[0], "Ada", "printed"),
+        (&models[1], "Ada", "failed"),
+        (&models[2], "Grace", "printed"),
+    ] {
+        adapter
+            .call_tool(
+                &writer,
+                "update_model",
+                json!({
+                    "target":{"modelId":model.id,"expectedVersion":model.metadata_version.to_string()},
+                    "patch":{"designer":designer,"printStatus":print_status}
+                }),
+            )
+            .unwrap();
+    }
+
+    let page = adapter
+        .call_tool(
+            &writer,
+            "search_models",
+            json!({
+                "search":"Designer match",
+                "designer":"Ada",
+                "printed":"printed",
+                "limit":10
+            }),
+        )
+        .unwrap();
+
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], models[0].id);
+}
+
+#[test]
 fn search_models_reaches_rating_and_favorite_filters() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(

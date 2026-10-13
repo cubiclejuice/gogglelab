@@ -2487,6 +2487,7 @@ impl<
             !matches!(
                 key.as_str(),
                 "query"
+                    | "search"
                     | "cursor"
                     | "limit"
                     | "thumbnailMode"
@@ -2494,10 +2495,16 @@ impl<
                     | "sourceDirectory"
                     | "minimumRating"
                     | "favorite"
+                    | "designer"
+                    | "printed"
             )
-        }) || object
-            .get("query")
-            .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 256))
+        }) || (object.contains_key("query") && object.contains_key("search"))
+            || object
+                .get("search")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 256))
+            || object
+                .get("query")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 256))
             || object
                 .get("cursor")
                 .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 512))
@@ -2520,6 +2527,25 @@ impl<
             || object
                 .get("favorite")
                 .is_some_and(|value| !value.is_boolean())
+            || object
+                .get("designer")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 200))
+            || object.get("printed").is_some_and(|value| {
+                value.as_str().is_none_or(|status| {
+                    !matches!(
+                        status,
+                        "unprinted"
+                            | "printed"
+                            | "want"
+                            | "queued"
+                            | "printing"
+                            | "failed"
+                            | "ever-printed"
+                            | "never-printed"
+                            | "all"
+                    )
+                })
+            })
             || object.get("sourceDirectory").is_some_and(|value| {
                 value.as_str().is_none_or(|value| {
                     value.len() > 1024 || value.contains('\\') || value.contains('\0')
@@ -2539,6 +2565,18 @@ impl<
             .and_then(|value| u16::try_from(value).ok())
             .unwrap_or(50)
             .min(MAX_PAGE_SIZE);
+        let (print_status, ever_printed) = match arguments.get("printed").and_then(Value::as_str) {
+            None | Some("all") => (None, None),
+            Some("unprinted") => (Some(PrintStatus::Unprinted), None),
+            Some("printed") => (Some(PrintStatus::Printed), None),
+            Some("want") => (Some(PrintStatus::Want), None),
+            Some("queued") => (Some(PrintStatus::Queued), None),
+            Some("printing") => (Some(PrintStatus::Printing), None),
+            Some("failed") => (Some(PrintStatus::Failed), None),
+            Some("ever-printed") => (None, Some(true)),
+            Some("never-printed") => (None, Some(false)),
+            Some(_) => return Err(invalid_tool()),
+        };
         let page = self.list_models(
             context,
             arguments.get("cursor").and_then(Value::as_str),
@@ -2546,8 +2584,15 @@ impl<
             ProtocolModelQuery {
                 search: arguments
                     .get("query")
+                    .or_else(|| arguments.get("search"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                designer: arguments
+                    .get("designer")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                print_status,
+                ever_printed,
                 thumbnail_mode: arguments
                     .get("thumbnailMode")
                     .and_then(Value::as_str)
@@ -3346,6 +3391,7 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         "search_models" => (
             &[
                 "query",
+                "search",
                 "cursor",
                 "limit",
                 "thumbnailMode",
@@ -3353,6 +3399,8 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 "sourceDirectory",
                 "minimumRating",
                 "favorite",
+                "designer",
+                "printed",
             ],
             &[],
         ),
@@ -3514,6 +3562,28 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         }
         "search_models" => {
             string_field_valid("query")
+                && string_field_valid("search")
+                && !(object.contains_key("query") && object.contains_key("search"))
+                && string_field_valid("designer")
+                && object.get("designer").is_none_or(|value| {
+                    value.as_str().is_some_and(|designer| designer.len() <= 200)
+                })
+                && object.get("printed").is_none_or(|value| {
+                    value.as_str().is_some_and(|status| {
+                        matches!(
+                            status,
+                            "unprinted"
+                                | "printed"
+                                | "want"
+                                | "queued"
+                                | "printing"
+                                | "failed"
+                                | "ever-printed"
+                                | "never-printed"
+                                | "all"
+                        )
+                    })
+                })
                 && string_field_valid("cursor")
                 && object.get("limit").is_none_or(Value::is_u64)
                 && string_field_valid("thumbnailMode")
@@ -6220,6 +6290,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "type":"object","additionalProperties":false,
                     "properties":{
                         "query":{"type":"string","maxLength":256},
+                        "search":{"type":"string","maxLength":256},
+                        "designer":{"type":"string","maxLength":200},
+                        "printed":{"type":"string","enum":["unprinted","printed","want","queued","printing","failed","ever-printed","never-printed","all"]},
                         "cursor":{"type":"string","maxLength":512},
                         "limit":{"type":"integer","minimum":1,"maximum":100},
                         "thumbnailMode":{"type":"string","enum":["missing","default","custom"]},
@@ -6340,6 +6413,7 @@ pub fn tool_definitions() -> Vec<Value> {
             serde_json::json!({
                 "name": name,
                 "description": match *name {
+                    "search_models" => "Search the catalog with either search or the legacy query field, plus designer, print-state, rating, favorite, thumbnail, and admitted-root filters. Uses cursor pagination.".to_owned(),
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
                     "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
                     "get_thumbnails" => "List thumbnail gallery descriptors for a model. When the caller has MediaRead, each descriptor includes a short-lived authenticated mediaLease for fetching its image bytes.".to_owned(),
