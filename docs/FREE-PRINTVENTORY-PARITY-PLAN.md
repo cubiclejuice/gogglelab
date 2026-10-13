@@ -1,7 +1,7 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-12
-Status: phases 1–5 and the Phase 6 code slices are implemented and the current Free workspace gate plus authenticated loopback Docker fixture pass. The Pro submodule/package sync and local install/launch review remain. The HTTP/MCP source includes a backup-root-gated `export_library` JSON tool with no-overwrite and unresolved-filament safeguards. Browser/MCP AI and Spoolman requests require a separate host-controlled opt-in, off by default. Guarded source Trash/undo and moves support batches up to 100 models under one plan. Native visual and full cross-platform release verification remain outstanding; Printventory JSON round-trip behavior is not established by the pinned source snapshot.
+Status: phases 1–5 and the Phase 6 code slices are implemented. The current Free workspace gate, authenticated loopback Docker fixture, Pro compatibility gate, unified ARM64 package verification, and local install/launch pass. The HTTP/MCP source includes a backup-root-gated `export_library` JSON tool with no-overwrite and unresolved-filament safeguards. Browser/MCP AI and Spoolman requests require a separate host-controlled opt-in, off by default. Guarded source Trash/undo and moves support batches up to 100 models under one plan. Native visual and full cross-platform release verification remain outstanding; Printventory JSON round-trip behavior is not established by the pinned source snapshot.
 
 ## Decision
 
