@@ -37,6 +37,7 @@ use library_protocol::{
     PrintAttemptBatchItem, PrintAttemptInput, PrintHistoryEngine, PrintStatus, RootHandle,
     RuntimeError, RuntimeErrorCode, ScanStatus, SettingsEngine, SortDirection, Tag, TagEngine,
     ThumbnailDescriptor, UploadIntent, UploadToken, VersionedMetadataUpdate, VersionedTarget,
+    MAX_MODEL_SEARCH_OFFSET,
 };
 pub use library_protocol::{Capability, RequestContext};
 pub use security::{AllowedAuthority, AllowedOrigin, SecurityConfig};
@@ -1470,6 +1471,39 @@ impl<
         limit: u16,
         query: ProtocolModelQuery,
     ) -> Result<Page<ModelSummary>, EngineError> {
+        let query = if let Some(requested_root_id) = query.root_id.clone() {
+            let mut matches = self
+                .roots(context)?
+                .into_iter()
+                .filter(|root| {
+                    root.id == requested_root_id
+                        || root.catalog_root_id.as_deref() == Some(requested_root_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err(EngineError {
+                    code: "forbidden",
+                    message: "Root handle is not admitted for catalog search".into(),
+                    retryable: false,
+                    current_version: None,
+                });
+            }
+            let catalog_root_id = matches
+                .pop()
+                .and_then(|root| root.catalog_root_id)
+                .ok_or_else(|| EngineError {
+                    code: "forbidden",
+                    message: "Root handle is not admitted for catalog search".into(),
+                    retryable: false,
+                    current_version: None,
+                })?;
+            ProtocolModelQuery {
+                root_id: Some(catalog_root_id),
+                ..query
+            }
+        } else {
+            query
+        };
         let page = self
             .inner
             .list_models(
@@ -2511,6 +2545,10 @@ impl<
                     | "search"
                     | "cursor"
                     | "limit"
+                    | "offset"
+                    | "tags"
+                    | "fileType"
+                    | "directory"
                     | "thumbnailMode"
                     | "rootId"
                     | "sourceDirectory"
@@ -2520,6 +2558,10 @@ impl<
                     | "printed"
             )
         }) || (object.contains_key("query") && object.contains_key("search"))
+            || (object.contains_key("cursor") && object.contains_key("offset"))
+            || (object.contains_key("directory") && object.contains_key("sourceDirectory"))
+            || ((object.contains_key("directory") || object.contains_key("sourceDirectory"))
+                && !object.contains_key("rootId"))
             || object
                 .get("search")
                 .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 256))
@@ -2567,7 +2609,26 @@ impl<
                     )
                 })
             })
+            || object
+                .get("tags")
+                .is_some_and(|value| !valid_search_tag_names(value))
+            || object.get("fileType").is_some_and(|value| {
+                value
+                    .as_str()
+                    .and_then(normalize_search_file_type)
+                    .is_none()
+            })
+            || object.get("offset").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|offset| offset > u64::from(MAX_MODEL_SEARCH_OFFSET))
+            })
             || object.get("sourceDirectory").is_some_and(|value| {
+                value.as_str().is_none_or(|value| {
+                    value.len() > 1024 || value.contains('\\') || value.contains('\0')
+                })
+            })
+            || object.get("directory").is_some_and(|value| {
                 value.as_str().is_none_or(|value| {
                     value.len() > 1024 || value.contains('\\') || value.contains('\0')
                 })
@@ -2614,6 +2675,20 @@ impl<
                     .map(str::to_owned),
                 print_status,
                 ever_printed,
+                tags: arguments.get("tags").and_then(Value::as_array).map(|tags| {
+                    tags.iter()
+                        .filter_map(Value::as_str)
+                        .map(|tag| tag.trim().to_owned())
+                        .collect()
+                }),
+                file_type: arguments
+                    .get("fileType")
+                    .and_then(Value::as_str)
+                    .and_then(normalize_search_file_type),
+                offset: arguments
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|offset| u32::try_from(offset).ok()),
                 thumbnail_mode: arguments
                     .get("thumbnailMode")
                     .and_then(Value::as_str)
@@ -2624,6 +2699,7 @@ impl<
                     .map(str::to_owned),
                 source_directory: arguments
                     .get("sourceDirectory")
+                    .or_else(|| arguments.get("directory"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 minimum_rating: arguments
@@ -3386,6 +3462,36 @@ fn invalid_tool() -> EngineError {
     }
 }
 
+fn normalize_search_file_type(value: &str) -> Option<String> {
+    let value = value.trim();
+    let extension = value.strip_prefix('.').unwrap_or(value);
+    if extension.is_empty()
+        || extension.len() > 16
+        || !extension
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-'))
+    {
+        return None;
+    }
+    Some(extension.to_ascii_lowercase())
+}
+
+fn valid_search_tag_names(value: &Value) -> bool {
+    let Some(tags) = value.as_array() else {
+        return false;
+    };
+    if tags.len() > 100 {
+        return false;
+    }
+    let mut unique = BTreeSet::new();
+    tags.iter().all(|tag| {
+        tag.as_str().is_some_and(|tag| {
+            let tag = tag.trim();
+            !tag.is_empty() && tag.len() <= 256 && unique.insert(tag.to_lowercase())
+        })
+    })
+}
+
 fn safe_leaf_filename(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200
@@ -3424,6 +3530,10 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 "search",
                 "cursor",
                 "limit",
+                "offset",
+                "tags",
+                "fileType",
+                "directory",
                 "thumbnailMode",
                 "rootId",
                 "sourceDirectory",
@@ -3594,6 +3704,10 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             string_field_valid("query")
                 && string_field_valid("search")
                 && !(object.contains_key("query") && object.contains_key("search"))
+                && !(object.contains_key("cursor") && object.contains_key("offset"))
+                && !(object.contains_key("directory") && object.contains_key("sourceDirectory"))
+                && (!(object.contains_key("directory") || object.contains_key("sourceDirectory"))
+                    || object.contains_key("rootId"))
                 && string_field_valid("designer")
                 && object.get("designer").is_none_or(|value| {
                     value.as_str().is_some_and(|designer| designer.len() <= 200)
@@ -3623,6 +3737,24 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                     .get("minimumRating")
                     .is_none_or(|value| value.as_u64().is_some_and(|rating| rating <= 5))
                 && object.get("favorite").is_none_or(Value::is_boolean)
+                && object.get("tags").is_none_or(valid_search_tag_names)
+                && object.get("fileType").is_none_or(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|file_type| normalize_search_file_type(file_type).is_some())
+                })
+                && object.get("offset").is_none_or(|value| {
+                    value
+                        .as_u64()
+                        .is_some_and(|offset| offset <= u64::from(MAX_MODEL_SEARCH_OFFSET))
+                })
+                && object.get("directory").is_none_or(|value| {
+                    value.as_str().is_some_and(|directory| {
+                        directory.len() <= 1024
+                            && !directory.contains('\\')
+                            && !directory.contains('\0')
+                    })
+                })
         }
         "integration_save_spoolman_config" => object
             .get("config")
@@ -4786,6 +4918,9 @@ async fn models<E: LibraryEngine>(
         source_directory: query.source_directory,
         minimum_rating: query.minimum_rating,
         favorite: query.favorite,
+        tags: None,
+        file_type: None,
+        offset: None,
         exclude_model_ids: Vec::new(),
     };
     let request = context.clone();
@@ -6393,9 +6528,13 @@ pub fn tool_definitions() -> Vec<Value> {
                         "printed":{"type":"string","enum":["unprinted","printed","want","queued","printing","failed","ever-printed","never-printed","all"]},
                         "cursor":{"type":"string","maxLength":512},
                         "limit":{"type":"integer","minimum":1,"maximum":100},
+                        "offset":{"type":"integer","minimum":0,"maximum":100000},
+                        "tags":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1,"maxLength":256}},
+                        "fileType":{"type":"string","maxLength":16},
+                        "directory":{"type":"string","maxLength":1024,"description":"Root-relative directory filter. Requires rootId."},
                         "thumbnailMode":{"type":"string","enum":["missing","default","custom"]},
-                        "rootId":{"type":"string","maxLength":128},
-                        "sourceDirectory":{"type":"string","maxLength":1024},
+                        "rootId":{"type":"string","maxLength":128,"description":"An admitted handle ID or catalogRootId returned by list_roots. Required with directory or sourceDirectory."},
+                        "sourceDirectory":{"type":"string","maxLength":1024,"description":"Root-relative directory filter. Requires rootId."},
                         "minimumRating":{"type":"integer","minimum":0,"maximum":5},
                         "favorite":{"type":"boolean"}
                     }
@@ -6522,7 +6661,7 @@ pub fn tool_definitions() -> Vec<Value> {
             serde_json::json!({
                 "name": name,
                 "description": match *name {
-                    "search_models" => "Search the catalog with either search or the legacy query field, plus designer, print-state, rating, favorite, thumbnail, and admitted-root filters. Uses cursor pagination.".to_owned(),
+                    "search_models" => "Search the catalog with either search or the legacy query field, plus designer, all supplied tag names, file type, print-state, rating, favorite, thumbnail, and admitted-root filters. Use offset only on the first page; follow the returned cursor for stable continuation.".to_owned(),
                     "update_models_batch" => "Atomically update multiple models. Use targets plus one patch for a shared change, or updates with one modelId, expectedVersion, and patch per model for heterogeneous changes.".to_owned(),
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
                     "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),

@@ -2172,10 +2172,8 @@ async fn opaque_root_handle_and_admitted_catalog_id_both_start_the_same_scan() {
     })
     .unwrap();
     let runtime_for_scheduler = Arc::clone(&runtime);
-    let app = router(
-        Arc::new(ProtocolEngineAdapter::new(runtime, HostMode::Headless)),
-        security(8),
-    );
+    let engine = Arc::new(ProtocolEngineAdapter::new(runtime, HostMode::Headless));
+    let app = router(Arc::clone(&engine), security(8));
     let started = app
         .clone()
         .oneshot(
@@ -2217,6 +2215,21 @@ async fn opaque_root_handle_and_admitted_catalog_id_both_start_the_same_scan() {
         serde_json::from_slice(&to_bytes(models.into_body(), 65536).await.unwrap()).unwrap();
     assert_eq!(models["items"][0]["displayName"], "fixture");
     let indexed_model_id = models["items"][0]["id"].as_str().unwrap().to_owned();
+    let search_context = RequestContext {
+        principal_id: "root-search-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead]),
+        request_id: "root-search".into(),
+    };
+    for root_id in ["models", catalog_root.id.as_str()] {
+        let page = engine
+            .call_tool(
+                &search_context,
+                "search_models",
+                json!({"rootId":root_id,"directory":"","limit":10}),
+            )
+            .unwrap();
+        assert_eq!(page["items"][0]["id"], indexed_model_id);
+    }
     let hash_status = app
         .clone()
         .oneshot(
@@ -3881,6 +3894,126 @@ fn search_models_reaches_rating_and_favorite_filters() {
     assert_eq!(items[0]["id"], favorite_match.id);
     assert_ne!(items[0]["id"], low_rating_match.id);
     assert_ne!(items[0]["id"], not_favorite_match.id);
+}
+
+#[test]
+fn search_models_filters_by_all_tags_file_type_and_offset_continuation() {
+    fn synthetic_stl() -> Vec<u8> {
+        let mut bytes = vec![0; 80];
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        for value in [
+            0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0]);
+        bytes
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let models = runtime
+        .mutate_db(|db| {
+            let mut models = Vec::new();
+            for name in ["Alpha filter", "Beta filter", "Gamma filter"] {
+                let source = temp.path().join(format!("{}.stl", name.replace(' ', "-")));
+                std::fs::write(&source, synthetic_stl()).unwrap();
+                models.push(db.import_file(&source, None, Some(name))?.model);
+            }
+            db.add_model_tags_by_name(
+                &models[0].id,
+                models[0].metadata_version,
+                &["Industrial".into(), "Precision".into()],
+            )?;
+            db.add_model_tags_by_name(
+                &models[1].id,
+                models[1].metadata_version,
+                &["Industrial".into()],
+            )?;
+            db.add_model_tags_by_name(
+                &models[2].id,
+                models[2].metadata_version,
+                &["Precision".into()],
+            )?;
+            Ok(models)
+        })
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let reader = RequestContext {
+        principal_id: "search-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "search-tags-file-type-offset".into(),
+    };
+
+    let tagged = adapter
+        .call_tool(
+            &reader,
+            "search_models",
+            json!({"tags":["industrial","PRECISION"],"fileType":"STL","limit":10}),
+        )
+        .unwrap();
+    let tagged_items = tagged["items"].as_array().unwrap();
+    assert_eq!(tagged_items.len(), 1);
+    assert_eq!(tagged_items[0]["id"], models[0].id);
+    let wrong_file_type = adapter
+        .call_tool(
+            &reader,
+            "search_models",
+            json!({"tags":["industrial","precision"],"fileType":"3mf","limit":10}),
+        )
+        .unwrap();
+    assert!(wrong_file_type["items"].as_array().unwrap().is_empty());
+    assert!(adapter
+        .call_tool(
+            &reader,
+            "search_models",
+            json!({"rootId":"unmatched-root","directory":"Parts"}),
+        )
+        .is_err());
+    assert!(adapter
+        .call_tool(&reader, "search_models", json!({"directory":"Parts"}))
+        .is_err());
+
+    let first = adapter
+        .call_tool(
+            &reader,
+            "search_models",
+            json!({"search":"filter","fileType":".stl","offset":0,"limit":1}),
+        )
+        .unwrap();
+    let second = adapter
+        .call_tool(
+            &reader,
+            "search_models",
+            json!({"search":"filter","fileType":"stl","offset":1,"limit":1}),
+        )
+        .unwrap();
+    assert_ne!(first["items"][0]["id"], second["items"][0]["id"]);
+    assert!(second["nextCursor"].is_string());
+    let third = adapter
+        .call_tool(
+            &reader,
+            "search_models",
+            json!({"search":"filter","fileType":"stl","cursor":second["nextCursor"],"limit":1}),
+        )
+        .unwrap();
+    assert_ne!(third["items"][0]["id"], first["items"][0]["id"]);
+    assert_ne!(third["items"][0]["id"], second["items"][0]["id"]);
+
+    assert!(adapter
+        .call_tool(
+            &reader,
+            "search_models",
+            json!({"cursor":second["nextCursor"],"offset":1}),
+        )
+        .is_err());
+    assert!(adapter
+        .call_tool(&reader, "search_models", json!({"offset":100001}))
+        .is_err());
 }
 
 #[test]

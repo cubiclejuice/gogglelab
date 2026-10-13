@@ -84,8 +84,13 @@ pub struct ModelPageQuery {
     pub minimum_rating: Option<u8>,
     pub favorite: Option<bool>,
     #[serde(default)]
+    pub tag_names: Vec<String>,
+    pub file_type: Option<String>,
+    #[serde(default)]
     pub exclude_model_ids: Vec<String>,
 }
+
+pub const MAX_MODEL_PAGE_OFFSET: u32 = 100_000;
 
 impl Default for ModelPageQuery {
     fn default() -> Self {
@@ -111,6 +116,8 @@ impl Default for ModelPageQuery {
             source_directory: None,
             minimum_rating: None,
             favorite: None,
+            tag_names: Vec::new(),
+            file_type: None,
             exclude_model_ids: Vec::new(),
         }
     }

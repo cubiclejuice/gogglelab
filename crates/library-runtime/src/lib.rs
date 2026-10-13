@@ -22,6 +22,7 @@ use library_core::{
     PrintOutcome as CorePrintOutcome, PrintStatus as CorePrintStatus,
     SortDirection as CoreSortDirection, TagMode as CoreTagMode,
     VersionedModelUpdate as CoreVersionedModelUpdate, VersionedTarget as CoreVersionedTarget,
+    MAX_MODEL_PAGE_OFFSET,
 };
 use library_protocol::{
     ActionPlan, ActionTargetSnapshot, BundleEngine, BundlePreviewSummary, Capability,
@@ -1633,6 +1634,18 @@ impl CatalogEngine for LibraryRuntime {
         if page.limit == 0 || page.limit > MAX_PAGE_LIMIT {
             return Err(invalid("Page limit is outside the supported range"));
         }
+        if query
+            .offset
+            .is_some_and(|offset| offset > MAX_MODEL_PAGE_OFFSET)
+            || (page.cursor.is_some() && query.offset.is_some())
+        {
+            return Err(invalid("Model page offset is invalid for this request"));
+        }
+        let offset = query.offset.unwrap_or(0);
+        let query = ModelQuery {
+            offset: None,
+            ..query
+        };
         let revision = self.catalog_revision();
         let cursor = if let Some(token) = page.cursor.as_deref() {
             let cursor = self
@@ -1651,11 +1664,12 @@ impl CatalogEngine for LibraryRuntime {
         };
         let core_query = core_model_query(&query);
         let (models, has_more) = self.read_db(|db| {
-            let (models, has_more) = db.list_models_page(
+            let (models, has_more) = db.list_models_page_with_offset(
                 &core_query,
                 cursor.as_ref().map(|cursor| cursor.sort_value.as_str()),
                 cursor.as_ref().map(|cursor| cursor.model_id.as_str()),
                 page.limit,
+                offset,
             )?;
             let models = models
                 .into_iter()
@@ -5321,6 +5335,8 @@ fn core_model_query(query: &ModelQuery) -> CoreModelPageQuery {
         source_directory: query.source_directory.clone(),
         minimum_rating: query.minimum_rating,
         favorite: query.favorite,
+        tag_names: query.tags.clone().unwrap_or_default(),
+        file_type: query.file_type.clone(),
         exclude_model_ids: query.exclude_model_ids.clone(),
         group: query.group.map(|group| match group {
             ModelGroupFilter::Standalone => CoreModelGroupFilter::Standalone,

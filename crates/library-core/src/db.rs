@@ -18,7 +18,7 @@ use crate::models::{
     PrintAttemptInput, PrintOutcome, PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource,
     ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel, SortDirection, SourceRef,
     SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry,
-    ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
+    ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget, MAX_MODEL_PAGE_OFFSET,
 };
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 6;
@@ -223,7 +223,23 @@ impl LibraryDb {
         after_id: Option<&str>,
         limit: u16,
     ) -> Result<(Vec<Model>, bool), LibraryError> {
-        if limit == 0 || limit > 500 || after_sort_value.is_some() != after_id.is_some() {
+        self.list_models_page_with_offset(query, after_sort_value, after_id, limit, 0)
+    }
+
+    pub fn list_models_page_with_offset(
+        &self,
+        query: &ModelPageQuery,
+        after_sort_value: Option<&str>,
+        after_id: Option<&str>,
+        limit: u16,
+        offset: u32,
+    ) -> Result<(Vec<Model>, bool), LibraryError> {
+        if limit == 0
+            || limit > 500
+            || offset > MAX_MODEL_PAGE_OFFSET
+            || after_sort_value.is_some() != after_id.is_some()
+            || (offset > 0 && after_sort_value.is_some())
+        {
             return Err(LibraryError::InvalidInput(
                 "model page request is invalid".into(),
             ));
@@ -261,6 +277,43 @@ impl LibraryDb {
                 "Thumbnail exclusion list exceeds 2000 model IDs".into(),
             ));
         }
+        if query.tag_names.len() > 100 {
+            return Err(LibraryError::InvalidInput(
+                "Tag filter exceeds 100 names".into(),
+            ));
+        }
+        let tag_names = query
+            .tag_names
+            .iter()
+            .map(|name| name.trim().to_owned())
+            .collect::<Vec<_>>();
+        let mut unique_tag_names = HashSet::new();
+        if tag_names.iter().any(|name| {
+            name.is_empty() || name.len() > 256 || !unique_tag_names.insert(name.to_lowercase())
+        }) {
+            return Err(LibraryError::InvalidInput(
+                "Tag filter contains an invalid or duplicate name".into(),
+            ));
+        }
+        let file_type = query.file_type.as_deref().map(|value| {
+            value
+                .trim()
+                .strip_prefix('.')
+                .unwrap_or(value.trim())
+                .to_ascii_lowercase()
+        });
+        if query.file_type.as_deref().is_some_and(|value| {
+            let extension = value.trim().strip_prefix('.').unwrap_or(value.trim());
+            extension.is_empty()
+                || extension.len() > 16
+                || !extension
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-'))
+        }) {
+            return Err(LibraryError::InvalidInput(
+                "File type must be a short extension".into(),
+            ));
+        }
         let mut excluded = HashSet::new();
         if query
             .exclude_model_ids
@@ -273,6 +326,8 @@ impl LibraryDb {
         }
         let exclude_model_ids = serde_json::to_string(&query.exclude_model_ids)
             .map_err(|_| LibraryError::InvalidInput("Thumbnail exclusions are invalid".into()))?;
+        let tag_names = serde_json::to_string(&tag_names)
+            .map_err(|_| LibraryError::InvalidInput("Tag filter is invalid".into()))?;
         let search = query
             .search
             .as_deref()
@@ -351,9 +406,20 @@ impl LibraryDb {
              AND NOT EXISTS (
                  SELECT 1 FROM json_each(?23) excluded WHERE excluded.value=m.id
              )
+             AND NOT EXISTS (
+                 SELECT 1 FROM json_each(?24) requested_tag
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM model_tags mt JOIN tags t ON t.id=mt.tag_id
+                     WHERE mt.model_id=m.id AND t.name=requested_tag.value
+                 )
+             )
+             AND (?25 IS NULL OR (?25='stl' AND COALESCE(r.format,d.format) IN ('stl-binary','stl-ascii'))
+                  OR lower(COALESCE(r.format,d.format))=?25
+                  OR lower(COALESCE(r.original_name,d.original_name)) LIKE '%.'||?25
+                  OR (m.source_kind='indexed' AND lower(m.source_path) LIKE '%.'||?25))
              AND (?16 IS NULL OR {sort_expression}{comparison}{cursor_expression}
                   OR ({sort_expression}={cursor_expression} AND m.id{comparison}?17))
-             ORDER BY {sort_expression} {direction},m.id {direction} LIMIT ?18"
+             ORDER BY {sort_expression} {direction},m.id {direction} LIMIT ?18 OFFSET ?26"
         ))?;
         let rows = stmt.query_map(
             params![
@@ -379,7 +445,10 @@ impl LibraryDb {
                 query.source_directory.as_deref(),
                 query.minimum_rating.map(i64::from),
                 query.favorite.map(i64::from),
-                exclude_model_ids
+                exclude_model_ids,
+                tag_names,
+                file_type,
+                i64::from(offset)
             ],
             model_from_row,
         )?;
@@ -6082,8 +6151,10 @@ mod tests {
     #[test]
     fn source_directory_filter_is_root_relative_and_applied_before_keyset_limits() {
         let db = LibraryDb::open_in_memory().unwrap();
+        let first_root_path = temp_root("source-directory-first-root");
+        fs::create_dir_all(&first_root_path).unwrap();
         let root = db
-            .add_index_root(std::env::temp_dir(), 60, 1024 * 1024)
+            .add_index_root(&first_root_path, 60, 1024 * 1024)
             .unwrap();
         let entries = [
             ("A in parts", "Parts/a.stl"),
@@ -6099,6 +6170,16 @@ mod tests {
             ).unwrap();
             models.push(db.get_model(&model.id).unwrap().unwrap());
         }
+        let second_root_path = temp_root("source-directory-second-root");
+        fs::create_dir_all(&second_root_path).unwrap();
+        let second_root = db
+            .add_index_root(&second_root_path, 60, 1024 * 1024)
+            .unwrap();
+        let second_root_model = db.create_model("Parts in second root", None).unwrap();
+        db.conn.execute(
+            "UPDATE models SET source_kind='indexed',source_root_id=?1,source_path='Parts/d.stl',source_missing=0 WHERE id=?2",
+            params![second_root.id, second_root_model.id],
+        ).unwrap();
         let query = ModelPageQuery {
             root_id: Some(root.id),
             source_directory: Some("Parts".into()),
@@ -6112,6 +6193,21 @@ mod tests {
             .list_models_page(&query, Some("a in parts"), Some(&first[0].id), 1)
             .unwrap();
         assert_eq!(second[0].id, models[1].id);
+        assert!(!has_more);
+        let (other_root_parts, has_more) = db
+            .list_models_page(
+                &ModelPageQuery {
+                    root_id: Some(second_root.id),
+                    source_directory: Some("Parts".into()),
+                    ..ModelPageQuery::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(other_root_parts.len(), 1);
+        assert_eq!(other_root_parts[0].id, second_root_model.id);
         assert!(!has_more);
 
         for (root_id, source_directory) in [
@@ -6134,6 +6230,61 @@ mod tests {
                 )
                 .is_err());
         }
+        let _ = fs::remove_dir_all(first_root_path);
+        let _ = fs::remove_dir_all(second_root_path);
+    }
+
+    #[test]
+    fn file_type_filter_matches_archive_source_extension_and_member_format() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let source_root = temp_root("file-type-archive-source");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("parts.zip"), b"synthetic archive").unwrap();
+        let mut root = db.add_index_root(&source_root, 60, 1024 * 1024).unwrap();
+        root.scan_zip = true;
+        db.update_index_root(&root).unwrap();
+        db.record_scan_entries(
+            &root.id,
+            &[ScannedModel {
+                relative_path: "parts.zip".into(),
+                content_hash: hash(7),
+                bytes: 17,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("Archive member".into()),
+                archive_member: Some("member.stl".into()),
+                outer_fingerprint: Some("synthetic-archive-fingerprint".into()),
+            }],
+        )
+        .unwrap();
+
+        let (archive_matches, _) = db
+            .list_models_page(
+                &ModelPageQuery {
+                    file_type: Some("zip".into()),
+                    ..ModelPageQuery::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(archive_matches.len(), 1);
+        assert_eq!(archive_matches[0].display_name, "Archive member");
+
+        let (mesh_matches, _) = db
+            .list_models_page(
+                &ModelPageQuery {
+                    file_type: Some(".STL".into()),
+                    ..ModelPageQuery::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(mesh_matches.len(), 1);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]

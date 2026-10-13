@@ -17,5 +17,5 @@ pub use models::{
     RemovalResult, RemovedModel, ResolvedModelSource, ReviewedTag, ReviewedTagStrategy,
     ReviewedTagTarget, ScanReconcile, ScannedModel, SortDirection, SourceRef,
     SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry,
-    ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
+    ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget, MAX_MODEL_PAGE_OFFSET,
 };

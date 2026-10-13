@@ -80,6 +80,8 @@ impl Default for PageRequest {
     }
 }
 
+pub const MAX_MODEL_SEARCH_OFFSET: u32 = 100_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Page<T> {
@@ -812,6 +814,9 @@ pub struct ModelQuery {
     pub source_directory: Option<String>,
     pub minimum_rating: Option<u8>,
     pub favorite: Option<bool>,
+    pub tags: Option<Vec<String>>,
+    pub file_type: Option<String>,
+    pub offset: Option<u32>,
     #[serde(default)]
     pub exclude_model_ids: Vec<String>,
 }
@@ -840,6 +845,9 @@ impl Default for ModelQuery {
             source_directory: None,
             minimum_rating: None,
             favorite: None,
+            tags: None,
+            file_type: None,
+            offset: None,
             exclude_model_ids: Vec::new(),
         }
     }
