@@ -1344,6 +1344,139 @@ async fn mcp_2025_11_25_session_lifecycle_and_headers_are_enforced() {
     assert_eq!(after_delete.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn mcp_source_action_aliases_require_confirm_and_route_to_the_named_tool() {
+    let app = test_router();
+    let initialize = app
+        .clone()
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":1,"method":"initialize",
+                        "params":{"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session = initialize.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let initialize_notice = app
+        .clone()
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("mcp-session-id", &session)
+                .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initialize_notice.status(), StatusCode::ACCEPTED);
+
+    let listed = app
+        .clone()
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("mcp-session-id", &session)
+                .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed: Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    for name in ["trash_file", "undo_trash", "move_files"] {
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == name));
+    }
+
+    let denied = app
+        .clone()
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("mcp-session-id", &session)
+                .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":3,"method":"tools/call",
+                        "params":{"name":"trash_file","arguments":{"modelId":"model-1","expectedVersion":"3","confirm":false}}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let denied: Value =
+        serde_json::from_slice(&to_bytes(denied.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(denied["error"]["code"], -32602);
+
+    for (id, name, arguments) in [
+        (
+            4,
+            "trash_file",
+            json!({"modelId":"model-1","expectedVersion":"3","confirm":true}),
+        ),
+        (
+            5,
+            "undo_trash",
+            json!({"snapshotId":"snapshot-1","confirm":true}),
+        ),
+        (
+            6,
+            "move_files",
+            json!({"modelId":"model-1","expectedVersion":"3","destinationHandleId":"models","fileName":"model.stl","confirm":true}),
+        ),
+    ] {
+        let called = app
+            .clone()
+            .oneshot(
+                request("POST", "/mcp", true)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session)
+                    .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc":"2.0","id":id,"method":"tools/call",
+                            "params":{"name":name,"arguments":arguments}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let called: Value =
+            serde_json::from_slice(&to_bytes(called.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(called["result"]["structuredContent"]["tool"], name);
+    }
+}
+
 #[test]
 fn confirmation_tokens_are_one_use_and_bound_to_principal_body_and_epoch() {
     let store = ConfirmationStore::new(Duration::from_secs(60), 4);
@@ -1561,6 +1694,64 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
     assert!(super::validate_tool_shape("get_model", &json!({"modelId":"model-1"})).is_ok());
     assert!(super::validate_tool_shape("get_model", &json!({"modelId":1})).is_err());
     assert!(super::validate_tool_shape("get_model", &json!({"modelId":"m","extra":true})).is_err());
+}
+
+#[test]
+fn source_file_action_tools_require_confirmation_and_safe_handle_arguments() {
+    let definitions = tool_definitions();
+    for name in ["trash_file", "undo_trash", "move_files"] {
+        let schema = definitions
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap()["inputSchema"]
+            .clone();
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|value| value == "confirm")));
+        assert_eq!(schema["properties"]["confirm"]["const"], true);
+    }
+
+    assert!(super::validate_tool_shape(
+        "trash_file",
+        &json!({"modelId":"model-1","expectedVersion":"3","confirm":true}),
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape(
+        "trash_file",
+        &json!({"modelId":"model-1","expectedVersion":"3"}),
+    )
+    .is_err());
+    assert!(super::validate_tool_shape(
+        "trash_file",
+        &json!({"modelId":"model-1","expectedVersion":"3","confirm":false}),
+    )
+    .is_err());
+    assert!(super::validate_tool_shape(
+        "trash_file",
+        &json!({"modelId":"model-1","expectedVersion":"3","confirm":true,"sourcePath":"/tmp/model.stl"}),
+    )
+    .is_err());
+    assert!(super::validate_tool_shape(
+        "undo_trash",
+        &json!({"snapshotId":"snapshot-1","confirm":true}),
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape(
+        "move_files",
+        &json!({"modelId":"model-1","expectedVersion":"3","destinationHandleId":"writable-root","fileName":"model-copy.stl","confirm":true}),
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape(
+        "move_files",
+        &json!({"modelId":"model-1","expectedVersion":"3","destinationHandleId":"writable-root","fileName":"../model.stl","confirm":true}),
+    )
+    .is_err());
+    assert!(super::validate_tool_shape(
+        "plan_management_action",
+        &json!({"action":{"kind":"quarantineLooseSource","target":{"modelId":"model-1","expectedVersion":"3"}}}),
+    )
+    .is_err());
 }
 
 #[test]
@@ -2974,6 +3165,237 @@ fn protocol_adapter_remove_model_is_recoverable_and_requires_a_second_step() {
     assert!(adapter
         .call_tool(&writer, "execute_management_action", json!({"token":token}))
         .is_err());
+}
+
+#[test]
+fn source_management_aliases_require_source_write_capabilities_and_writable_roots() {
+    fn runtime_at(
+        root_path: &std::path::Path,
+        access: library_protocol::RootAccess,
+    ) -> Arc<library_runtime::LibraryRuntime> {
+        std::fs::create_dir_all(root_path).unwrap();
+        let parent = root_path.parent().unwrap();
+        let mut config = library_runtime::RuntimeConfig::desktop(
+            parent.join("library"),
+            parent.join("integrations.json"),
+        );
+        config.local_catalog_root_access = false;
+        config.roots.push(library_runtime::RuntimeRootPolicy {
+            id: "models".into(),
+            catalog_root_id: None,
+            label: "Models".into(),
+            path: root_path.to_owned(),
+            access,
+        });
+        library_runtime::LibraryRuntime::open(config).unwrap()
+    }
+
+    let writable_temp = tempfile::tempdir().unwrap();
+    let runtime = runtime_at(
+        &writable_temp.path().join("source"),
+        library_protocol::RootAccess::Writable,
+    );
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let writer = RequestContext {
+        principal_id: "source-writer".into(),
+        capabilities: BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::CatalogWrite,
+            Capability::PhysicalSourceWrite,
+        ]),
+        request_id: "source-actions".into(),
+    };
+    for name in ["trash_file", "undo_trash", "move_files"] {
+        assert!(
+            adapter.supports_tool(&writer, name),
+            "{name} should be enabled"
+        );
+    }
+
+    let no_physical_write = RequestContext {
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        ..writer.clone()
+    };
+    let no_catalog_write = RequestContext {
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::PhysicalSourceWrite]),
+        ..writer.clone()
+    };
+    for name in ["trash_file", "undo_trash", "move_files"] {
+        assert!(!adapter.supports_tool(&no_physical_write, name));
+        assert!(!adapter.supports_tool(&no_catalog_write, name));
+    }
+
+    let readonly_temp = tempfile::tempdir().unwrap();
+    let readonly_runtime = runtime_at(
+        &readonly_temp.path().join("source"),
+        library_protocol::RootAccess::ReadOnly,
+    );
+    let readonly_adapter = ProtocolEngineAdapter::new(readonly_runtime, HostMode::Headless);
+    for name in ["trash_file", "undo_trash", "move_files"] {
+        assert!(!readonly_adapter.supports_tool(&writer, name));
+    }
+
+    let trash = adapter
+        .call_tool(
+            &writer,
+            "trash_file",
+            json!({"modelId":"missing","expectedVersion":"1","confirm":true}),
+        )
+        .unwrap_err();
+    assert_eq!(trash.code, "notFound");
+    let undo = adapter
+        .call_tool(
+            &writer,
+            "undo_trash",
+            json!({"snapshotId":"missing","confirm":true}),
+        )
+        .unwrap_err();
+    assert_eq!(undo.code, "notFound");
+    let movement = adapter
+        .call_tool(
+            &writer,
+            "move_files",
+            json!({"modelId":"missing","expectedVersion":"1","destinationHandleId":"models","fileName":"moved.stl","confirm":true}),
+        )
+        .unwrap_err();
+    assert_eq!(movement.code, "notFound");
+}
+
+#[test]
+fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_root = temp.path().join("models");
+    let destination_root = temp.path().join("destination");
+    std::fs::create_dir(&source_root).unwrap();
+    std::fs::create_dir(&destination_root).unwrap();
+    let source = source_root.join("part.stl");
+    let mut source_bytes = vec![0_u8; 84];
+    source_bytes[80..84].copy_from_slice(&1_u32.to_le_bytes());
+    for value in [
+        0.0_f32, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ] {
+        source_bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    source_bytes.extend_from_slice(&0_u16.to_le_bytes());
+    std::fs::write(&source, &source_bytes).unwrap();
+
+    let capabilities = BTreeSet::from([
+        Capability::CatalogRead,
+        Capability::CatalogWrite,
+        Capability::Scan,
+        Capability::PhysicalSourceWrite,
+    ]);
+    let mut config = library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    );
+    config.local_catalog_root_access = false;
+    config.roots = vec![
+        library_runtime::RuntimeRootPolicy {
+            id: "models".into(),
+            catalog_root_id: None,
+            label: "Models".into(),
+            path: source_root.clone(),
+            access: library_protocol::RootAccess::Writable,
+        },
+        library_runtime::RuntimeRootPolicy {
+            id: "destination".into(),
+            catalog_root_id: None,
+            label: "Destination".into(),
+            path: destination_root,
+            access: library_protocol::RootAccess::Writable,
+        },
+    ];
+    config.capabilities = capabilities.clone();
+    let runtime = library_runtime::LibraryRuntime::open(config).unwrap();
+    let context = RequestContext {
+        principal_id: "source-manager".into(),
+        capabilities,
+        request_id: "source-alias-actions".into(),
+    };
+    let roots = runtime.root_handles(&context).unwrap();
+    let source_root_info = roots.iter().find(|root| root.label == "Models").unwrap();
+    let source_catalog_id = source_root_info.catalog_root_id.as_deref().unwrap();
+    let source_catalog = runtime
+        .read_db(|db| {
+            db.list_index_roots().map(|roots| {
+                roots
+                    .into_iter()
+                    .find(|root| root.id == source_catalog_id)
+                    .unwrap()
+            })
+        })
+        .unwrap();
+    library_runtime::scanner::scan_root(&runtime, &source_catalog).unwrap();
+    let model = runtime
+        .read_db(|db| {
+            db.list_models(None, None)
+                .map(|mut models| models.remove(0))
+        })
+        .unwrap();
+    let source_handle_id = source_root_info.id.clone();
+    let adapter = ProtocolEngineAdapter::new(runtime.clone(), HostMode::Headless);
+
+    let trash_plan = adapter
+        .call_tool(
+            &context,
+            "trash_file",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":model.metadata_version.to_string(),
+                "confirm":true
+            }),
+        )
+        .unwrap();
+    assert_eq!(trash_plan["actionKind"], "quarantineLooseSource");
+    let trash_token = trash_plan["token"].as_str().unwrap();
+
+    let move_plan = adapter
+        .call_tool(
+            &context,
+            "move_files",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":model.metadata_version.to_string(),
+                "destinationHandleId":source_handle_id,
+                "fileName":"part-copy.stl",
+                "confirm":true
+            }),
+        )
+        .unwrap();
+    assert_eq!(move_plan["actionKind"], "moveLooseSource");
+    assert!(!move_plan["token"].as_str().unwrap().is_empty());
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    assert!(!source_root.join("part-copy.stl").exists());
+
+    let quarantined = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":trash_token}),
+        )
+        .unwrap();
+    assert_eq!(quarantined["kind"], "quarantined");
+    assert!(!source.exists());
+
+    let undo_plan = adapter
+        .call_tool(
+            &context,
+            "undo_trash",
+            json!({"snapshotId":quarantined["snapshotId"],"confirm":true}),
+        )
+        .unwrap();
+    assert_eq!(undo_plan["actionKind"], "undoQuarantine");
+    assert!(!undo_plan["token"].as_str().unwrap().is_empty());
+    let restored = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":undo_plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(restored["kind"], "quarantineUndone");
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
 }
 
 #[test]

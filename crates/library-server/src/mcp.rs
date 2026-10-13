@@ -299,7 +299,11 @@ pub async fn post<E: LibraryEngine>(
                     .unwrap_or_else(|| json!({}));
                 if !arguments.is_object() {
                     rpc_error(id, -32602, "Tool arguments must be an object")
-                } else if destructive_tool(name)
+                } else if requires_explicit_confirmation(name)
+                    && arguments.get("confirm").and_then(Value::as_bool) != Some(true)
+                {
+                    rpc_error(id, -32602, "Explicit confirm:true is required")
+                } else if name == "restore_library"
                     && arguments
                         .get("confirmationToken")
                         .and_then(Value::as_str)
@@ -340,10 +344,10 @@ pub async fn post<E: LibraryEngine>(
     rpc_http(StatusCode::OK, response, Some(session_id))
 }
 
-fn destructive_tool(name: &str) -> bool {
+fn requires_explicit_confirmation(name: &str) -> bool {
     matches!(
         name,
-        "remove_model" | "trash_file" | "undo_trash" | "move_files" | "restore_library"
+        "remove_model" | "trash_file" | "undo_trash" | "move_files"
     )
 }
 

@@ -269,6 +269,28 @@ struct PlannedAction {
     catalog_revision: u64,
     targets: Vec<ActionTargetSnapshot>,
     input_fingerprint: Option<(u64, String)>,
+    physical_source: Option<PhysicalSourceSnapshot>,
+}
+
+#[derive(Clone)]
+struct PhysicalSourceSnapshot {
+    model_id: String,
+    metadata_version: u64,
+    root_handle_id: String,
+    catalog_root_id: String,
+    root_path: PathBuf,
+    relative_path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+struct MoveExecution<'a> {
+    target: &'a VersionedTarget,
+    snapshot: &'a PhysicalSourceSnapshot,
+    destination_handle_id: &'a str,
+    file_name: &'a str,
+    expected_epoch: u64,
+    expected_revision: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1265,13 +1287,22 @@ impl ManagementEngine for LibraryRuntime {
                 "exportLibrary"
             }
             ManagementAction::QuarantineLooseSource { .. } => {
-                return Err(unsupported_physical_management())
+                require_durable_source_mutations()?;
+                self.require(context, Capability::CatalogWrite)?;
+                self.require(context, Capability::PhysicalSourceWrite)?;
+                "quarantineLooseSource"
             }
             ManagementAction::UndoQuarantine { .. } => {
-                return Err(unsupported_physical_management())
+                require_durable_source_mutations()?;
+                self.require(context, Capability::CatalogWrite)?;
+                self.require(context, Capability::PhysicalSourceWrite)?;
+                "undoQuarantine"
             }
             ManagementAction::MoveLooseSource { .. } => {
-                return Err(unsupported_physical_management())
+                require_durable_source_mutations()?;
+                self.require(context, Capability::CatalogWrite)?;
+                self.require(context, Capability::PhysicalSourceWrite)?;
+                "moveLooseSource"
             }
             ManagementAction::PurgeCatalog { .. } => return Err(unsupported_physical_management()),
             ManagementAction::CleanupOrphans => return Err(unsupported_physical_management()),
@@ -1309,6 +1340,16 @@ impl ManagementEngine for LibraryRuntime {
                 .collect::<Result<Vec<_>, LibraryError>>()
         })?;
         validate_management_action(self, context, &action)?;
+        let physical_source = match &action {
+            ManagementAction::QuarantineLooseSource { target }
+            | ManagementAction::MoveLooseSource { target, .. } => {
+                Some(snapshot_active_source(self, context, target)?)
+            }
+            ManagementAction::UndoQuarantine { snapshot_id } => {
+                Some(snapshot_quarantine_source(self, context, snapshot_id)?)
+            }
+            _ => None,
+        };
         let input_fingerprint = if let ManagementAction::RestoreBackup {
             source_handle_id,
             file_name,
@@ -1364,6 +1405,7 @@ impl ManagementEngine for LibraryRuntime {
                 catalog_revision,
                 targets: targets.clone(),
                 input_fingerprint: input_fingerprint.clone(),
+                physical_source,
             },
         );
         Ok(ActionPlan {
@@ -1485,11 +1527,59 @@ impl ManagementEngine for LibraryRuntime {
                     expected_revision: planned.catalog_revision,
                 },
             ),
-            ManagementAction::QuarantineLooseSource { .. }
-            | ManagementAction::UndoQuarantine { .. }
-            | ManagementAction::MoveLooseSource { .. }
-            | ManagementAction::PurgeCatalog { .. }
-            | ManagementAction::CleanupOrphans => Err(unsupported_physical_management()),
+            ManagementAction::QuarantineLooseSource { target } => {
+                let snapshot = planned
+                    .physical_source
+                    .as_ref()
+                    .ok_or_else(|| internal("Quarantine plan lost its source snapshot"))?;
+                execute_quarantine(
+                    self,
+                    context,
+                    &target,
+                    snapshot,
+                    planned.library_epoch,
+                    planned.catalog_revision,
+                )
+            }
+            ManagementAction::UndoQuarantine { snapshot_id } => {
+                let snapshot = planned
+                    .physical_source
+                    .as_ref()
+                    .ok_or_else(|| internal("Undo plan lost its source snapshot"))?;
+                execute_undo_quarantine(
+                    self,
+                    context,
+                    &snapshot_id,
+                    snapshot,
+                    planned.library_epoch,
+                    planned.catalog_revision,
+                )
+            }
+            ManagementAction::MoveLooseSource {
+                target,
+                destination_handle_id,
+                file_name,
+            } => {
+                let snapshot = planned
+                    .physical_source
+                    .as_ref()
+                    .ok_or_else(|| internal("Move plan lost its source snapshot"))?;
+                execute_move_source(
+                    self,
+                    context,
+                    MoveExecution {
+                        target: &target,
+                        snapshot,
+                        destination_handle_id: &destination_handle_id,
+                        file_name: &file_name,
+                        expected_epoch: planned.library_epoch,
+                        expected_revision: planned.catalog_revision,
+                    },
+                )
+            }
+            ManagementAction::PurgeCatalog { .. } | ManagementAction::CleanupOrphans => {
+                Err(unsupported_physical_management())
+            }
         }
     }
 
@@ -3439,7 +3529,29 @@ fn validate_management_action(
         } => {
             validate_output_name(file_name)?;
             validate_physical_model_action(runtime, context, &target.model_id)?;
-            runtime.admitted_root_path(context, destination_handle_id, RootAccess::Writable)?;
+            let destination_root = runtime
+                .roots
+                .iter()
+                .find(|root| root.handle.id == *destination_handle_id)
+                .ok_or_else(|| invalid("Move destination root is not admitted"))?;
+            if destination_root.handle.access != RootAccess::Writable
+                || destination_root.catalog_root_id.is_none()
+            {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Forbidden,
+                    message: "Move destination must be an admitted writable catalog root".into(),
+                    retryable: false,
+                    current_version: None,
+                });
+            }
+            admitted_file(
+                runtime,
+                context,
+                destination_handle_id,
+                RootAccess::Writable,
+                file_name,
+                false,
+            )?;
         }
         ManagementAction::PurgeCatalog {
             backup_destination_handle_id,
@@ -3462,6 +3574,7 @@ fn validate_physical_model_action(
     context: &RequestContext,
     model_id: &str,
 ) -> Result<(), RuntimeError> {
+    runtime.require(context, Capability::CatalogWrite)?;
     runtime.require(context, Capability::PhysicalSourceWrite)?;
     let model = runtime
         .read_db(|db| db.get_model(model_id))?
@@ -3495,6 +3608,339 @@ fn validate_physical_model_action(
         return Err(stale("Model source root identity changed"));
     }
     Ok(())
+}
+
+fn snapshot_active_source(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    target: &VersionedTarget,
+) -> Result<PhysicalSourceSnapshot, RuntimeError> {
+    let model = runtime.read_db(|db| {
+        let model = db
+            .get_model(&target.model_id)?
+            .ok_or_else(|| LibraryError::ModelNotFound(target.model_id.clone()))?;
+        if model.metadata_version != target.expected_version {
+            return Err(LibraryError::MetadataConflict {
+                model_id: target.model_id.clone(),
+                expected: target.expected_version,
+                actual: model.metadata_version,
+            });
+        }
+        Ok(model)
+    })?;
+    let snapshot = source_location_snapshot(runtime, context, &model)?;
+    let source = runtime.read_db(|db| db.resolve_model_source_ref(&model.id))?;
+    if source.outer_path != snapshot.root_path.join(&snapshot.relative_path)
+        || source.archive_member.is_some()
+    {
+        return Err(stale("Indexed source identity changed"));
+    }
+    verify_source_snapshot_file(&snapshot)?;
+    if model.bytes != snapshot.bytes || model.content_hash.as_deref() != Some(&snapshot.sha256) {
+        return Err(stale("Indexed source bytes do not match the catalog"));
+    }
+    Ok(snapshot)
+}
+
+fn source_location_snapshot(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    model: &Model,
+) -> Result<PhysicalSourceSnapshot, RuntimeError> {
+    runtime.require(context, Capability::CatalogWrite)?;
+    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    if model.source_kind != "indexed" || model.source_archive_member.is_some() {
+        return Err(invalid("Physical action requires a loose indexed model"));
+    }
+    let catalog_root_id = model
+        .source_root_id
+        .as_deref()
+        .ok_or_else(|| invalid("Indexed model has no source root"))?;
+    let root = runtime
+        .roots
+        .iter()
+        .find(|root| {
+            root.catalog_root_id.as_deref() == Some(catalog_root_id)
+                && root.handle.access == RootAccess::Writable
+        })
+        .ok_or_else(|| RuntimeError {
+            code: RuntimeErrorCode::Forbidden,
+            message: "Model source root is not admitted for writes".into(),
+            retryable: false,
+            current_version: None,
+        })?;
+    let root_path = runtime.admitted_root_path(context, &root.handle.id, RootAccess::Writable)?;
+    if root_path.canonicalize().map_err(|_| io_error())? != root_path {
+        return Err(stale("Model source root identity changed"));
+    }
+    let stored_source_path = PathBuf::from(
+        model
+            .source_path
+            .as_deref()
+            .ok_or_else(|| invalid("Indexed model has no source path"))?,
+    );
+    let relative_path = if stored_source_path.is_absolute() {
+        stored_source_path
+            .strip_prefix(&root_path)
+            .map_err(|_| invalid("Indexed source path is outside its admitted root"))?
+            .to_path_buf()
+    } else {
+        stored_source_path
+    };
+    validate_relative_source_path(&relative_path)?;
+    Ok(PhysicalSourceSnapshot {
+        model_id: model.id.clone(),
+        metadata_version: model.metadata_version,
+        root_handle_id: root.handle.id.clone(),
+        catalog_root_id: catalog_root_id.into(),
+        root_path,
+        relative_path,
+        bytes: model.bytes,
+        sha256: model
+            .content_hash
+            .clone()
+            .ok_or_else(|| invalid("Indexed model has no content hash"))?,
+    })
+}
+
+fn snapshot_quarantine_source(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    snapshot_id: &str,
+) -> Result<PhysicalSourceSnapshot, RuntimeError> {
+    validate_plain_id_text(snapshot_id, "Quarantine snapshot")?;
+    let removed = runtime
+        .read_db(|db| {
+            db.list_removed_models().map(|removed| {
+                removed
+                    .into_iter()
+                    .find(|item| item.snapshot_id == snapshot_id)
+            })
+        })?
+        .ok_or_else(|| RuntimeError {
+            code: RuntimeErrorCode::NotFound,
+            message: "Quarantine snapshot was not found".into(),
+            retryable: false,
+            current_version: None,
+        })?;
+    let snapshot = source_location_snapshot(runtime, context, &removed.model)?;
+    let quarantine_source = quarantine_source_file(&runtime.root, snapshot_id, false)?;
+    let (bytes, sha256) =
+        hash_management_file(&quarantine_source, library_core::MAX_INDEXED_FILE_BYTES)?;
+    if bytes != snapshot.bytes || sha256 != snapshot.sha256 {
+        return Err(stale(
+            "Quarantined source does not match its catalog record",
+        ));
+    }
+    let original_path = snapshot.root_path.join(&snapshot.relative_path);
+    validate_relative_target(&snapshot.root_path, &snapshot.relative_path, false)?;
+    if !matches!(fs::symlink_metadata(&original_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Conflict,
+            message: "Original source path is occupied".into(),
+            retryable: false,
+            current_version: None,
+        });
+    }
+    Ok(snapshot)
+}
+
+fn validate_relative_source_path(path: &Path) -> Result<(), RuntimeError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(invalid("Indexed source path is unsafe"));
+    }
+    Ok(())
+}
+
+fn model_relative_source_path(model: &Model, root: &Path) -> Result<PathBuf, RuntimeError> {
+    let stored = PathBuf::from(
+        model
+            .source_path
+            .as_deref()
+            .ok_or_else(|| invalid("Indexed model has no source path"))?,
+    );
+    let relative = if stored.is_absolute() {
+        stored
+            .strip_prefix(root)
+            .map_err(|_| invalid("Indexed source path is outside its admitted root"))?
+            .to_path_buf()
+    } else {
+        stored
+    };
+    validate_relative_source_path(&relative)?;
+    Ok(relative)
+}
+
+fn validate_relative_target(
+    root: &Path,
+    relative: &Path,
+    require_file: bool,
+) -> Result<PathBuf, RuntimeError> {
+    validate_relative_source_path(relative)?;
+    if root.canonicalize().map_err(|_| io_error())? != root {
+        return Err(stale("Admitted source root identity changed"));
+    }
+    let mut path = root.to_path_buf();
+    let parts = relative.components().collect::<Vec<_>>();
+    for (index, component) in parts.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(invalid("Indexed source path is unsafe"));
+        };
+        path.push(name);
+        let final_component = index + 1 == parts.len();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || (!final_component && !metadata.is_dir())
+                    || (final_component && require_file && !metadata.is_file()) =>
+            {
+                return Err(invalid(
+                    "Indexed source path is not a regular contained file",
+                ));
+            }
+            Ok(_) => {}
+            Err(error)
+                if final_component
+                    && !require_file
+                    && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(io_error());
+            }
+            Err(_) => return Err(io_error()),
+        }
+    }
+    Ok(path)
+}
+
+fn verify_source_snapshot_file(snapshot: &PhysicalSourceSnapshot) -> Result<PathBuf, RuntimeError> {
+    let path = validate_relative_target(&snapshot.root_path, &snapshot.relative_path, true)?;
+    let (bytes, sha256) = hash_management_file(&path, library_core::MAX_INDEXED_FILE_BYTES)?;
+    if bytes != snapshot.bytes || sha256 != snapshot.sha256 {
+        return Err(stale("Indexed source bytes changed after planning"));
+    }
+    Ok(path)
+}
+
+fn quarantine_source_file(
+    library_root: &Path,
+    snapshot_id: &str,
+    create: bool,
+) -> Result<PathBuf, RuntimeError> {
+    validate_plain_id_text(snapshot_id, "Quarantine snapshot")?;
+    let trash_root = library_root.join("trash");
+    match fs::symlink_metadata(&trash_root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(invalid("Quarantine directory is unsafe")),
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&trash_root).map_err(|_| io_error())?;
+            sync_directory(library_root)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::NotFound,
+                message: "Quarantine snapshot was not found".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        Err(_) => return Err(io_error()),
+    }
+    if trash_root.canonicalize().map_err(|_| io_error())? != trash_root {
+        return Err(invalid("Quarantine directory identity changed"));
+    }
+    let owned = trash_root.join(format!("source-{snapshot_id}"));
+    if create {
+        fs::create_dir(&owned).map_err(|_| io_error())?;
+        sync_directory(&trash_root)?;
+    } else {
+        let metadata = fs::symlink_metadata(&owned).map_err(|_| io_error())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid("Quarantine snapshot directory is unsafe"));
+        }
+    }
+    if owned.canonicalize().map_err(|_| io_error())? != owned {
+        return Err(invalid("Quarantine snapshot identity changed"));
+    }
+    Ok(owned.join("source.bin"))
+}
+
+fn clean_quarantine_source(library_root: &Path, snapshot_id: &str, expected: &(u64, String)) {
+    let owned = library_root
+        .join("trash")
+        .join(format!("source-{snapshot_id}"));
+    if let Ok(metadata) = fs::symlink_metadata(&owned) {
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || owned.parent().and_then(|parent| parent.canonicalize().ok())
+                != Some(library_root.join("trash"))
+        {
+            return;
+        }
+        let entries = match fs::read_dir(&owned) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>(),
+            Err(_) => return,
+        };
+        let Ok(entries) = entries else {
+            return;
+        };
+        if entries.len() != 1 || entries[0].file_name() != "source.bin" {
+            return;
+        }
+        let source = entries[0].path();
+        if !hash_management_file(&source, library_core::MAX_INDEXED_FILE_BYTES)
+            .is_ok_and(|fingerprint| fingerprint == *expected)
+        {
+            return;
+        }
+        if fs::remove_file(&source).is_ok() {
+            let _ = fs::remove_dir(&owned);
+        }
+    }
+}
+
+fn stage_source_path(source: &Path) -> Result<PathBuf, RuntimeError> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| invalid("Source has no parent"))?;
+    for _ in 0..3 {
+        let staged = parent.join(format!(
+            ".gogglelab-source-stage-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        match fs::symlink_metadata(&staged) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(staged),
+            Ok(_) => {}
+            Err(_) => return Err(io_error()),
+        }
+    }
+    Err(internal("Could not allocate a source staging name"))
+}
+
+fn restore_staged_source(staged: &Path, source: &Path) -> Result<(), RuntimeError> {
+    if fs::symlink_metadata(source).is_ok() {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Conflict,
+            message: "Original source path became occupied during the operation".into(),
+            retryable: false,
+            current_version: None,
+        });
+    }
+    fs::rename(staged, source).map_err(|_| io_error())
+}
+
+fn file_modified_seconds(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn revalidate_action_targets(
@@ -3611,6 +4057,40 @@ fn hash_management_file(path: &Path, max_bytes: u64) -> Result<(u64, String), Ru
     Ok((bytes, format!("{:x}", digest.finalize())))
 }
 
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), RuntimeError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| io_error())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), RuntimeError> {
+    Err(RuntimeError {
+        code: RuntimeErrorCode::Unsupported,
+        message: "Durable source mutations are unsupported on this host".into(),
+        retryable: false,
+        current_version: None,
+    })
+}
+
+#[cfg(unix)]
+fn require_durable_source_mutations() -> Result<(), RuntimeError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_durable_source_mutations() -> Result<(), RuntimeError> {
+    sync_directory(Path::new("."))
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), RuntimeError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("Managed file has no parent directory"))?;
+    sync_directory(parent)
+}
+
 fn copy_verified_management_file(
     source: &Path,
     destination: &Path,
@@ -3653,6 +4133,484 @@ fn copy_verified_management_file(
         let _ = fs::remove_file(destination);
     }
     result
+}
+
+fn copy_verified_source_file(
+    source: &Path,
+    destination: &Path,
+    expected: &(u64, String),
+) -> Result<(), RuntimeError> {
+    copy_verified_management_file(source, destination, expected)?;
+    sync_parent_directory(destination)
+}
+
+fn execute_quarantine(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    target: &VersionedTarget,
+    snapshot: &PhysicalSourceSnapshot,
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<ManagementResult, RuntimeError> {
+    runtime.require(context, Capability::CatalogWrite)?;
+    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    if target.model_id != snapshot.model_id || target.expected_version != snapshot.metadata_version
+    {
+        return Err(stale("Quarantine plan target changed"));
+    }
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime owner is unavailable"))?;
+    let mut guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let db = LibraryDb::open(guard.root()).map_err(runtime_library_error)?;
+    let source_path = revalidate_active_source(&db, runtime, context, target, snapshot)?;
+    let removal = db
+        .remove_models_recoverably(&[CoreVersionedTarget {
+            model_id: target.model_id.clone(),
+            expected_version: target.expected_version,
+        }])
+        .map_err(runtime_library_error)?;
+    let recovery_path = match quarantine_source_file(guard.root(), &removal.snapshot_id, true) {
+        Ok(path) => path,
+        Err(error) => {
+            restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+            return Err(error);
+        }
+    };
+    let expected = (snapshot.bytes, snapshot.sha256.clone());
+    if let Err(error) = copy_verified_source_file(&source_path, &recovery_path, &expected) {
+        restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+        clean_quarantine_source(guard.root(), &removal.snapshot_id, &expected);
+        return Err(error);
+    }
+    let staged = match stage_source_path(&source_path) {
+        Ok(path) => path,
+        Err(error) => {
+            restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+            clean_quarantine_source(guard.root(), &removal.snapshot_id, &expected);
+            return Err(error);
+        }
+    };
+    if fs::rename(&source_path, &staged).is_err() {
+        restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+        clean_quarantine_source(guard.root(), &removal.snapshot_id, &expected);
+        return Err(io_error());
+    }
+    if sync_parent_directory(&source_path).is_err() {
+        if restore_staged_source(&staged, &source_path).is_err() {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Quarantine staging could not be synced or restored".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+        clean_quarantine_source(guard.root(), &removal.snapshot_id, &expected);
+        return Err(io_error());
+    }
+    let staged_hash = hash_management_file(&staged, library_core::MAX_INDEXED_FILE_BYTES);
+    if !matches!(staged_hash, Ok((bytes, hash)) if bytes == expected.0 && hash == expected.1) {
+        if restore_staged_source(&staged, &source_path).is_err() {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Changed source bytes remain in a guarded recovery stage".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+        return Err(stale("Indexed source changed during quarantine"));
+    }
+    if !hash_management_file(&recovery_path, library_core::MAX_INDEXED_FILE_BYTES)
+        .is_ok_and(|fingerprint| fingerprint == expected)
+    {
+        if restore_staged_source(&staged, &source_path).is_err() {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Quarantine recovery changed and the source remains staged".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+        return Err(stale(
+            "Quarantine recovery bytes changed before source removal",
+        ));
+    }
+    if fs::remove_file(&staged).is_err() {
+        if restore_staged_source(&staged, &source_path).is_ok() {
+            restore_quarantine_catalog(&db, &removal.snapshot_id, &mut guard)?;
+            clean_quarantine_source(guard.root(), &removal.snapshot_id, &expected);
+        } else {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Quarantined source remains in a guarded recovery stage".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        return Err(io_error());
+    }
+    drop(db);
+    guard.invalidate();
+    Ok(ManagementResult::Quarantined {
+        snapshot_id: removal.snapshot_id,
+        model_id: target.model_id.clone(),
+    })
+}
+
+fn restore_quarantine_catalog(
+    db: &LibraryDb,
+    snapshot_id: &str,
+    guard: &mut RuntimeMaintenanceGuard,
+) -> Result<(), RuntimeError> {
+    if db.restore_removal(snapshot_id).is_ok() {
+        return Ok(());
+    }
+    guard.remain_armed();
+    Err(RuntimeError {
+        code: RuntimeErrorCode::Corrupt,
+        message: "Quarantine failed and the catalog rollback did not complete".into(),
+        retryable: false,
+        current_version: None,
+    })
+}
+
+fn execute_undo_quarantine(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    snapshot_id: &str,
+    snapshot: &PhysicalSourceSnapshot,
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<ManagementResult, RuntimeError> {
+    runtime.require(context, Capability::CatalogWrite)?;
+    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime owner is unavailable"))?;
+    let guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let db = LibraryDb::open(guard.root()).map_err(runtime_library_error)?;
+    let removed = db
+        .list_removed_models()
+        .map_err(runtime_library_error)?
+        .into_iter()
+        .find(|item| item.snapshot_id == snapshot_id && item.model.id == snapshot.model_id)
+        .ok_or_else(|| stale("Quarantine snapshot no longer matches the catalog"))?;
+    if removed.model.metadata_version != snapshot.metadata_version
+        || removed.model.content_hash.as_deref() != Some(&snapshot.sha256)
+        || removed.model.bytes != snapshot.bytes
+    {
+        return Err(stale("Quarantine catalog record changed"));
+    }
+    let recovery_path = quarantine_source_file(guard.root(), snapshot_id, false)?;
+    let (bytes, hash) = hash_management_file(&recovery_path, library_core::MAX_INDEXED_FILE_BYTES)?;
+    if bytes != snapshot.bytes || hash != snapshot.sha256 {
+        return Err(stale("Quarantine recovery bytes changed"));
+    }
+    let destination = revalidate_removed_destination(runtime, context, &removed.model, snapshot)?;
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Conflict,
+            message: "Original source path is occupied".into(),
+            retryable: false,
+            current_version: None,
+        });
+    }
+    let expected = (snapshot.bytes, snapshot.sha256.clone());
+    copy_verified_source_file(&recovery_path, &destination, &expected)?;
+    if !hash_management_file(&destination, library_core::MAX_INDEXED_FILE_BYTES)
+        .is_ok_and(|fingerprint| fingerprint == expected)
+    {
+        return Err(stale(
+            "Restored source changed before the catalog could be restored; recovery was retained",
+        ));
+    }
+    if let Err(error) = db.restore_removal(snapshot_id) {
+        return Err(runtime_library_error(error));
+    }
+    if !hash_management_file(&destination, library_core::MAX_INDEXED_FILE_BYTES)
+        .is_ok_and(|fingerprint| fingerprint == expected)
+    {
+        drop(db);
+        guard.invalidate();
+        return Err(stale(
+            "Restored source changed during catalog recovery; the verified recovery copy was retained",
+        ));
+    }
+    clean_quarantine_source(guard.root(), snapshot_id, &expected);
+    drop(db);
+    guard.invalidate();
+    Ok(ManagementResult::QuarantineUndone {
+        model: MutationVersion {
+            model_id: snapshot.model_id.clone(),
+            metadata_version: snapshot.metadata_version.saturating_add(1),
+        },
+    })
+}
+
+fn execute_move_source(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    execution: MoveExecution<'_>,
+) -> Result<ManagementResult, RuntimeError> {
+    let MoveExecution {
+        target,
+        snapshot,
+        destination_handle_id,
+        file_name,
+        expected_epoch,
+        expected_revision,
+    } = execution;
+    runtime.require(context, Capability::CatalogWrite)?;
+    runtime.require(context, Capability::PhysicalSourceWrite)?;
+    if target.model_id != snapshot.model_id || target.expected_version != snapshot.metadata_version
+    {
+        return Err(stale("Move plan target changed"));
+    }
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime owner is unavailable"))?;
+    let mut guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let db = LibraryDb::open(guard.root()).map_err(runtime_library_error)?;
+    let source_path = revalidate_active_source(&db, runtime, context, target, snapshot)?;
+    validate_output_name(file_name)?;
+    let destination_root =
+        runtime.admitted_root_path(context, destination_handle_id, RootAccess::Writable)?;
+    if destination_root.canonicalize().map_err(|_| io_error())? != destination_root {
+        return Err(stale("Move destination root identity changed"));
+    }
+    let destination_catalog_root_id = runtime
+        .roots
+        .iter()
+        .find(|root| root.handle.id == destination_handle_id)
+        .and_then(|root| root.catalog_root_id.as_deref())
+        .ok_or_else(|| invalid("Move destination is not a catalog root"))?;
+    let destination_catalog_root = db
+        .list_index_roots()
+        .map_err(runtime_library_error)?
+        .into_iter()
+        .find(|root| root.id == destination_catalog_root_id && root.path == destination_root)
+        .ok_or_else(|| stale("Move destination catalog mapping changed"))?;
+    let destination_relative = PathBuf::from(file_name);
+    let destination = validate_relative_target(&destination_root, &destination_relative, false)?;
+    if destination == source_path {
+        return Err(invalid("Move source and destination are identical"));
+    }
+    let expected = (snapshot.bytes, snapshot.sha256.clone());
+    copy_verified_source_file(&source_path, &destination, &expected)?;
+    let staged = match stage_source_path(&source_path) {
+        Ok(path) => path,
+        Err(error) => {
+            remove_file_if_verified(&destination, &expected);
+            return Err(error);
+        }
+    };
+    if fs::rename(&source_path, &staged).is_err() {
+        remove_file_if_verified(&destination, &expected);
+        return Err(io_error());
+    }
+    if sync_parent_directory(&source_path).is_err() {
+        if restore_staged_source(&staged, &source_path).is_err() {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Move staging could not be synced or restored".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        remove_file_if_verified(&destination, &expected);
+        return Err(io_error());
+    }
+    let staged_hash = hash_management_file(&staged, library_core::MAX_INDEXED_FILE_BYTES);
+    if !matches!(staged_hash, Ok((bytes, hash)) if bytes == expected.0 && hash == expected.1) {
+        if restore_staged_source(&staged, &source_path).is_err() {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Changed source bytes remain in a guarded recovery stage".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        remove_file_if_verified(&destination, &expected);
+        return Err(stale("Indexed source changed during move"));
+    }
+    if !hash_management_file(&destination, library_core::MAX_INDEXED_FILE_BYTES)
+        .is_ok_and(|fingerprint| fingerprint == expected)
+    {
+        if restore_staged_source(&staged, &source_path).is_err() {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Changed destination left the original in a guarded recovery stage".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        remove_file_if_verified(&destination, &expected);
+        return Err(stale("Move destination changed during execution"));
+    }
+    let moved = db.move_loose_indexed_model(
+        &target.model_id,
+        target.expected_version,
+        &destination_catalog_root.id,
+        &destination_relative,
+        file_modified_seconds(&destination),
+    );
+    let moved = match moved {
+        Ok(model) => model,
+        Err(error) => {
+            if restore_staged_source(&staged, &source_path).is_err() {
+                guard.remain_armed();
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Move failed and the original remains in a guarded recovery stage"
+                        .into(),
+                    retryable: false,
+                    current_version: None,
+                });
+            }
+            remove_file_if_verified(&destination, &expected);
+            return Err(runtime_library_error(error));
+        }
+    };
+    if !hash_management_file(&destination, library_core::MAX_INDEXED_FILE_BYTES)
+        .is_ok_and(|fingerprint| fingerprint == expected)
+    {
+        let restored = restore_staged_source(&staged, &source_path).is_ok();
+        let rolled_back = restored
+            && db
+                .move_loose_indexed_model(
+                    &target.model_id,
+                    moved.metadata_version,
+                    &snapshot.catalog_root_id,
+                    &snapshot.relative_path,
+                    file_modified_seconds(&source_path),
+                )
+                .is_ok();
+        if !rolled_back {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Move verification failed and the catalog rollback did not complete"
+                    .into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        remove_file_if_verified(&destination, &expected);
+        return Err(stale("Move destination changed before catalog handoff"));
+    }
+    if fs::remove_file(&staged).is_err() {
+        let restored = restore_staged_source(&staged, &source_path).is_ok();
+        let rolled_back = restored
+            && db
+                .move_loose_indexed_model(
+                    &target.model_id,
+                    moved.metadata_version,
+                    &snapshot.catalog_root_id,
+                    &snapshot.relative_path,
+                    file_modified_seconds(&source_path),
+                )
+                .is_ok();
+        if !rolled_back {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Move cleanup failed and the catalog rollback did not complete".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        remove_file_if_verified(&destination, &expected);
+        return Err(io_error());
+    }
+    drop(db);
+    guard.invalidate();
+    Ok(ManagementResult::Moved {
+        model: mutation_version(moved),
+    })
+}
+
+fn revalidate_active_source(
+    db: &LibraryDb,
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    target: &VersionedTarget,
+    snapshot: &PhysicalSourceSnapshot,
+) -> Result<PathBuf, RuntimeError> {
+    let model = db
+        .get_model(&target.model_id)
+        .map_err(runtime_library_error)?
+        .ok_or_else(|| stale("Model was removed before source mutation"))?;
+    if model.metadata_version != target.expected_version
+        || model.metadata_version != snapshot.metadata_version
+        || model.source_root_id.as_deref() != Some(snapshot.catalog_root_id.as_str())
+        || model_relative_source_path(&model, &snapshot.root_path)? != snapshot.relative_path
+        || model.content_hash.as_deref() != Some(snapshot.sha256.as_str())
+        || model.bytes != snapshot.bytes
+        || model.source_kind != "indexed"
+        || model.source_archive_member.is_some()
+    {
+        return Err(stale("Indexed source catalog identity changed"));
+    }
+    let source = db
+        .resolve_model_source_ref(&target.model_id)
+        .map_err(runtime_library_error)?;
+    let root_path =
+        runtime.admitted_root_path(context, &snapshot.root_handle_id, RootAccess::Writable)?;
+    if root_path != snapshot.root_path
+        || source.outer_path != snapshot.root_path.join(&snapshot.relative_path)
+        || source.archive_member.is_some()
+    {
+        return Err(stale("Indexed source root mapping changed"));
+    }
+    verify_source_snapshot_file(snapshot)
+}
+
+fn revalidate_removed_destination(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    model: &Model,
+    snapshot: &PhysicalSourceSnapshot,
+) -> Result<PathBuf, RuntimeError> {
+    if model.source_root_id.as_deref() != Some(snapshot.catalog_root_id.as_str())
+        || model_relative_source_path(model, &snapshot.root_path)? != snapshot.relative_path
+        || model.content_hash.as_deref() != Some(snapshot.sha256.as_str())
+        || model.bytes != snapshot.bytes
+    {
+        return Err(stale("Quarantine source identity changed"));
+    }
+    let root_path =
+        runtime.admitted_root_path(context, &snapshot.root_handle_id, RootAccess::Writable)?;
+    if root_path != snapshot.root_path {
+        return Err(stale("Quarantine root mapping changed"));
+    }
+    validate_relative_target(&snapshot.root_path, &snapshot.relative_path, false)
+}
+
+fn remove_file_if_verified(path: &Path, expected: &(u64, String)) {
+    if hash_management_file(path, library_core::MAX_INDEXED_FILE_BYTES)
+        .is_ok_and(|fingerprint| fingerprint == *expected)
+    {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn execute_backup(
@@ -6250,6 +7208,277 @@ mod tests {
             .read_db(|db| db.get_model(&model.id))
             .unwrap()
             .is_some());
+    }
+
+    #[cfg(unix)]
+    fn writable_source_fixture(
+        temp: &Path,
+    ) -> (
+        Arc<LibraryRuntime>,
+        RequestContext,
+        library_core::Model,
+        PathBuf,
+        String,
+    ) {
+        let source_root = temp.join("models");
+        let destination_root = temp.join("destination");
+        fs::create_dir(&source_root).unwrap();
+        fs::create_dir(&destination_root).unwrap();
+        let source = source_root.join("part.stl");
+        let bytes = triangle_stl(0.0);
+        fs::write(&source, &bytes).unwrap();
+
+        let capabilities = BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::CatalogWrite,
+            Capability::Scan,
+            Capability::PhysicalSourceWrite,
+        ]);
+        let mut runtime_config = config(temp.join("library"));
+        runtime_config.local_catalog_root_access = false;
+        runtime_config.roots = vec![
+            RuntimeRootPolicy {
+                id: "models".into(),
+                catalog_root_id: None,
+                label: "Models".into(),
+                path: source_root,
+                access: RootAccess::Writable,
+            },
+            RuntimeRootPolicy {
+                id: "destination".into(),
+                catalog_root_id: None,
+                label: "Destination".into(),
+                path: destination_root,
+                access: RootAccess::Writable,
+            },
+        ];
+        runtime_config.capabilities = capabilities.clone();
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        let context = RequestContext {
+            principal_id: "source-manager".into(),
+            capabilities,
+            request_id: "physical-source-test".into(),
+        };
+        let source_catalog_id = runtime
+            .root_handles(&context)
+            .unwrap()
+            .into_iter()
+            .find(|root| root.label == "Models")
+            .unwrap()
+            .catalog_root_id
+            .unwrap();
+        let source_catalog = runtime
+            .read_db(|db| {
+                db.list_index_roots().map(|roots| {
+                    roots
+                        .into_iter()
+                        .find(|root| root.id == source_catalog_id)
+                        .unwrap()
+                })
+            })
+            .unwrap();
+        scanner::scan_root(&runtime, &source_catalog).unwrap();
+        let model = runtime
+            .read_db(|db| {
+                db.list_models(None, None)
+                    .map(|mut models| models.remove(0))
+            })
+            .unwrap();
+        let destination_handle_id = runtime
+            .root_handles(&context)
+            .unwrap()
+            .into_iter()
+            .find(|root| root.label == "Destination")
+            .unwrap()
+            .id;
+        (runtime, context, model, source, destination_handle_id)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_quarantine_and_undo_use_one_use_versioned_plans() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, context, model, source, _) = writable_source_fixture(temp.path());
+        let original = fs::read(&source).unwrap();
+        let mut unprivileged = context.clone();
+        unprivileged
+            .capabilities
+            .remove(&Capability::PhysicalSourceWrite);
+        assert_eq!(
+            runtime
+                .plan_action(
+                    &unprivileged,
+                    ManagementAction::QuarantineLooseSource {
+                        target: VersionedTarget {
+                            model_id: model.id.clone(),
+                            expected_version: model.metadata_version,
+                        },
+                    },
+                )
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::QuarantineLooseSource {
+                    target: VersionedTarget {
+                        model_id: model.id.clone(),
+                        expected_version: model.metadata_version,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.action_kind, "quarantineLooseSource");
+        assert!(!serde_json::to_string(&plan)
+            .unwrap()
+            .contains(temp.path().to_string_lossy().as_ref()));
+
+        let snapshot_id = match runtime.execute_action(&context, &plan.token).unwrap() {
+            ManagementResult::Quarantined {
+                snapshot_id,
+                model_id,
+            } => {
+                assert_eq!(model_id, model.id);
+                snapshot_id
+            }
+            other => panic!("unexpected quarantine result: {other:?}"),
+        };
+        assert!(!source.exists());
+        assert_eq!(
+            runtime
+                .execute_action(&context, &plan.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+
+        let undo = runtime
+            .plan_action(
+                &context,
+                ManagementAction::UndoQuarantine {
+                    snapshot_id: snapshot_id.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(undo.action_kind, "undoQuarantine");
+        assert!(matches!(
+            runtime.execute_action(&context, &undo.token).unwrap(),
+            ManagementResult::QuarantineUndone { .. }
+        ));
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(runtime
+            .read_db(|db| db.get_model(&model.id))
+            .unwrap()
+            .is_some());
+        assert!(!runtime
+            .root
+            .join("trash")
+            .join(format!("source-{snapshot_id}"))
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_quarantine_rejects_changed_bytes_and_leaves_replacement_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, context, model, source, _) = writable_source_fixture(temp.path());
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::QuarantineLooseSource {
+                    target: VersionedTarget {
+                        model_id: model.id.clone(),
+                        expected_version: model.metadata_version,
+                    },
+                },
+            )
+            .unwrap();
+        let replacement = b"changed after planning";
+        fs::write(&source, replacement).unwrap();
+        assert_eq!(
+            runtime
+                .execute_action(&context, &plan.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        assert_eq!(fs::read(&source).unwrap(), replacement);
+        assert!(runtime
+            .read_db(|db| db.get_model(&model.id))
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_move_is_root_scoped_and_never_overwrites_a_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, context, model, source, destination_handle_id) =
+            writable_source_fixture(temp.path());
+        let original = fs::read(&source).unwrap();
+        let destination_root = temp.path().join("destination");
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::MoveLooseSource {
+                    target: VersionedTarget {
+                        model_id: model.id.clone(),
+                        expected_version: model.metadata_version,
+                    },
+                    destination_handle_id: destination_handle_id.clone(),
+                    file_name: "moved.stl".into(),
+                },
+            )
+            .unwrap();
+        let destination = destination_root.join("moved.stl");
+        fs::write(&destination, b"preserve existing file").unwrap();
+        assert!(runtime.execute_action(&context, &plan.token).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"preserve existing file");
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        fs::remove_file(&destination).unwrap();
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::MoveLooseSource {
+                    target: VersionedTarget {
+                        model_id: model.id.clone(),
+                        expected_version: model.metadata_version,
+                    },
+                    destination_handle_id,
+                    file_name: "moved.stl".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.execute_action(&context, &plan.token).unwrap(),
+            ManagementResult::Moved {
+                model: MutationVersion {
+                    model_id: model.id.clone(),
+                    metadata_version: model.metadata_version + 1,
+                }
+            }
+        );
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        assert_eq!(
+            runtime
+                .read_db(|db| db.get_model(&model.id))
+                .unwrap()
+                .unwrap()
+                .source_path
+                .as_deref(),
+            Some(
+                destination
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
     }
 
     #[test]

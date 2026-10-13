@@ -1888,6 +1888,59 @@ impl<
                     },
                 )?));
             }
+            "trash_file" => {
+                let target = VersionedTarget {
+                    model_id: arguments
+                        .get("modelId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned(),
+                    expected_version: tool_version(&arguments)?,
+                };
+                return encoded!(WireActionPlan::from(self.plan_management_action(
+                    context,
+                    ManagementAction::QuarantineLooseSource { target },
+                )?));
+            }
+            "undo_trash" => {
+                let snapshot_id = arguments
+                    .get("snapshotId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                return encoded!(WireActionPlan::from(self.plan_management_action(
+                    context,
+                    ManagementAction::UndoQuarantine { snapshot_id },
+                )?));
+            }
+            "move_files" => {
+                let target = VersionedTarget {
+                    model_id: arguments
+                        .get("modelId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned(),
+                    expected_version: tool_version(&arguments)?,
+                };
+                let destination_handle_id = arguments
+                    .get("destinationHandleId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                let file_name = arguments
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                return encoded!(WireActionPlan::from(self.plan_management_action(
+                    context,
+                    ManagementAction::MoveLooseSource {
+                        target,
+                        destination_handle_id,
+                        file_name,
+                    },
+                )?));
+            }
             "backup_database" => {
                 let action = ManagementAction::CreateBackup {
                     destination_handle_id: arguments
@@ -2538,6 +2591,9 @@ impl<
                 | "retry_capture"
                 | "list_slicers"
                 | "open_in_slicer"
+                | "trash_file"
+                | "undo_trash"
+                | "move_files"
         );
         if name == "list_slicers" {
             return connected
@@ -2553,6 +2609,26 @@ impl<
                 && context.capabilities.contains(&Capability::CatalogRead)
                 && context.capabilities.contains(&Capability::MediaRead)
                 && context.capabilities.contains(&Capability::HostSlicer);
+        }
+        if matches!(name, "trash_file" | "undo_trash" | "move_files") {
+            if !cfg!(unix)
+                || !connected
+                || !context.capabilities.contains(&Capability::CatalogWrite)
+                || !context
+                    .capabilities
+                    .contains(&Capability::PhysicalSourceWrite)
+            {
+                return false;
+            }
+            let Ok(info) = self.inner.runtime_info(context) else {
+                return false;
+            };
+            return info.capabilities.contains(&Capability::CatalogWrite)
+                && info.capabilities.contains(&Capability::PhysicalSourceWrite)
+                && info
+                    .roots
+                    .iter()
+                    .any(|root| root.access == library_protocol::RootAccess::Writable);
         }
         let write = matches!(
             name,
@@ -3141,6 +3217,21 @@ fn invalid_tool() -> EngineError {
         current_version: None,
     }
 }
+
+fn safe_leaf_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && !matches!(value, "." | "..")
+        && !value.ends_with([' ', '.'])
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '"' | '<' | '>' | '|' | '?' | '*'
+                )
+        })
+}
+
 fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
     let object = value.as_object().ok_or_else(invalid_tool)?;
     let (allowed, required): (&[&str], &[&str]) = match name {
@@ -3193,6 +3284,27 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         "remove_model" => (
             &["modelId", "expectedVersion", "confirm"],
             &["modelId", "expectedVersion", "confirm"],
+        ),
+        "trash_file" => (
+            &["modelId", "expectedVersion", "confirm"],
+            &["modelId", "expectedVersion", "confirm"],
+        ),
+        "undo_trash" => (&["snapshotId", "confirm"], &["snapshotId", "confirm"]),
+        "move_files" => (
+            &[
+                "modelId",
+                "expectedVersion",
+                "destinationHandleId",
+                "fileName",
+                "confirm",
+            ],
+            &[
+                "modelId",
+                "expectedVersion",
+                "destinationHandleId",
+                "fileName",
+                "confirm",
+            ],
         ),
         "backup_database" => (
             &["destinationHandleId", "fileName"],
@@ -3353,11 +3465,52 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 && string_field_valid("expectedVersion")
                 && object.get("confirm").is_some_and(Value::is_boolean)
         }
+        "trash_file" => {
+            object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                && string_field_valid("expectedVersion")
+                && object.get("confirm").and_then(Value::as_bool) == Some(true)
+        }
+        "undo_trash" => {
+            object
+                .get("snapshotId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                && object.get("confirm").and_then(Value::as_bool) == Some(true)
+        }
+        "move_files" => {
+            object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                && string_field_valid("expectedVersion")
+                && object.get("confirm").and_then(Value::as_bool) == Some(true)
+                && object
+                    .get("destinationHandleId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                && object
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .is_some_and(safe_leaf_filename)
+        }
         "backup_database" => {
             string_field_valid("destinationHandleId") && string_field_valid("fileName")
         }
         "export_library" => string_field_valid("destPath"),
-        "plan_management_action" => object.get("action").is_some_and(Value::is_object),
+        "plan_management_action" => {
+            object
+                .get("action")
+                .and_then(Value::as_object)
+                .is_some_and(|action| {
+                    !matches!(
+                        action.get("kind").and_then(Value::as_str),
+                        Some("quarantineLooseSource" | "undoQuarantine" | "moveLooseSource")
+                    )
+                })
+        }
         "execute_management_action" => string_field_valid("token"),
         "update_index_root_settings" => {
             string_field_valid("handleId") && object.get("settings").is_some_and(Value::is_object)
@@ -5859,6 +6012,9 @@ pub fn tool_definitions() -> Vec<Value> {
                 "delete_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","name"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"name":{"type":"string","minLength":1,"maxLength":200}}}),
                 "add_model_tags"|"remove_model_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","tags"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"tags":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"string","minLength":1,"maxLength":256}}}}),
                 "remove_model" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"confirm":{"const":true}}}),
+                "trash_file" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"confirm":{"const":true}}}),
+                "undo_trash" => serde_json::json!({"type":"object","additionalProperties":false,"required":["snapshotId","confirm"],"properties":{"snapshotId":{"type":"string","minLength":1,"maxLength":128},"confirm":{"const":true}}}),
+                "move_files" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","destinationHandleId","fileName","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200,"pattern":"^[^/\\\\\\\\:*?\"<>|]+$"},"confirm":{"const":true}}}),
                 "backup_database" => serde_json::json!({"type":"object","additionalProperties":false,"required":["destinationHandleId","fileName"],"properties":{"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200}}}),
                 "export_library" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"destPath":{"type":"string","maxLength":1024}}}),
                 "integration_delete_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128}}}),
@@ -5925,7 +6081,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "list_slicers" => serde_json::json!({"type":"object","additionalProperties":false}),
                 "open_in_slicer" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","slicerId"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"},"slicerId":{"type":"string","minLength":1,"maxLength":128}}}),
                 "delete_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
-                "trash_file"|"undo_trash"|"move_files"|"restore_library" => serde_json::json!({
+                "restore_library" => serde_json::json!({
                     "type":"object",
                     "properties":{"confirmationToken":{"type":"string","minLength":43,"maxLength":256}},
                     "required":["confirmationToken"]
@@ -5938,6 +6094,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
                     "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
                     "open_in_slicer" => "Open a catalog model in a supported slicer on this authenticated desktop host. Provide modelId, expectedVersion, and slicerId; client filesystem paths are not accepted.".to_owned(),
+                    "trash_file" => "Plan moving the verified source file into the application trash. Provide modelId, expectedVersion, and confirm:true; then execute the returned one-use token with execute_management_action. Client filesystem paths are not accepted.".to_owned(),
+                    "undo_trash" => "Plan restoring a previously quarantined source file. Provide snapshotId and confirm:true; then execute the returned one-use token with execute_management_action.".to_owned(),
+                    "move_files" => "Plan moving a verified source file to an admitted writable root. Provide modelId, expectedVersion, destinationHandleId, a safe leaf fileName, and confirm:true; then execute the returned one-use token with execute_management_action. Client source paths are not accepted.".to_owned(),
                     _ => format!("GoggleLab {} operation", name.replace('_', " ")),
                 },
                 "inputSchema": input_schema
