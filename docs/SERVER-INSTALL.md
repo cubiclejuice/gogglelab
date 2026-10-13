@@ -51,6 +51,14 @@ To enable consistent backups and selected exports over the browser/MCP API, crea
 
 The backup directory must already exist and be writable by the service account. Mount it as a separate writable volume for Docker/NAS. Before acquiring the catalog lock or opening the database, runtime admission resolves canonical paths and rejects a `backupOnly` root that contains or is contained by the library root or any other admitted root, so recursive scans cannot enter the backup destination. Parent segments such as `..` are resolved, and a not-yet-created library path is checked before files are created. The `backupOnly` handle supports new backup/export files and can be read as a restore source; it cannot be used for trash, moves, purge, indexing or model-source writes. Restoring mapped model roots still requires the separate writable-root capability. Backup/export operations use one-use plans and refuse to overwrite existing filenames.
 
+### Optional source Trash and moves
+
+Source-file MCP actions are off by default. To enable them on a Unix host, configure only the selected model root as `writable`, mount that same directory read-write, and explicitly add `physicalSourceWrite` to the server capabilities. Keep `backupOnly` roots separate; they never grant source-write access. The default Docker config remains read-only.
+
+The authenticated MCP tools operate on one loose indexed model at a time. `trash_file` and `move_files` require `modelId`, `expectedVersion`, and `confirm: true`; `move_files` also requires an admitted writable destination handle and a safe leaf filename. `undo_trash` uses the returned snapshot ID. Each planning call returns an expiring, principal-bound, one-use action token; execute it separately with `execute_management_action`. The tools accept no client source paths, reject ZIP members and stale hashes/versions, and do not overwrite a destination. Trash first writes and syncs a verified recovery copy under the library's `trash` directory. The original source is removed only after the recovery copy and source hash checks succeed.
+
+These MCP source-write tools are not advertised on Windows yet because durable directory synchronization is not implemented there. Unix filesystem path operations also retain a narrow race against another local process that can concurrently replace directories inside the same writable root; use roots whose write access is controlled by the server operator.
+
 Start with an absolute config path:
 
 ```sh
