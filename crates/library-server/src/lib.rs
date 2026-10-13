@@ -176,6 +176,26 @@ pub struct HostCapabilities {
     pub limits: LimitSet,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSlicerSummary {
+    pub id: String,
+    pub display_name: String,
+}
+
+pub trait HostSlicerAdapter: Send + Sync {
+    fn list_slicers(&self, context: &RequestContext)
+        -> Result<Vec<HostSlicerSummary>, EngineError>;
+
+    fn open_in_slicer(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        slicer_id: &str,
+    ) -> Result<(), EngineError>;
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum HostMode {
@@ -1313,6 +1333,7 @@ pub struct ProtocolEngineAdapter<
 > {
     inner: Arc<E>,
     host_mode: HostMode,
+    host_slicer: Option<Arc<dyn HostSlicerAdapter>>,
 }
 
 impl<
@@ -1334,7 +1355,16 @@ impl<
     > ProtocolEngineAdapter<E>
 {
     pub fn new(inner: Arc<E>, host_mode: HostMode) -> Self {
-        Self { inner, host_mode }
+        Self {
+            inner,
+            host_mode,
+            host_slicer: None,
+        }
+    }
+
+    pub fn with_host_slicer(mut self, host_slicer: Arc<dyn HostSlicerAdapter>) -> Self {
+        self.host_slicer = Some(host_slicer);
+        self
     }
 }
 
@@ -1371,7 +1401,10 @@ impl<
             features: FeatureSet {
                 reveal_source: false,
                 trash_source: false,
-                launch_slicer: false,
+                launch_slicer: self.host_mode == HostMode::Desktop
+                    && self.host_slicer.is_some()
+                    && info.capabilities.contains(&Capability::HostSlicer)
+                    && info.capabilities.contains(&Capability::MediaRead),
                 download_source: info.capabilities.contains(&Capability::MediaRead),
                 download_bundle: info.capabilities.contains(&Capability::MediaRead),
                 ai: integrations_enabled,
@@ -1600,6 +1633,36 @@ impl<
         }
         validate_tool_shape(name, &arguments)?;
         match name {
+            "list_slicers" => {
+                if !self.supports_tool(context, name) {
+                    return Err(host_slicer_unavailable());
+                }
+                let slicers = self
+                    .host_slicer
+                    .as_ref()
+                    .ok_or_else(host_slicer_unavailable)?
+                    .list_slicers(context)?;
+                return encoded!(slicers);
+            }
+            "open_in_slicer" => {
+                if !self.supports_tool(context, name) {
+                    return Err(host_slicer_unavailable());
+                }
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let expected_version = tool_version(&arguments)?;
+                let slicer_id = arguments
+                    .get("slicerId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.host_slicer
+                    .as_ref()
+                    .ok_or_else(host_slicer_unavailable)?
+                    .open_in_slicer(context, model_id, expected_version, slicer_id)?;
+                return Ok(serde_json::json!({"opened":true}));
+            }
             "integration_get_settings" => return encoded!(self.integration_settings(context)?),
             "integration_save_spoolman_config" => {
                 let config = match arguments.get("config") {
@@ -2473,7 +2536,24 @@ impl<
                 | "apply_embedded_3mf_metadata"
                 | "list_capture_items"
                 | "retry_capture"
+                | "list_slicers"
+                | "open_in_slicer"
         );
+        if name == "list_slicers" {
+            return connected
+                && self.host_mode == HostMode::Desktop
+                && self.host_slicer.is_some()
+                && context.capabilities.contains(&Capability::CatalogRead)
+                && context.capabilities.contains(&Capability::HostSlicer);
+        }
+        if name == "open_in_slicer" {
+            return connected
+                && self.host_mode == HostMode::Desktop
+                && self.host_slicer.is_some()
+                && context.capabilities.contains(&Capability::CatalogRead)
+                && context.capabilities.contains(&Capability::MediaRead)
+                && context.capabilities.contains(&Capability::HostSlicer);
+        }
         let write = matches!(
             name,
             "add_thumbnail"
@@ -3183,6 +3263,11 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             &["modelId", "expectedVersion", "image"],
         ),
         "download_model" => (&["modelId", "expectedHash"], &["modelId"]),
+        "list_slicers" => (&[], &[]),
+        "open_in_slicer" => (
+            &["modelId", "expectedVersion", "slicerId"],
+            &["modelId", "expectedVersion", "slicerId"],
+        ),
         _ => return Ok(()),
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str()))
@@ -3193,6 +3278,22 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
     let string_field_valid = |key: &str| object.get(key).is_none_or(Value::is_string);
     let valid_types = match name {
         "get_model" | "get_all_metadata" => string_field_valid("modelId"),
+        "list_slicers" => true,
+        "open_in_slicer" => {
+            object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                && string_field_valid("expectedVersion")
+                && object
+                    .get("expectedVersion")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.len() <= 20)
+                && object
+                    .get("slicerId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+        }
         "search_models" => {
             string_field_valid("query")
                 && string_field_valid("cursor")
@@ -3304,6 +3405,15 @@ fn internal_tool() -> EngineError {
     EngineError {
         code: "internal",
         message: "Tool response could not be encoded".into(),
+        retryable: false,
+        current_version: None,
+    }
+}
+
+fn host_slicer_unavailable() -> EngineError {
+    EngineError {
+        code: "unsupported",
+        message: "Host slicer integration is unavailable on this server".into(),
         retryable: false,
         current_version: None,
     }
@@ -5812,6 +5922,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "get_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId"]}),
                 "set_default_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
                 "download_model" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
+                "list_slicers" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "open_in_slicer" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","slicerId"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"},"slicerId":{"type":"string","minLength":1,"maxLength":128}}}),
                 "delete_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
                 "trash_file"|"undo_trash"|"move_files"|"restore_library" => serde_json::json!({
                     "type":"object",
@@ -5822,10 +5934,11 @@ pub fn tool_definitions() -> Vec<Value> {
             };
             serde_json::json!({
                 "name": name,
-                "description": if *name == "export_library" {
-                    "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned()
-                } else {
-                    format!("GoggleLab {} operation", name.replace('_', " "))
+                "description": match *name {
+                    "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
+                    "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
+                    "open_in_slicer" => "Open a catalog model in a supported slicer on this authenticated desktop host. Provide modelId, expectedVersion, and slicerId; client filesystem paths are not accepted.".to_owned(),
+                    _ => format!("GoggleLab {} operation", name.replace('_', " ")),
                 },
                 "inputSchema": input_schema
             })

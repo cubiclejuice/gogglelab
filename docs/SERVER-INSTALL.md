@@ -118,6 +118,8 @@ The same authenticated listener exposes `/mcp` using Streamable HTTP protocol `2
 
 The client must initialize, acknowledge initialization, and send the returned session ID plus the negotiated protocol version on subsequent requests. A session ID does not replace authentication. Requests advertise JSON and event-stream acceptance. POST supports JSON-RPC; accepted notifications return 202; DELETE ends a session. Standalone GET SSE and JSON-RPC batch arrays are not supported. `tools/list` advertises only connected, authorized operations. Review destructive actions before consuming their one-use confirmation; model IDs, versions and source hashes prevent applying stale work.
 
+The embedded desktop server also offers `list_slicers` and `open_in_slicer` to authorized principals with host-slicer and media-read capability. These tools return only stable slicer IDs/display names and accept a catalog model ID/version plus slicer ID; they do not accept client filesystem paths. Opening stages a verified copy in app-owned handoff storage and launches a freshly detected supported slicer. The standalone/headless server, including Docker/NAS, has no host slicer adapter and does not advertise these operations; clients can download a model or bundle and open it in their own slicer.
+
 ## Capture extension
 
 Load the `browser-extension/` source directory as an unpacked Manifest V3 extension in an explicitly selected Chrome or Edge profile. It captures supported model pages and completed download metadata into a persistent queue while GoggleLab is closed. It does not automatically fetch model files or authenticate to catalog APIs.

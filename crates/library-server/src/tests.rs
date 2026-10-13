@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
@@ -12,6 +12,36 @@ use tower::ServiceExt;
 use super::*;
 
 struct FakeEngine;
+
+#[derive(Default)]
+struct FakeHostSlicerAdapter {
+    opened: Mutex<Vec<(String, u64, String)>>,
+}
+
+impl HostSlicerAdapter for FakeHostSlicerAdapter {
+    fn list_slicers(&self, _: &RequestContext) -> Result<Vec<HostSlicerSummary>, EngineError> {
+        Ok(vec![HostSlicerSummary {
+            id: "com.bambulab.bambu-studio".into(),
+            display_name: "Bambu Studio".into(),
+        }])
+    }
+
+    fn open_in_slicer(
+        &self,
+        _: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        slicer_id: &str,
+    ) -> Result<(), EngineError> {
+        self.opened.lock().unwrap().push((
+            model_id.to_owned(),
+            expected_version,
+            slicer_id.to_owned(),
+        ));
+        Ok(())
+    }
+}
+
 static SLOW_PRODUCERS: AtomicUsize = AtomicUsize::new(0);
 struct ProducerGuard;
 impl Drop for ProducerGuard {
@@ -3033,4 +3063,244 @@ fn export_library_tool_plans_json_only_inside_backup_root() {
         )
         .is_err());
     assert_eq!(model.display_name, "JSON export model");
+}
+
+#[test]
+fn desktop_slicer_tools_are_capability_gated_and_never_expose_host_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let model = runtime
+        .mutate_db(|db| db.create_model("Slicer handoff", None))
+        .unwrap();
+    let slicers = Arc::new(FakeHostSlicerAdapter::default());
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Desktop)
+        .with_host_slicer(slicers.clone());
+    let context = RequestContext {
+        principal_id: "desktop-user".into(),
+        capabilities: BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::MediaRead,
+            Capability::HostSlicer,
+        ]),
+        request_id: "slicer".into(),
+    };
+    let catalog_reader = RequestContext {
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::MediaRead]),
+        ..context.clone()
+    };
+
+    assert!(!adapter.supports_tool(&catalog_reader, "list_slicers"));
+    assert!(!adapter.supports_tool(&catalog_reader, "open_in_slicer"));
+    assert!(adapter.supports_tool(&context, "list_slicers"));
+    assert!(adapter.supports_tool(&context, "open_in_slicer"));
+    assert!(
+        adapter
+            .capabilities(&context)
+            .unwrap()
+            .features
+            .launch_slicer
+    );
+
+    let slicer_list = adapter
+        .call_tool(&context, "list_slicers", json!({}))
+        .unwrap();
+    assert_eq!(slicer_list[0]["id"], "com.bambulab.bambu-studio");
+    assert_eq!(slicer_list[0]["displayName"], "Bambu Studio");
+    assert!(slicer_list[0].get("appPath").is_none());
+    assert!(slicer_list[0].get("bundleId").is_none());
+
+    let result = adapter
+        .call_tool(
+            &context,
+            "open_in_slicer",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":model.metadata_version.to_string(),
+                "slicerId":"com.bambulab.bambu-studio"
+            }),
+        )
+        .unwrap();
+    assert_eq!(result["opened"], true);
+    assert_eq!(
+        *slicers.opened.lock().unwrap(),
+        vec![(
+            model.id,
+            model.metadata_version,
+            "com.bambulab.bambu-studio".into()
+        )]
+    );
+
+    assert!(validate_tool_shape(
+        "open_in_slicer",
+        &json!({
+            "modelId":"model-1",
+            "expectedVersion":"1",
+            "slicerId":"com.bambulab.bambu-studio",
+            "filePath":"/private/model.stl"
+        })
+    )
+    .is_err());
+    assert!(validate_tool_shape(
+        "open_in_slicer",
+        &json!({
+            "modelId":"model-1",
+            "expectedVersion":"9".repeat(21),
+            "slicerId":"com.bambulab.bambu-studio"
+        })
+    )
+    .is_err());
+    let open_schema = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "open_in_slicer")
+        .unwrap();
+    assert_eq!(open_schema["inputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        open_schema["inputSchema"]["required"],
+        json!(["modelId", "expectedVersion", "slicerId"])
+    );
+
+    let headless =
+        ProtocolEngineAdapter::new(runtime, HostMode::Headless).with_host_slicer(slicers);
+    assert!(!headless.supports_tool(&context, "list_slicers"));
+    assert!(
+        !headless
+            .capabilities(&context)
+            .unwrap()
+            .features
+            .launch_slicer
+    );
+}
+
+#[tokio::test]
+async fn desktop_slicer_tools_are_advertised_and_invokable_over_authenticated_mcp() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let slicers = Arc::new(FakeHostSlicerAdapter::default());
+    let engine = Arc::new(
+        ProtocolEngineAdapter::new(runtime, HostMode::Desktop).with_host_slicer(slicers.clone()),
+    );
+    let mut config = security(8);
+    config.principal_capabilities.insert(Capability::HostSlicer);
+    let app = router(engine, config);
+    let initialized = app
+        .clone()
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":1,"method":"initialize",
+                        "params":{"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let session = initialized.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let headers = |builder: http::request::Builder| {
+        builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-session-id", &session)
+            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+    };
+    let notice = app
+        .clone()
+        .oneshot(
+            headers(request("POST", "/mcp", true))
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(notice.status(), StatusCode::ACCEPTED);
+
+    let tools = app
+        .clone()
+        .oneshot(
+            headers(request("POST", "/mcp", true))
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tool_body: Value =
+        serde_json::from_slice(&to_bytes(tools.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    let names = tool_body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"list_slicers"));
+    assert!(names.contains(&"open_in_slicer"));
+
+    let list = app
+        .clone()
+        .oneshot(
+            headers(request("POST", "/mcp", true))
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":3,"method":"tools/call",
+                        "params":{"name":"list_slicers","arguments":{}}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_body: Value =
+        serde_json::from_slice(&to_bytes(list.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        list_body["result"]["structuredContent"][0]["displayName"],
+        "Bambu Studio"
+    );
+    assert!(list_body["result"]["structuredContent"][0]
+        .get("appPath")
+        .is_none());
+
+    let open = app
+        .oneshot(
+            headers(request("POST", "/mcp", true))
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":4,"method":"tools/call",
+                        "params":{"name":"open_in_slicer","arguments":{
+                            "modelId":"model-1","expectedVersion":"7","slicerId":"com.bambulab.bambu-studio"
+                        }}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let open_body: Value =
+        serde_json::from_slice(&to_bytes(open.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(open_body["result"]["structuredContent"]["opened"], true);
+    assert_eq!(
+        *slicers.opened.lock().unwrap(),
+        vec![("model-1".into(), 7, "com.bambulab.bambu-studio".into())]
+    );
 }

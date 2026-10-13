@@ -1,18 +1,158 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use library_protocol::Capability;
+use library_protocol::{Capability, CatalogEngine, ContentEngine, DownloadEngine, RequestContext};
 use library_server::{
-    AllowedAuthority, AllowedOrigin, HostMode, ProtocolEngineAdapter, SecurityConfig, ServerHandle,
+    AllowedAuthority, AllowedOrigin, EngineError, HostMode, HostSlicerAdapter, HostSlicerSummary,
+    ProtocolEngineAdapter, SecurityConfig, ServerHandle,
 };
 use serde::Serialize;
 use tauri::State;
 use tokio::sync::Mutex;
 
-use crate::extension_api::AppError;
+use crate::extension_api::{AppError, SlicerApp, SourceFormat};
 use crate::library_commands::LibraryState;
+
+type SlicerDetector = dyn Fn() -> Vec<SlicerApp> + Send + Sync;
+type SlicerLauncher = dyn Fn(&SlicerApp, &Path) -> Result<(), AppError> + Send + Sync;
+
+struct DesktopHostSlicerAdapter {
+    runtime: Arc<library_runtime::LibraryRuntime>,
+    detect: Arc<SlicerDetector>,
+    launch: Arc<SlicerLauncher>,
+}
+
+impl DesktopHostSlicerAdapter {
+    fn new(runtime: Arc<library_runtime::LibraryRuntime>) -> Self {
+        Self::with_host_ops(runtime, crate::slicers::detect_slicers, |slicer, path| {
+            crate::handoff::launch_paths(slicer, &[path.to_path_buf()])
+        })
+    }
+
+    fn with_host_ops(
+        runtime: Arc<library_runtime::LibraryRuntime>,
+        detect: impl Fn() -> Vec<SlicerApp> + Send + Sync + 'static,
+        launch: impl Fn(&SlicerApp, &Path) -> Result<(), AppError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            runtime,
+            detect: Arc::new(detect),
+            launch: Arc::new(launch),
+        }
+    }
+}
+
+impl HostSlicerAdapter for DesktopHostSlicerAdapter {
+    fn list_slicers(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Vec<HostSlicerSummary>, EngineError> {
+        if !context.capabilities.contains(&Capability::CatalogRead)
+            || !context.capabilities.contains(&Capability::HostSlicer)
+        {
+            return Err(host_slicer_error(
+                "forbidden",
+                "Host slicer access is not allowed",
+            ));
+        }
+        Ok((self.detect)()
+            .into_iter()
+            .map(|slicer| HostSlicerSummary {
+                id: slicer.id,
+                display_name: slicer.display_name,
+            })
+            .collect())
+    }
+
+    fn open_in_slicer(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        slicer_id: &str,
+    ) -> Result<(), EngineError> {
+        if !context.capabilities.contains(&Capability::CatalogRead)
+            || !context.capabilities.contains(&Capability::MediaRead)
+            || !context.capabilities.contains(&Capability::HostSlicer)
+        {
+            return Err(host_slicer_error(
+                "forbidden",
+                "Host slicer access is not allowed",
+            ));
+        }
+        let model = self
+            .runtime
+            .get_model(context, model_id)
+            .map_err(|_| host_slicer_error("notFound", "Model is not available for handoff"))?;
+        if model.metadata_version != expected_version {
+            return Err(EngineError {
+                code: "conflict",
+                message: "Model metadata changed; refresh the model before opening it".into(),
+                retryable: true,
+                current_version: Some(model.metadata_version),
+            });
+        }
+        let lease = self
+            .runtime
+            .issue_model_download(context, model_id, model.content_hash.as_deref())
+            .map_err(|_| host_slicer_error("conflict", "Model source is unavailable or changed"))?;
+        if lease.bytes > stl_core::limits::MAX_FILE_BYTES {
+            return Err(host_slicer_error(
+                "invalidInput",
+                "Model exceeds the slicer handoff size limit",
+            ));
+        }
+        let capacity = usize::try_from(lease.bytes)
+            .map_err(|_| host_slicer_error("invalidInput", "Model size cannot be represented"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| host_slicer_error("io", "Model could not be staged for slicer handoff"))?;
+        self.runtime
+            .stream_content(context, &lease.id, &mut bytes)
+            .map_err(|_| host_slicer_error("io", "Verified model bytes could not be read"))?;
+        let format = match lease.mime.as_str() {
+            "model/stl" => SourceFormat::Stl,
+            "model/3mf" => SourceFormat::ThreeMf,
+            _ => {
+                return Err(host_slicer_error(
+                    "invalidInput",
+                    "Model format is not supported by slicers",
+                ))
+            }
+        };
+        crate::handoff::checked_bytes_launch(
+            crate::handoff::VerifiedHandoffRequest {
+                bytes: &bytes,
+                file_name: &lease.file_name,
+                expected_digest: &lease.sha256,
+                format,
+                library_root: self.runtime.host_library_root(),
+                slicer_id,
+            },
+            || (self.detect)(),
+            |slicer, path| (self.launch)(slicer, path),
+        )
+        .map(|_| ())
+        .map_err(|_| {
+            host_slicer_error(
+                "io",
+                "Verified model could not be opened in the selected slicer",
+            )
+        })
+    }
+}
+
+fn host_slicer_error(code: &'static str, message: &str) -> EngineError {
+    EngineError {
+        code,
+        message: message.into(),
+        retryable: false,
+        current_version: None,
+    }
+}
 
 const DEFAULT_DESKTOP_SERVER_PORT: u16 = 3745;
 
@@ -96,10 +236,12 @@ async fn start_impl(
     let origin = format!("http://{authority}");
     let bearer_token =
         library_server::load_or_create_bearer_secret(&server.token_path).map_err(server_error)?;
-    let engine = Arc::new(ProtocolEngineAdapter::new(
-        library.runtime().clone(),
-        HostMode::Desktop,
-    ));
+    let engine = Arc::new(
+        ProtocolEngineAdapter::new(Arc::clone(library.runtime()), HostMode::Desktop)
+            .with_host_slicer(Arc::new(DesktopHostSlicerAdapter::new(Arc::clone(
+                library.runtime(),
+            )))),
+    );
     let app = library_server::router_with_static(
         engine,
         SecurityConfig {
@@ -225,6 +367,8 @@ fn server_error(message: impl Into<String>) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex;
 
     #[test]
     fn status_urls_are_loopback_and_never_include_credentials() {
@@ -248,5 +392,78 @@ mod tests {
         assert!(capabilities.contains(&Capability::CatalogRead));
         assert!(capabilities.contains(&Capability::CatalogWrite));
         assert!(!capabilities.contains(&Capability::PhysicalSourceWrite));
+    }
+
+    #[test]
+    fn desktop_host_slicer_uses_a_verified_managed_copy_and_checks_model_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        let settings_path = temp.path().join("integrations.json");
+        let runtime = library_runtime::LibraryRuntime::open(
+            library_runtime::RuntimeConfig::desktop(library_root.clone(), settings_path),
+        )
+        .unwrap();
+        let source = temp.path().join("fixture.stl");
+        let source_bytes = b"solid fixture\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid fixture\n";
+        fs::write(&source, source_bytes).unwrap();
+        let model = runtime
+            .mutate_db(|db| {
+                db.import_file(&source, None, None)
+                    .map(|result| result.model)
+            })
+            .unwrap();
+        let launched = Arc::new(Mutex::new(None));
+        let launch_result = Arc::clone(&launched);
+        let adapter = DesktopHostSlicerAdapter::with_host_ops(
+            Arc::clone(&runtime),
+            || {
+                vec![SlicerApp {
+                    id: "com.bambulab.bambu-studio".into(),
+                    bundle_id: "com.bambulab.bambu-studio".into(),
+                    display_name: "Bambu Studio".into(),
+                    app_path: "/fixture/Bambu Studio.app".into(),
+                }]
+            },
+            move |slicer, path| {
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                *launch_result.lock().unwrap() =
+                    Some((path.to_path_buf(), fs::read(path).unwrap()));
+                Ok(())
+            },
+        );
+        let context = RequestContext {
+            principal_id: "fixture".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::MediaRead,
+                Capability::HostSlicer,
+            ]),
+            request_id: "open-in-slicer".into(),
+        };
+
+        adapter
+            .open_in_slicer(
+                &context,
+                &model.id,
+                model.metadata_version,
+                "com.bambulab.bambu-studio",
+            )
+            .unwrap();
+        let (staged_path, staged_bytes) = launched.lock().unwrap().clone().unwrap();
+        assert_eq!(staged_bytes, source_bytes);
+        assert_ne!(staged_path, source);
+        assert!(staged_path.starts_with(
+            crate::handoff::stable_handoff_root(runtime.host_library_root()).unwrap()
+        ));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+
+        let stale = adapter.open_in_slicer(
+            &context,
+            &model.id,
+            model.metadata_version + 1,
+            "com.bambulab.bambu-studio",
+        );
+        assert!(stale.is_err());
+        assert_eq!(launched.lock().unwrap().as_ref().unwrap().0, staged_path);
     }
 }

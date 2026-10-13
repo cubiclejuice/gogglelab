@@ -99,6 +99,30 @@ fn copy_loaded_source(
             message: "Loaded source changed after it was opened".into(),
         });
     }
+    stage_handoff_bytes(
+        &bytes,
+        &handoff_filename(source),
+        expected_digest,
+        library_root,
+    )
+    .map(|(directory, _)| directory)
+}
+
+fn stage_handoff_bytes(
+    bytes: &[u8],
+    file_name: &str,
+    expected_digest: &str,
+    library_root: &Path,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    if bytes.len() as u64 > stl_core::limits::MAX_FILE_BYTES
+        || expected_digest.len() != 64
+        || !expected_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || format!("{:x}", Sha256::digest(bytes)) != expected_digest
+    {
+        return Err(AppError::Library {
+            message: "Handoff source failed size or digest verification".into(),
+        });
+    }
     let root = stable_handoff_root(library_root)?;
     create_real_directory(&root)?;
     for _ in 0..1024 {
@@ -110,7 +134,7 @@ fn copy_loaded_source(
         ));
         match fs::create_dir(&directory) {
             Ok(()) => {
-                let path = directory.join(handoff_filename(source));
+                let path = directory.join(file_name);
                 let result = (|| {
                     let mut output = fs::OpenOptions::new()
                         .write(true)
@@ -118,7 +142,7 @@ fn copy_loaded_source(
                         .open(&path)
                         .map_err(|error| crate::error::map_io_error(&error))?;
                     output
-                        .write_all(&bytes)
+                        .write_all(bytes)
                         .map_err(|error| crate::error::map_io_error(&error))?;
                     output
                         .sync_all()
@@ -129,7 +153,7 @@ fn copy_loaded_source(
                     let _ = fs::remove_dir_all(&directory);
                     return Err(error);
                 }
-                return Ok(directory);
+                return Ok((directory, path));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(crate::error::map_io_error(&error)),
@@ -138,6 +162,52 @@ fn copy_loaded_source(
     Err(AppError::Library {
         message: "Could not allocate stable handoff storage".into(),
     })
+}
+
+pub(crate) struct VerifiedHandoffRequest<'a> {
+    pub bytes: &'a [u8],
+    pub file_name: &'a str,
+    pub expected_digest: &'a str,
+    pub format: SourceFormat,
+    pub library_root: &'a Path,
+    pub slicer_id: &'a str,
+}
+
+pub(crate) fn checked_bytes_launch(
+    request: VerifiedHandoffRequest<'_>,
+    detect: impl FnOnce() -> Vec<SlicerApp>,
+    launch: impl FnOnce(&SlicerApp, &Path) -> Result<(), AppError>,
+) -> Result<PathBuf, AppError> {
+    let VerifiedHandoffRequest {
+        bytes,
+        file_name,
+        expected_digest,
+        format,
+        library_root,
+        slicer_id,
+    } = request;
+    let installed = detect();
+    if supported_slicer(slicer_id, &installed).is_none() {
+        return Err(AppError::UnknownSlicer);
+    }
+    let name = handoff_filename(&OriginalSource {
+        path: PathBuf::from(file_name),
+        format,
+    });
+    let (directory, path) = stage_handoff_bytes(bytes, &name, expected_digest, library_root)?;
+    let result = checked_source_launch(
+        &OriginalSource {
+            path: path.clone(),
+            format,
+        },
+        slicer_id,
+        &installed,
+        launch,
+    );
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result.map(|_| path)
 }
 
 fn handoff_filename(source: &OriginalSource) -> String {
@@ -308,8 +378,9 @@ fn executable_arguments(source_paths: &[PathBuf]) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_owned_source_launch, checked_paths_launch, checked_source_launch, launch_arguments,
-        stable_handoff_root, supported_slicer, HANDOFF_SEQUENCE,
+        checked_bytes_launch, checked_owned_source_launch, checked_paths_launch,
+        checked_source_launch, launch_arguments, stable_handoff_root, supported_slicer,
+        VerifiedHandoffRequest, HANDOFF_SEQUENCE,
     };
     use crate::extension_api::{AppError, OriginalSource, SlicerApp, SourceFormat};
     use sha2::{Digest, Sha256};
@@ -324,6 +395,87 @@ mod tests {
             display_name: "Bambu Studio".into(),
             app_path: "/Applications/Bambu Studio.app".into(),
         }
+    }
+
+    #[test]
+    fn catalog_handoff_stages_verified_bytes_under_a_safe_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let bytes = b"verified catalog model bytes";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let mut launched_path = None;
+
+        let path = checked_bytes_launch(
+            VerifiedHandoffRequest {
+                bytes,
+                file_name: "Part;$(touch marker).3mf",
+                expected_digest: &digest,
+                format: SourceFormat::ThreeMf,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            || vec![installed_bambu()],
+            |slicer, path| {
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                launched_path = Some(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(launched_path.as_deref(), Some(path.as_path()));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("3mf")
+        );
+        assert!(!path.to_string_lossy().contains('$'));
+        assert!(!path.to_string_lossy().contains(';'));
+        assert!(!path.to_string_lossy().contains('('));
+        assert!(!path.to_string_lossy().contains(')'));
+    }
+
+    #[test]
+    fn catalog_handoff_rejects_unknown_slicers_and_bad_hashes_before_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let bytes = b"verified catalog model bytes";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+
+        assert!(matches!(
+            checked_bytes_launch(
+                VerifiedHandoffRequest {
+                    bytes,
+                    file_name: "model.stl",
+                    expected_digest: &digest,
+                    format: SourceFormat::Stl,
+                    library_root: &library_root,
+                    slicer_id: "unknown.slicer",
+                },
+                || vec![installed_bambu()],
+                |_, _| panic!("unknown slicer must not launch"),
+            ),
+            Err(AppError::UnknownSlicer)
+        ));
+        assert!(!stable_handoff_root(&library_root).unwrap().exists());
+
+        assert!(checked_bytes_launch(
+            VerifiedHandoffRequest {
+                bytes,
+                file_name: "model.stl",
+                expected_digest: &"0".repeat(64),
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            || vec![installed_bambu()],
+            |_, _| panic!("digest mismatch must not launch"),
+        )
+        .is_err());
+        assert!(!stable_handoff_root(&library_root).unwrap().exists());
     }
 
     #[test]
