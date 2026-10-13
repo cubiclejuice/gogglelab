@@ -256,6 +256,23 @@ impl LibraryDb {
                 "Minimum rating must be between 0 and 5".into(),
             ));
         }
+        if query.exclude_model_ids.len() > 2000 {
+            return Err(LibraryError::InvalidInput(
+                "Thumbnail exclusion list exceeds 2000 model IDs".into(),
+            ));
+        }
+        let mut excluded = HashSet::new();
+        if query
+            .exclude_model_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 128 || !excluded.insert(id.as_str()))
+        {
+            return Err(LibraryError::InvalidInput(
+                "Thumbnail exclusion list contains an invalid or duplicate model ID".into(),
+            ));
+        }
+        let exclude_model_ids = serde_json::to_string(&query.exclude_model_ids)
+            .map_err(|_| LibraryError::InvalidInput("Thumbnail exclusions are invalid".into()))?;
         let search = query
             .search
             .as_deref()
@@ -331,6 +348,9 @@ impl LibraryDb {
                   AND (?20='' OR substr(m.source_path,1,length(?20)+1)=?20||'/')))
              AND (?21 IS NULL OR m.rating>=?21)
              AND (?22 IS NULL OR m.favorite=?22)
+             AND NOT EXISTS (
+                 SELECT 1 FROM json_each(?23) excluded WHERE excluded.value=m.id
+             )
              AND (?16 IS NULL OR {sort_expression}{comparison}{cursor_expression}
                   OR ({sort_expression}={cursor_expression} AND m.id{comparison}?17))
              ORDER BY {sort_expression} {direction},m.id {direction} LIMIT ?18"
@@ -358,7 +378,8 @@ impl LibraryDb {
                 query.thumbnail_mode.as_deref(),
                 query.source_directory.as_deref(),
                 query.minimum_rating.map(i64::from),
-                query.favorite.map(i64::from)
+                query.favorite.map(i64::from),
+                exclude_model_ids
             ],
             model_from_row,
         )?;

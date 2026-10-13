@@ -5297,6 +5297,7 @@ fn core_model_query(query: &ModelQuery) -> CoreModelPageQuery {
         source_directory: query.source_directory.clone(),
         minimum_rating: query.minimum_rating,
         favorite: query.favorite,
+        exclude_model_ids: query.exclude_model_ids.clone(),
         group: query.group.map(|group| match group {
             ModelGroupFilter::Standalone => CoreModelGroupFilter::Standalone,
             ModelGroupFilter::Bundle => CoreModelGroupFilter::Bundle,

@@ -804,6 +804,8 @@ pub struct ModelQuery {
     pub source_directory: Option<String>,
     pub minimum_rating: Option<u8>,
     pub favorite: Option<bool>,
+    #[serde(default)]
+    pub exclude_model_ids: Vec<String>,
 }
 
 impl Default for ModelQuery {
@@ -830,6 +832,7 @@ impl Default for ModelQuery {
             source_directory: None,
             minimum_rating: None,
             favorite: None,
+            exclude_model_ids: Vec::new(),
         }
     }
 }

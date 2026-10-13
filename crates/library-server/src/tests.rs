@@ -3172,6 +3172,60 @@ fn protocol_adapter_adds_and_removes_model_tags_by_name_with_versions() {
         .any(|tag| tag.name == "Stale"));
 }
 
+#[test]
+fn get_models_missing_thumbnails_excludes_render_failures_before_limiting() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let _models = runtime
+        .mutate_db(|db| {
+            Ok(vec![
+                db.create_model("Render failure one", None)?,
+                db.create_model("Render failure two", None)?,
+                db.create_model("Renderable model", None)?,
+            ])
+        })
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let reader = RequestContext {
+        principal_id: "thumbnail-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead]),
+        request_id: "missing-thumbnails-exclude".into(),
+    };
+
+    let unfiltered = adapter
+        .call_tool(
+            &reader,
+            "get_models_missing_thumbnails",
+            json!({"limit":10}),
+        )
+        .unwrap();
+    let ordered_ids = unfiltered["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let expected_id = ordered_ids.last().unwrap().clone();
+    let excluded_ids = ordered_ids[..ordered_ids.len() - 1].to_vec();
+
+    let page = adapter
+        .call_tool(
+            &reader,
+            "get_models_missing_thumbnails",
+            json!({"limit":1,"excludeIds":excluded_ids}),
+        )
+        .unwrap();
+
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], expected_id);
+    assert!(page["nextCursor"].is_null());
+}
+
 #[tokio::test]
 async fn protocol_adapter_set_thumbnail_replaces_while_add_thumbnail_appends() {
     use base64::Engine as _;

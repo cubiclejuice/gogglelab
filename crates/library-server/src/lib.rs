@@ -1804,12 +1804,24 @@ impl<
                 } else {
                     "default"
                 };
+                let exclude_model_ids = if name == "get_models_missing_thumbnails" {
+                    arguments
+                        .get("excludeIds")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|_| invalid_tool())?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 return encoded!(self.list_models(
                     context,
                     arguments.get("cursor").and_then(Value::as_str),
                     limit,
                     ProtocolModelQuery {
                         thumbnail_mode: Some(thumbnail_mode.into()),
+                        exclude_model_ids,
                         ..ProtocolModelQuery::default()
                     }
                 )?);
@@ -3313,6 +3325,21 @@ fn safe_leaf_filename(value: &str) -> bool {
         })
 }
 
+fn valid_excluded_model_ids(value: &Value) -> bool {
+    let Some(ids) = value.as_array() else {
+        return false;
+    };
+    if ids.len() > 2000 {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    ids.iter().all(|id| {
+        id.as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 128)
+            .is_some_and(|id| seen.insert(id.to_owned()))
+    })
+}
+
 fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
     let object = value.as_object().ok_or_else(invalid_tool)?;
     let (allowed, required): (&[&str], &[&str]) = match name {
@@ -3346,9 +3373,8 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         "calculate_missing_hashes" => (&[], &[]),
         "check_files_exist" => (&["modelIds"], &["modelIds"]),
         "start_thumbnail_job" => (&["modelIds", "force"], &["modelIds"]),
-        "get_models_missing_thumbnails" | "get_models_with_default_thumbnails" => {
-            (&["cursor", "limit"], &[])
-        }
+        "get_models_missing_thumbnails" => (&["cursor", "limit", "excludeIds"], &[]),
+        "get_models_with_default_thumbnails" => (&["cursor", "limit"], &[]),
         "get_models_by_directory" => (
             &["rootId", "directory", "cursor", "limit"],
             &["rootId", "directory"],
@@ -3520,7 +3546,14 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             object.get("modelIds").is_some_and(Value::is_array)
                 && object.get("force").is_none_or(Value::is_boolean)
         }
-        "get_models_missing_thumbnails" | "get_models_with_default_thumbnails" => {
+        "get_models_missing_thumbnails" => {
+            string_field_valid("cursor")
+                && object.get("limit").is_none_or(Value::is_u64)
+                && object
+                    .get("excludeIds")
+                    .is_none_or(valid_excluded_model_ids)
+        }
+        "get_models_with_default_thumbnails" => {
             string_field_valid("cursor") && object.get("limit").is_none_or(Value::is_u64)
         }
         "get_models_by_directory" => {
@@ -4585,6 +4618,7 @@ async fn models<E: LibraryEngine>(
         source_directory: query.source_directory,
         minimum_rating: query.minimum_rating,
         favorite: query.favorite,
+        exclude_model_ids: Vec::new(),
     };
     let request = context.clone();
     blocking_engine(state.engine, &context.request_id, move |engine| {
@@ -6226,7 +6260,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "get_hash_status"|"calculate_missing_hashes"|"refresh_hashes" => serde_json::json!({"type":"object","additionalProperties":false}),
                 "check_files_exist" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelIds"],"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128}}}}),
                 "start_thumbnail_job" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelIds"],"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128}},"force":{"type":"boolean"}}}),
-                "get_models_missing_thumbnails"|"get_models_with_default_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
+                "get_models_missing_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100},"excludeIds":{"type":"array","maxItems":2000,"items":{"type":"string","minLength":1,"maxLength":128}}}}),
+                "get_models_with_default_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
                 "get_models_by_directory" => serde_json::json!({"type":"object","additionalProperties":false,"required":["rootId","directory"],"properties":{"rootId":{"type":"string","minLength":1,"maxLength":128},"directory":{"type":"string","maxLength":1024},"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
                 "plan_management_action" => serde_json::json!({
                     "type":"object","additionalProperties":false,"required":["action"],
@@ -6308,6 +6343,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
                     "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
                     "get_thumbnails" => "List thumbnail gallery descriptors for a model. When the caller has MediaRead, each descriptor includes a short-lived authenticated mediaLease for fetching its image bytes.".to_owned(),
+                    "get_models_missing_thumbnails" => "List missing-thumbnail models with keyset pagination. Pass excludeIds for models that repeatedly fail rendering; excluded IDs are filtered before the page limit.".to_owned(),
                     "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
                     "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
                     "open_in_slicer" => "Open a catalog model in a supported slicer on this authenticated desktop host. Provide modelId, expectedVersion, and slicerId; client filesystem paths are not accepted.".to_owned(),
