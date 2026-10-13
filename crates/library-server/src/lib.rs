@@ -5,7 +5,7 @@ mod confirmation;
 mod mcp;
 mod security;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -1872,20 +1872,10 @@ impl<
                 if arguments.get("confirm").and_then(Value::as_bool) != Some(true) {
                     return Err(invalid_tool());
                 }
-                let model_id = arguments
-                    .get("modelId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(invalid_tool)?
-                    .to_owned();
-                let target = VersionedTarget {
-                    model_id,
-                    expected_version: tool_version(&arguments)?,
-                };
+                let targets = versioned_tool_targets(&arguments)?;
                 return encoded!(WireActionPlan::from(self.plan_management_action(
                     context,
-                    ManagementAction::RecoverableRemove {
-                        targets: vec![target],
-                    },
+                    ManagementAction::RecoverableRemove { targets },
                 )?));
             }
             "trash_file" => {
@@ -3289,8 +3279,8 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             &["modelId", "expectedVersion", "tags"],
         ),
         "remove_model" => (
-            &["modelId", "expectedVersion", "confirm"],
-            &["modelId", "expectedVersion", "confirm"],
+            &["targets", "modelId", "expectedVersion", "confirm"],
+            &["confirm"],
         ),
         "trash_file" => (
             &["modelId", "expectedVersion", "confirm"],
@@ -3468,9 +3458,30 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 && object.get("tags").is_some_and(Value::is_array)
         }
         "remove_model" => {
-            string_field_valid("modelId")
-                && string_field_valid("expectedVersion")
-                && object.get("confirm").is_some_and(Value::is_boolean)
+            let target_shape_valid = if let Some(targets) = object.get("targets") {
+                targets.as_array().is_some_and(|targets| {
+                    !targets.is_empty()
+                        && targets.len() <= 50_000
+                        && !object.contains_key("modelId")
+                        && !object.contains_key("expectedVersion")
+                        && targets.iter().all(|target| {
+                            target.as_object().is_some_and(|target| {
+                                target.len() == 2
+                                    && target.get("modelId").and_then(Value::as_str).is_some_and(
+                                        |value| !value.is_empty() && value.len() <= 128,
+                                    )
+                                    && tool_version(&Value::Object(target.clone())).is_ok()
+                            })
+                        })
+                })
+            } else {
+                object
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                    && tool_version(value).is_ok()
+            };
+            target_shape_valid && object.get("confirm").and_then(Value::as_bool) == Some(true)
         }
         "trash_file" => {
             object
@@ -3584,6 +3595,38 @@ fn tool_version(value: &Value) -> Result<u64, EngineError> {
         .and_then(Value::as_str)
         .ok_or_else(invalid_tool)
         .and_then(|value| parse_decimal(value).map_err(|_| invalid_tool()))
+}
+fn versioned_tool_targets(value: &Value) -> Result<Vec<VersionedTarget>, EngineError> {
+    if let Some(targets) = value.get("targets") {
+        let targets = targets.as_array().ok_or_else(invalid_tool)?;
+        let mut seen = BTreeSet::new();
+        targets
+            .iter()
+            .map(|target| {
+                let model_id = target
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                if !seen.insert(model_id.clone()) {
+                    return Err(invalid_tool());
+                }
+                Ok(VersionedTarget {
+                    model_id,
+                    expected_version: tool_version(target)?,
+                })
+            })
+            .collect()
+    } else {
+        Ok(vec![VersionedTarget {
+            model_id: value
+                .get("modelId")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid_tool)?
+                .to_owned(),
+            expected_version: tool_version(value)?,
+        }])
+    }
 }
 fn decode_tool_image(value: &Value) -> Result<Vec<u8>, EngineError> {
     use base64::Engine as _;
@@ -6018,7 +6061,19 @@ pub fn tool_definitions() -> Vec<Value> {
                 "rename_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","oldName","newName"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"oldName":{"type":"string","minLength":1,"maxLength":200},"newName":{"type":"string","minLength":1,"maxLength":200}}}),
                 "delete_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","name"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"name":{"type":"string","minLength":1,"maxLength":200}}}),
                 "add_model_tags"|"remove_model_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","tags"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"tags":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"string","minLength":1,"maxLength":256}}}}),
-                "remove_model" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"confirm":{"const":true}}}),
+                "remove_model" => serde_json::json!({
+                    "type":"object","additionalProperties":false,"required":["confirm"],
+                    "properties":{
+                        "targets":{"type":"array","minItems":1,"maxItems":50000,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                        "confirm":{"const":true}
+                    },
+                    "oneOf":[
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]}]}},
+                        {"required":["modelId","expectedVersion"],"not":{"required":["targets"]}}
+                    ]
+                }),
                 "trash_file" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"confirm":{"const":true}}}),
                 "undo_trash" => serde_json::json!({"type":"object","additionalProperties":false,"required":["snapshotId","confirm"],"properties":{"snapshotId":{"type":"string","minLength":1,"maxLength":128},"confirm":{"const":true}}}),
                 "move_files" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","destinationHandleId","fileName","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200,"pattern":"^[^/\\\\\\\\:*?\"<>|]+$"},"confirm":{"const":true}}}),
@@ -6098,6 +6153,7 @@ pub fn tool_definitions() -> Vec<Value> {
             serde_json::json!({
                 "name": name,
                 "description": match *name {
+                    "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
                     "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
                     "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
                     "open_in_slicer" => "Open a catalog model in a supported slicer on this authenticated desktop host. Provide modelId, expectedVersion, and slicerId; client filesystem paths are not accepted.".to_owned(),

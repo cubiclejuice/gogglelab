@@ -3108,6 +3108,109 @@ fn protocol_adapter_adds_and_removes_model_tags_by_name_with_versions() {
 }
 
 #[test]
+fn protocol_adapter_remove_model_accepts_multiple_versioned_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let (first, second, keep) = runtime
+        .mutate_db(|db| {
+            Ok((
+                db.create_model("Batch remove first", None)?,
+                db.create_model("Batch remove second", None)?,
+                db.create_model("Batch keep", None)?,
+            ))
+        })
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let writer = RequestContext {
+        principal_id: "catalog-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "batch-remove-model".into(),
+    };
+    let targets = json!([
+        {"modelId":first.id,"expectedVersion":first.metadata_version.to_string()},
+        {"modelId":second.id,"expectedVersion":second.metadata_version.to_string()}
+    ]);
+    assert!(adapter
+        .call_tool(
+            &writer,
+            "remove_model",
+            json!({
+                "targets":[
+                    {"modelId":first.id,"expectedVersion":first.metadata_version.to_string()},
+                    {"modelId":first.id,"expectedVersion":first.metadata_version.to_string()}
+                ],
+                "confirm":true
+            }),
+        )
+        .is_err());
+    assert!(adapter
+        .call_tool(
+            &writer,
+            "remove_model",
+            json!({
+                "targets":[
+                    {"modelId":first.id,"expectedVersion":first.metadata_version.to_string()},
+                    {"modelId":second.id,"expectedVersion":(second.metadata_version + 1).to_string()}
+                ],
+                "confirm":true
+            }),
+        )
+        .is_err());
+    assert!(adapter.get_model(&writer, &first.id).is_ok());
+    assert!(adapter.get_model(&writer, &second.id).is_ok());
+
+    let plan = adapter
+        .call_tool(
+            &writer,
+            "remove_model",
+            json!({"targets":targets,"confirm":true}),
+        )
+        .unwrap();
+    assert_eq!(plan["actionKind"], "recoverableRemove");
+    assert_eq!(plan["targets"].as_array().unwrap().len(), 2);
+    let removed = adapter
+        .call_tool(
+            &writer,
+            "execute_management_action",
+            json!({"token":plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(removed["kind"], "removed");
+    assert_eq!(removed["removedIds"].as_array().unwrap().len(), 2);
+
+    let page = adapter
+        .call_tool(&writer, "search_models", json!({"query":"Batch remove"}))
+        .unwrap();
+    assert!(page["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        adapter
+            .call_tool(&writer, "get_model", json!({"modelId":keep.id}))
+            .unwrap()["id"],
+        keep.id
+    );
+    let restore = adapter
+        .call_tool(
+            &writer,
+            "plan_management_action",
+            json!({"action":{"kind":"restoreRemoval","snapshotId":removed["snapshotId"]}}),
+        )
+        .unwrap();
+    let restored = adapter
+        .call_tool(
+            &writer,
+            "execute_management_action",
+            json!({"token":restore["token"]}),
+        )
+        .unwrap();
+    assert_eq!(restored["kind"], "restoredRemoval");
+    assert_eq!(restored["models"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn protocol_adapter_remove_model_is_recoverable_and_requires_a_second_step() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
