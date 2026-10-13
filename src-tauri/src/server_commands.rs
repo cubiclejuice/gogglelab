@@ -3,7 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use library_protocol::{Capability, CatalogEngine, ContentEngine, DownloadEngine, RequestContext};
+use library_protocol::{
+    Capability, CatalogEngine, ContentEngine, DownloadEngine, RequestContext, VersionedTarget,
+};
 use library_server::{
     AllowedAuthority, AllowedOrigin, EngineError, HostMode, HostSlicerAdapter, HostSlicerSummary,
     ProtocolEngineAdapter, SecurityConfig, ServerHandle,
@@ -17,29 +19,61 @@ use crate::library_commands::LibraryState;
 
 type SlicerDetector = dyn Fn() -> Vec<SlicerApp> + Send + Sync;
 type SlicerLauncher = dyn Fn(&SlicerApp, &Path) -> Result<(), AppError> + Send + Sync;
+type SlicerBatchLauncher = dyn Fn(&SlicerApp, &[PathBuf]) -> Result<(), AppError> + Send + Sync;
+
+const MAX_SLICER_BATCH_MODELS: usize = 100;
+const MAX_SLICER_BATCH_BYTES: u64 = 256 * 1024 * 1024;
 
 struct DesktopHostSlicerAdapter {
     runtime: Arc<library_runtime::LibraryRuntime>,
     detect: Arc<SlicerDetector>,
     launch: Arc<SlicerLauncher>,
+    launch_many: Arc<SlicerBatchLauncher>,
 }
 
 impl DesktopHostSlicerAdapter {
     fn new(runtime: Arc<library_runtime::LibraryRuntime>) -> Self {
-        Self::with_host_ops(runtime, crate::slicers::detect_slicers, |slicer, path| {
-            crate::handoff::launch_paths(slicer, &[path.to_path_buf()])
-        })
+        Self::with_host_batch_ops(
+            runtime,
+            crate::slicers::detect_slicers,
+            |slicer, path| crate::handoff::launch_paths(slicer, &[path.to_path_buf()]),
+            crate::handoff::launch_paths,
+        )
     }
 
+    #[cfg(test)]
     fn with_host_ops(
         runtime: Arc<library_runtime::LibraryRuntime>,
         detect: impl Fn() -> Vec<SlicerApp> + Send + Sync + 'static,
         launch: impl Fn(&SlicerApp, &Path) -> Result<(), AppError> + Send + Sync + 'static,
     ) -> Self {
+        let launch: Arc<SlicerLauncher> = Arc::new(launch);
+        let launch_many_single = Arc::clone(&launch);
+        let launch_many: Arc<SlicerBatchLauncher> = Arc::new(move |slicer, paths| {
+            for path in paths {
+                launch_many_single(slicer, path)?;
+            }
+            Ok(())
+        });
+        Self {
+            runtime,
+            detect: Arc::new(detect),
+            launch,
+            launch_many,
+        }
+    }
+
+    fn with_host_batch_ops(
+        runtime: Arc<library_runtime::LibraryRuntime>,
+        detect: impl Fn() -> Vec<SlicerApp> + Send + Sync + 'static,
+        launch: impl Fn(&SlicerApp, &Path) -> Result<(), AppError> + Send + Sync + 'static,
+        launch_many: impl Fn(&SlicerApp, &[PathBuf]) -> Result<(), AppError> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             runtime,
             detect: Arc::new(detect),
             launch: Arc::new(launch),
+            launch_many: Arc::new(launch_many),
         }
     }
 }
@@ -140,6 +174,123 @@ impl HostSlicerAdapter for DesktopHostSlicerAdapter {
             host_slicer_error(
                 "io",
                 "Verified model could not be opened in the selected slicer",
+            )
+        })
+    }
+
+    fn open_in_slicer_batch(
+        &self,
+        context: &RequestContext,
+        targets: &[VersionedTarget],
+        slicer_id: &str,
+    ) -> Result<(), EngineError> {
+        if !context.capabilities.contains(&Capability::CatalogRead)
+            || !context.capabilities.contains(&Capability::MediaRead)
+            || !context.capabilities.contains(&Capability::HostSlicer)
+        {
+            return Err(host_slicer_error(
+                "forbidden",
+                "Host slicer access is not allowed",
+            ));
+        }
+        if targets.is_empty() || targets.len() > MAX_SLICER_BATCH_MODELS {
+            return Err(host_slicer_error(
+                "invalidInput",
+                "Slicer handoff target count is invalid",
+            ));
+        }
+        if !crate::handoff::is_supported_slicer(slicer_id, &(self.detect)()) {
+            return Err(host_slicer_error(
+                "invalidInput",
+                "Selected slicer is not installed or supported",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut total_bytes = 0_u64;
+        let mut prepared: Vec<(library_protocol::ContentLease, SourceFormat)> =
+            Vec::with_capacity(targets.len());
+        for target in targets {
+            if !seen.insert(target.model_id.as_str()) {
+                return Err(host_slicer_error(
+                    "invalidInput",
+                    "Slicer handoff targets must be unique",
+                ));
+            }
+            let model = self
+                .runtime
+                .get_model(context, &target.model_id)
+                .map_err(|_| host_slicer_error("notFound", "Model is not available for handoff"))?;
+            if model.metadata_version != target.expected_version {
+                return Err(EngineError {
+                    code: "conflict",
+                    message: "Model metadata changed; refresh the model before opening it".into(),
+                    retryable: true,
+                    current_version: Some(model.metadata_version),
+                });
+            }
+            let lease = self
+                .runtime
+                .issue_model_download(context, &target.model_id, model.content_hash.as_deref())
+                .map_err(|_| {
+                    host_slicer_error("conflict", "Model source is unavailable or changed")
+                })?;
+            if lease.bytes > stl_core::limits::MAX_FILE_BYTES {
+                return Err(host_slicer_error(
+                    "invalidInput",
+                    "Model exceeds the slicer handoff size limit",
+                ));
+            }
+            total_bytes = total_bytes.checked_add(lease.bytes).ok_or_else(|| {
+                host_slicer_error("invalidInput", "Slicer handoff byte total is out of range")
+            })?;
+            if total_bytes > MAX_SLICER_BATCH_BYTES {
+                return Err(host_slicer_error(
+                    "invalidInput",
+                    "Slicer handoff batch exceeds its byte limit",
+                ));
+            }
+            let format = match lease.mime.as_str() {
+                "model/stl" => SourceFormat::Stl,
+                "model/3mf" => SourceFormat::ThreeMf,
+                _ => {
+                    return Err(host_slicer_error(
+                        "invalidInput",
+                        "Model format is not supported by slicers",
+                    ))
+                }
+            };
+            prepared.push((lease, format));
+        }
+        let requests = prepared
+            .iter()
+            .map(|(lease, format)| crate::handoff::StreamHandoffRequest {
+                content_id: &lease.id,
+                file_name: &lease.file_name,
+                expected_digest: &lease.sha256,
+                expected_bytes: lease.bytes,
+                format: *format,
+                library_root: self.runtime.host_library_root(),
+                slicer_id,
+            })
+            .collect::<Vec<_>>();
+        let launch_many = Arc::clone(&self.launch_many);
+        crate::handoff::checked_stream_batch_launch(
+            &requests,
+            |lease_id, sink| {
+                self.runtime
+                    .stream_content(context, lease_id, sink)
+                    .map_err(|_| AppError::Library {
+                        message: "Verified model bytes could not be read".into(),
+                    })
+            },
+            || (self.detect)(),
+            move |slicer, paths| launch_many(slicer, paths),
+        )
+        .map(|_| ())
+        .map_err(|_| {
+            host_slicer_error(
+                "io",
+                "Verified models could not be opened in the selected slicer",
             )
         })
     }
@@ -465,5 +616,166 @@ mod tests {
         );
         assert!(stale.is_err());
         assert_eq!(launched.lock().unwrap().as_ref().unwrap().0, staged_path);
+    }
+
+    #[test]
+    fn desktop_host_slicer_preflights_and_launches_a_verified_batch_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        let runtime =
+            library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+                library_root.clone(),
+                temp.path().join("integrations.json"),
+            ))
+            .unwrap();
+        fn triangle_stl(z: f32) -> Vec<u8> {
+            let mut bytes = vec![0_u8; 80];
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            for value in [0.0_f32, 0.0, z, 0.0, 0.0, 1.0, 1.0, 0.0, z, 0.0, 1.0, z] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(&[0, 0]);
+            bytes
+        }
+        let first_path = temp.path().join("first.stl");
+        let second_path = temp.path().join("second.stl");
+        let first_bytes = triangle_stl(0.0);
+        let second_bytes = triangle_stl(1.0);
+        fs::write(&first_path, &first_bytes).unwrap();
+        fs::write(&second_path, &second_bytes).unwrap();
+        let first = runtime
+            .mutate_db(|db| {
+                db.import_file(&first_path, None, None)
+                    .map(|result| result.model)
+            })
+            .unwrap();
+        let second = runtime
+            .mutate_db(|db| {
+                db.import_file(&second_path, None, None)
+                    .map(|result| result.model)
+            })
+            .unwrap();
+        let launches = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&launches);
+        let adapter = DesktopHostSlicerAdapter::with_host_batch_ops(
+            Arc::clone(&runtime),
+            || {
+                vec![SlicerApp {
+                    id: "com.bambulab.bambu-studio".into(),
+                    bundle_id: "com.bambulab.bambu-studio".into(),
+                    display_name: "Bambu Studio".into(),
+                    app_path: "/fixture/Bambu Studio.app".into(),
+                }]
+            },
+            |_, _| panic!("batch handoff should launch one path set"),
+            move |slicer, paths| {
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                recorded.lock().unwrap().push((
+                    paths.to_vec(),
+                    paths
+                        .iter()
+                        .map(|path| fs::read(path).unwrap())
+                        .collect::<Vec<_>>(),
+                ));
+                Ok(())
+            },
+        );
+        let context = RequestContext {
+            principal_id: "fixture".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::MediaRead,
+                Capability::HostSlicer,
+            ]),
+            request_id: "open-in-slicer-batch".into(),
+        };
+        let targets = [
+            VersionedTarget {
+                model_id: first.id.clone(),
+                expected_version: first.metadata_version,
+            },
+            VersionedTarget {
+                model_id: second.id.clone(),
+                expected_version: second.metadata_version,
+            },
+        ];
+
+        adapter
+            .open_in_slicer_batch(&context, &targets, "com.bambulab.bambu-studio")
+            .unwrap();
+        let launched = launches.lock().unwrap().clone();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].0.len(), 2);
+        assert_eq!(
+            launched[0].1,
+            vec![first_bytes.to_vec(), second_bytes.to_vec()]
+        );
+        let handoff_root =
+            crate::handoff::stable_handoff_root(runtime.host_library_root()).unwrap();
+        assert!(
+            launched[0]
+                .0
+                .iter()
+                .all(|path| path.starts_with(&handoff_root)),
+            "staged paths {:?} should be inside {:?}",
+            launched[0].0,
+            handoff_root
+        );
+        assert_eq!(fs::read(&first_path).unwrap(), first_bytes);
+        assert_eq!(fs::read(&second_path).unwrap(), second_bytes);
+
+        let stale = [
+            targets[0].clone(),
+            VersionedTarget {
+                expected_version: second.metadata_version + 1,
+                ..targets[1].clone()
+            },
+        ];
+        assert!(adapter
+            .open_in_slicer_batch(&context, &stale, "com.bambulab.bambu-studio")
+            .is_err());
+        assert_eq!(launches.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn desktop_host_slicer_rejects_unknown_slicer_before_resolving_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime =
+            library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+                temp.path().join("library"),
+                temp.path().join("integrations.json"),
+            ))
+            .unwrap();
+        let adapter = DesktopHostSlicerAdapter::with_host_batch_ops(
+            runtime,
+            Vec::new,
+            |_, _| panic!("unknown slicer must not launch"),
+            |_, _| panic!("unknown slicer must not launch"),
+        );
+        let context = RequestContext {
+            principal_id: "fixture".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::MediaRead,
+                Capability::HostSlicer,
+            ]),
+            request_id: "reject-unknown-slicer".into(),
+        };
+        let error = adapter
+            .open_in_slicer_batch(
+                &context,
+                &[VersionedTarget {
+                    model_id: "not-present".into(),
+                    expected_version: 1,
+                }],
+                "unknown.slicer",
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "invalidInput");
+        assert_eq!(
+            error.message,
+            "Selected slicer is not installed or supported"
+        );
     }
 }

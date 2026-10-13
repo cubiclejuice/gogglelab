@@ -1463,7 +1463,13 @@ async function showEmbeddedMetadata(model: BrowserModel): Promise<void> {
   dialog.showModal();
   try {
     const proposal = await client.embeddedMetadata(model.id, model.contentHash);
-    const selection = { designer: false, sourceUrl: false, notes: false, modelLicense: false };
+    const selection = {
+      designer: false,
+      sourceUrl: false,
+      notes: false,
+      modelLicense: false,
+      parentModel: false,
+    };
     for (const key of Object.keys(selection) as Array<keyof typeof selection>) {
       const label = document.createElement("label");
       const input = document.createElement("input");

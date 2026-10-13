@@ -368,13 +368,18 @@ test("scan and capture inbox methods use bounded explicit routes", async () => {
       });
     };
     await client.startScan("root");
+    await client.startScanDirectory("root", "parts/nested");
     await client.cancelScan();
     await client.listCaptures({ limit: 25, cursor: "opaque" });
     await client.startThumbnailJob(["a", "b"], true);
     expect(JSON.parse(requests[0].init.body)).toEqual({ rootId: "root" });
-    expect(requests[1].init.method).toBe("DELETE");
-    expect(new URL(requests[2].url).searchParams.toString()).toBe("limit=25&cursor=opaque");
-    expect(JSON.parse(requests[3].init.body)).toEqual({ modelIds: ["a", "b"], force: true });
+    expect(JSON.parse(requests[1].init.body)).toEqual({
+      rootId: "root",
+      directory: "parts/nested",
+    });
+    expect(requests[2].init.method).toBe("DELETE");
+    expect(new URL(requests[3].url).searchParams.toString()).toBe("limit=25&cursor=opaque");
+    expect(JSON.parse(requests[4].init.body)).toEqual({ modelIds: ["a", "b"], force: true });
   } finally {
     globalThis.fetch = original;
   }

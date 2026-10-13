@@ -2,7 +2,7 @@ use std::io::{Cursor, Read};
 
 use library_protocol::{EmbeddedFilament, EmbeddedMetadataFields, RuntimeError, RuntimeErrorCode};
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 
 use crate::LibraryRuntime;
 
@@ -48,30 +48,23 @@ fn parse_standard_fields(bytes: &[u8]) -> Result<EmbeddedMetadataFields, Runtime
     if archive.len() > 10_000 {
         return Err(invalid("3MF metadata package has too many entries"));
     }
-    let mut model_xml = None;
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|_| invalid("3MF entry is invalid"))?;
-        if entry.is_file() && entry.name().to_ascii_lowercase().ends_with(".model") {
-            let entry_size = entry.size();
-            if entry_size > library_core::MAX_INDEXED_FILE_BYTES {
-                return Err(invalid("3MF model metadata entry is too large"));
-            }
-            let mut xml = Vec::with_capacity(entry_size as usize);
-            entry
-                .by_ref()
-                .take(entry_size.saturating_add(1))
-                .read_to_end(&mut xml)
-                .map_err(|_| invalid("3MF model metadata entry could not be read"))?;
-            if xml.len() as u64 != entry_size {
-                return Err(invalid("3MF model metadata entry changed while reading"));
-            }
-            model_xml = Some(xml);
-            break;
-        }
+    let root_model_path = root_model_path(&mut archive)?;
+    let mut entry = archive
+        .by_name(&root_model_path)
+        .map_err(|_| invalid("3MF root model metadata document is missing"))?;
+    let entry_size = entry.size();
+    if entry_size > library_core::MAX_INDEXED_FILE_BYTES {
+        return Err(invalid("3MF model metadata entry is too large"));
     }
-    let xml = model_xml.ok_or_else(|| invalid("3MF package has no model metadata document"))?;
+    let mut xml = Vec::with_capacity(entry_size as usize);
+    entry
+        .by_ref()
+        .take(entry_size.saturating_add(1))
+        .read_to_end(&mut xml)
+        .map_err(|_| invalid("3MF model metadata entry could not be read"))?;
+    if xml.len() as u64 != entry_size {
+        return Err(invalid("3MF model metadata entry changed while reading"));
+    }
     let mut reader = Reader::from_reader(xml.as_slice());
     reader.config_mut().trim_text(true);
     let mut fields = EmbeddedMetadataFields::default();
@@ -124,6 +117,9 @@ fn parse_standard_fields(bytes: &[u8]) -> Result<EmbeddedMetadataFields, Runtime
                         "license" | "terms" => {
                             fields.model_license.get_or_insert(value);
                         }
+                        "parentmodel" | "parent_model" => {
+                            fields.parent_model.get_or_insert(value);
+                        }
                         _ => {}
                     }
                 }
@@ -139,11 +135,119 @@ fn parse_standard_fields(bytes: &[u8]) -> Result<EmbeddedMetadataFields, Runtime
     Ok(fields)
 }
 
+/// Selects the root model document in the same way as `stl_core`'s 3MF
+/// geometry parser: follow the package-level model relationship, then fall
+/// back to the conventional root part when no relationship target is present.
+fn root_model_path(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<String, RuntimeError> {
+    let has_relationships = archive.file_names().any(|name| name == "_rels/.rels");
+    if has_relationships {
+        let mut relationships = String::new();
+        archive
+            .by_name("_rels/.rels")
+            .map_err(|_| invalid("3MF package relationships are invalid"))?
+            .read_to_string(&mut relationships)
+            .map_err(|_| invalid("3MF package relationships are invalid"))?;
+        if let Some(target) = model_relationship_target(&relationships) {
+            // OPC part names may begin with `/`, while ZIP entry names do not.
+            return Ok(target.trim_start_matches('/').to_owned());
+        }
+    }
+
+    const ROOT_MODEL_FALLBACK: &str = "3D/3dmodel.model";
+    if archive.file_names().any(|name| name == ROOT_MODEL_FALLBACK) {
+        Ok(ROOT_MODEL_FALLBACK.into())
+    } else {
+        Err(invalid("3MF package has no model metadata document"))
+    }
+}
+
+fn model_relationship_target(relationships: &str) -> Option<String> {
+    let mut reader = Reader::from_str(relationships);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if element.local_name().as_ref() == b"Relationship" =>
+            {
+                let mut target = None;
+                let mut is_model = false;
+                for attribute in element.attributes().flatten() {
+                    let value = attribute.normalized_value(XmlVersion::Implicit1_0).ok()?;
+                    match attribute.key.local_name().as_ref() {
+                        b"Target" => target = Some(value.into_owned()),
+                        b"Type" => is_model = value.ends_with("/3dmodel"),
+                        _ => {}
+                    }
+                }
+                if is_model {
+                    return target;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
 fn invalid(message: &str) -> RuntimeError {
     RuntimeError {
         code: RuntimeErrorCode::InvalidInput,
         message: message.into(),
         retryable: false,
         current_version: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Write};
+
+    use zip::write::SimpleFileOptions;
+
+    use super::parse_standard_fields;
+
+    fn package(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            archive
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn embedded_metadata_uses_relationship_root_model_before_component_parts() {
+        let relationships = br#"<Relationships>
+            <Relationship Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"
+                Target="/3D/3dmodel.model" />
+        </Relationships>"#;
+        let component =
+            br#"<model><metadata name="ParentModel">Component Parent</metadata></model>"#;
+        let root = br#"<model><metadata name="ParentModel">Root Parent</metadata></model>"#;
+        let bytes = package(&[
+            ("_rels/.rels", relationships),
+            ("3D/Objects/component.model", component),
+            ("3D/3dmodel.model", root),
+        ]);
+
+        let fields = parse_standard_fields(&bytes).unwrap();
+
+        assert_eq!(fields.parent_model.as_deref(), Some("Root Parent"));
+    }
+
+    #[test]
+    fn embedded_metadata_falls_back_to_the_conventional_root_model_part() {
+        let component =
+            br#"<model><metadata name="ParentModel">Component Parent</metadata></model>"#;
+        let root = br#"<model><metadata name="ParentModel">Root Parent</metadata></model>"#;
+        let bytes = package(&[
+            ("3D/Objects/component.model", component),
+            ("3D/3dmodel.model", root),
+        ]);
+
+        let fields = parse_standard_fields(&bytes).unwrap();
+
+        assert_eq!(fields.parent_model.as_deref(), Some("Root Parent"));
     }
 }

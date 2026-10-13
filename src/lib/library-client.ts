@@ -140,12 +140,14 @@ export interface EmbeddedMetadataProposal {
     sourceUrl: string | null;
     notes: string | null;
     modelLicense: string | null;
+    parentModel: string | null;
   };
   embedded: {
     designer: string | null;
     sourceUrl: string | null;
     notes: string | null;
     modelLicense: string | null;
+    parentModel: string | null;
   };
   embeddedFilaments: BrowserGeometryLease["embeddedFilaments"];
 }
@@ -560,6 +562,11 @@ export interface LibraryClient {
   listRoots(signal?: AbortSignal): Promise<BrowserRootHandle[]>;
   scanStatus(signal?: AbortSignal): Promise<BrowserScanStatus>;
   startScan(rootId?: string | null, signal?: AbortSignal): Promise<BrowserScanStatus>;
+  startScanDirectory(
+    rootId: string,
+    directory: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserScanStatus>;
   cancelScan(signal?: AbortSignal): Promise<BrowserScanStatus>;
   startThumbnailJob(
     modelIds: string[],
@@ -703,7 +710,13 @@ export interface LibraryClient {
     modelId: string,
     expectedVersion: string,
     expectedSourceHash: string,
-    selection: { designer: boolean; sourceUrl: boolean; notes: boolean; modelLicense: boolean },
+    selection: {
+      designer: boolean;
+      sourceUrl: boolean;
+      notes: boolean;
+      modelLicense: boolean;
+      parentModel: boolean;
+    },
     signal?: AbortSignal,
   ): Promise<MutationVersion>;
 }
@@ -878,6 +891,18 @@ export class HttpLibraryClient implements LibraryClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rootId }),
+      signal,
+    });
+  }
+  startScanDirectory(
+    rootId: string,
+    directory: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserScanStatus> {
+    return this.json("/api/v1/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rootId, directory }),
       signal,
     });
   }
@@ -1304,7 +1329,13 @@ export class HttpLibraryClient implements LibraryClient {
     modelId: string,
     expectedVersion: string,
     expectedSourceHash: string,
-    selection: { designer: boolean; sourceUrl: boolean; notes: boolean; modelLicense: boolean },
+    selection: {
+      designer: boolean;
+      sourceUrl: boolean;
+      notes: boolean;
+      modelLicense: boolean;
+      parentModel: boolean;
+    },
     signal?: AbortSignal,
   ): Promise<MutationVersion> {
     return this.json(`/api/v1/models/${segment(modelId)}/embedded-metadata/apply`, {

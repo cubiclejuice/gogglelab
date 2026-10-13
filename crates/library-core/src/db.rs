@@ -13,12 +13,13 @@ use crate::models::{
     CaptureDownloadRecord, CaptureReceipt, CaptureReceiptInput, CaptureSummary, CatalogFacetValue,
     CatalogFacets, CatalogSettings, CatalogStats, DuplicateGroup, Filament, FilamentInput,
     FilamentOrigin, FilamentResourceKind, FilamentSyncSummary, Folder, ImportResult, IndexRoot,
-    IndexedSourceMetadata, MetadataPatch, Model, ModelFilamentAssignment, ModelGroupFilter,
-    ModelMetadata, ModelPageQuery, ModelSort, PrintAttempt, PrintAttemptBatchItem,
-    PrintAttemptInput, PrintOutcome, PrintStatus, RemovalResult, RemovedModel, ResolvedModelSource,
-    ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel, SortDirection, SourceRef,
-    SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry,
-    ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget, MAX_MODEL_PAGE_OFFSET,
+    IndexedModelMove, IndexedSourceMetadata, MetadataPatch, Model, ModelFilamentAssignment,
+    ModelGroupFilter, ModelMetadata, ModelPageQuery, ModelSort, PrintAttempt,
+    PrintAttemptBatchItem, PrintAttemptInput, PrintOutcome, PrintStatus, RemovalResult,
+    RemovedModel, ResolvedModelSource, ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile,
+    ScannedModel, SortDirection, SourceRef, SpoolmanFilamentRecord, SpoolmanSource,
+    SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry, ThumbnailGalleryItem,
+    VersionedModelUpdate, VersionedTarget, MAX_MODEL_PAGE_OFFSET,
 };
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 6;
@@ -180,6 +181,38 @@ impl LibraryDb {
             Ok(Some(model))
         } else {
             Ok(None)
+        }
+    }
+
+    pub fn resolve_parent_model_id(&self, value: &str) -> Result<String, LibraryError> {
+        let value = clean_name(value, "Parent model")?;
+        let id_match: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM models WHERE id=?1 AND deleted_at IS NULL",
+                params![value],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = id_match {
+            return Ok(id);
+        }
+        let ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM models WHERE deleted_at IS NULL AND lower(display_name)=lower(?1)
+                 ORDER BY id LIMIT 2",
+            )?;
+            let rows = stmt.query_map(params![value], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        match ids.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => Err(LibraryError::InvalidInput(
+                "embedded parent model does not match an active catalog model".into(),
+            )),
+            _ => Err(LibraryError::InvalidInput(
+                "embedded parent model name is ambiguous".into(),
+            )),
         }
     }
 
@@ -485,9 +518,9 @@ impl LibraryDb {
         &self,
         model_ids: &[String],
     ) -> Result<Vec<DuplicateGroup>, LibraryError> {
-        if model_ids.len() > 50_000 {
+        if model_ids.len() > 1_000 {
             return Err(LibraryError::InvalidInput(
-                "duplicate scope exceeds 50000 models".into(),
+                "duplicate scope exceeds 1000 models".into(),
             ));
         }
         let mut unique = HashSet::new();
@@ -642,9 +675,27 @@ impl LibraryDb {
         &self,
         targets: &[VersionedTarget],
     ) -> Result<RemovalResult, LibraryError> {
+        self.remove_models_recoverably_with_snapshot_id(targets, &new_id("removal"))
+    }
+
+    pub fn remove_models_recoverably_with_snapshot_id(
+        &self,
+        targets: &[VersionedTarget],
+        snapshot_id: &str,
+    ) -> Result<RemovalResult, LibraryError> {
         if targets.is_empty() || targets.len() > 50_000 {
             return Err(LibraryError::InvalidInput(
                 "removal target count is invalid".into(),
+            ));
+        }
+        if snapshot_id.is_empty()
+            || snapshot_id.len() > 128
+            || !snapshot_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(LibraryError::InvalidInput(
+                "removal snapshot id is invalid".into(),
             ));
         }
         let mut unique = HashSet::new();
@@ -656,9 +707,20 @@ impl LibraryDb {
                 "duplicate removal target".into(),
             ));
         }
-        let snapshot_id = new_id("removal");
         let now = timestamp();
         let tx = self.conn.unchecked_transaction()?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM jobs WHERE kind='removal' AND status=?1 LIMIT 1",
+                params![snapshot_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "removal snapshot id is already in use".into(),
+            ));
+        }
         for target in targets {
             let row: Option<(i64, Option<String>)> = tx
                 .query_row(
@@ -690,7 +752,7 @@ impl LibraryDb {
         }
         tx.commit()?;
         Ok(RemovalResult {
-            snapshot_id,
+            snapshot_id: snapshot_id.to_owned(),
             removed_ids: targets
                 .iter()
                 .map(|target| target.model_id.clone())
@@ -1316,50 +1378,128 @@ impl LibraryDb {
         destination_relative_path: &Path,
         modified_at: u64,
     ) -> Result<Model, LibraryError> {
-        let relative = validated_relative_path(destination_relative_path)?;
-        let modified_at = i64::try_from(modified_at)
-            .map_err(|_| LibraryError::InvalidInput("modified time is out of range".into()))?;
-        self.get_index_root(destination_root_id)?
-            .ok_or_else(|| LibraryError::IndexRootNotFound(destination_root_id.into()))?;
-        let tx = self.conn.unchecked_transaction()?;
-        let row: Option<(i64, String, Option<String>, Option<String>)> = tx
-            .query_row(
-                "SELECT metadata_version,source_kind,source_archive_member,deleted_at
-                 FROM models WHERE id=?1",
-                params![model_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        let Some((actual, source_kind, archive_member, deleted_at)) = row else {
-            return Err(LibraryError::ModelNotFound(model_id.into()));
-        };
-        if actual as u64 != expected_version {
-            return Err(LibraryError::MetadataConflict {
-                model_id: model_id.into(),
-                expected: expected_version,
-                actual: actual as u64,
-            });
-        }
-        if deleted_at.is_some() || source_kind != "indexed" || archive_member.is_some() {
+        self.move_loose_indexed_models(&[IndexedModelMove {
+            model_id: model_id.into(),
+            expected_version,
+            destination_root_id: destination_root_id.into(),
+            destination_relative_path: destination_relative_path.to_path_buf(),
+            modified_at,
+        }])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+    }
+
+    pub fn move_loose_indexed_models(
+        &self,
+        moves: &[IndexedModelMove],
+    ) -> Result<Vec<Model>, LibraryError> {
+        const MAX_MOVE_TARGETS: usize = 100;
+        if moves.is_empty() || moves.len() > MAX_MOVE_TARGETS {
             return Err(LibraryError::InvalidInput(
-                "only active loose indexed models can be moved".into(),
+                "move target count is invalid".into(),
             ));
         }
-        tx.execute(
-            "UPDATE models SET source_root_id=?1,source_path=?2,source_missing=0,
-                    source_modified_at=?3,metadata_version=metadata_version+1,updated_at=?4
-             WHERE id=?5",
-            params![
-                destination_root_id,
-                relative,
-                modified_at,
-                timestamp(),
-                model_id
-            ],
-        )?;
+        let mut model_ids = HashSet::new();
+        let mut destinations = HashSet::new();
+        let mut normalized = Vec::with_capacity(moves.len());
+        for item in moves {
+            if !model_ids.insert(item.model_id.as_str()) {
+                return Err(LibraryError::InvalidInput("duplicate move target".into()));
+            }
+            let relative = validated_relative_path(&item.destination_relative_path)?;
+            if !destinations.insert((item.destination_root_id.clone(), relative.clone())) {
+                return Err(LibraryError::InvalidInput(
+                    "duplicate move destination".into(),
+                ));
+            }
+            let modified_at = i64::try_from(item.modified_at)
+                .map_err(|_| LibraryError::InvalidInput("modified time is out of range".into()))?;
+            normalized.push((item, relative, modified_at));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let move_ids = model_ids;
+        for (item, _, _) in &normalized {
+            tx.query_row(
+                "SELECT id FROM index_roots WHERE id=?1",
+                params![item.destination_root_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::IndexRootNotFound(item.destination_root_id.clone()))?;
+            let row: Option<(i64, String, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT metadata_version,source_kind,source_archive_member,deleted_at
+                     FROM models WHERE id=?1",
+                    params![item.model_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((actual, source_kind, archive_member, deleted_at)) = row else {
+                return Err(LibraryError::ModelNotFound(item.model_id.clone()));
+            };
+            if actual as u64 != item.expected_version {
+                return Err(LibraryError::MetadataConflict {
+                    model_id: item.model_id.clone(),
+                    expected: item.expected_version,
+                    actual: actual as u64,
+                });
+            }
+            if deleted_at.is_some() || source_kind != "indexed" || archive_member.is_some() {
+                return Err(LibraryError::InvalidInput(
+                    "only active loose indexed models can be moved".into(),
+                ));
+            }
+        }
+        for (item, relative, _) in &normalized {
+            let collision: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM models WHERE source_kind='indexed' AND source_root_id=?1
+                     AND source_path=?2 AND COALESCE(source_archive_member,'')=''
+                     AND id<>?3 LIMIT 1",
+                    params![item.destination_root_id, relative, item.model_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if collision
+                .as_ref()
+                .is_some_and(|id| !move_ids.contains(id.as_str()))
+            {
+                return Err(LibraryError::InvalidInput(
+                    "move destination is already cataloged".into(),
+                ));
+            }
+        }
+        let now = timestamp();
+        for (item, _, _) in &normalized {
+            let temporary_path = format!(".gogglelab-move-{}", Uuid::new_v4().simple());
+            tx.execute(
+                "UPDATE models SET source_path=?1 WHERE id=?2",
+                params![temporary_path, item.model_id],
+            )?;
+        }
+        for (item, relative, modified_at) in &normalized {
+            tx.execute(
+                "UPDATE models SET source_root_id=?1,source_path=?2,source_missing=0,
+                        source_modified_at=?3,metadata_version=metadata_version+1,updated_at=?4
+                 WHERE id=?5",
+                params![
+                    item.destination_root_id,
+                    relative,
+                    modified_at,
+                    now,
+                    item.model_id
+                ],
+            )?;
+        }
         tx.commit()?;
-        self.get_model(model_id)?
-            .ok_or_else(|| LibraryError::ModelNotFound(model_id.into()))
+        moves
+            .iter()
+            .map(|item| {
+                self.get_model(&item.model_id)?
+                    .ok_or_else(|| LibraryError::ModelNotFound(item.model_id.clone()))
+            })
+            .collect()
     }
 
     pub fn indexed_source_metadata(
@@ -1370,14 +1510,24 @@ impl LibraryDb {
     ) -> Result<Option<IndexedSourceMetadata>, LibraryError> {
         let relative_path = validated_relative_path(relative_path)?;
         let archive_member = archive_member.map(validated_archive_member).transpose()?;
+        let root = self
+            .get_index_root(root_id)?
+            .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.to_owned()))?;
+        let absolute_path = root
+            .path
+            .join(&relative_path)
+            .to_str()
+            .map(ToOwned::to_owned);
         self.conn
             .query_row(
                 "SELECT d.bytes, m.source_modified_at, d.content_hash,
                         m.source_archive_member, d.outer_fingerprint
                  FROM models m JOIN indexed_model_data d ON d.model_id = m.id
-                 WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1 AND m.source_path = ?2
-                   AND COALESCE(m.source_archive_member,'') = COALESCE(?3,'')",
-                params![root_id, relative_path, archive_member],
+                 WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1
+                   AND (m.source_path = ?2 OR (?4 IS NOT NULL AND m.source_path = ?4))
+                   AND COALESCE(m.source_archive_member,'') = COALESCE(?3,'')
+                 ORDER BY (m.source_path = ?2) DESC LIMIT 1",
+                params![root_id, relative_path, archive_member, absolute_path],
                 |row| {
                     Ok(IndexedSourceMetadata {
                         bytes: row.get::<_, i64>(0)? as u64,
@@ -1398,8 +1548,12 @@ impl LibraryDb {
         relative_path: &Path,
     ) -> Result<Vec<IndexedSourceMetadata>, LibraryError> {
         let relative = validated_relative_path(relative_path)?;
-        let mut stmt = self.conn.prepare("SELECT d.bytes,m.source_modified_at,d.content_hash,m.source_archive_member,d.outer_fingerprint FROM models m JOIN indexed_model_data d ON d.model_id=m.id WHERE m.source_kind='indexed' AND m.source_root_id=?1 AND m.source_path=?2 AND m.source_archive_member IS NOT NULL ORDER BY m.source_archive_member")?;
-        let rows = stmt.query_map(params![root_id, relative], |row| {
+        let root = self
+            .get_index_root(root_id)?
+            .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.to_owned()))?;
+        let absolute = root.path.join(&relative).to_str().map(ToOwned::to_owned);
+        let mut stmt = self.conn.prepare("SELECT d.bytes,m.source_modified_at,d.content_hash,m.source_archive_member,d.outer_fingerprint FROM models m JOIN indexed_model_data d ON d.model_id=m.id WHERE m.source_kind='indexed' AND m.source_root_id=?1 AND (m.source_path=?2 OR (?3 IS NOT NULL AND m.source_path=?3)) AND m.source_archive_member IS NOT NULL ORDER BY m.source_archive_member")?;
+        let rows = stmt.query_map(params![root_id, relative, absolute], |row| {
             Ok(IndexedSourceMetadata {
                 bytes: row.get::<_, i64>(0)? as u64,
                 modified_at: row.get::<_, i64>(1)? as u64,
@@ -1450,7 +1604,8 @@ impl LibraryDb {
                 ));
             }
             resolve_under_root(&root.path, Path::new(&relative))?;
-            validated.push((relative, archive_member, entry));
+            let absolute = root.path.join(&relative).to_str().map(ToOwned::to_owned);
+            validated.push((relative, absolute, archive_member, entry));
         }
 
         let tx = self.conn.unchecked_transaction()?;
@@ -1458,14 +1613,16 @@ impl LibraryDb {
             seen: validated.len(),
             ..ScanReconcile::default()
         };
-        for (relative, archive_member, entry) in validated {
+        for (relative, absolute, archive_member, entry) in validated {
             let existing: Option<(String, String)> = tx
                 .query_row(
                     "SELECT m.id, d.content_hash
                      FROM models m JOIN indexed_model_data d ON d.model_id = m.id
-                     WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1 AND m.source_path = ?2
-                       AND COALESCE(m.source_archive_member,'')=COALESCE(?3,'')",
-                    params![root_id, relative, archive_member],
+                     WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1
+                       AND (m.source_path = ?2 OR (?4 IS NOT NULL AND m.source_path = ?4))
+                       AND COALESCE(m.source_archive_member,'')=COALESCE(?3,'')
+                     ORDER BY (m.source_path = ?2) DESC LIMIT 1",
+                    params![root_id, relative, archive_member, absolute],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
@@ -1490,15 +1647,24 @@ impl LibraryDb {
                     ],
                 )?;
                 tx.execute(
-                    "UPDATE models SET source_missing = 0, source_modified_at = ?1,
-                            metadata_version = metadata_version + ?2, updated_at = ?3 WHERE id = ?4",
+                    "UPDATE models SET source_path = ?1, source_missing = 0, source_modified_at = ?2,
+                            metadata_version = metadata_version + ?3, updated_at = ?4 WHERE id = ?5",
                     params![
+                        relative,
                         entry.modified_at as i64,
                         if content_changed { 1_i64 } else { 0_i64 },
                         timestamp(),
                         model_id
                     ],
                 )?;
+                if archive_member.is_some() {
+                    tx.execute(
+                        "UPDATE bundles SET source_path=?1
+                         WHERE id=(SELECT bundle_id FROM models WHERE id=?2)
+                           AND source_root_id=?3",
+                        params![relative, model_id, root_id],
+                    )?;
+                }
                 result.updated += 1;
             } else {
                 let model_id = new_id("model");
@@ -1598,6 +1764,75 @@ impl LibraryDb {
         newly_added_model_ids: &[String],
         completed_at: &str,
     ) -> Result<ScanReconcile, LibraryError> {
+        self.complete_scan_sources_in_scope(
+            root_id,
+            None,
+            seen_sources,
+            newly_added_model_ids,
+            Some(completed_at),
+        )
+    }
+
+    pub fn indexed_archive_source_refs(
+        &self,
+        root_id: &str,
+        scope: Option<&Path>,
+    ) -> Result<Vec<SourceRef>, LibraryError> {
+        let root = self
+            .get_index_root(root_id)?
+            .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.to_owned()))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT source_path, source_archive_member FROM models
+             WHERE source_kind='indexed' AND source_root_id=?1 AND deleted_at IS NULL
+               AND source_archive_member IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![root_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut sources = Vec::new();
+        for row in rows {
+            let (path, archive_member) = row?;
+            let relative_path = normalize_indexed_source_path(&root.path, Path::new(&path))?;
+            if scope.is_some_and(|scope| !relative_path.starts_with(scope)) {
+                continue;
+            }
+            sources.push(SourceRef {
+                relative_path,
+                archive_member: Some(validated_archive_member(
+                    archive_member.as_deref().ok_or_else(|| {
+                        LibraryError::InvalidInput("archive member path is missing".into())
+                    })?,
+                )?),
+            });
+        }
+        Ok(sources)
+    }
+
+    pub fn complete_subdirectory_scan_sources_with_new_models(
+        &self,
+        root_id: &str,
+        relative_directory: &Path,
+        seen_sources: &[SourceRef],
+        newly_added_model_ids: &[String],
+    ) -> Result<ScanReconcile, LibraryError> {
+        let relative_directory = PathBuf::from(validated_relative_path(relative_directory)?);
+        self.complete_scan_sources_in_scope(
+            root_id,
+            Some(&relative_directory),
+            seen_sources,
+            newly_added_model_ids,
+            None,
+        )
+    }
+
+    fn complete_scan_sources_in_scope(
+        &self,
+        root_id: &str,
+        scope: Option<&Path>,
+        seen_sources: &[SourceRef],
+        newly_added_model_ids: &[String],
+        completed_at: Option<&str>,
+    ) -> Result<ScanReconcile, LibraryError> {
         let root = self
             .get_index_root(root_id)?
             .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.to_owned()))?;
@@ -1609,17 +1844,32 @@ impl LibraryDb {
                 "configured root identity changed".into(),
             ));
         }
+        let scope_relative = scope.and_then(|scope| scope.to_str().map(ToOwned::to_owned));
+        let scope_absolute =
+            scope.and_then(|scope| root.path.join(scope).to_str().map(ToOwned::to_owned));
+        if scope.is_some() && scope_relative.is_none() {
+            return Err(LibraryError::InvalidInput(
+                "scan directory is not valid UTF-8".into(),
+            ));
+        }
+        let separator = std::path::MAIN_SEPARATOR.to_string();
         let seen = seen_sources
             .iter()
             .map(|source| -> Result<SourceRef, LibraryError> {
-                Ok(SourceRef {
+                let source = SourceRef {
                     relative_path: PathBuf::from(validated_relative_path(&source.relative_path)?),
                     archive_member: source
                         .archive_member
                         .as_deref()
                         .map(validated_archive_member)
                         .transpose()?,
-                })
+                };
+                if scope.is_some_and(|scope| !source.relative_path.starts_with(scope)) {
+                    return Err(LibraryError::InvalidInput(
+                        "scanned source is outside the selected directory".into(),
+                    ));
+                }
+                Ok(source)
             })
             .collect::<Result<HashSet<_>, _>>()?;
         let tx = self.conn.unchecked_transaction()?;
@@ -1628,17 +1878,31 @@ impl LibraryDb {
             let mut stmt = tx.prepare(
                 "SELECT m.id, m.source_path, m.source_archive_member, d.content_hash
                  FROM models m JOIN indexed_model_data d ON d.model_id = m.id
-                 WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1",
+                 WHERE m.source_kind = 'indexed' AND m.source_root_id = ?1
+                   AND (?2 IS NULL OR m.source_path = ?2
+                        OR substr(m.source_path, 1, length(?2) + 1) = ?2 || ?3
+                        OR (?4 IS NOT NULL AND (m.source_path = ?4
+                            OR substr(m.source_path, 1, length(?4) + 1) = ?4 || ?3)))",
             )?;
-            let rows = stmt.query_map(params![root_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            indexed.extend(rows.collect::<Result<Vec<_>, _>>()?);
+            let rows = stmt.query_map(
+                params![root_id, scope_relative, separator, scope_absolute],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (id, path, member, hash) = row?;
+                let path = normalize_indexed_source_path(&root.path, Path::new(&path))?;
+                if scope.is_some_and(|scope| !path.starts_with(scope)) {
+                    continue;
+                }
+                indexed.push((id, validated_relative_path(&path)?, member, hash));
+            }
         }
 
         let newly_added = newly_added_model_ids.iter().collect::<HashSet<_>>();
@@ -1813,16 +2077,30 @@ impl LibraryDb {
         {
             let mut stmt = tx.prepare(
                 "SELECT id, source_path,source_archive_member FROM models
-                 WHERE source_kind = 'indexed' AND source_root_id = ?1",
+                 WHERE source_kind = 'indexed' AND source_root_id = ?1
+                   AND (?2 IS NULL OR source_path = ?2
+                        OR substr(source_path, 1, length(?2) + 1) = ?2 || ?3
+                        OR (?4 IS NOT NULL AND (source_path = ?4
+                            OR substr(source_path, 1, length(?4) + 1) = ?4 || ?3)))",
             )?;
-            let rows = stmt.query_map(params![root_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })?;
-            ids_and_paths.extend(rows.collect::<Result<Vec<_>, _>>()?);
+            let rows = stmt.query_map(
+                params![root_id, scope_relative, separator, scope_absolute],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (id, path, member) = row?;
+                let path = normalize_indexed_source_path(&root.path, Path::new(&path))?;
+                if scope.is_some_and(|scope| !path.starts_with(scope)) {
+                    continue;
+                }
+                ids_and_paths.push((id, validated_relative_path(&path)?, member));
+            }
         }
         for (id, path, member) in ids_and_paths {
             let missing = !seen.contains(&SourceRef {
@@ -1835,13 +2113,22 @@ impl LibraryDb {
             )?;
             result.missing += usize::from(missing);
         }
-        reconcile_folder_bundles(&tx, root_id)?;
-        let changed = tx.execute(
-            "UPDATE index_roots SET last_scanned_at = ?1 WHERE id = ?2",
-            params![completed_at, root_id],
-        )?;
-        if changed == 0 {
-            return Err(LibraryError::IndexRootNotFound(root_id.to_owned()));
+        if scope.is_none() {
+            reconcile_folder_bundles(&tx, root_id)?;
+            let changed = tx.execute(
+                "UPDATE index_roots SET last_scanned_at = ?1 WHERE id = ?2",
+                params![
+                    completed_at.ok_or_else(|| {
+                        LibraryError::InvalidInput(
+                            "full scan is missing its completion time".into(),
+                        )
+                    })?,
+                    root_id
+                ],
+            )?;
+            if changed == 0 {
+                return Err(LibraryError::IndexRootNotFound(root_id.to_owned()));
+            }
         }
         tx.commit()?;
         Ok(result)
@@ -1928,8 +2215,9 @@ impl LibraryDb {
                 let relative = source_path.ok_or_else(|| {
                     LibraryError::InvalidInput("indexed model has no source path".into())
                 })?;
+                let relative = normalize_indexed_source_path(&root.path, Path::new(&relative))?;
                 Ok(ResolvedModelSource {
-                    outer_path: resolve_under_root(&root.path, Path::new(&relative))?,
+                    outer_path: resolve_under_root(&root.path, &relative)?,
                     archive_member,
                     outer_fingerprint,
                     content_hash,
@@ -3959,7 +4247,15 @@ const MODEL_SELECT: &str = "SELECT m.id, m.display_name, m.description, m.folder
             b.relative_path, m.metadata_version, m.created_at, m.updated_at,
             m.source_kind,
             CASE WHEN m.source_kind = 'indexed'
-                 THEN rtrim(ir.path, '/') || '/' || m.source_path
+                 THEN CASE WHEN (ir.path = '/' AND substr(m.source_path, 1, 1) = '/')
+                                OR (ir.path <> '/' AND (
+                                    m.source_path = ir.path
+                                    OR substr(m.source_path, 1, length(ir.path) + 1) = ir.path || '/'
+                                    OR substr(m.source_path, 1, length(ir.path) + 1) = ir.path || char(92)
+                                ))
+                           THEN m.source_path
+                           ELSE rtrim(ir.path, '/') || '/' || m.source_path
+                      END
                  ELSE b.relative_path END,
             m.source_root_id, m.source_missing, m.source_modified_at,
             (SELECT t.relative_path FROM thumbnails t
@@ -4633,6 +4929,17 @@ fn validated_relative_path(path: &Path) -> Result<String, LibraryError> {
     path.to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| LibraryError::InvalidInput("source path is not valid UTF-8".into()))
+}
+
+fn normalize_indexed_source_path(root: &Path, stored_path: &Path) -> Result<PathBuf, LibraryError> {
+    let relative_path = if stored_path.is_absolute() {
+        stored_path.strip_prefix(root).map_err(|_| {
+            LibraryError::InvalidInput("indexed source path is outside its configured root".into())
+        })?
+    } else {
+        stored_path
+    };
+    Ok(PathBuf::from(validated_relative_path(relative_path)?))
 }
 
 fn resolve_under_root(root: &Path, relative: &Path) -> Result<PathBuf, LibraryError> {
@@ -6288,6 +6595,117 @@ mod tests {
     }
 
     #[test]
+    fn indexed_source_move_batch_is_atomic_and_rejects_duplicate_destinations() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let source_root_path = temp_root("move-batch-source");
+        let destination_root_path = temp_root("move-batch-destination");
+        fs::create_dir_all(&source_root_path).unwrap();
+        fs::create_dir_all(&destination_root_path).unwrap();
+        fs::write(source_root_path.join("a.stl"), b"synthetic a").unwrap();
+        fs::write(source_root_path.join("b.stl"), b"synthetic b").unwrap();
+        let source_root = db
+            .add_index_root(&source_root_path, 60, 1024 * 1024)
+            .unwrap();
+        let destination_root = db
+            .add_index_root(&destination_root_path, 60, 1024 * 1024)
+            .unwrap();
+        db.record_scan_entries(
+            &source_root.id,
+            &[
+                ScannedModel {
+                    relative_path: "a.stl".into(),
+                    content_hash: hash(1),
+                    bytes: 11,
+                    format: "stl-binary".into(),
+                    modified_at: 1,
+                    display_name: Some("A".into()),
+                    archive_member: None,
+                    outer_fingerprint: None,
+                },
+                ScannedModel {
+                    relative_path: "b.stl".into(),
+                    content_hash: hash(2),
+                    bytes: 11,
+                    format: "stl-binary".into(),
+                    modified_at: 1,
+                    display_name: Some("B".into()),
+                    archive_member: None,
+                    outer_fingerprint: None,
+                },
+            ],
+        )
+        .unwrap();
+        let before = db.list_models(None, None).unwrap();
+        let moves = vec![
+            IndexedModelMove {
+                model_id: before[0].id.clone(),
+                expected_version: before[0].metadata_version,
+                destination_root_id: destination_root.id.clone(),
+                destination_relative_path: "moved-a.stl".into(),
+                modified_at: 2,
+            },
+            IndexedModelMove {
+                model_id: before[1].id.clone(),
+                expected_version: before[1].metadata_version,
+                destination_root_id: destination_root.id.clone(),
+                destination_relative_path: "moved-b.stl".into(),
+                modified_at: 2,
+            },
+        ];
+
+        let moved = db.move_loose_indexed_models(&moves).unwrap();
+        assert_eq!(moved.len(), 2);
+        for (index, model) in moved.iter().enumerate() {
+            assert_eq!(model.id, before[index].id);
+            assert_eq!(model.metadata_version, before[index].metadata_version + 1);
+            assert_eq!(
+                model.source_root_id.as_deref(),
+                Some(destination_root.id.as_str())
+            );
+            assert!(model
+                .source_path
+                .as_deref()
+                .unwrap()
+                .ends_with(if index == 0 {
+                    "moved-a.stl"
+                } else {
+                    "moved-b.stl"
+                }));
+        }
+
+        let mut stale = moves.clone();
+        stale[0].destination_relative_path = "should-not-move-a.stl".into();
+        stale[0].expected_version = moved[0].metadata_version;
+        stale[1].destination_relative_path = "should-not-move-b.stl".into();
+        stale[1].expected_version = moved[1].metadata_version + 1;
+        assert!(db.move_loose_indexed_models(&stale).is_err());
+
+        let mut duplicate_destinations = moves.clone();
+        duplicate_destinations[0].expected_version = moved[0].metadata_version;
+        duplicate_destinations[1].expected_version = moved[1].metadata_version;
+        duplicate_destinations[0].destination_relative_path = "same.stl".into();
+        duplicate_destinations[1].destination_relative_path = "same.stl".into();
+        assert!(db
+            .move_loose_indexed_models(&duplicate_destinations)
+            .is_err());
+        for (index, original) in before.iter().enumerate() {
+            let unchanged = db.get_model(&original.id).unwrap().unwrap();
+            assert_eq!(unchanged.metadata_version, moved[index].metadata_version);
+            assert!(unchanged
+                .source_path
+                .as_deref()
+                .unwrap()
+                .ends_with(if index == 0 {
+                    "moved-a.stl"
+                } else {
+                    "moved-b.stl"
+                }));
+        }
+        let _ = fs::remove_dir_all(source_root_path);
+        let _ = fs::remove_dir_all(destination_root_path);
+    }
+
+    #[test]
     fn paged_catalog_filters_are_applied_before_keyset_limits() {
         let db = LibraryDb::open_in_memory().unwrap();
         let a = db.create_model("Alpha", None).unwrap();
@@ -6663,6 +7081,176 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bundle_path, "renamed.zip");
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn scoped_scan_matches_and_updates_absolute_legacy_source_paths() {
+        let library = temp_root("absolute-legacy-scan-library");
+        let sources = temp_root("absolute-legacy-scan-source");
+        fs::create_dir_all(sources.join("parts")).unwrap();
+        fs::write(sources.join("parts/loose.stl"), b"old loose").unwrap();
+        fs::write(sources.join("parts/pack.zip"), b"old archive").unwrap();
+        let db = LibraryDb::open(&library).unwrap();
+        let root = db.add_index_root(&sources, 60, 1024).unwrap();
+        let initial = [
+            ScannedModel {
+                relative_path: "parts/loose.stl".into(),
+                content_hash: hash(1),
+                bytes: 9,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("Loose".into()),
+                archive_member: None,
+                outer_fingerprint: None,
+            },
+            ScannedModel {
+                relative_path: "parts/pack.zip".into(),
+                content_hash: hash(2),
+                bytes: 11,
+                format: "stl-binary".into(),
+                modified_at: 1,
+                display_name: Some("Archive member".into()),
+                archive_member: Some("member.stl".into()),
+                outer_fingerprint: Some("archive-v1".into()),
+            },
+        ];
+        db.record_scan_entries(&root.id, &initial).unwrap();
+        let models = db.list_models(None, None).unwrap();
+        let loose_id = models
+            .iter()
+            .find(|model| model.source_archive_member.is_none())
+            .unwrap()
+            .id
+            .clone();
+        let archive_id = models
+            .iter()
+            .find(|model| model.source_archive_member.as_deref() == Some("member.stl"))
+            .unwrap()
+            .id
+            .clone();
+        let absolute_loose = root.path.join("parts/loose.stl");
+        let absolute_archive = root.path.join("parts/pack.zip");
+        db.conn
+            .execute(
+                "UPDATE models SET source_path=?1 WHERE id=?2",
+                params![absolute_loose.to_string_lossy(), loose_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE models SET source_path=?1 WHERE id=?2",
+                params![absolute_archive.to_string_lossy(), archive_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.resolve_model_source_ref(&loose_id).unwrap().outer_path,
+            absolute_loose.canonicalize().unwrap()
+        );
+        let archive_source = db.resolve_model_source_ref(&archive_id).unwrap();
+        assert_eq!(
+            archive_source.outer_path,
+            absolute_archive.canonicalize().unwrap()
+        );
+        assert_eq!(archive_source.archive_member.as_deref(), Some("member.stl"));
+        assert_eq!(
+            db.indexed_source_metadata(&root.id, Path::new("parts/loose.stl"), None)
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            hash(1)
+        );
+        assert_eq!(
+            db.indexed_archive_metadata(&root.id, Path::new("parts/pack.zip"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.indexed_archive_source_refs(&root.id, Some(Path::new("parts")))
+                .unwrap(),
+            vec![SourceRef {
+                relative_path: "parts/pack.zip".into(),
+                archive_member: Some("member.stl".into()),
+            }]
+        );
+
+        let seen = [
+            SourceRef {
+                relative_path: "parts/loose.stl".into(),
+                archive_member: None,
+            },
+            SourceRef {
+                relative_path: "parts/pack.zip".into(),
+                archive_member: Some("member.stl".into()),
+            },
+        ];
+        db.complete_subdirectory_scan_sources_with_new_models(
+            &root.id,
+            Path::new("parts"),
+            &seen,
+            &[],
+        )
+        .unwrap();
+        for id in [&loose_id, &archive_id] {
+            assert!(!db.get_model(id).unwrap().unwrap().source_missing);
+        }
+        assert_eq!(
+            db.get_model(&loose_id)
+                .unwrap()
+                .unwrap()
+                .source_path
+                .as_deref(),
+            absolute_loose.to_str()
+        );
+
+        fs::write(sources.join("parts/loose.stl"), b"new loose bytes").unwrap();
+        fs::write(sources.join("parts/pack.zip"), b"new archive bytes").unwrap();
+        let changed = [
+            ScannedModel {
+                content_hash: hash(3),
+                bytes: 15,
+                modified_at: 2,
+                ..initial[0].clone()
+            },
+            ScannedModel {
+                content_hash: hash(4),
+                bytes: 16,
+                modified_at: 2,
+                outer_fingerprint: Some("archive-v2".into()),
+                ..initial[1].clone()
+            },
+        ];
+        let updated = db.record_scan_entries(&root.id, &changed).unwrap();
+        assert_eq!(updated.added, 0);
+        assert_eq!(updated.updated, 2);
+        assert!(updated.added_model_ids.is_empty());
+        let stored_paths = db
+            .conn
+            .prepare("SELECT source_path FROM models ORDER BY source_archive_member IS NOT NULL")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stored_paths, ["parts/loose.stl", "parts/pack.zip"]);
+        let current = db.list_models(None, None).unwrap();
+        assert_eq!(current.len(), 2);
+        assert!(current.iter().any(|model| {
+            model.id == loose_id
+                && model.source_path.as_deref() == absolute_loose.to_str()
+                && model.content_hash.as_deref() == Some(hash(3).as_str())
+                && !model.source_missing
+        }));
+        assert!(current.iter().any(|model| {
+            model.id == archive_id
+                && model.source_path.as_deref() == absolute_archive.to_str()
+                && model.content_hash.as_deref() == Some(hash(4).as_str())
+                && !model.source_missing
+        }));
+
         let _ = fs::remove_dir_all(library);
         let _ = fs::remove_dir_all(sources);
     }
@@ -7190,6 +7778,20 @@ mod tests {
         assert!(db.get_model(&first.id).unwrap().unwrap().metadata_version > floor);
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(sources);
+    }
+
+    #[test]
+    fn duplicate_scope_limit_is_checked_before_model_lookups() {
+        let root = temp_root("duplicate-scope-limit");
+        let db = LibraryDb::open(&root).unwrap();
+        let ids = (0..1_001)
+            .map(|index| format!("model-{index}"))
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            db.duplicate_groups(&ids),
+            Err(LibraryError::InvalidInput(_))
+        ));
     }
 
     #[test]

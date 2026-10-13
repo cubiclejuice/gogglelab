@@ -33,11 +33,11 @@ use library_protocol::{
     IntegrationSpoolmanPullResult, LibraryEngine as ProtocolLibraryEngine, ManagementAction,
     ManagementEngine, ManagementResult, MetadataEngine, MetadataPatch, MetadataValueKind,
     ModelAvailability, ModelFilamentAssignment, ModelGroupFilter, ModelQuery as ProtocolModelQuery,
-    ModelSort, ModelSourceStatus, MutationVersion, PageRequest, PrintAttempt,
-    PrintAttemptBatchItem, PrintAttemptInput, PrintHistoryEngine, PrintStatus, RootHandle,
-    RuntimeError, RuntimeErrorCode, ScanStatus, SettingsEngine, SortDirection, Tag, TagEngine,
-    ThumbnailDescriptor, UploadIntent, UploadToken, VersionedMetadataUpdate, VersionedTarget,
-    MAX_MODEL_SEARCH_OFFSET,
+    ModelSort, ModelSourceStatus, MoveLooseSourceTarget, MutationVersion, PageRequest,
+    PrintAttempt, PrintAttemptBatchItem, PrintAttemptInput, PrintHistoryEngine, PrintStatus,
+    RootHandle, RuntimeError, RuntimeErrorCode, ScanStatus, SettingsEngine, SortDirection, Tag,
+    TagEngine, ThumbnailDescriptor, UploadIntent, UploadToken, VersionedMetadataUpdate,
+    VersionedTarget, MAX_MODEL_SEARCH_OFFSET,
 };
 pub use library_protocol::{Capability, RequestContext};
 pub use security::{AllowedAuthority, AllowedOrigin, SecurityConfig};
@@ -52,6 +52,8 @@ pub const MAX_PAGE_SIZE: u16 = 100;
 const MAX_STATIC_FILES: usize = 2_048;
 const MAX_STATIC_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_STATIC_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FILTERED_CATALOG_MODELS: usize = 10_000;
+const MAX_DUPLICATE_SCOPE: usize = 1_000;
 
 #[derive(Clone)]
 struct StaticAsset {
@@ -195,6 +197,29 @@ pub trait HostSlicerAdapter: Send + Sync {
         expected_version: u64,
         slicer_id: &str,
     ) -> Result<(), EngineError>;
+
+    fn open_in_slicer_batch(
+        &self,
+        context: &RequestContext,
+        targets: &[VersionedTarget],
+        slicer_id: &str,
+    ) -> Result<(), EngineError> {
+        if targets.len() != 1 {
+            return Err(EngineError {
+                code: "unsupported",
+                message: "This host adapter does not support multi-model slicer handoff".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        let target = &targets[0];
+        self.open_in_slicer(
+            context,
+            &target.model_id,
+            target.expected_version,
+            slicer_id,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -517,6 +542,27 @@ impl WireTarget {
         })
     }
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireMoveLooseSourceTarget {
+    model_id: String,
+    expected_version: String,
+    file_name: String,
+}
+
+impl WireMoveLooseSourceTarget {
+    fn parse(self) -> Result<MoveLooseSourceTarget, EngineError> {
+        if !safe_leaf_filename(&self.file_name) {
+            return Err(invalid_tool());
+        }
+        Ok(MoveLooseSourceTarget {
+            model_id: self.model_id,
+            expected_version: parse_decimal(&self.expected_version).map_err(|_| invalid_tool())?,
+            file_name: self.file_name,
+        })
+    }
+}
 #[derive(Deserialize)]
 #[serde(
     tag = "kind",
@@ -547,14 +593,17 @@ enum WireManagementAction {
     },
     QuarantineLooseSource {
         target: WireTarget,
+        confirm: bool,
     },
     UndoQuarantine {
         snapshot_id: String,
+        confirm: bool,
     },
     MoveLooseSource {
         target: WireTarget,
         destination_handle_id: String,
         file_name: String,
+        confirm: bool,
     },
     PurgeCatalog {
         backup_destination_handle_id: String,
@@ -602,21 +651,47 @@ impl WireManagementAction {
                 destination_handle_id,
                 file_name,
             },
-            Self::QuarantineLooseSource { target } => ManagementAction::QuarantineLooseSource {
-                target: target.parse()?,
-            },
-            Self::UndoQuarantine { snapshot_id } => {
+            Self::QuarantineLooseSource { target, confirm } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Physical source actions require confirm:true",
+                    ));
+                }
+                ManagementAction::QuarantineLooseSource {
+                    target: target.parse()?,
+                }
+            }
+            Self::UndoQuarantine {
+                snapshot_id,
+                confirm,
+            } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Physical source actions require confirm:true",
+                    ));
+                }
                 ManagementAction::UndoQuarantine { snapshot_id }
             }
             Self::MoveLooseSource {
                 target,
                 destination_handle_id,
                 file_name,
-            } => ManagementAction::MoveLooseSource {
-                target: target.parse()?,
-                destination_handle_id,
-                file_name,
-            },
+                confirm,
+            } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Physical source actions require confirm:true",
+                    ));
+                }
+                ManagementAction::MoveLooseSource {
+                    target: target.parse()?,
+                    destination_handle_id,
+                    file_name,
+                }
+            }
             Self::PurgeCatalog {
                 backup_destination_handle_id,
                 backup_file_name,
@@ -721,11 +796,27 @@ fn wire_management_result(value: ManagementResult) -> Value {
             snapshot_id,
             model_id,
         } => serde_json::json!({"kind":"quarantined","snapshotId":snapshot_id,"modelId":model_id}),
+        ManagementResult::QuarantinedBatch {
+            snapshot_id,
+            models,
+        } => serde_json::json!({
+            "kind":"quarantinedMany",
+            "snapshotId":snapshot_id,
+            "models":models
+        }),
         ManagementResult::QuarantineUndone { model } => serde_json::json!({
             "kind":"quarantineUndone","model":WireMutation::from(model)
         }),
+        ManagementResult::QuarantineUndoneBatch { models } => serde_json::json!({
+            "kind":"quarantineUndoneMany",
+            "models":models.into_iter().map(WireMutation::from).collect::<Vec<_>>()
+        }),
         ManagementResult::Moved { model } => serde_json::json!({
             "kind":"moved","model":WireMutation::from(model)
+        }),
+        ManagementResult::MovedBatch { models } => serde_json::json!({
+            "kind":"movedMany",
+            "models":models.into_iter().map(WireMutation::from).collect::<Vec<_>>()
         }),
         ManagementResult::Purged {
             backup_destination_handle_id,
@@ -1264,6 +1355,23 @@ pub trait LibraryEngine: Send + Sync + 'static {
     fn roots(&self, c: &RequestContext) -> Result<Vec<RootHandle>, EngineError>;
     fn start_scan(&self, c: &RequestContext, id: Option<String>)
         -> Result<ScanStatus, EngineError>;
+    fn start_scan_subdirectory(
+        &self,
+        c: &RequestContext,
+        root_id: String,
+        directory: String,
+    ) -> Result<ScanStatus, EngineError> {
+        if directory.is_empty() {
+            self.start_scan(c, Some(root_id))
+        } else {
+            Err(EngineError {
+                code: "unsupported",
+                message: "Root-relative subdirectory scans are unsupported by this host".into(),
+                retryable: false,
+                current_version: None,
+            })
+        }
+    }
     fn cancel_scan(&self, c: &RequestContext) -> Result<ScanStatus, EngineError>;
     fn scan_status(&self, c: &RequestContext) -> Result<ScanStatus, EngineError>;
     fn prepare_bundle(
@@ -1394,6 +1502,77 @@ impl<
     pub fn with_host_slicer(mut self, host_slicer: Arc<dyn HostSlicerAdapter>) -> Self {
         self.host_slicer = Some(host_slicer);
         self
+    }
+
+    fn collect_filtered_models(
+        &self,
+        context: &RequestContext,
+        filters: &serde_json::Map<String, Value>,
+    ) -> Result<Vec<ModelSummary>, EngineError>
+    where
+        Self: LibraryEngine,
+    {
+        self.collect_filtered_models_bounded(context, filters, MAX_FILTERED_CATALOG_MODELS)
+    }
+
+    fn collect_filtered_models_bounded(
+        &self,
+        context: &RequestContext,
+        filters: &serde_json::Map<String, Value>,
+        maximum: usize,
+    ) -> Result<Vec<ModelSummary>, EngineError>
+    where
+        Self: LibraryEngine,
+    {
+        let mut arguments = filters.clone();
+        arguments.remove("modelIds");
+        arguments.remove("includeZip");
+        arguments.remove("limit");
+        arguments.remove("cursor");
+        arguments.remove("offset");
+        arguments.insert("limit".into(), Value::from(100));
+        let mut cursor = None::<String>;
+        let mut cursors = BTreeSet::new();
+        let mut models = Vec::new();
+        loop {
+            if let Some(cursor) = &cursor {
+                arguments.insert("cursor".into(), Value::String(cursor.clone()));
+            } else {
+                arguments.remove("cursor");
+            }
+            let page = LibraryEngine::call_tool(
+                self,
+                context,
+                "search_models",
+                Value::Object(arguments.clone()),
+            )?;
+            let mut page_models: Vec<ModelSummary> =
+                serde_json::from_value(page.get("items").cloned().ok_or_else(internal_tool)?)
+                    .map_err(|_| internal_tool())?;
+            models.append(&mut page_models);
+            if models.len() > maximum {
+                return Err(EngineError {
+                    code: "invalidInput",
+                    message: format!(
+                        "Filtered catalog scope exceeds {maximum} models; narrow the filters"
+                    ),
+                    retryable: false,
+                    current_version: None,
+                });
+            }
+            let next = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match next {
+                Some(next) if cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => {
+                    return Err(internal_tool());
+                }
+                None => break,
+            }
+        }
+        Ok(models)
     }
 }
 
@@ -1710,20 +1889,88 @@ impl<
                 if !self.supports_tool(context, name) {
                     return Err(host_slicer_unavailable());
                 }
-                let model_id = arguments
-                    .get("modelId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(invalid_tool)?;
-                let expected_version = tool_version(&arguments)?;
                 let slicer_id = arguments
                     .get("slicerId")
                     .and_then(Value::as_str)
                     .ok_or_else(invalid_tool)?;
-                self.host_slicer
-                    .as_ref()
-                    .ok_or_else(host_slicer_unavailable)?
-                    .open_in_slicer(context, model_id, expected_version, slicer_id)?;
-                return Ok(serde_json::json!({"opened":true}));
+                let targets = slicer_targets(&arguments)?;
+                if self.host_mode == HostMode::Desktop {
+                    self.host_slicer
+                        .as_ref()
+                        .ok_or_else(host_slicer_unavailable)?
+                        .open_in_slicer_batch(context, &targets, slicer_id)?;
+                    return Ok(serde_json::json!({
+                        "kind":"opened",
+                        "opened":true,
+                        "modelIds":targets.into_iter().map(|target| target.model_id).collect::<Vec<_>>()
+                    }));
+                }
+
+                const MAX_CLIENT_HANDOFF_BYTES: u64 = 1024 * 1024 * 1024;
+                let mut preflight = Vec::with_capacity(targets.len());
+                let mut total_bytes = 0_u64;
+                for target in &targets {
+                    let model = self.get_model(context, &target.model_id)?;
+                    let actual_version =
+                        parse_decimal(&model.metadata_version).map_err(|_| internal_tool())?;
+                    if actual_version != target.expected_version {
+                        return Err(EngineError {
+                            code: "conflict",
+                            message: "Model metadata changed; refresh the model before opening it"
+                                .into(),
+                            retryable: true,
+                            current_version: Some(actual_version),
+                        });
+                    }
+                    let model_bytes = parse_decimal(&model.bytes).map_err(|_| internal_tool())?;
+                    total_bytes = total_bytes
+                        .checked_add(model_bytes)
+                        .ok_or_else(invalid_tool)?;
+                    if total_bytes > MAX_CLIENT_HANDOFF_BYTES {
+                        return Err(EngineError {
+                            code: "invalidInput",
+                            message: "Slicer client-command batch exceeds its byte limit".into(),
+                            retryable: false,
+                            current_version: None,
+                        });
+                    }
+                    preflight.push(model);
+                }
+                total_bytes = 0;
+                let mut client_targets = Vec::with_capacity(targets.len());
+                for (target, model) in targets.into_iter().zip(preflight) {
+                    let lease = self.issue_model_download(
+                        context,
+                        &target.model_id,
+                        model.content_hash.as_deref(),
+                    )?;
+                    total_bytes = total_bytes
+                        .checked_add(lease.bytes)
+                        .ok_or_else(invalid_tool)?;
+                    if total_bytes > MAX_CLIENT_HANDOFF_BYTES {
+                        return Err(EngineError {
+                            code: "invalidInput",
+                            message: "Slicer client-command batch exceeds its byte limit".into(),
+                            retryable: false,
+                            current_version: None,
+                        });
+                    }
+                    let lease_id = lease.id.clone();
+                    let wire_lease = WireLease::from(lease);
+                    client_targets.push(serde_json::json!({
+                        "modelId":target.model_id,
+                        "expectedVersion":target.expected_version.to_string(),
+                        "downloadLease":wire_lease,
+                        "contentRoute":format!("/api/v1/content/{lease_id}")
+                    }));
+                }
+                return Ok(serde_json::json!({
+                    "kind":"clientCommand",
+                    "command":"openInSlicer",
+                    "slicerId":slicer_id,
+                    "targets":client_targets,
+                    "totalBytes":total_bytes.to_string()
+                }));
             }
             "integration_get_settings" => return encoded!(self.integration_settings(context)?),
             "integration_save_spoolman_config" => {
@@ -1812,7 +2059,39 @@ impl<
                 self.discard_ai_review(context, review_token)?;
                 return Ok(serde_json::json!({"ok":true}));
             }
-            "get_hash_status" => return encoded!(self.catalog_hash_status(context)?),
+            "get_hash_status" => {
+                let filters = arguments.as_object().ok_or_else(invalid_tool)?;
+                if !has_catalog_filters(filters) {
+                    return encoded!(self.catalog_hash_status(context)?);
+                }
+                let models = self.collect_filtered_models(context, filters)?;
+                let model_count = models.len() as u64;
+                let hashed_count = models
+                    .iter()
+                    .filter(|model| model.content_hash.is_some())
+                    .count() as u64;
+                let bookmark_count = models
+                    .iter()
+                    .filter(|model| model.catalog_kind == "bookmark")
+                    .count() as u64;
+                let unhashed_count = models
+                    .iter()
+                    .filter(|model| {
+                        model.catalog_kind != "bookmark" && model.content_hash.is_none()
+                    })
+                    .count() as u64;
+                let missing_count = models
+                    .iter()
+                    .filter(|model| model.availability == "missing")
+                    .count() as u64;
+                return encoded!(HashStatus {
+                    model_count: model_count.to_string(),
+                    hashed_count: hashed_count.to_string(),
+                    unhashed_count: unhashed_count.to_string(),
+                    bookmark_count: bookmark_count.to_string(),
+                    missing_count: missing_count.to_string(),
+                });
+            }
             "check_files_exist" => {
                 let model_ids: Vec<String> = serde_json::from_value(
                     arguments
@@ -1824,7 +2103,64 @@ impl<
                 return encoded!(self.check_model_sources(context, model_ids)?);
             }
             "calculate_missing_hashes" | "refresh_hashes" => {
-                return encoded!(self.start_scan(context, None)?)
+                let filters = arguments.as_object().ok_or_else(invalid_tool)?;
+                if let Some(root_id) = filters.get("rootId").and_then(Value::as_str) {
+                    return encoded!(self.start_scan(context, Some(root_id.to_owned()))?);
+                }
+                if !has_catalog_filters(filters) {
+                    return encoded!(self.start_scan(context, None)?);
+                }
+                let models = self.collect_filtered_models(context, filters)?;
+                let missing_hashes = models
+                    .iter()
+                    .filter(|model| {
+                        model.catalog_kind != "bookmark" && model.content_hash.is_none()
+                    })
+                    .count();
+                if name == "calculate_missing_hashes" && missing_hashes == 0 {
+                    return Ok(serde_json::json!({
+                        "started":false,
+                        "total":"0",
+                        "message":"Filtered models already have stored SHA-256 hashes"
+                    }));
+                }
+                if models.is_empty() {
+                    return Ok(serde_json::json!({"started":false,"total":"0"}));
+                }
+                let roots = models
+                    .iter()
+                    .filter_map(|model| model.source_root_id.clone())
+                    .collect::<BTreeSet<_>>();
+                if roots.is_empty() && filters.get("rootId").is_none() {
+                    if missing_hashes == 0 {
+                        return Ok(serde_json::json!({
+                            "started":false,
+                            "total":"0",
+                            "message":"Filtered models have no indexed root requiring a scan"
+                        }));
+                    }
+                    return Err(EngineError {
+                        code: "invalidInput",
+                        message:
+                            "Missing hashes cannot be calculated for models without an indexed root"
+                                .into(),
+                        retryable: false,
+                        current_version: None,
+                    });
+                }
+                let root_id = match (filters.get("rootId").and_then(Value::as_str), roots.len()) {
+                    (Some(root_id), _) => root_id.to_owned(),
+                    (None, 1) => roots.into_iter().next().ok_or_else(invalid_tool)?,
+                    _ => {
+                        return Err(EngineError {
+                            code: "invalidInput",
+                            message: "Filtered hash refresh must resolve to one admitted root; provide rootId to narrow it".into(),
+                            retryable: false,
+                            current_version: None,
+                        });
+                    }
+                };
+                return encoded!(self.start_scan(context, Some(root_id))?);
             }
             "start_thumbnail_job" => {
                 let model_ids: Vec<String> = serde_json::from_value(
@@ -1953,18 +2289,16 @@ impl<
                 )?));
             }
             "trash_file" => {
-                let target = VersionedTarget {
-                    model_id: arguments
-                        .get("modelId")
-                        .and_then(Value::as_str)
-                        .ok_or_else(invalid_tool)?
-                        .to_owned(),
-                    expected_version: tool_version(&arguments)?,
+                let targets = versioned_tool_targets(&arguments)?;
+                let action = if arguments.get("targets").is_some() {
+                    ManagementAction::QuarantineLooseSources { targets }
+                } else {
+                    let target = targets.into_iter().next().ok_or_else(invalid_tool)?;
+                    ManagementAction::QuarantineLooseSource { target }
                 };
-                return encoded!(WireActionPlan::from(self.plan_management_action(
-                    context,
-                    ManagementAction::QuarantineLooseSource { target },
-                )?));
+                return encoded!(WireActionPlan::from(
+                    self.plan_management_action(context, action,)?
+                ));
             }
             "undo_trash" => {
                 let snapshot_id = arguments
@@ -1978,32 +2312,45 @@ impl<
                 )?));
             }
             "move_files" => {
-                let target = VersionedTarget {
-                    model_id: arguments
-                        .get("modelId")
-                        .and_then(Value::as_str)
-                        .ok_or_else(invalid_tool)?
-                        .to_owned(),
-                    expected_version: tool_version(&arguments)?,
-                };
                 let destination_handle_id = arguments
                     .get("destinationHandleId")
                     .and_then(Value::as_str)
                     .ok_or_else(invalid_tool)?
                     .to_owned();
-                let file_name = arguments
-                    .get("fileName")
-                    .and_then(Value::as_str)
-                    .ok_or_else(invalid_tool)?
-                    .to_owned();
-                return encoded!(WireActionPlan::from(self.plan_management_action(
-                    context,
+                let action = if let Some(value) = arguments.get("targets") {
+                    let targets: Vec<WireMoveLooseSourceTarget> =
+                        serde_json::from_value(value.clone()).map_err(|_| invalid_tool())?;
+                    let targets = targets
+                        .into_iter()
+                        .map(WireMoveLooseSourceTarget::parse)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    ManagementAction::MoveLooseSources {
+                        targets,
+                        destination_handle_id,
+                    }
+                } else {
+                    let target = VersionedTarget {
+                        model_id: arguments
+                            .get("modelId")
+                            .and_then(Value::as_str)
+                            .ok_or_else(invalid_tool)?
+                            .to_owned(),
+                        expected_version: tool_version(&arguments)?,
+                    };
+                    let file_name = arguments
+                        .get("fileName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned();
                     ManagementAction::MoveLooseSource {
                         target,
                         destination_handle_id,
                         file_name,
-                    },
-                )?));
+                    }
+                };
+                return encoded!(WireActionPlan::from(
+                    self.plan_management_action(context, action,)?
+                ));
             }
             "backup_database" => {
                 let action = ManagementAction::CreateBackup {
@@ -2126,13 +2473,19 @@ impl<
             "list_licenses" => return encoded!(self.catalog_facets(context)?.licenses),
             "list_roots" => return encoded!(self.roots(context)?),
             "scan_directory" => {
-                return encoded!(self.start_scan(
-                    context,
-                    arguments
-                        .get("rootId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                )?)
+                let root_id = arguments
+                    .get("rootId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(directory) = arguments.get("directory").and_then(Value::as_str) {
+                    let root_id = root_id.ok_or_else(invalid_tool)?;
+                    return encoded!(self.start_scan_subdirectory(
+                        context,
+                        root_id,
+                        directory.to_owned(),
+                    )?);
+                }
+                return encoded!(self.start_scan(context, root_id,)?);
             }
             "cancel_scan" => return encoded!(self.cancel_scan(context)?),
             "get_scan_status" => return encoded!(self.scan_status(context)?),
@@ -2180,15 +2533,53 @@ impl<
                 )?));
             }
             "find_duplicates" => {
-                let model_ids: Vec<String> = serde_json::from_value(
-                    arguments
-                        .get("modelIds")
-                        .cloned()
-                        .ok_or_else(invalid_tool)?,
-                )
-                .map_err(|_| invalid_tool())?;
-                return encoded!(self
-                    .duplicate_groups(context, model_ids)?
+                let include_zip = arguments
+                    .get("includeZip")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let group_limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(50)
+                    .min(200);
+                let model_ids = if let Some(ids) = arguments.get("modelIds") {
+                    let ids: Vec<String> =
+                        serde_json::from_value(ids.clone()).map_err(|_| invalid_tool())?;
+                    if include_zip {
+                        ids
+                    } else {
+                        ids.into_iter()
+                            .filter_map(|id| match self.get_model(context, &id) {
+                                Ok(model) if !model.archive_member => Some(Ok(id)),
+                                Ok(_) => None,
+                                Err(error) => Some(Err(error)),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    }
+                } else {
+                    let filter_object = arguments.as_object().ok_or_else(invalid_tool)?;
+                    self.collect_filtered_models_bounded(
+                        context,
+                        filter_object,
+                        MAX_DUPLICATE_SCOPE,
+                    )?
+                    .into_iter()
+                    .filter(|model| include_zip || !model.archive_member)
+                    .map(|model| model.id)
+                    .collect()
+                };
+                if model_ids.len() > MAX_DUPLICATE_SCOPE {
+                    return Err(EngineError {
+                        code: "invalidInput",
+                        message: "Duplicate scope exceeds 1000 models; narrow the filters".into(),
+                        retryable: false,
+                        current_version: None,
+                    });
+                }
+                let mut groups = self.duplicate_groups(context, model_ids)?;
+                groups.truncate(group_limit);
+                return encoded!(groups
                     .into_iter()
                     .map(WireDuplicateGroup::from)
                     .collect::<Vec<_>>());
@@ -2807,12 +3198,17 @@ impl<
                 && context.capabilities.contains(&Capability::HostSlicer);
         }
         if name == "open_in_slicer" {
+            let can_read = context.capabilities.contains(&Capability::CatalogRead)
+                && context.capabilities.contains(&Capability::MediaRead);
             return connected
-                && self.host_mode == HostMode::Desktop
-                && self.host_slicer.is_some()
-                && context.capabilities.contains(&Capability::CatalogRead)
-                && context.capabilities.contains(&Capability::MediaRead)
-                && context.capabilities.contains(&Capability::HostSlicer);
+                && can_read
+                && match self.host_mode {
+                    HostMode::Desktop => {
+                        self.host_slicer.is_some()
+                            && context.capabilities.contains(&Capability::HostSlicer)
+                    }
+                    HostMode::Headless => true,
+                };
         }
         if matches!(name, "trash_file" | "undo_trash" | "move_files") {
             if !cfg!(unix)
@@ -3328,6 +3724,38 @@ impl<
             .start_scan(c, catalog_root_id)
             .map_err(map_runtime_error)
     }
+    fn start_scan_subdirectory(
+        &self,
+        c: &RequestContext,
+        root_id: String,
+        directory: String,
+    ) -> Result<ScanStatus, EngineError> {
+        if directory.is_empty() {
+            return self.start_scan(c, Some(root_id));
+        }
+        let mut matches = self
+            .inner
+            .runtime_info(c)
+            .map_err(map_runtime_error)?
+            .roots
+            .into_iter()
+            .filter(|root| {
+                root.id == root_id || root.catalog_root_id.as_deref() == Some(root_id.as_str())
+            })
+            .filter_map(|root| root.catalog_root_id)
+            .collect::<BTreeSet<_>>();
+        if matches.len() != 1 {
+            return Err(EngineError {
+                code: "forbidden",
+                message: "Root handle is not admitted for scanning".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        self.inner
+            .start_scan_subdirectory(c, matches.pop_first().unwrap(), directory)
+            .map_err(map_runtime_error)
+    }
     fn cancel_scan(&self, c: &RequestContext) -> Result<ScanStatus, EngineError> {
         self.inner.cancel_scan(c).map_err(map_runtime_error)
     }
@@ -3462,6 +3890,20 @@ fn invalid_tool() -> EngineError {
     }
 }
 
+fn has_catalog_filters(object: &serde_json::Map<String, Value>) -> bool {
+    [
+        "search",
+        "designer",
+        "tags",
+        "directory",
+        "rootId",
+        "fileType",
+        "printed",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
 fn normalize_search_file_type(value: &str) -> Option<String> {
     let value = value.trim();
     let extension = value.strip_prefix('.').unwrap_or(value);
@@ -3521,8 +3963,163 @@ fn valid_excluded_model_ids(value: &Value) -> bool {
     })
 }
 
+fn valid_source_target_object(
+    target: &serde_json::Map<String, Value>,
+    has_file_name: bool,
+) -> bool {
+    target.len() == (if has_file_name { 3 } else { 2 })
+        && target
+            .get("modelId")
+            .and_then(Value::as_str)
+            .is_some_and(|model_id| !model_id.is_empty() && model_id.len() <= 128)
+        && target
+            .get("expectedVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|version| parse_decimal(version).is_ok())
+        && (!has_file_name
+            || target
+                .get("fileName")
+                .and_then(Value::as_str)
+                .is_some_and(safe_leaf_filename))
+}
+
+fn valid_catalog_filter_fields(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("search")
+        .is_none_or(|value| value.as_str().is_some_and(|value| value.len() <= 256))
+        && object
+            .get("designer")
+            .is_none_or(|value| value.as_str().is_some_and(|value| value.len() <= 200))
+        && object.get("tags").is_none_or(valid_search_tag_names)
+        && object.get("fileType").is_none_or(|value| {
+            value
+                .as_str()
+                .and_then(normalize_search_file_type)
+                .is_some()
+        })
+        && object.get("printed").is_none_or(|value| {
+            value.as_str().is_some_and(|status| {
+                matches!(
+                    status,
+                    "unprinted"
+                        | "printed"
+                        | "want"
+                        | "queued"
+                        | "printing"
+                        | "failed"
+                        | "ever-printed"
+                        | "never-printed"
+                        | "all"
+                )
+            })
+        })
+        && object.get("rootId").is_none_or(|value| {
+            value
+                .as_str()
+                .is_some_and(|root| !root.is_empty() && root.len() <= 128)
+        })
+        && object.get("directory").is_none_or(|value| {
+            value.as_str().is_some_and(|directory| {
+                directory.len() <= 1024 && !directory.contains('\\') && !directory.contains('\0')
+            })
+        })
+        && (!(object.contains_key("directory")) || object.contains_key("rootId"))
+}
+
+fn validate_source_file_action_shape(
+    name: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), EngineError> {
+    const TRASH_ALLOWED: &[&str] = &["modelId", "expectedVersion", "targets", "confirm"];
+    const MOVE_ALLOWED: &[&str] = &[
+        "modelId",
+        "expectedVersion",
+        "destinationHandleId",
+        "fileName",
+        "targets",
+        "confirm",
+    ];
+    let is_move = name == "move_files";
+    let allowed = if is_move { MOVE_ALLOWED } else { TRASH_ALLOWED };
+    if object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || object.get("confirm").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(invalid_tool());
+    }
+    if is_move
+        && !object
+            .get("destinationHandleId")
+            .and_then(Value::as_str)
+            .is_some_and(|handle| !handle.is_empty() && handle.len() <= 128)
+    {
+        return Err(invalid_tool());
+    }
+
+    if let Some(targets) = object.get("targets") {
+        if object.contains_key("modelId")
+            || object.contains_key("expectedVersion")
+            || (is_move && object.contains_key("fileName"))
+        {
+            return Err(invalid_tool());
+        }
+        let targets = targets.as_array().ok_or_else(invalid_tool)?;
+        if targets.is_empty() || targets.len() > 100 {
+            return Err(invalid_tool());
+        }
+        let mut model_ids = BTreeSet::new();
+        let mut file_names = BTreeSet::new();
+        for target in targets {
+            let target = target.as_object().ok_or_else(invalid_tool)?;
+            if !valid_source_target_object(target, is_move) {
+                return Err(invalid_tool());
+            }
+            let model_id = target
+                .get("modelId")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid_tool)?;
+            if !model_ids.insert(model_id.to_owned()) {
+                return Err(invalid_tool());
+            }
+            if is_move {
+                let file_name = target
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                if !file_names.insert(file_name.to_lowercase()) {
+                    return Err(invalid_tool());
+                }
+            }
+        }
+    } else {
+        let _model_id = object
+            .get("modelId")
+            .and_then(Value::as_str)
+            .filter(|model_id| !model_id.is_empty() && model_id.len() <= 128)
+            .ok_or_else(invalid_tool)?;
+        let version = object
+            .get("expectedVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_tool)?;
+        if parse_decimal(version).is_err() {
+            return Err(invalid_tool());
+        }
+        if is_move
+            && !object
+                .get("fileName")
+                .and_then(Value::as_str)
+                .is_some_and(safe_leaf_filename)
+        {
+            return Err(invalid_tool());
+        }
+    }
+    Ok(())
+}
+
 fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
     let object = value.as_object().ok_or_else(invalid_tool)?;
+    if matches!(name, "trash_file" | "move_files") {
+        return validate_source_file_action_shape(name, object);
+    }
     let (allowed, required): (&[&str], &[&str]) = match name {
         "search_models" => (
             &[
@@ -3557,8 +4154,18 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             &["reviewToken", "decisions", "strategy"],
         ),
         "discard_tag_review" => (&["reviewToken"], &["reviewToken"]),
-        "get_hash_status" | "refresh_hashes" => (&[], &[]),
-        "calculate_missing_hashes" => (&[], &[]),
+        "get_hash_status" | "calculate_missing_hashes" | "refresh_hashes" => (
+            &[
+                "search",
+                "designer",
+                "tags",
+                "directory",
+                "rootId",
+                "fileType",
+                "printed",
+            ],
+            &[],
+        ),
         "check_files_exist" => (&["modelIds"], &["modelIds"]),
         "start_thumbnail_job" => (&["modelIds", "force"], &["modelIds"]),
         "get_models_missing_thumbnails" => (&["cursor", "limit", "excludeIds"], &[]),
@@ -3580,27 +4187,7 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             &["targets", "modelId", "expectedVersion", "confirm"],
             &["confirm"],
         ),
-        "trash_file" => (
-            &["modelId", "expectedVersion", "confirm"],
-            &["modelId", "expectedVersion", "confirm"],
-        ),
         "undo_trash" => (&["snapshotId", "confirm"], &["snapshotId", "confirm"]),
-        "move_files" => (
-            &[
-                "modelId",
-                "expectedVersion",
-                "destinationHandleId",
-                "fileName",
-                "confirm",
-            ],
-            &[
-                "modelId",
-                "expectedVersion",
-                "destinationHandleId",
-                "fileName",
-                "confirm",
-            ],
-        ),
         "backup_database" => (
             &["destinationHandleId", "fileName"],
             &["destinationHandleId", "fileName"],
@@ -3614,13 +4201,27 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         "get_model" | "get_all_metadata" => (&["modelId"], &["modelId"]),
         "get_library_stats" | "list_parent_models" | "list_designers" | "list_licenses"
         | "list_roots" | "cancel_scan" | "get_scan_status" => (&[], &[]),
-        "scan_directory" => (&["rootId"], &[]),
+        "scan_directory" => (&["rootId", "directory"], &[]),
         "prepare_bundle_preview" => (&["bundleId"], &["bundleId"]),
         "get_bundle_preview_geometry" | "download_bundle" | "close_bundle_preview" => {
             (&["token"], &["token"])
         }
         "get_model_geometry" => (&["modelId", "expectedHash", "plateId"], &["modelId"]),
-        "find_duplicates" => (&["modelIds"], &["modelIds"]),
+        "find_duplicates" => (
+            &[
+                "modelIds",
+                "includeZip",
+                "search",
+                "designer",
+                "tags",
+                "directory",
+                "rootId",
+                "fileType",
+                "printed",
+                "limit",
+            ],
+            &[],
+        ),
         "get_embedded_3mf_metadata" => (&["modelId", "expectedHash"], &["modelId"]),
         "pull_3mf_metadata" => (&["modelId", "expectedHash", "targets"], &[]),
         "apply_embedded_3mf_metadata" => (
@@ -3671,8 +4272,8 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         "download_model" => (&["modelId", "expectedHash"], &["modelId"]),
         "list_slicers" => (&[], &[]),
         "open_in_slicer" => (
-            &["modelId", "expectedVersion", "slicerId"],
-            &["modelId", "expectedVersion", "slicerId"],
+            &["modelId", "expectedVersion", "targets", "slicerId"],
+            &["slicerId"],
         ),
         _ => return Ok(()),
     };
@@ -3684,21 +4285,86 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
     let string_field_valid = |key: &str| object.get(key).is_none_or(Value::is_string);
     let valid_types = match name {
         "get_model" | "get_all_metadata" => string_field_valid("modelId"),
+        "get_hash_status" | "calculate_missing_hashes" | "refresh_hashes" => {
+            valid_catalog_filter_fields(object)
+        }
+        "find_duplicates" => {
+            let ids_valid = object.get("modelIds").is_none_or(|value| {
+                let Some(ids) = value.as_array() else {
+                    return false;
+                };
+                if ids.is_empty() || ids.len() > MAX_DUPLICATE_SCOPE {
+                    return false;
+                }
+                let mut unique = BTreeSet::new();
+                ids.iter().all(|id| {
+                    id.as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128)
+                        .is_some_and(|id| unique.insert(id.to_owned()))
+                })
+            });
+            let direct = object.contains_key("modelIds");
+            let has_filters = has_catalog_filters(object);
+            ids_valid
+                && !(direct && has_filters)
+                && object.get("includeZip").is_none_or(Value::is_boolean)
+                && object.get("limit").is_none_or(|value| {
+                    value
+                        .as_u64()
+                        .is_some_and(|limit| (1..=200).contains(&limit))
+                })
+                && if direct {
+                    true
+                } else {
+                    valid_catalog_filter_fields(object)
+                }
+        }
         "list_slicers" => true,
         "open_in_slicer" => {
-            object
-                .get("modelId")
+            let valid_slicer = object
+                .get("slicerId")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
-                && string_field_valid("expectedVersion")
-                && object
-                    .get("expectedVersion")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value.len() <= 20)
-                && object
-                    .get("slicerId")
+                .is_some_and(|value| !value.is_empty() && value.len() <= 128);
+            let valid_targets = if let Some(targets) = object.get("targets") {
+                if object.contains_key("modelId") || object.contains_key("expectedVersion") {
+                    false
+                } else if let Some(targets) = targets.as_array() {
+                    if targets.is_empty() || targets.len() > 100 {
+                        false
+                    } else {
+                        let mut model_ids = BTreeSet::new();
+                        targets.iter().all(|target| {
+                            let Some(target) = target.as_object() else {
+                                return false;
+                            };
+                            target.len() == 2
+                                && target.get("modelId").and_then(Value::as_str).is_some_and(
+                                    |model_id| {
+                                        !model_id.is_empty()
+                                            && model_id.len() <= 128
+                                            && model_ids.insert(model_id.to_owned())
+                                    },
+                                )
+                                && target
+                                    .get("expectedVersion")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|version| parse_decimal(version).is_ok())
+                        })
+                    }
+                } else {
+                    false
+                }
+            } else {
+                object
+                    .get("modelId")
                     .and_then(Value::as_str)
                     .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                    && object
+                        .get("expectedVersion")
+                        .and_then(Value::as_str)
+                        .is_some_and(|version| parse_decimal(version).is_ok())
+            };
+            valid_slicer && valid_targets
         }
         "search_models" => {
             string_field_valid("query")
@@ -3844,36 +4510,12 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             };
             target_shape_valid && object.get("confirm").and_then(Value::as_bool) == Some(true)
         }
-        "trash_file" => {
-            object
-                .get("modelId")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
-                && string_field_valid("expectedVersion")
-                && object.get("confirm").and_then(Value::as_bool) == Some(true)
-        }
         "undo_trash" => {
             object
                 .get("snapshotId")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.is_empty() && value.len() <= 128)
                 && object.get("confirm").and_then(Value::as_bool) == Some(true)
-        }
-        "move_files" => {
-            object
-                .get("modelId")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
-                && string_field_valid("expectedVersion")
-                && object.get("confirm").and_then(Value::as_bool) == Some(true)
-                && object
-                    .get("destinationHandleId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty() && value.len() <= 128)
-                && object
-                    .get("fileName")
-                    .and_then(Value::as_str)
-                    .is_some_and(safe_leaf_filename)
         }
         "backup_database" => {
             string_field_valid("destinationHandleId") && string_field_valid("fileName")
@@ -3895,7 +4537,22 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
             string_field_valid("handleId") && object.get("settings").is_some_and(Value::is_object)
         }
         "update_catalog_settings" => object.get("settings").is_some_and(Value::is_object),
-        "scan_directory" => string_field_valid("rootId"),
+        "scan_directory" => {
+            string_field_valid("rootId")
+                && object.get("rootId").is_none_or(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+                })
+                && object.get("directory").is_none_or(|value| {
+                    value.as_str().is_some_and(|directory| {
+                        directory.len() <= 1024
+                            && !directory.contains('\\')
+                            && !directory.contains('\0')
+                    })
+                })
+                && (!object.contains_key("directory") || object.contains_key("rootId"))
+        }
         "prepare_bundle_preview" => string_field_valid("bundleId"),
         "get_bundle_preview_geometry" | "download_bundle" | "close_bundle_preview" => {
             string_field_valid("token")
@@ -3905,7 +4562,6 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 && string_field_valid("expectedHash")
                 && object.get("plateId").is_none_or(Value::is_u64)
         }
-        "find_duplicates" => object.get("modelIds").is_some_and(Value::is_array),
         "get_embedded_3mf_metadata" => {
             string_field_valid("modelId") && string_field_valid("expectedHash")
         }
@@ -3969,6 +4625,13 @@ fn tool_version(value: &Value) -> Result<u64, EngineError> {
         .and_then(Value::as_str)
         .ok_or_else(invalid_tool)
         .and_then(|value| parse_decimal(value).map_err(|_| invalid_tool()))
+}
+fn slicer_targets(value: &Value) -> Result<Vec<VersionedTarget>, EngineError> {
+    let targets = versioned_tool_targets(value)?;
+    if targets.is_empty() || targets.len() > 100 {
+        return Err(invalid_tool());
+    }
+    Ok(targets)
 }
 fn versioned_tool_targets(value: &Value) -> Result<Vec<VersionedTarget>, EngineError> {
     if let Some(targets) = value.get("targets") {
@@ -4795,7 +5458,7 @@ pub fn openapi_document() -> Value {
             "/api/v1/integrations/ai/suggestions":{"post":{"responses":{"200":{"description":"Human-review-only bounded tag suggestions"},"501":{"description":"Network transport is not enabled by this host"}}}},
             "/api/v1/integrations/ai/reviews/{reviewToken}/apply":{"post":{"responses":{"200":{"description":"Atomic versioned accepted tag mutations"},"409":{"description":"Review is stale or replayed"}}}},
             "/api/v1/integrations/ai/reviews/{reviewToken}":{"delete":{"responses":{"204":{"description":"Review discarded"}}}},
-            "/api/v1/scan":{"get":{"responses":{"200":{"description":"Scan status"}}},"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"properties":{"rootId":{"type":["string","null"],"maxLength":128}}}}}},"responses":{"200":{"description":"Started admitted-root scan"},"403":{"description":"Root handle is not admitted"}}},"delete":{"responses":{"200":{"description":"Cancellation requested"}}}},
+            "/api/v1/scan":{"get":{"responses":{"200":{"description":"Scan status"}}},"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"properties":{"rootId":{"type":["string","null"],"maxLength":128},"directory":{"type":"string","maxLength":1024}},"oneOf":[{"not":{"required":["directory"]}},{"required":["rootId","directory"]}]}}}},"responses":{"200":{"description":"Started admitted-root or root-relative subdirectory scan"},"403":{"description":"Root handle is not admitted"}}},"delete":{"responses":{"200":{"description":"Cancellation requested"}}}},
             "/api/v1/bundles/{bundleId}/preview":{"post":{"responses":{"200":{"description":"Prepared bounded bundle preview summary"}}}},
             "/api/v1/bundle-previews/{token}/geometry":{"get":{"responses":{"200":{"description":"Existing GoggleLab binary geometry packet","content":{"application/vnd.gogglelab.geometry":{}}}}}},
             "/api/v1/bundle-previews/{token}/download-lease":{"post":{"responses":{"200":{"description":"Verified all-member ZIP content lease"}}}},
@@ -5954,18 +6617,33 @@ async fn discard_ai_review<E: LibraryEngine>(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScanRequest {
     root_id: Option<String>,
+    directory: Option<String>,
 }
 async fn start_scan<E: LibraryEngine>(
     State(s): State<ServerState<E>>,
     axum::Extension(c): axum::Extension<RequestContext>,
     Json(b): Json<ScanRequest>,
 ) -> Result<Json<ScanStatus>, ApiError> {
-    if b.root_id.as_ref().is_some_and(|value| value.len() > 128) {
+    if b.root_id.as_ref().is_some_and(|value| value.len() > 128)
+        || b.directory
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024 || value.contains('\\') || value.contains('\0'))
+    {
         return Err(api_bad("invalidInput", "rootId is outside its limits"));
+    }
+    if b.directory.is_some() && b.root_id.is_none() {
+        return Err(api_bad(
+            "invalidInput",
+            "directory requires an admitted rootId",
+        ));
     }
     let request = c.clone();
     blocking_engine(s.engine, &c.request_id, move |engine| {
-        engine.start_scan(&request, b.root_id)
+        if let (Some(root_id), Some(directory)) = (b.root_id.clone(), b.directory) {
+            engine.start_scan_subdirectory(&request, root_id, directory)
+        } else {
+            engine.start_scan(&request, b.root_id)
+        }
     })
     .await
     .map(Json)
@@ -6558,16 +7236,44 @@ pub fn tool_definitions() -> Vec<Value> {
                         {"required":["modelId","expectedVersion"],"not":{"required":["targets"]}}
                     ]
                 }),
-                "trash_file" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"confirm":{"const":true}}}),
+                "trash_file" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "confirm":{"const":true}
+                    },
+                    "required":["confirm"],
+                    "oneOf":[
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]}]}},
+                        {"required":["modelId","expectedVersion"],"not":{"required":["targets"]}}
+                    ]
+                }),
                 "undo_trash" => serde_json::json!({"type":"object","additionalProperties":false,"required":["snapshotId","confirm"],"properties":{"snapshotId":{"type":"string","minLength":1,"maxLength":128},"confirm":{"const":true}}}),
-                "move_files" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","destinationHandleId","fileName","confirm"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200,"pattern":"^[^/\\\\\\\\:*?\"<>|]+$"},"confirm":{"const":true}}}),
+                "move_files" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                        "destinationHandleId":{"type":"string","minLength":1,"maxLength":128},
+                        "fileName":{"type":"string","minLength":1,"maxLength":200,"pattern":"^[^/\\\\\\\\:*?\"<>|]+$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","fileName"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"fileName":{"type":"string","minLength":1,"maxLength":200,"pattern":"^[^/\\\\\\\\:*?\"<>|]+$"}}}},
+                        "confirm":{"const":true}
+                    },
+                    "required":["destinationHandleId","confirm"],
+                    "oneOf":[
+                        {"required":["modelId","expectedVersion","fileName"],"not":{"required":["targets"]}},
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]},{"required":["fileName"]}]}}
+                    ]
+                }),
                 "backup_database" => serde_json::json!({"type":"object","additionalProperties":false,"required":["destinationHandleId","fileName"],"properties":{"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200}}}),
                 "export_library" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"destPath":{"type":"string","maxLength":1024}}}),
                 "integration_delete_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128}}}),
                 "generate_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId","targets"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128},"targets":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"object","required":["modelId","expectedVersion"]}}}}),
                 "apply_tag_review" => serde_json::json!({"type":"object","additionalProperties":false,"required":["reviewToken","decisions","strategy"],"properties":{"reviewToken":{"type":"string","minLength":1,"maxLength":128},"decisions":{"type":"array","minItems":1,"maxItems":50},"strategy":{"type":"string","enum":["append","replace","merge"]}}}),
                 "discard_tag_review" => serde_json::json!({"type":"object","additionalProperties":false,"required":["reviewToken"],"properties":{"reviewToken":{"type":"string","minLength":1,"maxLength":128}}}),
-                "get_hash_status"|"calculate_missing_hashes"|"refresh_hashes" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "get_hash_status"|"calculate_missing_hashes"|"refresh_hashes" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"search":{"type":"string","maxLength":256},"designer":{"type":"string","maxLength":200},"tags":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1,"maxLength":120}},"directory":{"type":"string","maxLength":1024},"rootId":{"type":"string","minLength":1,"maxLength":128},"fileType":{"type":"string","minLength":1,"maxLength":16},"printed":{"type":"string","enum":["unprinted","printed","want","queued","printing","failed","ever-printed","never-printed","all"]}}}),
                 "check_files_exist" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelIds"],"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128}}}}),
                 "start_thumbnail_job" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelIds"],"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128}},"force":{"type":"boolean"}}}),
                 "get_models_missing_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100},"excludeIds":{"type":"array","maxItems":2000,"items":{"type":"string","minLength":1,"maxLength":128}}}}),
@@ -6589,11 +7295,11 @@ pub fn tool_definitions() -> Vec<Value> {
                 "update_catalog_settings" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"settings":{"type":"object","additionalProperties":false,"required":["thumbnailSize","thumbnailBackground","thumbnailConcurrency","scanBatchSize"],"properties":{"thumbnailSize":{"type":"integer","enum":[128,256,512]},"thumbnailBackground":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},"thumbnailConcurrency":{"type":"integer","minimum":1,"maximum":2},"scanBatchSize":{"type":"integer","minimum":16,"maximum":256}}}},"required":["settings"]}),
                 "get_model"|"get_all_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId"]}),
                 "get_library_stats"|"list_parent_models"|"list_designers"|"list_licenses"|"list_roots"|"cancel_scan"|"get_scan_status" => serde_json::json!({"type":"object","additionalProperties":false}),
-                "scan_directory" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"rootId":{"type":"string","maxLength":128}}}),
+                "scan_directory" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"rootId":{"type":"string","minLength":1,"maxLength":128},"directory":{"type":"string","maxLength":1024}},"oneOf":[{"not":{"required":["directory"]}},{"required":["rootId","directory"]}]}),
                 "prepare_bundle_preview" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"bundleId":{"type":"string","minLength":1,"maxLength":128}},"required":["bundleId"]}),
                 "get_bundle_preview_geometry"|"download_bundle"|"close_bundle_preview" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"token":{"type":"string","minLength":1,"maxLength":256}},"required":["token"]}),
                 "get_model_geometry" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"plateId":{"type":"integer","minimum":0,"maximum":4294967295_u64}},"required":["modelId"]}),
-                "find_duplicates" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":50000,"items":{"type":"string","minLength":1,"maxLength":128}}},"required":["modelIds"]}),
+                "find_duplicates" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":1000,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}},"includeZip":{"type":"boolean"},"search":{"type":"string","maxLength":256},"designer":{"type":"string","maxLength":200},"tags":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1,"maxLength":120}},"directory":{"type":"string","maxLength":1024},"rootId":{"type":"string","minLength":1,"maxLength":128},"fileType":{"type":"string","minLength":1,"maxLength":16},"printed":{"type":"string","enum":["unprinted","printed","want","queued","printing","failed","ever-printed","never-printed","all"]},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
                 "get_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
                 "pull_3mf_metadata" => serde_json::json!({
                     "type":"object","additionalProperties":false,
@@ -6607,7 +7313,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         {"required":["modelId"],"not":{"required":["targets"]}}
                     ]
                 }),
-                "apply_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"expectedSourceHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"selection":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":"boolean"},"sourceUrl":{"type":"boolean"},"notes":{"type":"boolean"},"modelLicense":{"type":"boolean"}}}},"required":["modelId","expectedVersion","expectedSourceHash","selection"]}),
+                "apply_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"expectedSourceHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"selection":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":"boolean"},"sourceUrl":{"type":"boolean"},"notes":{"type":"boolean"},"modelLicense":{"type":"boolean"},"parentModel":{"type":"boolean"}}}},"required":["modelId","expectedVersion","expectedSourceHash","selection"]}),
                 "list_capture_items" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
                 "retry_capture" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"itemId":{"type":"string","minLength":1,"maxLength":128},"envelope":{"type":"object"},"uploads":{"type":"array","maxItems":10000,"items":{"type":"object","required":["id","itemId","captureId","expiresAt","libraryEpoch"]}}},"required":["itemId","envelope","uploads"]}),
                 "get_folder_tree"|"list_tags" => serde_json::json!({"type":"object","additionalProperties":false}),
@@ -6649,7 +7355,19 @@ pub fn tool_definitions() -> Vec<Value> {
                 "set_default_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
                 "download_model" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
                 "list_slicers" => serde_json::json!({"type":"object","additionalProperties":false}),
-                "open_in_slicer" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","slicerId"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"},"slicerId":{"type":"string","minLength":1,"maxLength":128}}}),
+                "open_in_slicer" => serde_json::json!({
+                    "type":"object","additionalProperties":false,"required":["slicerId"],
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "slicerId":{"type":"string","minLength":1,"maxLength":128}
+                    },
+                    "oneOf":[
+                        {"required":["modelId","expectedVersion"],"not":{"required":["targets"]}},
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]}]}}
+                    ]
+                }),
                 "delete_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
                 "restore_library" => serde_json::json!({
                     "type":"object",
@@ -6662,6 +7380,9 @@ pub fn tool_definitions() -> Vec<Value> {
                 "name": name,
                 "description": match *name {
                     "search_models" => "Search the catalog with either search or the legacy query field, plus designer, all supplied tag names, file type, print-state, rating, favorite, thumbnail, and admitted-root filters. Use offset only on the first page; follow the returned cursor for stable continuation.".to_owned(),
+                    "find_duplicates" => "Find duplicate models by stored SHA-256, either for up to 1,000 explicit modelIds or a catalog filter set limited to 1,000 matches. Filtered scans require an admitted root when directory is supplied, exclude ZIP members by default, and return at most 200 groups. Hashes are the catalog's import/scan fingerprints; use source-status checks before making file decisions.".to_owned(),
+                    "get_hash_status" => "Return global hash counts, or counts for a bounded catalog filter set. Directory filters require an admitted root. Stored hashes are computed during import and scans; this count does not claim that current source bytes still match.".to_owned(),
+                    "calculate_missing_hashes" => "Refresh source hashes by scanning the selected admitted root. Optional catalog filters choose the matching scope; filtered work must resolve to one root and the scan refreshes that root's sources. GoggleLab normally stores hashes during import and indexing, so no background job is created when the filtered selection already has hashes.".to_owned(),
                     "update_models_batch" => "Atomically update multiple models. Use targets plus one patch for a shared change, or updates with one modelId, expectedVersion, and patch per model for heterogeneous changes.".to_owned(),
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
                     "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
@@ -6669,10 +7390,11 @@ pub fn tool_definitions() -> Vec<Value> {
                     "get_models_missing_thumbnails" => "List missing-thumbnail models with keyset pagination. Pass excludeIds for models that repeatedly fail rendering; excluded IDs are filtered before the page limit.".to_owned(),
                     "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
                     "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
-                    "open_in_slicer" => "Open a catalog model in a supported slicer on this authenticated desktop host. Provide modelId, expectedVersion, and slicerId; client filesystem paths are not accepted.".to_owned(),
-                    "trash_file" => "Plan moving the verified source file into the application trash. Provide modelId, expectedVersion, and confirm:true; then execute the returned one-use token with execute_management_action. Client filesystem paths are not accepted.".to_owned(),
+                    "open_in_slicer" => "Open one model or a bounded targets array in a supported slicer. Desktop hosts preflight and stage all verified models before launch. Headless hosts return a clientCommand with short-lived authenticated download leases and content routes for the caller to fetch locally. Provide slicerId and either modelId/expectedVersion or targets; filesystem paths are not accepted.".to_owned(),
+                    "scan_directory" => "Scan all admitted roots, one admitted rootId, or a safe root-relative directory under an admitted root. When directory is supplied, rootId is required; absolute paths, parent traversal, and symlinked directories are rejected. Subdirectory scans add/update sources without marking files outside that subdirectory missing.".to_owned(),
+                    "trash_file" => "Plan moving one or more verified source files into the application trash. Provide either modelId and expectedVersion, or a targets array of 1 to 100 versioned model IDs; always set confirm:true. Execute the returned one-use token separately with execute_management_action. Client filesystem paths are not accepted.".to_owned(),
                     "undo_trash" => "Plan restoring a previously quarantined source file. Provide snapshotId and confirm:true; then execute the returned one-use token with execute_management_action.".to_owned(),
-                    "move_files" => "Plan moving a verified source file to an admitted writable root. Provide modelId, expectedVersion, destinationHandleId, a safe leaf fileName, and confirm:true; then execute the returned one-use token with execute_management_action. Client source paths are not accepted.".to_owned(),
+                    "move_files" => "Plan moving one or more verified source files to an admitted writable root. Provide destinationHandleId and confirm:true, plus either modelId, expectedVersion, and fileName, or a targets array of 1 to 100 objects containing those fields. Execute the returned one-use token separately with execute_management_action. Client source paths are not accepted.".to_owned(),
                     _ => format!("GoggleLab {} operation", name.replace('_', " ")),
                 },
                 "inputSchema": input_schema

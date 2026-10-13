@@ -207,6 +207,62 @@ pub fn start_manual_scan(
     start_scan(state, root_id, None)
 }
 
+pub fn start_manual_scan_subdirectory(
+    state: Arc<LibraryRuntime>,
+    root_id: String,
+    directory: String,
+) -> Result<(), String> {
+    if directory.is_empty() {
+        return start_manual_scan(state, Some(root_id));
+    }
+    if state.maintenance_active() {
+        return Err("Library maintenance is in progress".into());
+    }
+    let root = state
+        .read_db(|db| {
+            db.list_index_roots()
+                .map(|roots| roots.into_iter().find(|root| root.id == root_id))
+        })
+        .map_err(runtime_error_text)?
+        .ok_or_else(|| "Index root was not found".to_string())?;
+    if !root.enabled {
+        return Err("Index root is disabled".into());
+    }
+    state
+        .validate_scan_root(&root)
+        .map_err(runtime_error_text)?;
+    let relative = PathBuf::from(&directory);
+    validate_scan_subdirectory(&root.path, &relative)?;
+    if !state.scan_control().try_begin(1, "subdirectoryScan") {
+        return Err("A library scan is already running".into());
+    }
+    if state.maintenance_active() {
+        state.scan_control().finish();
+        return Err("Library maintenance is in progress".into());
+    }
+    let scanner_state = Arc::clone(&state);
+    if let Err(error) = thread::Builder::new()
+        .name("gogglelab-library-subdirectory-scan".into())
+        .spawn(move || {
+            state.scan_control().status.lock().unwrap().current_root_id = Some(root.id.clone());
+            if let Err(error) = scan_subdirectory(&state, &root, &relative) {
+                state
+                    .scan_control()
+                    .error(format!("{}: {error}", root.path.display()));
+            }
+            state.scan_control().status.lock().unwrap().roots_completed += 1;
+            state.scan_control().finish();
+        })
+    {
+        let message = error.to_string();
+        scanner_state
+            .scan_control()
+            .failed_to_spawn(message.clone());
+        return Err(message);
+    }
+    Ok(())
+}
+
 pub fn start_selected_scan(
     state: Arc<LibraryRuntime>,
     selected_ids: Vec<String>,
@@ -278,6 +334,25 @@ fn run_scan(state: Arc<LibraryRuntime>, roots: Vec<IndexRoot>) {
 }
 
 pub fn scan_root(state: &Arc<LibraryRuntime>, root: &IndexRoot) -> Result<ScanReconcile, String> {
+    scan_root_scope(state, root, None)
+}
+
+pub fn scan_subdirectory(
+    state: &Arc<LibraryRuntime>,
+    root: &IndexRoot,
+    relative_directory: &Path,
+) -> Result<ScanReconcile, String> {
+    if relative_directory.as_os_str().is_empty() {
+        return scan_root_scope(state, root, None);
+    }
+    scan_root_scope(state, root, Some(relative_directory))
+}
+
+fn scan_root_scope(
+    state: &Arc<LibraryRuntime>,
+    root: &IndexRoot,
+    relative_directory: Option<&Path>,
+) -> Result<ScanReconcile, String> {
     state.validate_scan_root(root).map_err(runtime_error_text)?;
     let _io_guard = state.begin_io().map_err(runtime_error_text)?;
     let canonical_root = root
@@ -291,7 +366,23 @@ pub fn scan_root(state: &Arc<LibraryRuntime>, root: &IndexRoot) -> Result<ScanRe
         return Err("Index root is not a directory".into());
     }
 
-    let mut stack = vec![canonical_root.clone()];
+    let selected_directory = match relative_directory {
+        Some(relative) => validate_scan_subdirectory(&canonical_root, relative)?,
+        None => canonical_root.clone(),
+    };
+    let is_full_root = relative_directory.is_none();
+    let scan_scope = if is_full_root {
+        None
+    } else {
+        Some(
+            selected_directory
+                .strip_prefix(&canonical_root)
+                .map_err(|_| "Scan directory escaped its configured root".to_string())?
+                .to_path_buf(),
+        )
+    };
+
+    let mut stack = vec![selected_directory];
     let batch_size = state
         .read_db(|db| {
             db.get_catalog_settings()
@@ -300,7 +391,7 @@ pub fn scan_root(state: &Arc<LibraryRuntime>, root: &IndexRoot) -> Result<ScanRe
         .map_err(runtime_error_text)?;
     let mut seen = Vec::<SourceRef>::new();
     if !root.scan_zip {
-        preserve_paused_archive_sources(state, root, &mut seen)?;
+        preserve_paused_archive_sources(state, root, scan_scope.as_deref(), &mut seen)?;
     }
     let mut batch = Vec::<ScannedModel>::with_capacity(batch_size);
     let mut reconciled = ScanReconcile::default();
@@ -457,13 +548,19 @@ pub fn scan_root(state: &Arc<LibraryRuntime>, root: &IndexRoot) -> Result<ScanRe
     }
     if complete && !state.scan_control().cancel.load(Ordering::Acquire) {
         let result = state
-            .mutate_db(|db| {
-                db.complete_scan_sources_with_new_models(
+            .mutate_db(|db| match scan_scope.as_deref() {
+                Some(scope) => db.complete_subdirectory_scan_sources_with_new_models(
+                    &root.id,
+                    scope,
+                    &seen,
+                    &reconciled.added_model_ids,
+                ),
+                None => db.complete_scan_sources_with_new_models(
                     &root.id,
                     &seen,
                     &reconciled.added_model_ids,
                     &timestamp(),
-                )
+                ),
             })
             .map_err(runtime_error_text)?;
         add_reconcile(&mut reconciled, &result);
@@ -472,51 +569,52 @@ pub fn scan_root(state: &Arc<LibraryRuntime>, root: &IndexRoot) -> Result<ScanRe
     Ok(reconciled)
 }
 
+fn validate_scan_subdirectory(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || relative.to_string_lossy().contains('\\')
+        || relative.to_string_lossy().contains('\0')
+    {
+        return Err("Scan directory must be a safe root-relative path".into());
+    }
+    if root.canonicalize().map_err(|error| error.to_string())? != root {
+        return Err("Configured root identity changed".into());
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err("Scan directory contains an unsafe component".into());
+        };
+        current.push(name);
+        let metadata = fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("Scan directory must contain only real directories".into());
+        }
+    }
+    let canonical = current.canonicalize().map_err(|error| error.to_string())?;
+    if !canonical.starts_with(root) {
+        return Err("Scan directory escaped its configured root".into());
+    }
+    Ok(canonical)
+}
+
 fn preserve_paused_archive_sources(
     state: &Arc<LibraryRuntime>,
     root: &IndexRoot,
+    scope: Option<&Path>,
     seen: &mut Vec<SourceRef>,
 ) -> Result<(), String> {
-    let models = state
-        .read_db(|db| db.list_models(None, None))
+    let archive_sources = state
+        .read_db(|db| db.indexed_archive_source_refs(&root.id, scope))
         .map_err(runtime_error_text)?;
-    for model in models {
-        if model.source_root_id.as_deref() != Some(&root.id) {
-            continue;
-        }
-        let Some(archive_member) = model.source_archive_member else {
-            continue;
-        };
-        let source_path = model
-            .source_path
-            .as_deref()
-            .ok_or_else(|| "Archive model has no source path".to_string())?;
-        let source_path = Path::new(source_path);
-        let relative_path = if source_path.is_absolute() {
-            source_path
-                .strip_prefix(&root.path)
-                .map_err(|_| "Archive model source escaped its configured root".to_string())?
-                .to_path_buf()
-        } else {
-            source_path.to_path_buf()
-        };
-        if relative_path.as_os_str().is_empty()
-            || relative_path
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            return Err("Archive model source path is invalid".into());
-        }
-        if seen.len() == MAX_SCAN_FILES {
-            return Err(format!(
-                "Root exceeds the safety limit of {MAX_SCAN_FILES} model files"
-            ));
-        }
-        seen.push(SourceRef {
-            relative_path,
-            archive_member: Some(archive_member),
-        });
+    if archive_sources.len() > MAX_SCAN_FILES.saturating_sub(seen.len()) {
+        return Err(format!(
+            "Root exceeds the safety limit of {MAX_SCAN_FILES} model files"
+        ));
     }
+    seen.extend(archive_sources);
     Ok(())
 }
 

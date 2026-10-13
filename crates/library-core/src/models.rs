@@ -268,6 +268,15 @@ pub struct VersionedTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexedModelMove {
+    pub model_id: String,
+    pub expected_version: u64,
+    pub destination_root_id: String,
+    pub destination_relative_path: PathBuf,
+    pub modified_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelFilamentAssignment {
     pub target: VersionedTarget,
     pub filament_ids: Vec<String>,

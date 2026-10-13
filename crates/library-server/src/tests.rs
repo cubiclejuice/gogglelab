@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
+use library_protocol::ContentEngine;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -38,6 +39,23 @@ impl HostSlicerAdapter for FakeHostSlicerAdapter {
             expected_version,
             slicer_id.to_owned(),
         ));
+        Ok(())
+    }
+
+    fn open_in_slicer_batch(
+        &self,
+        context: &RequestContext,
+        targets: &[VersionedTarget],
+        slicer_id: &str,
+    ) -> Result<(), EngineError> {
+        for target in targets {
+            self.open_in_slicer(
+                context,
+                &target.model_id,
+                target.expected_version,
+                slicer_id,
+            )?;
+        }
         Ok(())
     }
 }
@@ -1755,6 +1773,33 @@ fn source_file_action_tools_require_confirmation_and_safe_handle_arguments() {
 }
 
 #[test]
+fn rest_physical_source_management_actions_require_confirmation() {
+    for action in [
+        json!({"kind":"quarantineLooseSource","target":{"modelId":"model-1","expectedVersion":"3"}}),
+        json!({"kind":"undoQuarantine","snapshotId":"snapshot-1"}),
+        json!({"kind":"moveLooseSource","target":{"modelId":"model-1","expectedVersion":"3"},"destinationHandleId":"root-1","fileName":"moved.stl"}),
+    ] {
+        assert!(serde_json::from_value::<super::WireManagementAction>(action.clone()).is_err());
+        let mut rejected = action.clone();
+        rejected["confirm"] = json!(false);
+        assert!(
+            serde_json::from_value::<super::WireManagementAction>(rejected)
+                .unwrap()
+                .parse()
+                .is_err()
+        );
+        let mut approved = action;
+        approved["confirm"] = json!(true);
+        assert!(
+            serde_json::from_value::<super::WireManagementAction>(approved)
+                .unwrap()
+                .parse()
+                .is_ok()
+        );
+    }
+}
+
+#[test]
 fn bootstrap_secret_is_256_bit_and_persisted_outside_catalog_contract() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();
@@ -3039,28 +3084,40 @@ async fn pull_3mf_metadata_returns_bounded_path_free_batch_proposals() {
 
 #[tokio::test]
 async fn real_runtime_embedded_3mf_proposal_and_versioned_apply_work() {
-    use base64::Engine as _;
+    use std::io::Write as _;
 
-    const MODEL_3MF: &str = "UEsDBBQAAAAAAK19S12dfITk7wEAAO8BAAAQAAAAM0QvM2Rtb2RlbC5tb2RlbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04Ij8+PG1vZGVsIHVuaXQ9Im1pbGxpbWV0ZXIiIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5taWNyb3NvZnQuY29tLzNkbWFudWZhY3R1cmluZy9jb3JlLzIwMTUvMDIiPjxtZXRhZGF0YSBuYW1lPSJEZXNpZ25lciI+RW1iZWRkZWQgRGVzaWduZXI8L21ldGFkYXRhPjxtZXRhZGF0YSBuYW1lPSJMaWNlbnNlIj5DQzA8L21ldGFkYXRhPjxyZXNvdXJjZXM+PG9iamVjdCBpZD0iMSIgdHlwZT0ibW9kZWwiPjxtZXNoPjx2ZXJ0aWNlcz48dmVydGV4IHg9IjAiIHk9IjAiIHo9IjAiLz48dmVydGV4IHg9IjEiIHk9IjAiIHo9IjAiLz48dmVydGV4IHg9IjAiIHk9IjEiIHo9IjAiLz48L3ZlcnRpY2VzPjx0cmlhbmdsZXM+PHRyaWFuZ2xlIHYxPSIwIiB2Mj0iMSIgdjM9IjIiLz48L3RyaWFuZ2xlcz48L21lc2g+PC9vYmplY3Q+PC9yZXNvdXJjZXM+PGJ1aWxkPjxpdGVtIG9iamVjdGlkPSIxIi8+PC9idWlsZD48L21vZGVsPlBLAQIUAxQAAAAAAK19S12dfITk7wEAAO8BAAAQAAAAAAAAAAAAAACAAQAAAAAzRC8zZG1vZGVsLm1vZGVsUEsFBgAAAAABAAEAPgAAAB0CAAAAAA==";
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("metadata.3mf");
-    std::fs::write(
-        &source,
-        base64::engine::general_purpose::STANDARD
-            .decode(MODEL_3MF)
-            .unwrap(),
-    )
-    .unwrap();
+    let model_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+<metadata name="Designer">Embedded Designer</metadata>
+<metadata name="ParentModel">Parent Family</metadata>
+<resources><object id="1" type="model"><mesh><vertices>
+<vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>
+</vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources>
+<build><item objectid="1"/></build></model>"#;
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive
+        .start_file("3D/3dmodel.model", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive.write_all(model_xml.as_bytes()).unwrap();
+    std::fs::write(&source, archive.finish().unwrap().into_inner()).unwrap();
     let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
         temp.path().join("library"),
         temp.path().join("integrations.json"),
     ))
     .unwrap();
+    let parent = runtime
+        .mutate_db(|db| db.create_model("Parent Family", None))
+        .unwrap();
     let model = runtime
         .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
         .unwrap();
     let app = router(
-        Arc::new(ProtocolEngineAdapter::new(runtime, HostMode::Headless)),
+        Arc::new(ProtocolEngineAdapter::new(
+            Arc::clone(&runtime),
+            HostMode::Headless,
+        )),
         security(8),
     );
     let proposal = app
@@ -3083,6 +3140,7 @@ async fn real_runtime_embedded_3mf_proposal_and_versioned_apply_work() {
     let proposal: Value =
         serde_json::from_slice(&to_bytes(proposal.into_body(), 65536).await.unwrap()).unwrap();
     assert_eq!(proposal["embedded"]["designer"], "Embedded Designer");
+    assert_eq!(proposal["embedded"]["parentModel"], "Parent Family");
     let applied = app
         .oneshot(
             request(
@@ -3095,7 +3153,7 @@ async fn real_runtime_embedded_3mf_proposal_and_versioned_apply_work() {
                 json!({
                     "expectedVersion":model.metadata_version.to_string(),
                     "expectedSourceHash":proposal["sourceHash"],
-                    "selection":{"designer":true,"sourceUrl":false,"notes":false,"modelLicense":false}
+                    "selection":{"designer":true,"sourceUrl":false,"notes":false,"modelLicense":false,"parentModel":true}
                 })
                 .to_string(),
             ))
@@ -3104,6 +3162,14 @@ async fn real_runtime_embedded_3mf_proposal_and_versioned_apply_work() {
         .await
         .unwrap();
     assert_eq!(applied.status(), StatusCode::OK);
+    let updated = runtime
+        .read_db(|db| db.get_model(&model.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated.metadata.parent_model_id.as_deref(),
+        Some(parent.id.as_str())
+    );
 }
 
 #[test]
@@ -3655,6 +3721,7 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
     std::fs::create_dir(&source_root).unwrap();
     std::fs::create_dir(&destination_root).unwrap();
     let source = source_root.join("part.stl");
+    let second_source = source_root.join("part-two.stl");
     let mut source_bytes = vec![0_u8; 84];
     source_bytes[80..84].copy_from_slice(&1_u32.to_le_bytes());
     for value in [
@@ -3664,6 +3731,7 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
     }
     source_bytes.extend_from_slice(&0_u16.to_le_bytes());
     std::fs::write(&source, &source_bytes).unwrap();
+    std::fs::write(&second_source, &source_bytes).unwrap();
 
     let capabilities = BTreeSet::from([
         Capability::CatalogRead,
@@ -3688,7 +3756,7 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
             id: "destination".into(),
             catalog_root_id: None,
             label: "Destination".into(),
-            path: destination_root,
+            path: destination_root.clone(),
             access: library_protocol::RootAccess::Writable,
         },
     ];
@@ -3713,12 +3781,17 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
         })
         .unwrap();
     library_runtime::scanner::scan_root(&runtime, &source_catalog).unwrap();
-    let model = runtime
-        .read_db(|db| {
-            db.list_models(None, None)
-                .map(|mut models| models.remove(0))
-        })
-        .unwrap();
+    let models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+    let model = models
+        .iter()
+        .find(|candidate| candidate.display_name == "part")
+        .unwrap()
+        .clone();
+    let second_model = models
+        .iter()
+        .find(|candidate| candidate.display_name == "part-two")
+        .unwrap()
+        .clone();
     let source_handle_id = source_root_info.id.clone();
     let adapter = ProtocolEngineAdapter::new(runtime.clone(), HostMode::Headless);
 
@@ -3782,6 +3855,101 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
         .unwrap();
     assert_eq!(restored["kind"], "quarantineUndone");
     assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+
+    let active_models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+    let active_first = active_models
+        .iter()
+        .find(|candidate| candidate.id == model.id)
+        .unwrap();
+    let active_second = active_models
+        .iter()
+        .find(|candidate| candidate.id == second_model.id)
+        .unwrap();
+    let batch_targets = json!([
+        {"modelId":active_first.id,"expectedVersion":active_first.metadata_version.to_string()},
+        {"modelId":active_second.id,"expectedVersion":active_second.metadata_version.to_string()}
+    ]);
+    let batch_trash_plan = adapter
+        .call_tool(
+            &context,
+            "trash_file",
+            json!({"targets":batch_targets,"confirm":true}),
+        )
+        .unwrap();
+    assert_eq!(batch_trash_plan["actionKind"], "quarantineLooseSources");
+    assert_eq!(batch_trash_plan["targets"].as_array().unwrap().len(), 2);
+    let batch_trash_result = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":batch_trash_plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(batch_trash_result["kind"], "quarantinedMany");
+    assert!(!source.exists());
+    assert!(!second_source.exists());
+
+    let batch_undo_plan = adapter
+        .call_tool(
+            &context,
+            "undo_trash",
+            json!({"snapshotId":batch_trash_result["snapshotId"],"confirm":true}),
+        )
+        .unwrap();
+    let batch_undo_result = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":batch_undo_plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(batch_undo_result["kind"], "quarantineUndoneMany");
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(std::fs::read(&second_source).unwrap(), source_bytes);
+
+    let restored_models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+    let restored_first = restored_models
+        .iter()
+        .find(|candidate| candidate.id == model.id)
+        .unwrap();
+    let restored_second = restored_models
+        .iter()
+        .find(|candidate| candidate.id == second_model.id)
+        .unwrap();
+    let batch_move_plan = adapter
+        .call_tool(
+            &context,
+            "move_files",
+            json!({
+                "destinationHandleId":"destination",
+                "targets":[
+                    {"modelId":restored_first.id,"expectedVersion":restored_first.metadata_version.to_string(),"fileName":"part-moved.stl"},
+                    {"modelId":restored_second.id,"expectedVersion":restored_second.metadata_version.to_string(),"fileName":"part-two-moved.stl"}
+                ],
+                "confirm":true
+            }),
+        )
+        .unwrap();
+    assert_eq!(batch_move_plan["actionKind"], "moveLooseSources");
+    assert_eq!(batch_move_plan["targets"].as_array().unwrap().len(), 2);
+    let batch_move_result = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":batch_move_plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(batch_move_result["kind"], "movedMany");
+    assert!(!source.exists());
+    assert!(!second_source.exists());
+    assert_eq!(
+        std::fs::read(destination_root.join("part-moved.stl")).unwrap(),
+        source_bytes
+    );
+    assert_eq!(
+        std::fs::read(destination_root.join("part-two-moved.stl")).unwrap(),
+        source_bytes
+    );
 }
 
 #[test]
@@ -3840,6 +4008,242 @@ fn search_models_accepts_search_designer_and_print_state_filters() {
     let items = page["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], models[0].id);
+}
+
+#[test]
+fn scan_directory_accepts_only_root_relative_subdirectory_scopes() {
+    assert!(validate_tool_shape("scan_directory", &json!({})).is_ok());
+    assert!(validate_tool_shape("scan_directory", &json!({"rootId":"admitted-root"})).is_ok());
+    assert!(validate_tool_shape(
+        "scan_directory",
+        &json!({"rootId":"admitted-root","directory":"parts/nested"})
+    )
+    .is_ok());
+    assert!(validate_tool_shape("scan_directory", &json!({"directory":"parts/nested"})).is_err());
+    assert!(validate_tool_shape(
+        "scan_directory",
+        &json!({"rootId":"admitted-root","directory":1})
+    )
+    .is_err());
+
+    let temp = tempfile::tempdir().unwrap();
+    let source_root = temp.path().join("models");
+    std::fs::create_dir_all(source_root.join("parts/nested")).unwrap();
+    std::fs::create_dir_all(source_root.join("other")).unwrap();
+    let triangle = b"solid part\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid part\n";
+    std::fs::write(source_root.join("parts/nested/inside.stl"), triangle).unwrap();
+    std::fs::write(source_root.join("other/outside.stl"), triangle).unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig {
+        library_root: temp.path().join("library"),
+        integration_settings_path: temp.path().join("integrations.json"),
+        roots: vec![library_runtime::RuntimeRootPolicy {
+            id: "models".into(),
+            catalog_root_id: None,
+            label: "Models".into(),
+            path: source_root,
+            access: library_protocol::RootAccess::ReadOnly,
+        }],
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::Scan]),
+        local_catalog_root_access: false,
+    })
+    .unwrap();
+    let context = RequestContext {
+        principal_id: "subdirectory-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::Scan]),
+        request_id: "safe-subdirectory-scan".into(),
+    };
+    let handle = runtime.root_handles(&context).unwrap().remove(0);
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    assert!(adapter
+        .call_tool(
+            &context,
+            "scan_directory",
+            json!({"rootId":handle.id.clone(),"directory":"../other"}),
+        )
+        .is_err());
+    adapter
+        .call_tool(
+            &context,
+            "scan_directory",
+            json!({"rootId":handle.id,"directory":"parts"}),
+        )
+        .unwrap();
+    for _ in 0..100 {
+        if !runtime.scan_control().status().running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!runtime.scan_control().status().running);
+    let models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+    assert_eq!(models.len(), 1);
+    assert!(models[0]
+        .source_path
+        .as_deref()
+        .is_some_and(|path| path.ends_with("inside.stl")));
+}
+
+#[test]
+fn duplicates_and_hash_status_apply_bounded_catalog_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_path = temp.path().join("Duplicate A.stl");
+    let second_path = temp.path().join("Duplicate B.stl");
+    let unrelated_path = temp.path().join("Unrelated.stl");
+    let mut duplicate_bytes = vec![0_u8; 80];
+    duplicate_bytes.extend_from_slice(&1_u32.to_le_bytes());
+    for value in [
+        0.0_f32, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ] {
+        duplicate_bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    duplicate_bytes.extend_from_slice(&[0, 0]);
+    let mut unrelated_bytes = duplicate_bytes.clone();
+    unrelated_bytes[0] = 0x5a;
+    std::fs::write(&first_path, &duplicate_bytes).unwrap();
+    std::fs::write(&second_path, &duplicate_bytes).unwrap();
+    std::fs::write(&unrelated_path, unrelated_bytes).unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let (first, second) = runtime
+        .mutate_db(|db| {
+            let first = db.import_file(&first_path, None, None)?.model;
+            let second = db.import_file(&second_path, None, None)?.model;
+            let _unrelated = db.import_file(&unrelated_path, None, None)?.model;
+            Ok((first, second))
+        })
+        .unwrap();
+    let context = RequestContext {
+        principal_id: "duplicate-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "filtered-duplicates".into(),
+    };
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    adapter
+        .call_tool(
+            &context,
+            "add_tag",
+            json!({"name":"hinge","category":"part"}),
+        )
+        .unwrap();
+    for model in [&first, &second] {
+        adapter
+            .call_tool(
+                &context,
+                "add_model_tags",
+                json!({
+                    "modelId":model.id,
+                    "expectedVersion":model.metadata_version.to_string(),
+                    "tags":["hinge"]
+                }),
+            )
+            .unwrap();
+    }
+    let filter = json!({
+        "search":"Duplicate",
+        "tags":["hinge"],
+        "fileType":".STL",
+        "printed":"all"
+    });
+    let groups = adapter
+        .call_tool(
+            &context,
+            "find_duplicates",
+            json!({"search":filter["search"],"tags":filter["tags"],"fileType":filter["fileType"],"printed":filter["printed"],"limit":1}),
+        )
+        .unwrap();
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["models"].as_array().unwrap().len(), 2);
+    let ids = groups[0]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ids, BTreeSet::from([first.id.as_str(), second.id.as_str()]));
+
+    let status = adapter
+        .call_tool(&context, "get_hash_status", filter.clone())
+        .unwrap();
+    assert_eq!(status["modelCount"], "2");
+    assert_eq!(status["hashedCount"], "2");
+    assert_eq!(status["unhashedCount"], "0");
+    let no_work = adapter
+        .call_tool(&context, "calculate_missing_hashes", filter)
+        .unwrap();
+    assert_eq!(no_work["started"], false);
+    assert_eq!(no_work["total"], "0");
+
+    assert!(validate_tool_shape(
+        "find_duplicates",
+        &json!({"directory":"parts/nested","limit":20})
+    )
+    .is_err());
+    assert!(validate_tool_shape("find_duplicates", &json!({"modelIds":["one","one"]})).is_err());
+    let oversized_duplicate_scope = (0..1_001)
+        .map(|index| Value::String(format!("model-{index}")))
+        .collect::<Vec<_>>();
+    assert!(validate_tool_shape(
+        "find_duplicates",
+        &json!({"modelIds":oversized_duplicate_scope})
+    )
+    .is_err());
+}
+
+#[test]
+fn refresh_hashes_with_explicit_empty_root_discovers_new_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_root = temp.path().join("models");
+    std::fs::create_dir_all(&source_root).unwrap();
+    let triangle = b"solid part\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid part\n";
+    std::fs::write(source_root.join("new-part.stl"), triangle).unwrap();
+    let library = temp.path().join("library");
+    let integration_settings = temp.path().join("integrations.json");
+    let bootstrap = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        library.clone(),
+        integration_settings.clone(),
+    ))
+    .unwrap();
+    let root = bootstrap
+        .mutate_db(|db| db.add_index_root(&source_root, 60, 50 * 1024 * 1024))
+        .unwrap();
+    drop(bootstrap);
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig {
+        library_root: library,
+        integration_settings_path: integration_settings,
+        roots: vec![library_runtime::RuntimeRootPolicy {
+            id: "models".into(),
+            catalog_root_id: Some(root.id),
+            label: "Models".into(),
+            path: source_root,
+            access: library_protocol::RootAccess::ReadOnly,
+        }],
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::Scan]),
+        local_catalog_root_access: false,
+    })
+    .unwrap();
+    let context = RequestContext {
+        principal_id: "empty-root-refresh".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::Scan]),
+        request_id: "refresh-empty-root".into(),
+    };
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let result = adapter
+        .call_tool(&context, "refresh_hashes", json!({"rootId":"models"}))
+        .unwrap();
+    assert_eq!(result["jobKind"], "scan");
+    for _ in 0..100 {
+        if !runtime.scan_control().status().running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!runtime.scan_control().status().running);
+    let models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].display_name, "new-part");
 }
 
 #[test]
@@ -4168,11 +4572,31 @@ fn desktop_slicer_tools_are_capability_gated_and_never_expose_host_paths() {
     assert_eq!(
         *slicers.opened.lock().unwrap(),
         vec![(
-            model.id,
+            model.id.clone(),
             model.metadata_version,
             "com.bambulab.bambu-studio".into()
         )]
     );
+
+    let second_model = runtime
+        .mutate_db(|db| db.create_model("Second slicer handoff", None))
+        .unwrap();
+    let batch_result = adapter
+        .call_tool(
+            &context,
+            "open_in_slicer",
+            json!({
+                "targets":[
+                    {"modelId":model.id,"expectedVersion":model.metadata_version.to_string()},
+                    {"modelId":second_model.id,"expectedVersion":second_model.metadata_version.to_string()}
+                ],
+                "slicerId":"com.bambulab.bambu-studio"
+            }),
+        )
+        .unwrap();
+    assert_eq!(batch_result["opened"], true);
+    assert_eq!(batch_result["modelIds"].as_array().unwrap().len(), 2);
+    assert_eq!(slicers.opened.lock().unwrap().len(), 3);
 
     assert!(validate_tool_shape(
         "open_in_slicer",
@@ -4182,6 +4606,42 @@ fn desktop_slicer_tools_are_capability_gated_and_never_expose_host_paths() {
             "slicerId":"com.bambulab.bambu-studio",
             "filePath":"/private/model.stl"
         })
+    )
+    .is_err());
+    assert!(validate_tool_shape(
+        "open_in_slicer",
+        &json!({
+            "targets":[
+                {"modelId":"model-1","expectedVersion":"1"},
+                {"modelId":"model-2","expectedVersion":"2"}
+            ],
+            "slicerId":"com.bambulab.bambu-studio"
+        })
+    )
+    .is_ok());
+    assert!(validate_tool_shape(
+        "open_in_slicer",
+        &json!({
+            "targets":[
+                {"modelId":"model-1","expectedVersion":"1"},
+                {"modelId":"model-1","expectedVersion":"2"}
+            ],
+            "slicerId":"com.bambulab.bambu-studio"
+        })
+    )
+    .is_err());
+    assert!(validate_tool_shape(
+        "open_in_slicer",
+        &json!({
+            "modelId":"model-1","expectedVersion":"1",
+            "targets":[{"modelId":"model-2","expectedVersion":"2"}],
+            "slicerId":"com.bambulab.bambu-studio"
+        })
+    )
+    .is_err());
+    assert!(validate_tool_shape(
+        "open_in_slicer",
+        &json!({"targets":[],"slicerId":"com.bambulab.bambu-studio"})
     )
     .is_err());
     assert!(validate_tool_shape(
@@ -4198,14 +4658,12 @@ fn desktop_slicer_tools_are_capability_gated_and_never_expose_host_paths() {
         .find(|tool| tool["name"] == "open_in_slicer")
         .unwrap();
     assert_eq!(open_schema["inputSchema"]["additionalProperties"], false);
-    assert_eq!(
-        open_schema["inputSchema"]["required"],
-        json!(["modelId", "expectedVersion", "slicerId"])
-    );
+    assert_eq!(open_schema["inputSchema"]["required"], json!(["slicerId"]));
 
     let headless =
         ProtocolEngineAdapter::new(runtime, HostMode::Headless).with_host_slicer(slicers);
     assert!(!headless.supports_tool(&context, "list_slicers"));
+    assert!(headless.supports_tool(&context, "open_in_slicer"));
     assert!(
         !headless
             .capabilities(&context)
@@ -4213,6 +4671,83 @@ fn desktop_slicer_tools_are_capability_gated_and_never_expose_host_paths() {
             .features
             .launch_slicer
     );
+}
+
+#[test]
+fn headless_slicer_handoff_returns_path_free_verified_client_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let library_root = temp.path().join("library");
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        library_root,
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let mut bytes = vec![0_u8; 80];
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    for value in [
+        0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0, 0]);
+    let first_path = temp.path().join("first.stl");
+    let second_path = temp.path().join("second.stl");
+    std::fs::write(&first_path, &bytes).unwrap();
+    std::fs::write(&second_path, &bytes).unwrap();
+    let first = runtime
+        .mutate_db(|db| {
+            db.import_file(&first_path, None, None)
+                .map(|result| result.model)
+        })
+        .unwrap();
+    let second = runtime
+        .mutate_db(|db| {
+            db.import_file(&second_path, None, None)
+                .map(|result| result.model)
+        })
+        .unwrap();
+    let context = RequestContext {
+        principal_id: "remote-client".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::MediaRead]),
+        request_id: "remote-slicer-command".into(),
+    };
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    assert!(adapter.supports_tool(&context, "open_in_slicer"));
+    assert!(!adapter.supports_tool(&context, "list_slicers"));
+
+    let command = adapter
+        .call_tool(
+            &context,
+            "open_in_slicer",
+            json!({
+                "targets":[
+                    {"modelId":first.id,"expectedVersion":first.metadata_version.to_string()},
+                    {"modelId":second.id,"expectedVersion":second.metadata_version.to_string()}
+                ],
+                "slicerId":"com.bambulab.bambu-studio"
+            }),
+        )
+        .unwrap();
+    assert_eq!(command["kind"], "clientCommand");
+    assert_eq!(command["command"], "openInSlicer");
+    assert_eq!(command["targets"].as_array().unwrap().len(), 2);
+    assert!(!command
+        .to_string()
+        .contains(temp.path().to_string_lossy().as_ref()));
+    for target in command["targets"].as_array().unwrap() {
+        let lease = &target["downloadLease"];
+        assert_eq!(
+            target["contentRoute"],
+            format!("/api/v1/content/{}", lease["id"].as_str().unwrap())
+        );
+        assert_eq!(lease["kind"], "model");
+        assert_eq!(lease["sha256"].as_str().unwrap().len(), 64);
+        let mut downloaded = Vec::new();
+        runtime
+            .stream_content(&context, lease["id"].as_str().unwrap(), &mut downloaded)
+            .unwrap();
+        assert_eq!(downloaded, bytes);
+    }
 }
 
 #[tokio::test]

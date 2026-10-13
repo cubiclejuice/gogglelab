@@ -408,6 +408,7 @@ pub struct EmbeddedMetadataFields {
     pub source_url: Option<String>,
     pub notes: Option<String>,
     pub model_license: Option<String>,
+    pub parent_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -421,12 +422,13 @@ pub struct EmbeddedMetadataProposal {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct EmbeddedMetadataSelection {
     pub designer: bool,
     pub source_url: bool,
     pub notes: bool,
     pub model_license: bool,
+    pub parent_model: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,6 +437,14 @@ pub struct RestoreRootMapping {
     pub backup_catalog_root_id: String,
     pub operator_handle_id: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveLooseSourceTarget {
+    pub model_id: String,
+    pub expected_version: u64,
+    pub file_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -467,6 +477,9 @@ pub enum ManagementAction {
     QuarantineLooseSource {
         target: VersionedTarget,
     },
+    QuarantineLooseSources {
+        targets: Vec<VersionedTarget>,
+    },
     UndoQuarantine {
         snapshot_id: String,
     },
@@ -474,6 +487,10 @@ pub enum ManagementAction {
         target: VersionedTarget,
         destination_handle_id: String,
         file_name: String,
+    },
+    MoveLooseSources {
+        targets: Vec<MoveLooseSourceTarget>,
+        destination_handle_id: String,
     },
     PurgeCatalog {
         backup_destination_handle_id: String,
@@ -541,11 +558,21 @@ pub enum ManagementResult {
         snapshot_id: String,
         model_id: String,
     },
+    QuarantinedBatch {
+        snapshot_id: String,
+        models: Vec<String>,
+    },
     QuarantineUndone {
         model: MutationVersion,
     },
+    QuarantineUndoneBatch {
+        models: Vec<MutationVersion>,
+    },
     Moved {
         model: MutationVersion,
+    },
+    MovedBatch {
+        models: Vec<MutationVersion>,
     },
     Purged {
         backup_destination_handle_id: String,
@@ -1162,6 +1189,24 @@ pub trait ScanEngine: Send + Sync {
         context: &RequestContext,
         catalog_root_id: Option<String>,
     ) -> Result<ScanStatus, RuntimeError>;
+
+    fn start_scan_subdirectory(
+        &self,
+        context: &RequestContext,
+        catalog_root_id: String,
+        directory: String,
+    ) -> Result<ScanStatus, RuntimeError> {
+        if directory.is_empty() {
+            self.start_scan(context, Some(catalog_root_id))
+        } else {
+            Err(RuntimeError {
+                code: RuntimeErrorCode::Unsupported,
+                message: "Root-relative subdirectory scans are unsupported by this host".into(),
+                retryable: false,
+                current_version: None,
+            })
+        }
+    }
 
     fn cancel_scan(&self, context: &RequestContext) -> Result<ScanStatus, RuntimeError>;
 
