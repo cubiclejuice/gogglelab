@@ -2960,6 +2960,71 @@ async fn real_runtime_bundle_preview_geometry_stream_and_close_work() {
 }
 
 #[tokio::test]
+async fn pull_3mf_metadata_returns_bounded_path_free_batch_proposals() {
+    use base64::Engine as _;
+
+    const MODEL_3MF: &str = "UEsDBBQAAAAAAK19S12dfITk7wEAAO8BAAAQAAAAM0QvM2Rtb2RlbC5tb2RlbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04Ij8+PG1vZGVsIHVuaXQ9Im1pbGxpbWV0ZXIiIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5taWNyb3NvZnQuY29tLzNkbWFudWZhY3R1cmluZy9jb3JlLzIwMTUvMDIiPjxtZXRhZGF0YSBuYW1lPSJEZXNpZ25lciI+RW1iZWRkZWQgRGVzaWduZXI8L21ldGFkYXRhPjxtZXRhZGF0YSBuYW1lPSJMaWNlbnNlIj5DQzA8L21ldGFkYXRhPjxyZXNvdXJjZXM+PG9iamVjdCBpZD0iMSIgdHlwZT0ibW9kZWwiPjxtZXNoPjx2ZXJ0aWNlcz48dmVydGV4IHg9IjAiIHk9IjAiIHo9IjAiLz48dmVydGV4IHg9IjEiIHk9IjAiIHo9IjAiLz48dmVydGV4IHg9IjAiIHk9IjEiIHo9IjAiLz48L3ZlcnRpY2VzPjx0cmlhbmdsZXM+PHRyaWFuZ2xlIHYxPSIwIiB2Mj0iMSIgdjM9IjIiLz48L3RyaWFuZ2xlcz48L21lc2g+PC9vYmplY3Q+PC9yZXNvdXJjZXM+PGJ1aWxkPjxpdGVtIG9iamVjdGlkPSIxIi8+PC9idWlsZD48L21vZGVsPlBLAQIUAxQAAAAAAK19S12dfITk7wEAAO8BAAAQAAAAAAAAAAAAAACAAQAAAAAzRC8zZG1vZGVsLm1vZGVsUEsFBgAAAAABAAEAPgAAAB0CAAAAAA==";
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(MODEL_3MF)
+        .unwrap();
+    let first_source = temp.path().join("first.3mf");
+    let second_source = temp.path().join("second.3mf");
+    std::fs::write(&first_source, &bytes).unwrap();
+    std::fs::write(&second_source, &bytes).unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let (first, second) = runtime
+        .mutate_db(|db| {
+            Ok((
+                db.import_file(&first_source, None, None)?.model,
+                db.import_file(&second_source, None, None)?.model,
+            ))
+        })
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let context = RequestContext {
+        principal_id: "metadata-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead]),
+        request_id: "pull-3mf-metadata-batch".into(),
+    };
+
+    let batch = adapter
+        .call_tool(
+            &context,
+            "pull_3mf_metadata",
+            json!({"targets":[
+                {"modelId":first.id,"expectedHash":first.content_hash},
+                {"modelId":second.id,"expectedHash":second.content_hash}
+            ]}),
+        )
+        .unwrap();
+
+    assert_eq!(batch["items"].as_array().unwrap().len(), 2);
+    assert_eq!(batch["items"][0]["modelId"], first.id);
+    assert_eq!(batch["items"][1]["modelId"], second.id);
+    assert_eq!(
+        batch["items"][0]["embedded"]["designer"],
+        "Embedded Designer"
+    );
+    assert!(adapter
+        .call_tool(
+            &context,
+            "pull_3mf_metadata",
+            json!({"targets":[
+                {"modelId":first.id},
+                {"modelId":first.id}
+            ]}),
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&first_source).unwrap(), bytes);
+    assert_eq!(std::fs::read(&second_source).unwrap(), bytes);
+}
+
+#[tokio::test]
 async fn real_runtime_embedded_3mf_proposal_and_versioned_apply_work() {
     use base64::Engine as _;
 

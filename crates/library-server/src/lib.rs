@@ -1959,6 +1959,20 @@ impl<
                 ));
             }
             "pull_3mf_metadata" => {
+                if arguments.get("targets").is_some() {
+                    let targets = embedded_metadata_targets(&arguments)?;
+                    let items = targets
+                        .into_iter()
+                        .map(|(model_id, expected_hash)| {
+                            self.read_embedded_metadata(
+                                context,
+                                &model_id,
+                                expected_hash.as_deref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return encoded!(serde_json::json!({"items":items}));
+                }
                 let model_id = arguments
                     .get("modelId")
                     .and_then(Value::as_str)
@@ -3323,9 +3337,8 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         }
         "get_model_geometry" => (&["modelId", "expectedHash", "plateId"], &["modelId"]),
         "find_duplicates" => (&["modelIds"], &["modelIds"]),
-        "get_embedded_3mf_metadata" | "pull_3mf_metadata" => {
-            (&["modelId", "expectedHash"], &["modelId"])
-        }
+        "get_embedded_3mf_metadata" => (&["modelId", "expectedHash"], &["modelId"]),
+        "pull_3mf_metadata" => (&["modelId", "expectedHash", "targets"], &[]),
         "apply_embedded_3mf_metadata" => (
             &[
                 "modelId",
@@ -3545,8 +3558,21 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 && object.get("plateId").is_none_or(Value::is_u64)
         }
         "find_duplicates" => object.get("modelIds").is_some_and(Value::is_array),
-        "get_embedded_3mf_metadata" | "pull_3mf_metadata" => {
+        "get_embedded_3mf_metadata" => {
             string_field_valid("modelId") && string_field_valid("expectedHash")
+        }
+        "pull_3mf_metadata" => {
+            if object.contains_key("targets") {
+                !object.contains_key("modelId")
+                    && !object.contains_key("expectedHash")
+                    && embedded_metadata_targets(value).is_ok()
+            } else {
+                object
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|model_id| !model_id.is_empty() && model_id.len() <= 128)
+                    && string_field_valid("expectedHash")
+            }
         }
         "apply_embedded_3mf_metadata" => {
             string_field_valid("modelId")
@@ -3627,6 +3653,50 @@ fn versioned_tool_targets(value: &Value) -> Result<Vec<VersionedTarget>, EngineE
             expected_version: tool_version(value)?,
         }])
     }
+}
+fn embedded_metadata_targets(value: &Value) -> Result<Vec<(String, Option<String>)>, EngineError> {
+    let targets = value
+        .get("targets")
+        .and_then(Value::as_array)
+        .filter(|targets| !targets.is_empty() && targets.len() <= 100)
+        .ok_or_else(invalid_tool)?;
+    let mut seen = BTreeSet::new();
+    targets
+        .iter()
+        .map(|target| {
+            let object = target.as_object().ok_or_else(invalid_tool)?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "modelId" | "expectedHash"))
+            {
+                return Err(invalid_tool());
+            }
+            let model_id = object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .ok_or_else(invalid_tool)?
+                .to_owned();
+            if !seen.insert(model_id.clone()) {
+                return Err(invalid_tool());
+            }
+            let expected_hash = object
+                .get("expectedHash")
+                .map(|value| {
+                    let hash = value.as_str().ok_or_else(invalid_tool)?;
+                    if hash.len() != 64
+                        || !hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    {
+                        return Err(invalid_tool());
+                    }
+                    Ok(hash.to_owned())
+                })
+                .transpose()?;
+            Ok((model_id, expected_hash))
+        })
+        .collect()
 }
 fn decode_tool_image(value: &Value) -> Result<Vec<u8>, EngineError> {
     use base64::Engine as _;
@@ -6109,7 +6179,19 @@ pub fn tool_definitions() -> Vec<Value> {
                 "get_bundle_preview_geometry"|"download_bundle"|"close_bundle_preview" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"token":{"type":"string","minLength":1,"maxLength":256}},"required":["token"]}),
                 "get_model_geometry" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"plateId":{"type":"integer","minimum":0,"maximum":4294967295_u64}},"required":["modelId"]}),
                 "find_duplicates" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":50000,"items":{"type":"string","minLength":1,"maxLength":128}}},"required":["modelIds"]}),
-                "get_embedded_3mf_metadata"|"pull_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
+                "get_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
+                "pull_3mf_metadata" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
+                    },
+                    "oneOf":[
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedHash"]}]}},
+                        {"required":["modelId"],"not":{"required":["targets"]}}
+                    ]
+                }),
                 "apply_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"expectedSourceHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"selection":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":"boolean"},"sourceUrl":{"type":"boolean"},"notes":{"type":"boolean"},"modelLicense":{"type":"boolean"}}}},"required":["modelId","expectedVersion","expectedSourceHash","selection"]}),
                 "list_capture_items" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
                 "retry_capture" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"itemId":{"type":"string","minLength":1,"maxLength":128},"envelope":{"type":"object"},"uploads":{"type":"array","maxItems":10000,"items":{"type":"object","required":["id","itemId","captureId","expiresAt","libraryEpoch"]}}},"required":["itemId","envelope","uploads"]}),
@@ -6154,6 +6236,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "name": name,
                 "description": match *name {
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
+                    "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
                     "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
                     "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
                     "open_in_slicer" => "Open a catalog model in a supported slicer on this authenticated desktop host. Provide modelId, expectedVersion, and slicerId; client filesystem paths are not accepted.".to_owned(),
