@@ -36,7 +36,7 @@ use library_protocol::{
     ModelSort, ModelSourceStatus, MutationVersion, PageRequest, PrintAttempt,
     PrintAttemptBatchItem, PrintAttemptInput, PrintHistoryEngine, PrintStatus, RootHandle,
     RuntimeError, RuntimeErrorCode, ScanStatus, SettingsEngine, SortDirection, Tag, TagEngine,
-    ThumbnailDescriptor, UploadIntent, UploadToken, VersionedTarget,
+    ThumbnailDescriptor, UploadIntent, UploadToken, VersionedMetadataUpdate, VersionedTarget,
 };
 pub use library_protocol::{Capability, RequestContext};
 pub use security::{AllowedAuthority, AllowedOrigin, SecurityConfig};
@@ -1163,6 +1163,19 @@ pub trait LibraryEngine: Send + Sync + 'static {
         t: Vec<VersionedTarget>,
         p: MetadataPatch,
     ) -> Result<Vec<MutationVersion>, EngineError>;
+    fn update_metadata_batch(
+        &self,
+        context: &RequestContext,
+        updates: Vec<VersionedMetadataUpdate>,
+    ) -> Result<Vec<MutationVersion>, EngineError> {
+        let _ = (context, updates);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Per-model metadata patches are unavailable".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
     fn list_tags(&self, c: &RequestContext) -> Result<Vec<Tag>, EngineError>;
     fn create_tag(
         &self,
@@ -2279,6 +2292,14 @@ impl<
                 )?));
             }
             "update_models_batch" => {
+                if arguments.get("updates").is_some() {
+                    let updates = versioned_metadata_updates(&arguments)?;
+                    return encoded!(self
+                        .update_metadata_batch(context, updates)?
+                        .into_iter()
+                        .map(WireMutation::from)
+                        .collect::<Vec<_>>());
+                }
                 let request: BulkMetadataRequest =
                     serde_json::from_value(arguments).map_err(|_| invalid_tool())?;
                 let targets = request
@@ -3021,6 +3042,15 @@ impl<
             .bulk_update_metadata(c, t, p)
             .map_err(map_runtime_error)
     }
+    fn update_metadata_batch(
+        &self,
+        context: &RequestContext,
+        updates: Vec<VersionedMetadataUpdate>,
+    ) -> Result<Vec<MutationVersion>, EngineError> {
+        self.inner
+            .update_metadata_batch(context, updates)
+            .map_err(map_runtime_error)
+    }
     fn list_tags(&self, c: &RequestContext) -> Result<Vec<Tag>, EngineError> {
         self.inner.list_tags(c).map_err(map_runtime_error)
     }
@@ -3505,7 +3535,7 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         "get_folder_tree" | "list_tags" => (&[], &[]),
         "list_filaments" => (&["includeUnavailable"], &[]),
         "update_model" => (&["target", "patch"], &["target", "patch"]),
-        "update_models_batch" => (&["targets", "patch"], &["targets", "patch"]),
+        "update_models_batch" => (&["targets", "patch", "updates"], &[]),
         "add_tag" => (&["name", "category"], &["name"]),
         "rename_tag" => (&["tagId", "name", "category"], &["tagId", "name"]),
         "delete_tag" => (&["tagId"], &["tagId"]),
@@ -3611,6 +3641,19 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 && object.get("strategy").is_some_and(Value::is_string)
         }
         "discard_tag_review" => string_field_valid("reviewToken"),
+        "update_models_batch" => {
+            if object.contains_key("updates") {
+                !object.contains_key("targets")
+                    && !object.contains_key("patch")
+                    && versioned_metadata_updates(value).is_ok()
+            } else {
+                object
+                    .get("targets")
+                    .and_then(Value::as_array)
+                    .is_some_and(|targets| !targets.is_empty() && targets.len() <= 50_000)
+                    && object.get("patch").is_some_and(Value::is_object)
+            }
+        }
         "check_files_exist" => object.get("modelIds").is_some_and(Value::is_array),
         "start_thumbnail_job" => {
             object.get("modelIds").is_some_and(Value::is_array)
@@ -3827,6 +3870,61 @@ fn versioned_tool_targets(value: &Value) -> Result<Vec<VersionedTarget>, EngineE
         }])
     }
 }
+
+fn versioned_metadata_updates(value: &Value) -> Result<Vec<VersionedMetadataUpdate>, EngineError> {
+    let updates = value
+        .get("updates")
+        .and_then(Value::as_array)
+        .filter(|updates| !updates.is_empty() && updates.len() <= 50_000)
+        .ok_or_else(invalid_tool)?;
+    let mut seen = BTreeSet::new();
+    updates
+        .iter()
+        .map(|update| {
+            let object = update.as_object().ok_or_else(invalid_tool)?;
+            if object.len() != 3
+                || object
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "modelId" | "expectedVersion" | "patch"))
+            {
+                return Err(invalid_tool());
+            }
+            let model_id = object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .ok_or_else(invalid_tool)?
+                .to_owned();
+            if !seen.insert(model_id.clone()) {
+                return Err(invalid_tool());
+            }
+            let patch_value = object.get("patch").ok_or_else(invalid_tool)?;
+            let patch_object = patch_value.as_object().ok_or_else(invalid_tool)?;
+            if patch_object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "designer"
+                        | "sourceUrl"
+                        | "notes"
+                        | "modelLicense"
+                        | "printStatus"
+                        | "parentModelId"
+                        | "rating"
+                        | "favorite"
+                )
+            }) {
+                return Err(invalid_tool());
+            }
+            let patch = serde_json::from_value(patch_value.clone()).map_err(|_| invalid_tool())?;
+            Ok(VersionedMetadataUpdate {
+                model_id,
+                expected_version: tool_version(update)?,
+                patch,
+            })
+        })
+        .collect()
+}
+
 fn embedded_metadata_targets(value: &Value) -> Result<Vec<(String, Option<String>)>, EngineError> {
     let targets = value
         .get("targets")
@@ -6376,7 +6474,18 @@ pub fn tool_definitions() -> Vec<Value> {
                 "get_folder_tree"|"list_tags" => serde_json::json!({"type":"object","additionalProperties":false}),
                 "list_filaments" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"includeUnavailable":{"type":"boolean"}}}),
                 "update_model" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"target":{"type":"object","required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string"},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}},"patch":{"type":"object","properties":{"designer":{"type":["string","null"]},"sourceUrl":{"type":["string","null"]},"notes":{"type":["string","null"]},"modelLicense":{"type":["string","null"]},"printStatus":{"type":"string"},"parentModelId":{"type":["string","null"]},"rating":{"type":"integer","minimum":0,"maximum":5},"favorite":{"type":"boolean"}}}},"required":["target","patch"]}),
-                "update_models_batch" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"targets":{"type":"array","maxItems":50000,"items":{"type":"object","required":["modelId","expectedVersion"]}},"patch":{"type":"object","properties":{"designer":{"type":["string","null"]},"sourceUrl":{"type":["string","null"]},"notes":{"type":["string","null"]},"modelLicense":{"type":["string","null"]},"printStatus":{"type":"string"},"parentModelId":{"type":["string","null"]},"rating":{"type":"integer","minimum":0,"maximum":5},"favorite":{"type":"boolean"}}}},"required":["targets","patch"]}),
+                "update_models_batch" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "targets":{"type":"array","maxItems":50000,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "patch":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":["string","null"]},"sourceUrl":{"type":["string","null"]},"notes":{"type":["string","null"]},"modelLicense":{"type":["string","null"]},"printStatus":{"type":"string"},"parentModelId":{"type":["string","null"]},"rating":{"type":"integer","minimum":0,"maximum":5},"favorite":{"type":"boolean"}}},
+                        "updates":{"type":"array","minItems":1,"maxItems":50000,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","patch"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"patch":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":["string","null"]},"sourceUrl":{"type":["string","null"]},"notes":{"type":["string","null"]},"modelLicense":{"type":["string","null"]},"printStatus":{"type":"string"},"parentModelId":{"type":["string","null"]},"rating":{"type":"integer","minimum":0,"maximum":5},"favorite":{"type":"boolean"}}}}}}
+                    },
+                    "oneOf":[
+                        {"required":["targets","patch"],"not":{"required":["updates"]}},
+                        {"required":["updates"],"not":{"anyOf":[{"required":["targets"]},{"required":["patch"]}]}}
+                    ]
+                }),
                 "add_tag" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"name":{"type":"string","maxLength":256},"category":{"type":["string","null"],"maxLength":120}},"required":["name"]}),
                 "rename_tag" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"tagId":{"type":"string"},"name":{"type":"string","maxLength":256},"category":{"type":["string","null"],"maxLength":120}},"required":["tagId","name"]}),
                 "delete_tag" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"tagId":{"type":"string"}},"required":["tagId"]}),
@@ -6414,6 +6523,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "name": name,
                 "description": match *name {
                     "search_models" => "Search the catalog with either search or the legacy query field, plus designer, print-state, rating, favorite, thumbnail, and admitted-root filters. Uses cursor pagination.".to_owned(),
+                    "update_models_batch" => "Atomically update multiple models. Use targets plus one patch for a shared change, or updates with one modelId, expectedVersion, and patch per model for heterogeneous changes.".to_owned(),
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
                     "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
                     "get_thumbnails" => "List thumbnail gallery descriptors for a model. When the caller has MediaRead, each descriptor includes a short-lived authenticated mediaLease for fetching its image bytes.".to_owned(),

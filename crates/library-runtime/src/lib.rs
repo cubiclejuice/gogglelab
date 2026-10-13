@@ -21,7 +21,7 @@ use library_core::{
     PrintAttemptBatchItem as CorePrintAttemptBatchItem, PrintAttemptInput as CorePrintAttemptInput,
     PrintOutcome as CorePrintOutcome, PrintStatus as CorePrintStatus,
     SortDirection as CoreSortDirection, TagMode as CoreTagMode,
-    VersionedTarget as CoreVersionedTarget,
+    VersionedModelUpdate as CoreVersionedModelUpdate, VersionedTarget as CoreVersionedTarget,
 };
 use library_protocol::{
     ActionPlan, ActionTargetSnapshot, BundleEngine, BundlePreviewSummary, Capability,
@@ -39,7 +39,8 @@ use library_protocol::{
     RootHandle, RuntimeError, RuntimeErrorCode, RuntimeEvent, RuntimeInfo, RuntimeInfoEngine,
     RuntimeOwnership, RuntimeStatus, RuntimeStatusEngine, ScanEngine, ScanStatus, SettingsEngine,
     SortDirection, SourceLease, Tag, TagEngine, TagMode, ThumbnailDescriptor, UploadEngine,
-    UploadIntent, UploadToken, VersionedTarget, CAPTURE_ENVELOPE_VERSION, MAX_PAGE_LIMIT,
+    UploadIntent, UploadToken, VersionedMetadataUpdate, VersionedTarget, CAPTURE_ENVELOPE_VERSION,
+    MAX_PAGE_LIMIT,
 };
 use sha2::{Digest, Sha256};
 
@@ -1773,6 +1774,29 @@ impl MetadataEngine for LibraryRuntime {
             .collect::<Vec<_>>();
         let patch = core_metadata_patch(patch);
         self.mutate_db(|db| db.bulk_update_metadata(&targets, &patch))
+            .map(|models| models.into_iter().map(mutation_version).collect())
+    }
+
+    fn update_metadata_batch(
+        &self,
+        context: &RequestContext,
+        updates: Vec<VersionedMetadataUpdate>,
+    ) -> Result<Vec<MutationVersion>, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        if updates.is_empty() || updates.len() > 50_000 {
+            return Err(invalid(
+                "Metadata update batch must contain 1 to 50000 targets",
+            ));
+        }
+        let updates = updates
+            .into_iter()
+            .map(|update| CoreVersionedModelUpdate {
+                model_id: update.model_id,
+                expected_version: update.expected_version,
+                patch: core_metadata_patch(update.patch),
+            })
+            .collect::<Vec<_>>();
+        self.mutate_db(|db| db.update_models_metadata(&updates))
             .map(|models| models.into_iter().map(mutation_version).collect())
     }
 }

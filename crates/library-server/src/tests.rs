@@ -3317,6 +3317,67 @@ async fn protocol_adapter_set_thumbnail_replaces_while_add_thumbnail_appends() {
 }
 
 #[test]
+fn protocol_adapter_updates_heterogeneous_model_batches_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let (first, second) = runtime
+        .mutate_db(|db| {
+            Ok((
+                db.create_model("Heterogeneous first", None)?,
+                db.create_model("Heterogeneous second", None)?,
+            ))
+        })
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let writer = RequestContext {
+        principal_id: "metadata-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "heterogeneous-update-batch".into(),
+    };
+
+    let result = adapter
+        .call_tool(
+            &writer,
+            "update_models_batch",
+            json!({"updates":[
+                {"modelId":first.id,"expectedVersion":first.metadata_version.to_string(),"patch":{"designer":"Ada","favorite":true}},
+                {"modelId":second.id,"expectedVersion":second.metadata_version.to_string(),"patch":{"notes":"Resin prototype","rating":4}}
+            ]}),
+        )
+        .unwrap();
+    assert_eq!(result.as_array().unwrap().len(), 2);
+    let updated_first = adapter.get_model(&writer, &first.id).unwrap();
+    let updated_second = adapter.get_model(&writer, &second.id).unwrap();
+    assert_eq!(updated_first.designer.as_deref(), Some("Ada"));
+    assert!(updated_first.favorite);
+    assert_eq!(updated_second.notes.as_deref(), Some("Resin prototype"));
+    assert_eq!(updated_second.rating, 4);
+
+    let stale_result = adapter.call_tool(
+        &writer,
+        "update_models_batch",
+        json!({"updates":[
+            {"modelId":first.id,"expectedVersion":updated_first.metadata_version.clone(),"patch":{"notes":"Must roll back"}},
+            {"modelId":second.id,"expectedVersion":"999999999","patch":{"designer":"Must not apply"}}
+        ]}),
+    );
+    assert!(stale_result.is_err());
+    assert_eq!(
+        adapter.get_model(&writer, &first.id).unwrap().notes,
+        None,
+        "a stale item must roll back every heterogeneous patch"
+    );
+    assert_eq!(
+        adapter.get_model(&writer, &second.id).unwrap().designer,
+        None
+    );
+}
+
+#[test]
 fn protocol_adapter_remove_model_accepts_multiple_versioned_targets() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(

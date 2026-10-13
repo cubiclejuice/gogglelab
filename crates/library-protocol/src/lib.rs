@@ -684,6 +684,14 @@ pub struct MetadataPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct VersionedMetadataUpdate {
+    pub model_id: String,
+    pub expected_version: u64,
+    pub patch: MetadataPatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct MutationVersion {
     pub model_id: String,
     pub metadata_version: u64,
@@ -941,6 +949,12 @@ pub trait MetadataEngine: Send + Sync {
         context: &RequestContext,
         targets: Vec<VersionedTarget>,
         patch: MetadataPatch,
+    ) -> Result<Vec<MutationVersion>, RuntimeError>;
+
+    fn update_metadata_batch(
+        &self,
+        context: &RequestContext,
+        updates: Vec<VersionedMetadataUpdate>,
     ) -> Result<Vec<MutationVersion>, RuntimeError>;
 }
 
