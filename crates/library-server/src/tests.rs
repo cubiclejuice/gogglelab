@@ -3399,6 +3399,60 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
 }
 
 #[test]
+fn search_models_reaches_rating_and_favorite_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let (favorite_match, low_rating_match, not_favorite_match) = runtime
+        .mutate_db(|db| {
+            let favorite_match = db.create_model("Favorite high rating", None)?;
+            let low_rating_match = db.create_model("Favorite low rating", None)?;
+            let not_favorite_match = db.create_model("Not favorite", None)?;
+            Ok((favorite_match, low_rating_match, not_favorite_match))
+        })
+        .unwrap();
+    let context = RequestContext {
+        principal_id: "catalog-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "rating-favorite-search".into(),
+    };
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    for (model, rating, favorite) in [
+        (&favorite_match, 5, true),
+        (&low_rating_match, 2, true),
+        (&not_favorite_match, 5, false),
+    ] {
+        adapter
+            .call_tool(
+                &context,
+                "update_model",
+                json!({
+                    "target":{"modelId":model.id,"expectedVersion":model.metadata_version.to_string()},
+                    "patch":{"rating":rating,"favorite":favorite}
+                }),
+            )
+            .unwrap();
+    }
+
+    let page = adapter
+        .call_tool(
+            &context,
+            "search_models",
+            json!({"minimumRating":4,"favorite":true}),
+        )
+        .unwrap();
+
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], favorite_match.id);
+    assert_ne!(items[0]["id"], low_rating_match.id);
+    assert_ne!(items[0]["id"], not_favorite_match.id);
+}
+
+#[test]
 fn export_library_tool_plans_json_only_inside_backup_root() {
     let temp = tempfile::tempdir().unwrap();
     let library = temp.path().join("library");

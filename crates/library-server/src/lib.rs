@@ -2431,7 +2431,14 @@ impl<
         if object.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "query" | "cursor" | "limit" | "thumbnailMode" | "rootId" | "sourceDirectory"
+                "query"
+                    | "cursor"
+                    | "limit"
+                    | "thumbnailMode"
+                    | "rootId"
+                    | "sourceDirectory"
+                    | "minimumRating"
+                    | "favorite"
             )
         }) || object
             .get("query")
