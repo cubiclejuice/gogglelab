@@ -3173,6 +3173,79 @@ fn protocol_adapter_adds_and_removes_model_tags_by_name_with_versions() {
 }
 
 #[test]
+fn protocol_adapter_set_thumbnail_replaces_while_add_thumbnail_appends() {
+    use base64::Engine as _;
+    use image::ImageFormat;
+
+    fn png(color: [u8; 3]) -> String {
+        let mut output = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(1, 1, image::Rgb(color))
+            .write_to(&mut output, ImageFormat::Png)
+            .unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(output.into_inner())
+        )
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let model = runtime
+        .mutate_db(|db| db.create_model("Thumbnail set target", None))
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let context = RequestContext {
+        principal_id: "thumbnail-writer".into(),
+        capabilities: BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::MediaRead,
+            Capability::MediaWrite,
+        ]),
+        request_id: "thumbnail-set-versus-add".into(),
+    };
+    let added = adapter
+        .call_tool(
+            &context,
+            "add_thumbnail",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":model.metadata_version.to_string(),
+                "image":png([255,0,0])
+            }),
+        )
+        .unwrap();
+    let added_version = added["metadataVersion"].as_str().unwrap();
+    let replaced = adapter
+        .call_tool(
+            &context,
+            "set_thumbnail",
+            json!({
+                "modelId":model.id,
+                "expectedVersion":added_version,
+                "image":png([0,0,255])
+            }),
+        )
+        .unwrap();
+    assert!(replaced["metadataVersion"].as_str().is_some());
+
+    let thumbnails = adapter
+        .call_tool(&context, "get_thumbnails", json!({"modelId":model.id}))
+        .unwrap();
+    let custom = thumbnails
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|thumbnail| thumbnail["custom"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(custom.len(), 1);
+    assert_eq!(custom[0]["active"], true);
+}
+
+#[test]
 fn protocol_adapter_remove_model_accepts_multiple_versioned_targets() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(

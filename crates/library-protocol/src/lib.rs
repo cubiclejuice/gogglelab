@@ -1099,6 +1099,14 @@ pub trait GalleryEngine: Send + Sync {
         thumbnail_id: &str,
     ) -> Result<u64, RuntimeError>;
 
+    fn set_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        upload_token: &str,
+    ) -> Result<u64, RuntimeError>;
+
     fn add_thumbnail(
         &self,
         context: &RequestContext,

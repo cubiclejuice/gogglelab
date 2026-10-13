@@ -2521,6 +2521,51 @@ impl GalleryEngine for LibraryRuntime {
         Ok(model.metadata_version)
     }
 
+    fn set_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        upload_token: &str,
+    ) -> Result<u64, RuntimeError> {
+        self.require(context, Capability::MediaWrite)?;
+        let _io = self.begin_borrowed_io()?;
+        let upload = self
+            .uploads
+            .lock()
+            .unwrap()
+            .get(upload_token)
+            .cloned()
+            .ok_or_else(|| stale("Thumbnail upload token is unknown or expired"))?;
+        if upload.expires <= SystemTime::now()
+            || upload.token.library_epoch != self.library_epoch()
+            || upload.principal_id != context.principal_id
+        {
+            return Err(stale("Thumbnail upload token is stale"));
+        }
+        let (relative, hash) = images::import_custom_image_file(&self.root, &upload.path)
+            .map_err(|_| invalid("Thumbnail upload is not a valid bounded PNG or JPEG"))?;
+        let model = self.mutate_db(|db| {
+            db.set_custom_thumbnail(model_id, expected_version, &hash, &relative)
+        })?;
+        let mut uploads = self.uploads.lock().unwrap();
+        if uploads
+            .get(upload_token)
+            .is_some_and(|upload| upload.principal_id != context.principal_id)
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Forbidden,
+                message: "Upload token belongs to another principal".into(),
+                retryable: false,
+                current_version: None,
+            });
+        }
+        if let Some(upload) = uploads.remove(upload_token) {
+            self.cleanup_upload(&upload);
+        }
+        Ok(model.metadata_version)
+    }
+
     fn add_thumbnail(
         &self,
         context: &RequestContext,

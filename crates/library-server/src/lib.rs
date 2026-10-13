@@ -1069,6 +1069,21 @@ pub trait LibraryEngine: Send + Sync + 'static {
         expected_version: u64,
         thumbnail_id: &str,
     ) -> Result<u64, EngineError>;
+    fn set_thumbnail(
+        &self,
+        _context: &RequestContext,
+        _model_id: &str,
+        _expected_version: u64,
+        _file_name: String,
+        _bytes: Vec<u8>,
+    ) -> Result<u64, EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Replacing a custom thumbnail is not supported by this engine".into(),
+            retryable: false,
+            current_version: None,
+        })
+    }
     fn add_thumbnail(
         &self,
         context: &RequestContext,
@@ -2403,7 +2418,14 @@ impl<
                         serde_json::json!({"metadataVersion":self.delete_thumbnail(context,&model_id,version,id)?.to_string()}),
                     )
                 }
-                "add_thumbnail" | "set_thumbnail" => {
+                "set_thumbnail" => {
+                    let version = tool_version(&arguments)?;
+                    let bytes = decode_tool_image(&arguments)?;
+                    Ok(
+                        serde_json::json!({"metadataVersion":self.set_thumbnail(context,&model_id,version,"thumbnail-replacement".into(),bytes)?.to_string()}),
+                    )
+                }
+                "add_thumbnail" => {
                     let version = tool_version(&arguments)?;
                     let bytes = decode_tool_image(&arguments)?;
                     Ok(
@@ -2771,6 +2793,37 @@ impl<
         self.inner
             .set_active_thumbnail(context, model_id, expected_version, thumbnail_id)
             .map_err(map_runtime_error)
+    }
+    fn set_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> Result<u64, EngineError> {
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let intent = UploadIntent {
+            item_id: model_id.into(),
+            capture_id: uuid::Uuid::new_v4().simple().to_string(),
+            file_name,
+            bytes: bytes.len() as u64,
+            sha256,
+        };
+        let token = self
+            .inner
+            .stage_upload(context, intent, &mut std::io::Cursor::new(bytes))
+            .map_err(map_runtime_error)?;
+        match self
+            .inner
+            .set_thumbnail(context, model_id, expected_version, &token.id)
+        {
+            Ok(version) => Ok(version),
+            Err(error) => {
+                let _ = self.inner.discard_upload(context, &token.id);
+                Err(map_runtime_error(error))
+            }
+        }
     }
     fn add_thumbnail(
         &self,
