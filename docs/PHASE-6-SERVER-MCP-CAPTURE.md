@@ -346,4 +346,12 @@ The public workspace suite passes serially after the path preflight, JSON export
 
 `docker buildx build --platform linux/arm64 --load -f Dockerfile.server -t gogglelab-parity-server:phase6-20261012-172e865 .` returned `Docker Desktop is unable to start`. `docker desktop start` reported that the app was already running, but `docker desktop status` could not retrieve engine status; the latest read-only `docker info` probe timed out after 8 seconds. CUA could not capture a Docker Desktop window. No image was rebuilt and no container was started or modified. Resume with the synthetic loopback build/startup checks after the local Docker engine is available.
 
-Cross-platform native checks remain open. An independent Phase 6 review found and validated the backup-root overlap fix and reviewed the export plan/write gates; final release review remains after the Docker image refresh, remaining parity decisions and native visual verification.
+### Cross-target compilation probe (2026-10-13)
+
+`CARGO_NET_OFFLINE=true cargo check -p stl-core --locked --offline --target x86_64-unknown-linux-gnu` and the equivalent `x86_64-pc-windows-gnu` check both pass. The broader runtime/server Linux cross-check cannot compile `aws-lc-sys` because `x86_64-linux-gnu-gcc` is missing; the Windows cross-check cannot be attempted because `x86_64-w64-mingw32-gcc` is not installed. These geometry-core checks do not substitute for Windows/Linux application builds or runtime/slicer launch tests.
+
+Cross-platform native checks remain open. An independent Phase 6 review validated the backup-root overlap fix and export plan/write gates; the independent desktop-slicer security review found no evidence-backed findings. Final release review remains after Docker fixture verification, remaining parity decisions and native visual verification.
+
+### Cross-target compilation probe (2026-10-13)
+
+`CARGO_NET_OFFLINE=true cargo check -p stl-core --locked --offline --target x86_64-unknown-linux-gnu` and the equivalent `x86_64-pc-windows-gnu` check both pass. The broader runtime/server Linux cross-check stops in `aws-lc-sys` because `x86_64-linux-gnu-gcc` is unavailable. The Windows runtime/server check could not be attempted because `x86_64-w64-mingw32-gcc` is not installed. These geometry-core checks do not substitute for complete Windows/Linux app builds or runtime/slicer launch tests.
