@@ -3172,8 +3172,8 @@ fn protocol_adapter_adds_and_removes_model_tags_by_name_with_versions() {
         .any(|tag| tag.name == "Stale"));
 }
 
-#[test]
-fn protocol_adapter_set_thumbnail_replaces_while_add_thumbnail_appends() {
+#[tokio::test]
+async fn protocol_adapter_set_thumbnail_replaces_while_add_thumbnail_appends() {
     use base64::Engine as _;
     use image::ImageFormat;
 
@@ -3197,7 +3197,8 @@ fn protocol_adapter_set_thumbnail_replaces_while_add_thumbnail_appends() {
     let model = runtime
         .mutate_db(|db| db.create_model("Thumbnail set target", None))
         .unwrap();
-    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let content_runtime = Arc::clone(&runtime);
+    let adapter = Arc::new(ProtocolEngineAdapter::new(runtime, HostMode::Headless));
     let context = RequestContext {
         principal_id: "thumbnail-writer".into(),
         capabilities: BTreeSet::from([
@@ -3243,6 +3244,22 @@ fn protocol_adapter_set_thumbnail_replaces_while_add_thumbnail_appends() {
         .collect::<Vec<_>>();
     assert_eq!(custom.len(), 1);
     assert_eq!(custom[0]["active"], true);
+    assert!(custom[0]["mediaLease"]["id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    let media_id = custom[0]["mediaLease"]["id"].as_str().unwrap();
+    library_protocol::ContentEngine::describe_content(content_runtime.as_ref(), &context, media_id)
+        .unwrap();
+    let mut content = Vec::new();
+    library_protocol::ContentEngine::stream_content(
+        content_runtime.as_ref(),
+        &context,
+        media_id,
+        &mut content,
+    )
+    .unwrap();
+    let image = image::load_from_memory(&content).unwrap().to_rgb8();
+    assert_eq!(*image.get_pixel(0, 0), image::Rgb([0, 0, 255]));
 }
 
 #[test]

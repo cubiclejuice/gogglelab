@@ -2391,13 +2391,30 @@ impl<
                 .ok_or_else(invalid_tool)?
                 .to_owned();
             return match name {
-                "get_thumbnails" => serde_json::to_value(
-                    self.list_thumbnails(context, &model_id)?
-                        .into_iter()
-                        .map(WireThumbnail::from)
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(|_| internal_tool()),
+                "get_thumbnails" => {
+                    let thumbnails = self.list_thumbnails(context, &model_id)?;
+                    let mut items = Vec::with_capacity(thumbnails.len());
+                    for thumbnail in thumbnails {
+                        let thumbnail_id = thumbnail.thumbnail_id.clone();
+                        let mut item = serde_json::to_value(WireThumbnail::from(thumbnail))
+                            .map_err(|_| internal_tool())?;
+                        if context.capabilities.contains(&Capability::MediaRead) {
+                            match self.issue_thumbnail_media(context, &model_id, &thumbnail_id) {
+                                Ok(lease) => {
+                                    item.as_object_mut().ok_or_else(internal_tool)?.insert(
+                                        "mediaLease".into(),
+                                        serde_json::to_value(WireLease::from(lease))
+                                            .map_err(|_| internal_tool())?,
+                                    );
+                                }
+                                Err(error) if error.code == "forbidden" => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        items.push(item);
+                    }
+                    Ok(Value::Array(items))
+                }
                 "set_default_thumbnail" => {
                     let version = tool_version(&arguments)?;
                     let id = arguments
@@ -6290,6 +6307,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "description": match *name {
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
                     "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
+                    "get_thumbnails" => "List thumbnail gallery descriptors for a model. When the caller has MediaRead, each descriptor includes a short-lived authenticated mediaLease for fetching its image bytes.".to_owned(),
                     "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
                     "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
                     "open_in_slicer" => "Open a catalog model in a supported slicer on this authenticated desktop host. Provide modelId, expectedVersion, and slicerId; client filesystem paths are not accepted.".to_owned(),
