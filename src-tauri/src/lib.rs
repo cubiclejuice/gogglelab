@@ -164,6 +164,9 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             )
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
             let runtime = library.runtime().clone();
+            runtime.install_shared_state(std::sync::Arc::new(
+                library_runtime::integrations::RuntimeIntegrationTransport::http(false),
+            ))?;
             let integrations = library_integrations::IntegrationState::load(
                 runtime.host_integration_settings_path().to_path_buf(),
             )?;

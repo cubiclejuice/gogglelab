@@ -419,7 +419,7 @@ export function startApp(extensions: AppExtensions): void {
   settingsPanel.addExtensionSection(extensions.createSettingsSection?.() ?? null);
   const libraryServerSettings = new LibraryServerSettingsSection({
     status: libraryServerStatus,
-    start: () => libraryServerStart(),
+    start: (allowExternalIntegrations) => libraryServerStart(undefined, allowExternalIntegrations),
     stop: libraryServerStop,
     revealAccessKey: libraryServerRevealAccessKey,
   });

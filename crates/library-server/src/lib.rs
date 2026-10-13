@@ -1362,6 +1362,7 @@ impl<
             .inner
             .runtime_info(context)
             .map_err(map_runtime_error)?;
+        let integrations_enabled = self.inner.integration_network_enabled(context);
         Ok(HostCapabilities {
             api_version: API_VERSION.into(),
             host_mode: self.host_mode,
@@ -1373,8 +1374,9 @@ impl<
                 launch_slicer: false,
                 download_source: info.capabilities.contains(&Capability::MediaRead),
                 download_bundle: info.capabilities.contains(&Capability::MediaRead),
-                ai: false,
-                spoolman: false,
+                ai: integrations_enabled,
+                spoolman: integrations_enabled
+                    && info.capabilities.contains(&Capability::CatalogWrite),
                 mcp: true,
                 capture_inbox: info.capabilities.contains(&Capability::CatalogWrite),
             },

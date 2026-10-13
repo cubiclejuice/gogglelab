@@ -20,6 +20,7 @@ Create an operator-owned configuration directory outside the catalog. Use absolu
   "web": "/srv/gogglelab/dist-browser",
   "tokenFile": "/srv/gogglelab/config/server-token",
   "integrationSettings": "/srv/gogglelab/config/integrations.json",
+  "allowExternalIntegrations": false,
   "networkExposure": "loopback",
   "allowedHosts": ["127.0.0.1:3745", "localhost:3745"],
   "allowedOrigins": ["http://127.0.0.1:3745", "http://localhost:3745"],
@@ -31,6 +32,8 @@ Create an operator-owned configuration directory outside the catalog. Use absolu
 ```
 
 Replace every example path with a real, deliberately selected directory. The configured model root is read-only by default; importing and catalog edits use the owned library. No browser or MCP request can expand the root allowlist.
+
+`allowExternalIntegrations` defaults to `false` for old and new configs. When explicitly enabled by the service operator, authenticated Browser/MCP clients may call the configured AI provider or Spoolman through the guarded HTTP transport. Requests happen only when a client explicitly calls Generate suggestions or Spoolman sync. Turning access off blocks new requests, while a request already in progress may finish. AI `categorySharing` (`local` by default) is a separate choice controlling which tag-category fields accompany an AI request. The desktop app has the same opt-in in its Browser and MCP server settings; it resets to off when that server stops. No network integration call is needed to build or test the server.
 
 ### Optional backup-only destination
 

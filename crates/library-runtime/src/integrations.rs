@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,11 +29,69 @@ use crate::integration_state::{
 use crate::{invalid, LibraryRuntime};
 
 #[derive(Clone)]
-pub struct RuntimeIntegrationTransport(pub Arc<dyn IntegrationTransport>);
+pub struct RuntimeIntegrationTransport {
+    transport: Arc<dyn IntegrationTransport>,
+    allow_network: Arc<AtomicBool>,
+}
+
+impl RuntimeIntegrationTransport {
+    pub fn new(transport: Arc<dyn IntegrationTransport>, allow_network: bool) -> Self {
+        Self {
+            transport,
+            allow_network: Arc::new(AtomicBool::new(allow_network)),
+        }
+    }
+
+    pub fn http(allow_network: bool) -> Self {
+        Self::new(
+            Arc::new(library_integrations::HttpIntegrationTransport),
+            allow_network,
+        )
+    }
+
+    pub fn set_allow_network(&self, allow_network: bool) {
+        self.allow_network.store(allow_network, Ordering::Release);
+    }
+
+    pub fn allow_network(&self) -> bool {
+        self.allow_network.load(Ordering::Acquire)
+    }
+}
+
+impl IntegrationTransport for RuntimeIntegrationTransport {
+    fn is_enabled(&self) -> bool {
+        self.allow_network() && self.transport.is_enabled()
+    }
+
+    fn pull_spoolman(
+        &self,
+        config: &library_integrations::SpoolmanConfig,
+    ) -> Result<library_integrations::SpoolmanSnapshot, String> {
+        if !self.is_enabled() {
+            return Err("External integration requests are disabled by the host".into());
+        }
+        self.transport.pull_spoolman(config)
+    }
+
+    fn suggest_tags(
+        &self,
+        config: &library_integrations::ProviderConfig,
+        credential: Option<&str>,
+        input: &SuggestionInput,
+    ) -> Result<Vec<SuggestedTag>, String> {
+        if !self.is_enabled() {
+            return Err("External integration requests are disabled by the host".into());
+        }
+        self.transport.suggest_tags(config, credential, input)
+    }
+}
 
 impl Default for RuntimeIntegrationTransport {
     fn default() -> Self {
-        Self(Arc::new(library_integrations::DisabledIntegrationTransport))
+        Self::new(
+            Arc::new(library_integrations::DisabledIntegrationTransport),
+            false,
+        )
     }
 }
 
@@ -41,7 +100,7 @@ impl IntegrationEngine for LibraryRuntime {
         context.capabilities.contains(&Capability::Integration)
             && self
                 .shared_state::<RuntimeIntegrationTransport>()
-                .is_some_and(|transport| transport.0.is_enabled())
+                .is_some_and(|transport| transport.is_enabled())
     }
     fn integration_settings(
         &self,
@@ -124,7 +183,6 @@ impl IntegrationEngine for LibraryRuntime {
         }
         let library_epoch = self.library_epoch();
         let snapshot = transport
-            .0
             .pull_spoolman(&stored.config)
             .map_err(integration_invalid)?;
         let completed_at = crate::format_system_time(SystemTime::now())?;
@@ -401,7 +459,7 @@ fn suggest_ai_tags(
         for _ in 0..usize::from(provider.config.concurrency) {
             let queue = Arc::clone(&queue);
             let output = Arc::clone(&output);
-            let transport = Arc::clone(&transport.0);
+            let transport = Arc::clone(&transport);
             let provider = &provider;
             let credential = credential.as_ref().map(|value| value.as_str());
             let allowed_categories = &allowed_categories;
@@ -1013,7 +1071,10 @@ fn category_sharing_to_network(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use library_integrations::{ProviderConfig, SpoolmanConfig, SpoolmanSnapshot, SuggestedTag};
+    use library_integrations::{
+        CategorySharing, ProviderConfig, ProviderKind, SpoolmanConfig, SpoolmanSnapshot,
+        StructuredOutputMode, SuggestedTag, SuggestionInput,
+    };
     use library_protocol::{
         IntegrationAiReviewStrategy, IntegrationCategorySharing, IntegrationEndpointScope,
         IntegrationProviderKind, IntegrationStructuredOutputMode,
@@ -1024,6 +1085,7 @@ mod tests {
     #[derive(Default)]
     struct MockTransport {
         pulls: AtomicUsize,
+        suggestions: AtomicUsize,
     }
 
     impl IntegrationTransport for MockTransport {
@@ -1041,6 +1103,7 @@ mod tests {
             _credential: Option<&str>,
             _input: &SuggestionInput,
         ) -> Result<Vec<SuggestedTag>, String> {
+            self.suggestions.fetch_add(1, Ordering::SeqCst);
             Ok(vec![SuggestedTag {
                 name: "Fixture".into(),
                 category: None,
@@ -1064,6 +1127,65 @@ mod tests {
     }
 
     #[test]
+    fn external_integration_transport_is_host_opt_in_and_revocable() {
+        let mock = Arc::new(MockTransport::default());
+        let transport = RuntimeIntegrationTransport::new(mock.clone(), false);
+        let config = SpoolmanConfig {
+            base_url: "http://127.0.0.1:3746/".into(),
+            endpoint_scope: library_integrations::EndpointScope::Local,
+            page_size: 50,
+            timeout_seconds: 5,
+        };
+        let provider = ProviderConfig {
+            kind: ProviderKind::OpenaiCompatible,
+            base_url: "http://127.0.0.1:11434/v1/".into(),
+            endpoint_scope: library_integrations::EndpointScope::Local,
+            model: "fixture".into(),
+            max_tags: 5,
+            detail: "brief".into(),
+            category_mode: "none".into(),
+            concurrency: 1,
+            timeout_seconds: 5,
+            structured_output: StructuredOutputMode::PlainJson,
+            category_sharing: CategorySharing::Local,
+        };
+        let suggestion_input = SuggestionInput {
+            model_id: "model".into(),
+            display_name: "Fixture model".into(),
+            existing_tags: Vec::new(),
+            assigned_tags: Vec::new(),
+            existing_categories: Vec::new(),
+            preview_data_url: "data:image/png;base64,AA==".into(),
+        };
+
+        assert!(!transport.is_enabled());
+        assert!(transport.pull_spoolman(&config).is_err());
+        assert!(transport
+            .suggest_tags(&provider, None, &suggestion_input)
+            .is_err());
+        assert_eq!(mock.pulls.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.suggestions.load(Ordering::SeqCst), 0);
+
+        transport.set_allow_network(true);
+        assert!(transport.is_enabled());
+        assert!(transport.pull_spoolman(&config).is_ok());
+        assert!(transport
+            .suggest_tags(&provider, None, &suggestion_input)
+            .is_ok());
+        assert_eq!(mock.pulls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.suggestions.load(Ordering::SeqCst), 1);
+
+        transport.set_allow_network(false);
+        assert!(!transport.is_enabled());
+        assert!(transport.pull_spoolman(&config).is_err());
+        assert!(transport
+            .suggest_tags(&provider, None, &suggestion_input)
+            .is_err());
+        assert_eq!(mock.pulls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.suggestions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn mock_transport_pulls_atomically_and_credentials_are_never_returned() {
         let temp = tempfile::tempdir().unwrap();
         let settings = temp
@@ -1080,7 +1202,10 @@ mod tests {
         let transport = Arc::new(MockTransport::default());
         runtime.install_shared_state(Arc::clone(&state)).unwrap();
         runtime
-            .install_shared_state(Arc::new(RuntimeIntegrationTransport(transport.clone())))
+            .install_shared_state(Arc::new(RuntimeIntegrationTransport::new(
+                transport.clone(),
+                true,
+            )))
             .unwrap();
         let context = context("fixture");
         runtime

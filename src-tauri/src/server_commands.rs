@@ -25,6 +25,8 @@ pub struct DesktopServerState {
 struct RunningServer {
     handle: ServerHandle,
     address: SocketAddr,
+    allow_external_integrations: bool,
+    integration_transport: Arc<library_runtime::integrations::RuntimeIntegrationTransport>,
 }
 
 impl DesktopServerState {
@@ -43,6 +45,7 @@ pub struct DesktopServerStatus {
     pub running: bool,
     pub base_url: Option<String>,
     pub mcp_url: Option<String>,
+    pub allow_external_integrations: bool,
 }
 
 #[tauri::command]
@@ -50,18 +53,33 @@ pub async fn library_server_start(
     library: State<'_, LibraryState>,
     server: State<'_, DesktopServerState>,
     port: Option<u16>,
+    allow_external_integrations: Option<bool>,
 ) -> Result<DesktopServerStatus, AppError> {
-    start_impl(&library, &server, port).await
+    start_impl(
+        &library,
+        &server,
+        port,
+        allow_external_integrations.unwrap_or(false),
+    )
+    .await
 }
 
 async fn start_impl(
     library: &LibraryState,
     server: &DesktopServerState,
     port: Option<u16>,
+    allow_external_integrations: bool,
 ) -> Result<DesktopServerStatus, AppError> {
     let mut running = server.running.lock().await;
-    if let Some(current) = running.as_ref() {
-        return Ok(status_for(Some(current.address)));
+    if let Some(current) = running.as_mut() {
+        current
+            .integration_transport
+            .set_allow_network(allow_external_integrations);
+        current.allow_external_integrations = allow_external_integrations;
+        return Ok(status_for(
+            Some(current.address),
+            current.allow_external_integrations,
+        ));
     }
     let port = port.unwrap_or(DEFAULT_DESKTOP_SERVER_PORT);
     if port == 0 {
@@ -107,11 +125,25 @@ async fn start_impl(
         &server.web_root,
     )
     .map_err(server_error)?;
-    let handle = library_server::start_listener(listener, app)
-        .await
-        .map_err(server_error)?;
-    *running = Some(RunningServer { handle, address });
-    Ok(status_for(Some(address)))
+    let integration_transport = library
+        .runtime()
+        .shared_state::<library_runtime::integrations::RuntimeIntegrationTransport>()
+        .ok_or_else(|| server_error("Integration transport state is unavailable"))?;
+    integration_transport.set_allow_network(allow_external_integrations);
+    let handle = match library_server::start_listener(listener, app).await {
+        Ok(handle) => handle,
+        Err(error) => {
+            integration_transport.set_allow_network(false);
+            return Err(server_error(error));
+        }
+    };
+    *running = Some(RunningServer {
+        handle,
+        address,
+        allow_external_integrations,
+        integration_transport,
+    });
+    Ok(status_for(Some(address), allow_external_integrations))
 }
 
 #[tauri::command]
@@ -124,23 +156,21 @@ pub async fn library_server_stop(
 async fn stop_impl(server: &DesktopServerState) -> Result<DesktopServerStatus, AppError> {
     let current = server.running.lock().await.take();
     if let Some(current) = current {
+        current.integration_transport.set_allow_network(false);
         current.handle.stop().await.map_err(server_error)?;
     }
-    Ok(status_for(None))
+    Ok(status_for(None, false))
 }
 
 #[tauri::command]
 pub async fn library_server_status(
     server: State<'_, DesktopServerState>,
 ) -> Result<DesktopServerStatus, AppError> {
-    Ok(status_for(
-        server
-            .running
-            .lock()
-            .await
-            .as_ref()
-            .map(|value| value.address),
-    ))
+    let running = server.running.lock().await;
+    Ok(match running.as_ref() {
+        Some(value) => status_for(Some(value.address), value.allow_external_integrations),
+        None => status_for(None, false),
+    })
 }
 
 #[derive(Serialize)]
@@ -173,11 +203,16 @@ fn desktop_capabilities() -> BTreeSet<Capability> {
     ])
 }
 
-fn status_for(address: Option<SocketAddr>) -> DesktopServerStatus {
+fn status_for(
+    address: Option<SocketAddr>,
+    allow_external_integrations: bool,
+) -> DesktopServerStatus {
+    let running = address.is_some();
     DesktopServerStatus {
-        running: address.is_some(),
+        running,
         base_url: address.map(|address| format!("http://{address}")),
         mcp_url: address.map(|address| format!("http://{address}/mcp")),
+        allow_external_integrations: running && allow_external_integrations,
     }
 }
 
@@ -194,10 +229,17 @@ mod tests {
     #[test]
     fn status_urls_are_loopback_and_never_include_credentials() {
         let address: SocketAddr = "127.0.0.1:3745".parse().unwrap();
-        let status = status_for(Some(address));
+        let status = status_for(Some(address), false);
         assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:3745"));
         assert_eq!(status.mcp_url.as_deref(), Some("http://127.0.0.1:3745/mcp"));
         assert!(!status.base_url.unwrap().contains('@'));
+    }
+
+    #[test]
+    fn stopped_server_status_never_keeps_external_integration_access_enabled() {
+        let address: SocketAddr = "127.0.0.1:3745".parse().unwrap();
+        assert!(status_for(Some(address), true).allow_external_integrations);
+        assert!(!status_for(None, true).allow_external_integrations);
     }
 
     #[test]

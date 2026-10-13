@@ -1622,6 +1622,37 @@ async fn protocol_adapter_pages_the_real_runtime_without_paths() {
     assert!(adapter.supports_tool(&integration_writer, "integration_save_spoolman_config"));
     assert!(!adapter.supports_tool(&integration_writer, "sync_spoolman_filaments"));
     assert!(!adapter.supports_tool(&integration_writer, "generate_tags"));
+    let integration_transport =
+        Arc::new(library_runtime::integrations::RuntimeIntegrationTransport::http(false));
+    runtime
+        .install_shared_state(Arc::clone(&integration_transport))
+        .unwrap();
+    assert!(
+        !adapter
+            .capabilities(&integration_writer)
+            .unwrap()
+            .features
+            .ai
+    );
+    assert!(
+        !adapter
+            .capabilities(&integration_writer)
+            .unwrap()
+            .features
+            .spoolman
+    );
+    integration_transport.set_allow_network(true);
+    assert!(adapter.supports_tool(&integration_writer, "sync_spoolman_filaments"));
+    assert!(adapter.supports_tool(&integration_writer, "generate_tags"));
+    let network_features = adapter.capabilities(&integration_writer).unwrap().features;
+    assert!(network_features.ai);
+    assert!(network_features.spoolman);
+    let read_only_network_features = adapter.capabilities(&integration_reader).unwrap().features;
+    assert!(read_only_network_features.ai);
+    assert!(!read_only_network_features.spoolman);
+    integration_transport.set_allow_network(false);
+    assert!(!adapter.supports_tool(&integration_writer, "sync_spoolman_filaments"));
+    assert!(!adapter.supports_tool(&integration_writer, "generate_tags"));
     let updated = adapter
         .update_metadata(
             &integration_writer,

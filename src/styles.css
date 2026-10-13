@@ -2473,8 +2473,20 @@ input[type="radio"] {
 }
 .library-server-settings legend,
 .library-server-settings .hint,
-.library-server-settings .settings-error {
+.library-server-settings .settings-error,
+.library-server-settings .library-server-network,
+.library-server-settings .library-server-integration-status {
   grid-column: 1 / -1;
+}
+.library-server-settings .library-server-network {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+.library-server-settings .library-server-network input {
+  flex: none;
+  margin-top: 0.15rem;
 }
 .library-server-settings [hidden] {
   display: none;

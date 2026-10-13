@@ -29,5 +29,6 @@
   "web": "/app/web",
   "tokenFile": "/run/secrets/gogglelab-token",
   "integrationSettings": "/data/config/integrations.json",
+  "allowExternalIntegrations": false,
   "networkExposure": "containerLoopbackPublish"
 }

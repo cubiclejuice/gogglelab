@@ -1039,10 +1039,14 @@ export interface DesktopLibraryServerStatus {
   running: boolean;
   baseUrl: string | null;
   mcpUrl: string | null;
+  allowExternalIntegrations: boolean;
 }
 
-export function libraryServerStart(port?: number): Promise<DesktopLibraryServerStatus> {
-  return invoke("library_server_start", { port });
+export function libraryServerStart(
+  port?: number,
+  allowExternalIntegrations = false,
+): Promise<DesktopLibraryServerStatus> {
+  return invoke("library_server_start", { port, allowExternalIntegrations });
 }
 
 export function libraryServerStop(): Promise<DesktopLibraryServerStatus> {

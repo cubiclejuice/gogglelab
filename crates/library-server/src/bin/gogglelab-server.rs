@@ -20,6 +20,8 @@ struct OperatorConfig {
     token_file: PathBuf,
     integration_settings: PathBuf,
     #[serde(default)]
+    allow_external_integrations: bool,
+    #[serde(default)]
     allowed_roots: Vec<ConfiguredRoot>,
     #[serde(default)]
     allowed_hosts: Vec<String>,
@@ -125,6 +127,7 @@ async fn main() -> Result<(), String> {
         return Err("Browser asset directory overlaps private server storage".into());
     }
     let integration_settings_path = config.integration_settings.clone();
+    let allow_external_integrations = config.allow_external_integrations;
     let runtime = LibraryRuntime::open(RuntimeConfig {
         library_root: config.library,
         integration_settings_path: integration_settings_path.clone(),
@@ -149,9 +152,11 @@ async fn main() -> Result<(), String> {
         ))
         .map_err(|error| error.to_string())?;
     runtime
-        .install_shared_state(Arc::new(
-            library_runtime::integrations::RuntimeIntegrationTransport::default(),
-        ))
+        .install_shared_state(Arc::new(if allow_external_integrations {
+            library_runtime::integrations::RuntimeIntegrationTransport::http(true)
+        } else {
+            library_runtime::integrations::RuntimeIntegrationTransport::default()
+        }))
         .map_err(|error| error.to_string())?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -384,5 +389,27 @@ mod tests {
         assert!(paths_overlap(base, &base.join("server-token")));
         assert!(paths_overlap(&base.join("web"), base));
         assert!(!paths_overlap(&base.join("web"), Path::new("/srv/catalog")));
+    }
+
+    #[test]
+    fn external_integrations_require_an_explicit_operator_opt_in() {
+        let legacy: OperatorConfig = serde_json::from_value(serde_json::json!({
+            "library":"/srv/library",
+            "web":"/srv/web",
+            "tokenFile":"/srv/server-token",
+            "integrationSettings":"/srv/integrations.json"
+        }))
+        .unwrap();
+        assert!(!legacy.allow_external_integrations);
+
+        let opted_in: OperatorConfig = serde_json::from_value(serde_json::json!({
+            "library":"/srv/library",
+            "web":"/srv/web",
+            "tokenFile":"/srv/server-token",
+            "integrationSettings":"/srv/integrations.json",
+            "allowExternalIntegrations":true
+        }))
+        .unwrap();
+        assert!(opted_in.allow_external_integrations);
     }
 }
