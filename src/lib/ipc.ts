@@ -215,6 +215,280 @@ export interface DetectedPrinter {
   source_display: string;
 }
 
+/** Catalog-backed printer records use the camelCase serde contract. */
+export type PrinterSourceKind = "manual" | "discovered" | "imported";
+export type PrinterConnectionStatus = "unknown" | "online" | "offline" | "auth_required" | "error";
+export type PrinterJobStatus = "unknown" | "idle" | "printing" | "paused" | "complete";
+export type PrinterReminderStatus = "active" | "paused" | "completed";
+
+export interface LibraryPrinter {
+  id: string;
+  metadataVersion: number;
+  nickname: string;
+  make: string | null;
+  model: string | null;
+  printerType: string | null;
+  firmware: string | null;
+  host: string | null;
+  webUrl: string | null;
+  endpointApproved: boolean;
+  bedMm: [number, number, number] | null;
+  notes: string;
+  sourceKind: PrinterSourceKind;
+  connectionStatus: PrinterConnectionStatus;
+  jobStatus: PrinterJobStatus;
+  lastCheckedAt: string | null;
+  connectionErrorCode: string | null;
+  printCount: number;
+  lastPrintedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrinterInput {
+  nickname: string;
+  make: string | null;
+  model: string | null;
+  printerType: string | null;
+  firmware: string | null;
+  host: string | null;
+  webUrl: string | null;
+  bedMm: [number, number, number] | null;
+  notes: string;
+}
+
+export interface PrinterBatchInput {
+  input: PrinterInput;
+  endpointApproved: boolean;
+}
+
+export interface PrinterDiscoverySuggestion {
+  key: string;
+  name: string;
+  model: string;
+  bedMm: [number, number, number];
+  connection: { kind: "network"; address: string };
+  source: "moonraker" | "prusalink" | "bambu_mqtt_tls";
+  printerType: "FDM";
+}
+
+export type PrinterConnectionTestResult =
+  | "connected"
+  | "unreachable"
+  | "unsupported"
+  | "authRequired"
+  | "failed"
+  | "cancelled";
+
+export interface PrinterConnectionTestResponse {
+  result: PrinterConnectionTestResult;
+  printer: LibraryPrinter;
+  statusEventObserved: boolean;
+}
+
+export interface PrinterMaintenanceInput {
+  title: string;
+  performedAt: string;
+  notes: string;
+}
+
+export interface PrinterMaintenanceLog extends PrinterMaintenanceInput {
+  id: string;
+  metadataVersion: number;
+  printerId: string | null;
+  printerNickname: string;
+  createdAt: string;
+}
+
+export interface PrinterReminderInput {
+  title: string;
+  notes: string;
+  dueAt: string;
+  intervalDays: number | null;
+}
+
+export interface PrinterReminder {
+  id: string;
+  metadataVersion: number;
+  printerId: string | null;
+  printerNickname: string;
+  title: string;
+  notes: string;
+  dueAt: string;
+  intervalDays: number | null;
+  status: PrinterReminderStatus;
+  lastCompletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrinterReminderCompletionInput {
+  completedAt: string;
+  notes: string;
+}
+
+export interface PrinterReminderCompletion {
+  reminder: PrinterReminder;
+  maintenanceLog: PrinterMaintenanceLog;
+}
+
+export interface PrinterDataImportPrinter {
+  externalRef: string;
+  mapToLocalPrinterId?: string | null;
+  input: PrinterInput;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PrinterDataImportMaintenanceLog {
+  externalRef: string;
+  printerExternalRef: string | null;
+  printerNickname: string;
+  input: PrinterMaintenanceInput;
+  createdAt?: string;
+}
+
+export interface PrinterDataImportReminder {
+  externalRef: string;
+  printerExternalRef: string | null;
+  printerNickname?: string | null;
+  input: PrinterReminderInput;
+  status: PrinterReminderStatus;
+  lastCompletedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrinterDataImport {
+  printers: PrinterDataImportPrinter[];
+  maintenanceLogs: PrinterDataImportMaintenanceLog[];
+  reminders: PrinterDataImportReminder[];
+}
+
+export interface PrinterDataImportResult {
+  printerRefMap: { externalRef: string; localPrinterId: string }[];
+  importedPrinterCount: number;
+  mappedPrinterCount: number;
+  importedMaintenanceLogCount: number;
+  importedReminderCount: number;
+}
+
+export function libraryListPrinters(): Promise<LibraryPrinter[]> {
+  return invoke("library_list_printers");
+}
+
+export function libraryCreatePrinter(
+  input: PrinterInput,
+  endpointApproved: boolean,
+): Promise<LibraryPrinter> {
+  return invoke("library_create_printer", { input, endpointApproved });
+}
+
+export function libraryUpdatePrinter(
+  id: string,
+  expectedVersion: number,
+  input: PrinterInput,
+  endpointApproved: boolean | null,
+): Promise<LibraryPrinter> {
+  return invoke("library_update_printer", { id, expectedVersion, input, endpointApproved });
+}
+
+export function libraryDeletePrinter(id: string, expectedVersion: number): Promise<void> {
+  return invoke("library_delete_printer", { id, expectedVersion });
+}
+
+export function libraryCreatePrintersBatch(inputs: PrinterBatchInput[]): Promise<LibraryPrinter[]> {
+  return invoke("library_create_printers_batch", { inputs });
+}
+
+export function libraryImportPrinterData(
+  input: PrinterDataImport,
+): Promise<PrinterDataImportResult> {
+  return invoke("library_import_printer_data", { input });
+}
+
+export function libraryDiscoverPrinters(range: string): Promise<PrinterDiscoverySuggestion[]> {
+  return invoke("library_discover_printers", { range });
+}
+
+export function libraryCancelPrinterDiscovery(): Promise<void> {
+  return invoke("library_cancel_printer_discovery");
+}
+
+export function libraryTestPrinterConnection(
+  id: string,
+  mainboardId?: string,
+  discoverMainboardId = false,
+): Promise<PrinterConnectionTestResponse> {
+  return invoke("library_test_printer_connection", {
+    id,
+    mainboardId: mainboardId ?? null,
+    discoverMainboardId,
+  });
+}
+
+export function libraryListPrinterMaintenanceLogs(
+  printerId: string | null = null,
+): Promise<PrinterMaintenanceLog[]> {
+  return invoke("library_list_printer_maintenance_logs", { printerId });
+}
+
+export function libraryCreatePrinterMaintenanceLog(
+  printerId: string,
+  input: PrinterMaintenanceInput,
+): Promise<PrinterMaintenanceLog> {
+  return invoke("library_create_printer_maintenance_log", { printerId, input });
+}
+
+export function libraryUpdatePrinterMaintenanceLog(
+  id: string,
+  expectedVersion: number,
+  input: PrinterMaintenanceInput,
+): Promise<PrinterMaintenanceLog> {
+  return invoke("library_update_printer_maintenance_log", { id, expectedVersion, input });
+}
+
+export function libraryDeletePrinterMaintenanceLog(
+  id: string,
+  expectedVersion: number,
+): Promise<void> {
+  return invoke("library_delete_printer_maintenance_log", { id, expectedVersion });
+}
+
+export function libraryListPrinterReminders(
+  printerId: string | null = null,
+  includeCompleted = true,
+): Promise<PrinterReminder[]> {
+  return invoke("library_list_printer_reminders", { printerId, includeCompleted });
+}
+
+export function libraryCreatePrinterReminder(
+  printerId: string,
+  input: PrinterReminderInput,
+): Promise<PrinterReminder> {
+  return invoke("library_create_printer_reminder", { printerId, input });
+}
+
+export function libraryUpdatePrinterReminder(
+  id: string,
+  expectedVersion: number,
+  input: PrinterReminderInput,
+): Promise<PrinterReminder> {
+  return invoke("library_update_printer_reminder", { id, expectedVersion, input });
+}
+
+export function libraryDeletePrinterReminder(id: string, expectedVersion: number): Promise<void> {
+  return invoke("library_delete_printer_reminder", { id, expectedVersion });
+}
+
+export function libraryCompletePrinterReminder(
+  id: string,
+  expectedVersion: number,
+  completion: PrinterReminderCompletionInput,
+): Promise<PrinterReminderCompletion> {
+  return invoke("library_complete_printer_reminder", { id, expectedVersion, completion });
+}
+
 export function detectPrinters(): Promise<DetectedPrinter[]> {
   return invoke("detect_printers");
 }
@@ -293,7 +567,15 @@ export function extractZip(root: string, path: string): Promise<ExtractResult> {
   return invoke("extract_zip", { root, path });
 }
 
-export function moveTreeFileToTrash(path: string): Promise<void> {
+export interface FileTreeTrashReceipt {
+  originalPath: string;
+  recoveryPath: string;
+  journalPath: string;
+  bytes: number | null;
+  sha256: string | null;
+}
+
+export function moveTreeFileToTrash(path: string): Promise<FileTreeTrashReceipt> {
   return invoke("move_tree_file_to_trash", { path });
 }
 export function moveTreeEntry(
@@ -319,6 +601,23 @@ export interface SlicerApp {
   app_path: string;
 }
 
+export interface SlicerProfileView {
+  id: string;
+  bundle_id: string;
+  display_name: string;
+  app_path: string;
+  is_custom: boolean;
+  available: boolean;
+}
+
+export interface SlicerProfileDraft {
+  id: string | null;
+  name: string;
+  path: string;
+  /** True only after the user explicitly confirms this executable identity. */
+  trust: boolean;
+}
+
 export interface SlicerPalette {
   slicer_id: string;
   slots: ActiveFilamentSlot[];
@@ -334,11 +633,28 @@ export function detectSlicers(): Promise<SlicerApp[]> {
   return invoke("detect_slicers");
 }
 
+export function listSlicerProfiles(): Promise<SlicerProfileView[]> {
+  return invoke("list_slicer_profiles");
+}
+
+export function detectSlicerProfileCandidates(): Promise<SlicerProfileDraft[]> {
+  return invoke("detect_slicer_profile_candidates");
+}
+
+export function saveSlicerProfiles(profiles: SlicerProfileDraft[]): Promise<void> {
+  return invoke("save_slicer_profiles", { profiles });
+}
+
+/** Append explicitly selected, trusted local apps without replacing saved profiles. */
+export function importSlicerProfiles(profiles: SlicerProfileDraft[]): Promise<string[]> {
+  return invoke("import_slicer_profiles", { profiles });
+}
+
 export function getDefaultSlicer(): Promise<string | null> {
   return invoke("get_default_slicer");
 }
 
-export function setDefaultSlicer(slicerId: string): Promise<void> {
+export function setDefaultSlicer(slicerId: string | null): Promise<void> {
   return invoke("set_default_slicer", { slicerId });
 }
 
@@ -558,7 +874,29 @@ export interface VersionedModelTarget {
   expected_version: number;
 }
 
-export type PrintOutcome = "printed" | "failed";
+export type PrintOutcome = "printed" | "failed" | "cancelled";
+
+export interface PrintAttemptPartInput {
+  id: string;
+  /** Amount consumed for one printed copy. */
+  quantity: number;
+  /** Historical label for an imported association that has no local stock row. */
+  snapshot?: {
+    name: string;
+    category: string | null;
+    unit: string;
+  };
+}
+
+export interface PrintAttemptPart {
+  id: string | null;
+  name: string;
+  category: string | null;
+  unit: string;
+  quantityPerCopy: number;
+  /** Total consumed across `PrintAttempt.quantity` copies. */
+  quantity: number;
+}
 
 export interface PrintAttemptInput {
   printed_at: string;
@@ -566,13 +904,50 @@ export interface PrintAttemptInput {
   notes: string;
   filament_ids: string[];
   outcome: PrintOutcome;
+  /** Optional for compatibility with older callers and stored event payloads. */
+  parts?: PrintAttemptPartInput[];
 }
 
-export interface PrintAttempt extends PrintAttemptInput {
+export interface PrintAttempt extends Omit<PrintAttemptInput, "parts"> {
   id: string;
   model_id: string;
+  printer_id?: string | null;
+  printer_name?: string | null;
+  /** Older history entries may not contain part snapshots. */
+  parts?: PrintAttemptPart[];
+  /** Null marks legacy part usage whose effect on stock cannot be reconstructed. */
+  stock_adjusted?: boolean | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface PartStockInput {
+  name: string;
+  category: string | null;
+  quantity: number;
+  unit: string;
+  notes: string;
+  lowStock: number;
+}
+
+export interface PartStock extends PartStockInput {
+  id: string;
+  metadataVersion: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PrintAttemptImportItem {
+  input: PrintAttemptInput;
+  createdAt: string | null;
+  printerId: string | null;
+  printerName: string | null;
+}
+
+export interface PrintAttemptImportResult {
+  addedCount: number;
+  skippedCount: number;
+  metadataVersion: number;
 }
 
 export interface IndexRoot {
@@ -648,8 +1023,11 @@ export interface RestoreResult {
 }
 
 export interface CleanupResult {
+  /** Hash-verified generated files permanently removed after cleanup admission. */
   files: number;
   bytes: number;
+  issues: string[];
+  handoffCleanupSkipped: boolean;
 }
 
 export interface ManagementStatus {
@@ -798,6 +1176,37 @@ export function libraryCreatePrintAttempt(
   return invoke("library_create_print_attempt", { modelId, input });
 }
 
+export function libraryCreatePrintAttemptWithPrinter(
+  modelId: string,
+  input: PrintAttemptInput,
+  printerId: string | null,
+): Promise<PrintAttempt> {
+  return invoke("library_create_print_attempt_with_printer", { modelId, input, printerId });
+}
+
+export function libraryImportPrintAttempt(
+  modelId: string,
+  input: PrintAttemptInput,
+  createdAt: string | null,
+  printerId: string | null,
+  printerName: string | null,
+): Promise<PrintAttempt> {
+  return invoke("library_import_print_attempt", {
+    modelId,
+    input,
+    createdAt,
+    printerId,
+    printerName,
+  });
+}
+
+export function libraryImportPrintAttempts(
+  modelId: string,
+  attempts: PrintAttemptImportItem[],
+): Promise<PrintAttemptImportResult> {
+  return invoke("library_import_print_attempts", { modelId, attempts });
+}
+
 export function libraryListPrintAttempts(modelId: string): Promise<PrintAttempt[]> {
   return invoke("library_list_print_attempts", { modelId });
 }
@@ -813,8 +1222,36 @@ export function libraryUpdatePrintAttempt(
   return invoke("library_update_print_attempt", { attemptId, input });
 }
 
+export function libraryUpdatePrintAttemptWithPrinter(
+  attemptId: string,
+  input: PrintAttemptInput,
+  printerId: string | null | undefined,
+): Promise<PrintAttempt> {
+  return invoke("library_update_print_attempt_with_printer", { attemptId, input, printerId });
+}
+
 export function libraryDeletePrintAttempt(attemptId: string): Promise<void> {
   return invoke("library_delete_print_attempt", { attemptId });
+}
+
+export function libraryListPartStock(): Promise<PartStock[]> {
+  return invoke("library_list_part_stock");
+}
+
+export function libraryCreatePartStock(input: PartStockInput): Promise<PartStock> {
+  return invoke("library_create_part_stock", { input });
+}
+
+export function libraryUpdatePartStock(
+  id: string,
+  expectedVersion: number,
+  input: PartStockInput,
+): Promise<PartStock> {
+  return invoke("library_update_part_stock", { id, expectedVersion, input });
+}
+
+export function libraryDeletePartStock(id: string, expectedVersion: number): Promise<void> {
+  return invoke("library_delete_part_stock", { id, expectedVersion });
 }
 
 export function libraryCreateBundle(modelIds: string[]): Promise<string> {
@@ -1076,6 +1513,10 @@ export function recoveryExportLibrary(
   destinationPath: string,
 ): Promise<RecoveryManifest> {
   return invoke("recovery_export_library", { modelIds, destinationPath });
+}
+
+export function recoveryExportPrintventoryJson(destinationPath: string): Promise<number> {
+  return invoke("recovery_export_printventory_json", { destinationPath });
 }
 
 export function recoveryExportColorways(rawJson: string, destinationPath: string): Promise<number> {

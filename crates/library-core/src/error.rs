@@ -40,6 +40,12 @@ pub enum LibraryError {
         expected: u64,
         actual: u64,
     },
+    #[error("part {part_id} version conflict: expected {expected}, found {actual}")]
+    PartStockVersionConflict {
+        part_id: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("idempotency key conflicts with another payload: {0}")]
     IdempotencyConflict(String),
     #[error("unsupported library format: {0}")]

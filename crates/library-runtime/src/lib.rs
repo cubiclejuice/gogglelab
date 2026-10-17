@@ -1,12 +1,14 @@
 use std::any::{Any, TypeId};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::cell::Cell;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
+use library_core::models::PrintAttemptInputWithPrinter as CorePrintAttemptInputWithPrinter;
 use library_core::{
     CaptureDownloadInput as CoreCaptureDownload, CapturePageInput as CoreCapturePage,
     CaptureReceipt as CoreCaptureReceipt, CaptureReceiptInput as CoreCaptureReceiptInput,
@@ -18,8 +20,10 @@ use library_core::{
     MetadataPatch as CoreMetadataPatch, Model,
     ModelFilamentAssignment as CoreModelFilamentAssignment,
     ModelGroupFilter as CoreModelGroupFilter, ModelPageQuery as CoreModelPageQuery,
-    ModelSort as CoreModelSort, PrintAttempt as CorePrintAttempt,
-    PrintAttemptBatchItem as CorePrintAttemptBatchItem, PrintAttemptInput as CorePrintAttemptInput,
+    ModelSort as CoreModelSort, PartStock as CorePartStock, PartStockInput as CorePartStockInput,
+    PartUsageInput as CorePartUsageInput, PartUsageSnapshot as CorePartUsageSnapshot,
+    PrintAttempt as CorePrintAttempt, PrintAttemptBatchItem as CorePrintAttemptBatchItem,
+    PrintAttemptInput as CorePrintAttemptInput, PrintAttemptPart as CorePrintAttemptPart,
     PrintOutcome as CorePrintOutcome, PrintStatus as CorePrintStatus,
     SortDirection as CoreSortDirection, TagMode as CoreTagMode,
     VersionedModelUpdate as CoreVersionedModelUpdate, VersionedTarget as CoreVersionedTarget,
@@ -36,14 +40,17 @@ use library_protocol::{
     GeometryLease, IndexRootSettings, IndexRootSettingsPatch, ManagementAction, ManagementEngine,
     ManagementResult, MediaLease, MetadataEngine, MetadataPatch, MetadataValueKind,
     ModelAvailability, ModelFilamentAssignment, ModelGroupFilter, ModelQuery, ModelSort,
-    MoveLooseSourceTarget, MutationVersion, Page, PageRequest, PrintAttempt, PrintAttemptBatchItem,
-    PrintAttemptInput, PrintHistoryEngine, PrintOutcome, PrintStatus, RequestContext,
-    RestoreRootMapping, RootAccess, RootHandle, RuntimeError, RuntimeErrorCode, RuntimeEvent,
-    RuntimeInfo, RuntimeInfoEngine, RuntimeOwnership, RuntimeStatus, RuntimeStatusEngine,
-    ScanEngine, ScanStatus, SettingsEngine, SortDirection, SourceLease, Tag, TagEngine, TagMode,
-    ThumbnailDescriptor, UploadEngine, UploadIntent, UploadToken, VersionedMetadataUpdate,
-    VersionedTarget, CAPTURE_ENVELOPE_VERSION, MAX_PAGE_LIMIT,
+    MoveLooseSourceTarget, MutationVersion, Page, PageRequest, PartStock, PartStockEngine,
+    PartStockInput, PrintAttempt, PrintAttemptBatchItem, PrintAttemptInput,
+    PrintAttemptInputWithPrinter, PrintAttemptPart, PrintHistoryEngine, PrintOutcome, PrintStatus,
+    RequestContext, RestoreRootMapping, RootAccess, RootHandle, RuntimeError, RuntimeErrorCode,
+    RuntimeEvent, RuntimeInfo, RuntimeInfoEngine, RuntimeOwnership, RuntimeStatus,
+    RuntimeStatusEngine, ScanEngine, ScanStatus, SettingsEngine, SortDirection, SourceHoldReceipt,
+    SourceLease, Tag, TagEngine, TagMode, ThumbnailDescriptor, UploadEngine, UploadIntent,
+    UploadToken, VersionedMetadataUpdate, VersionedTarget, CAPTURE_ENVELOPE_VERSION,
+    MAX_PAGE_LIMIT,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub mod archives;
@@ -55,7 +62,641 @@ pub mod images;
 pub mod integration_state;
 pub mod integrations;
 pub mod scanner;
+mod secure_fs;
+pub use secure_fs::{HeldEntry, MovedEntry};
 pub mod thumbnails;
+
+/// Opaque handle used by native management code for one admitted directory.
+#[doc(hidden)]
+pub struct GuardedDirectory(secure_fs::Directory);
+
+impl GuardedDirectory {
+    #[doc(hidden)]
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        secure_fs::Directory::open(path).map(Self)
+    }
+
+    #[doc(hidden)]
+    pub fn io_path(&self) -> std::io::Result<PathBuf> {
+        Ok(self.0.path()?.join("."))
+    }
+
+    #[doc(hidden)]
+    pub fn sync(&self) -> std::io::Result<()> {
+        self.0.sync()
+    }
+
+    #[doc(hidden)]
+    pub fn sync_tree(&self) -> std::io::Result<()> {
+        self.0.sync_tree()
+    }
+
+    #[doc(hidden)]
+    pub fn matches_path(&self, path: &Path) -> std::io::Result<bool> {
+        self.0.matches_path(path)
+    }
+
+    #[doc(hidden)]
+    pub fn copy_file_from_path(
+        &self,
+        source_root: &Path,
+        source_name: &std::ffi::OsStr,
+        destination_name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        let source = secure_fs::Directory::open(source_root)?;
+        secure_fs::copy_verified_into_directory(
+            &source,
+            source_name,
+            &self.0,
+            destination_name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn copy_file_from_directory(
+        &self,
+        source: &GuardedDirectory,
+        source_name: &std::ffi::OsStr,
+        destination_name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        secure_fs::copy_verified_into_directory(
+            &source.0,
+            source_name,
+            &self.0,
+            destination_name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn copy_tree_from_path(
+        &self,
+        source_root: &Path,
+        max_file_bytes: u64,
+    ) -> std::io::Result<()> {
+        self.0.copy_tree_from_path(source_root, max_file_bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn copy_tree_from_directory(
+        &self,
+        source: &GuardedDirectory,
+        max_file_bytes: u64,
+    ) -> std::io::Result<()> {
+        self.0.copy_tree_from_directory(&source.0, max_file_bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn create_new_relative_file(&self, relative: &Path) -> std::io::Result<File> {
+        self.0.create_new_relative_file(relative)
+    }
+
+    #[doc(hidden)]
+    pub fn hash_file(
+        &self,
+        name: &std::ffi::OsStr,
+        max_bytes: u64,
+    ) -> std::io::Result<(u64, String)> {
+        secure_fs::hash_file(&mut self.0.open_file(name)?, max_bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn open_file_handle(&self, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        self.0.open_file(name)
+    }
+
+    #[doc(hidden)]
+    pub fn write_new_file(&self, name: &std::ffi::OsStr, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = self.0.create_new_file(name)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        self.0.sync()
+    }
+
+    #[doc(hidden)]
+    pub fn hash_relative_file(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> std::io::Result<(u64, String)> {
+        self.0.hash_relative_file(relative, max_bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn relative_file_exists(&self, relative: &Path) -> std::io::Result<bool> {
+        self.0.relative_file_exists(relative)
+    }
+
+    /// Permanently delete a hash-verified generated file relative to this
+    /// pinned directory. Original model files must use recoverable holds.
+    #[doc(hidden)]
+    pub fn delete_verified_file(
+        &self,
+        relative: &Path,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        self.0.delete_verified_relative_file(
+            relative,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )
+    }
+
+    /// Move a hash-verified entry into a durable sibling hold instead of
+    /// permanently unlinking file bytes.
+    #[doc(hidden)]
+    pub fn remove_verified_file(
+        &self,
+        relative: &Path,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        let _held = self.0.remove_verified_relative_file(
+            relative,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )?;
+        Ok(())
+    }
+
+    /// Move a verified file into a durable, same-filesystem destination. The
+    /// source journal remains beside the original name for crash recovery.
+    #[doc(hidden)]
+    pub fn move_verified_file_to(
+        &self,
+        source_name: &std::ffi::OsStr,
+        destination: &GuardedDirectory,
+        destination_name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<MovedEntry> {
+        self.0.move_verified_file_to(
+            source_name,
+            &destination.0,
+            destination_name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )
+    }
+
+    /// Move a visible directory or file by stable entry identity, with a
+    /// durable journal and exclusive destination creation.
+    #[doc(hidden)]
+    pub fn move_entry_to(
+        &self,
+        source_name: &std::ffi::OsStr,
+        destination: &GuardedDirectory,
+        destination_name: &std::ffi::OsStr,
+    ) -> std::io::Result<MovedEntry> {
+        self.0
+            .move_entry_to(source_name, &destination.0, destination_name)
+    }
+
+    /// Preserve a file under a unique hidden name with a durable recovery
+    /// journal instead of unlinking it.
+    #[doc(hidden)]
+    pub fn hold_verified_file(
+        &self,
+        name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<HeldEntry> {
+        self.0.hold_verified_file(
+            name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )
+    }
+
+    /// Hold a verified file under deterministic sibling names so a higher
+    /// level transaction can reconstruct its recovery path after restart.
+    #[doc(hidden)]
+    pub fn hold_verified_file_as(
+        &self,
+        source_name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+        hold_name: &std::ffi::OsStr,
+        journal_name: &std::ffi::OsStr,
+    ) -> std::io::Result<HeldEntry> {
+        self.0.hold_verified_file_as(
+            source_name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+            hold_name,
+            journal_name,
+        )
+    }
+
+    /// Preserve an arbitrary file or directory entry by identity. This is for
+    /// visible filesystem items where a content hash is not available.
+    #[doc(hidden)]
+    pub fn hold_entry(&self, name: &std::ffi::OsStr) -> std::io::Result<HeldEntry> {
+        self.0.hold_entry(name)
+    }
+
+    /// Restore a held entry into its original pinned directory. The operation
+    /// refuses to overwrite an occupied original name.
+    #[doc(hidden)]
+    pub fn restore_held_entry(
+        &self,
+        held: &HeldEntry,
+        original_name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        self.0.restore_held_entry(held, original_name)
+    }
+
+    /// Rebuild a verified hold receipt after a process restart using its
+    /// durable journal in this same pinned directory.
+    #[doc(hidden)]
+    pub fn recover_held_entry(&self, journal_name: &std::ffi::OsStr) -> std::io::Result<HeldEntry> {
+        self.0.recover_held_entry(journal_name)
+    }
+
+    #[doc(hidden)]
+    pub fn remove_empty_directory(&self, relative: &Path) -> std::io::Result<()> {
+        self.0.remove_empty_relative_directory(relative)
+    }
+
+    #[doc(hidden)]
+    pub fn modified_nanos(&self, name: &std::ffi::OsStr) -> std::io::Result<u64> {
+        let modified = self.0.open_file(name)?.metadata()?.modified()?;
+        Ok(modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |value| {
+                u64::try_from(value.as_nanos()).unwrap_or(u64::MAX)
+            }))
+    }
+
+    #[doc(hidden)]
+    pub fn create_child_directory(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<GuardedDirectory> {
+        self.0.create_child_directory(name)?;
+        self.0.open_child(name).map(GuardedDirectory)
+    }
+}
+
+impl library_backup::RestoreTarget for GuardedDirectory {
+    fn create_new_file(&mut self, relative_path: &Path) -> std::io::Result<File> {
+        self.create_new_relative_file(relative_path)
+    }
+
+    fn staging_path(&self) -> std::io::Result<PathBuf> {
+        self.io_path()
+    }
+
+    fn sync_file_parent(&self, relative_path: &Path) -> std::io::Result<()> {
+        self.0.sync_relative_parent(relative_path)
+    }
+
+    fn sync_root(&self) -> std::io::Result<()> {
+        self.0.sync_tree()
+    }
+}
+
+/// Opaque parent-directory handle for sibling catalog swaps.
+#[doc(hidden)]
+pub struct GuardedDirectoryParent(secure_fs::Directory);
+
+impl GuardedDirectoryParent {
+    #[doc(hidden)]
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        secure_fs::Directory::open(path).map(Self)
+    }
+
+    #[doc(hidden)]
+    pub fn matches_path(&self, path: &Path) -> std::io::Result<bool> {
+        self.0.matches_path(path)
+    }
+
+    #[doc(hidden)]
+    pub fn open_child(&self, name: &std::ffi::OsStr) -> std::io::Result<GuardedDirectory> {
+        self.0.open_child(name).map(GuardedDirectory)
+    }
+
+    #[doc(hidden)]
+    pub fn open_file_handle(&self, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        self.0.open_file(name)
+    }
+
+    #[doc(hidden)]
+    pub fn create_new_file_read_write(&self, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        self.0.create_new_file_read_write(name)
+    }
+
+    #[doc(hidden)]
+    pub fn hash_file(
+        &self,
+        name: &std::ffi::OsStr,
+        max_bytes: u64,
+    ) -> std::io::Result<(u64, String)> {
+        self.0.hash_file(name, max_bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn create_child_directory(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<GuardedDirectory> {
+        self.0.create_child_directory(name)?;
+        self.0.open_child(name).map(GuardedDirectory)
+    }
+
+    #[doc(hidden)]
+    pub fn remove_child_tree(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        self.0.remove_child_tree(name)
+    }
+
+    /// Move a verified file into a durable, same-filesystem destination.
+    #[doc(hidden)]
+    pub fn move_verified_file_to(
+        &self,
+        source_name: &std::ffi::OsStr,
+        destination: &GuardedDirectoryParent,
+        destination_name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<MovedEntry> {
+        self.0.move_verified_file_to(
+            source_name,
+            &destination.0,
+            destination_name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )
+    }
+
+    /// Move a visible directory or file by stable entry identity.
+    #[doc(hidden)]
+    pub fn move_entry_to(
+        &self,
+        source_name: &std::ffi::OsStr,
+        destination: &GuardedDirectoryParent,
+        destination_name: &std::ffi::OsStr,
+    ) -> std::io::Result<MovedEntry> {
+        self.0
+            .move_entry_to(source_name, &destination.0, destination_name)
+    }
+
+    /// Preserve an arbitrary file or directory entry by identity.
+    #[doc(hidden)]
+    pub fn hold_entry(&self, name: &std::ffi::OsStr) -> std::io::Result<HeldEntry> {
+        self.0.hold_entry(name)
+    }
+
+    /// Preserve a verified file under a unique hidden name.
+    #[doc(hidden)]
+    pub fn hold_verified_file(
+        &self,
+        name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<HeldEntry> {
+        self.0.hold_verified_file(
+            name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )
+    }
+
+    /// Permanently delete a hash-verified generated file after checking that
+    /// its directory entry still names the opened file. Original model files
+    /// must use recoverable holds instead.
+    #[doc(hidden)]
+    pub fn delete_verified_file(
+        &self,
+        name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        self.0.delete_verified_file(
+            name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )
+    }
+
+    /// Hold a verified file under deterministic sibling names.
+    #[doc(hidden)]
+    pub fn hold_verified_file_as(
+        &self,
+        source_name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+        hold_name: &std::ffi::OsStr,
+        journal_name: &std::ffi::OsStr,
+    ) -> std::io::Result<HeldEntry> {
+        self.0.hold_verified_file_as(
+            source_name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+            hold_name,
+            journal_name,
+        )
+    }
+
+    /// Restore a held file or directory into its original pinned directory.
+    #[doc(hidden)]
+    pub fn restore_held_entry(
+        &self,
+        held: &HeldEntry,
+        original_name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        self.0.restore_held_entry(held, original_name)
+    }
+
+    /// Rebuild a verified hold receipt after a process restart.
+    #[doc(hidden)]
+    pub fn recover_held_entry(&self, journal_name: &std::ffi::OsStr) -> std::io::Result<HeldEntry> {
+        self.0.recover_held_entry(journal_name)
+    }
+
+    #[doc(hidden)]
+    pub fn entry_exists(&self, name: &std::ffi::OsStr) -> std::io::Result<bool> {
+        self.0.entry_exists(name)
+    }
+
+    #[doc(hidden)]
+    pub fn write_new_file(&self, name: &std::ffi::OsStr, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = self.0.create_new_file(name)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        self.0.sync()
+    }
+
+    #[doc(hidden)]
+    pub fn link_child(
+        &self,
+        source: &std::ffi::OsStr,
+        destination: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        self.0.link_child(source, destination)
+    }
+
+    #[doc(hidden)]
+    pub fn replace_child(
+        &self,
+        source: &std::ffi::OsStr,
+        destination: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        self.0.replace_child(source, destination)
+    }
+
+    /// Remove an entry from its active name by moving it into a recoverable
+    /// sibling hold. This does not permanently delete bytes.
+    #[doc(hidden)]
+    pub fn remove_file(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        self.0.unlink_file(name)?;
+        self.0.sync()
+    }
+
+    /// Move a hash-verified entry into a durable sibling hold.
+    #[doc(hidden)]
+    pub fn remove_verified_file(
+        &self,
+        name: &std::ffi::OsStr,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        let _held = self.0.unlink_verified_file(
+            name,
+            &(expected_bytes, expected_sha256.to_owned()),
+            max_bytes,
+        )?;
+        self.0.sync()
+    }
+
+    #[doc(hidden)]
+    pub fn remove_file_if_same(
+        &self,
+        name: &std::ffi::OsStr,
+        expected_file: &File,
+    ) -> std::io::Result<()> {
+        let _held = self.0.unlink_file_if_same(name, expected_file)?;
+        self.0.sync()
+    }
+
+    #[doc(hidden)]
+    pub fn create_empty_library_child(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<GuardedDirectory> {
+        self.0.create_child_directory(name)?;
+        let result = (|| {
+            let stage = self.0.open_child(name)?;
+            let template = create_scratch_directory("empty-library")
+                .map_err(|error| std::io::Error::other(error.message))?;
+            let template_root = template.path.clone();
+            drop(LibraryDb::open(&template_root).map_err(|error| {
+                std::io::Error::other(format!("could not initialize empty Library: {error}"))
+            })?);
+            for child in ["originals", "manuals", "thumbnails", "staging", "trash"] {
+                stage.create_child_directory(std::ffi::OsStr::new(child))?;
+            }
+            let source = secure_fs::Directory::open(&template_root)?;
+            let mut database = source.open_file(std::ffi::OsStr::new("library.sqlite3"))?;
+            let expected = secure_fs::hash_file(&mut database, 64 * 1024 * 1024)?;
+            secure_fs::copy_verified_into_directory(
+                &source,
+                std::ffi::OsStr::new("library.sqlite3"),
+                &stage,
+                std::ffi::OsStr::new("library.sqlite3"),
+                &expected,
+                64 * 1024 * 1024,
+            )?;
+            stage.sync()?;
+            Ok(GuardedDirectory(stage))
+        })();
+        if result.is_err() {
+            let _ = self.0.remove_child_tree(name);
+        }
+        result
+    }
+
+    #[doc(hidden)]
+    pub fn sync(&self) -> std::io::Result<()> {
+        self.0.sync()
+    }
+
+    #[doc(hidden)]
+    pub fn rename_child_exclusive(
+        &self,
+        source: &std::ffi::OsStr,
+        destination: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        self.0.rename_child_exclusive(source, destination)
+    }
+
+    #[doc(hidden)]
+    pub fn swap_library_children(
+        &self,
+        root_name: &std::ffi::OsStr,
+        staged_name: &std::ffi::OsStr,
+        previous_name: &std::ffi::OsStr,
+    ) -> Result<(), (String, bool)> {
+        if let Err(error) = self.0.rename_child_exclusive(root_name, previous_name) {
+            return Err((error.to_string(), true));
+        }
+        if let Err(error) = self.0.sync() {
+            return Err((
+                format!("Could not sync the saved Library directory: {error}"),
+                false,
+            ));
+        }
+        if let Err(error) = self.0.rename_child_exclusive(staged_name, root_name) {
+            let rollback = self.0.rename_child_exclusive(previous_name, root_name);
+            let recovered = rollback.is_ok() && self.0.sync().is_ok();
+            return Err((
+                format!("Could not install the empty Library: {error}; rollback: {rollback:?}"),
+                recovered,
+            ));
+        }
+        if let Err(error) = self.0.sync() {
+            return Err((
+                format!("Could not sync the new Library directory: {error}"),
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn rollback_library_children(
+        &self,
+        root_name: &std::ffi::OsStr,
+        previous_name: &std::ffi::OsStr,
+        failed_name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        self.0.rename_child_exclusive(root_name, failed_name)?;
+        self.0.sync()?;
+        self.0.rename_child_exclusive(previous_name, root_name)?;
+        self.0.sync()
+    }
+}
 
 const MAX_ADMITTED_ROOTS: usize = 256;
 const MAX_CURSORS: usize = 256;
@@ -66,6 +707,9 @@ const DEFAULT_OWNED_TEMP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_UPLOAD_TEMP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PHYSICAL_MUTATION_TARGETS: usize = 100;
 const MAX_PHYSICAL_MUTATION_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ORPHAN_CLEANUP_FILES: usize = 10_000;
+const MAX_ORPHAN_CLEANUP_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ORPHAN_CLEANUP_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 type EpochInvalidator = Arc<dyn Fn(u64) + Send + Sync>;
 type ScanCompletedHook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -90,22 +734,24 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn desktop(library_root: PathBuf, integration_settings_path: PathBuf) -> Self {
+        let mut capabilities = BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::CatalogWrite,
+            Capability::MediaRead,
+            Capability::MediaWrite,
+            Capability::Scan,
+            Capability::Integration,
+            Capability::Maintenance,
+            Capability::HostPaths,
+            Capability::HostSlicer,
+        ]);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        capabilities.insert(Capability::PhysicalSourceWrite);
         Self {
             library_root,
             integration_settings_path,
             roots: Vec::new(),
-            capabilities: BTreeSet::from([
-                Capability::CatalogRead,
-                Capability::CatalogWrite,
-                Capability::MediaRead,
-                Capability::MediaWrite,
-                Capability::Scan,
-                Capability::Integration,
-                Capability::Maintenance,
-                Capability::PhysicalSourceWrite,
-                Capability::HostPaths,
-                Capability::HostSlicer,
-            ]),
+            capabilities,
             local_catalog_root_access: true,
         }
     }
@@ -156,6 +802,7 @@ impl CatalogLock {
                     message: "Library ownership lock path is unsafe".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             Ok(_) => {}
@@ -180,12 +827,14 @@ impl CatalogLock {
                 message: "Library is already owned by another process".into(),
                 retryable: true,
                 current_version: None,
+                source_holds: Vec::new(),
             },
             std::fs::TryLockError::Error(_) => RuntimeError {
                 code: RuntimeErrorCode::Unsupported,
                 message: "Library filesystem does not support exclusive ownership locking".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             },
         })?;
         Ok(Self { file, identity })
@@ -275,6 +924,8 @@ struct PlannedAction {
     targets: Vec<ActionTargetSnapshot>,
     input_fingerprint: Option<(u64, String)>,
     physical_sources: Vec<PhysicalSourceSnapshot>,
+    managed_assets: Vec<ManagedAssetSnapshot>,
+    orphan_files: Vec<OrphanFileSnapshot>,
 }
 
 #[derive(Clone)]
@@ -287,6 +938,561 @@ struct PhysicalSourceSnapshot {
     relative_path: PathBuf,
     bytes: u64,
     sha256: String,
+}
+
+fn source_hold_receipt(
+    snapshot: &PhysicalSourceSnapshot,
+    held: &secure_fs::HeldEntry,
+) -> Result<SourceHoldReceipt, RuntimeError> {
+    let (bytes, sha256) = held
+        .expected
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| internal("Verified source hold is missing its fingerprint"))?;
+    Ok(SourceHoldReceipt {
+        model_id: snapshot.model_id.clone(),
+        root_handle_id: snapshot.root_handle_id.clone(),
+        relative_path: snapshot.relative_path.to_string_lossy().replace('\\', "/"),
+        hold_name: held.hold_name.to_string_lossy().into_owned(),
+        journal_name: held.journal_name.to_string_lossy().into_owned(),
+        bytes,
+        sha256,
+    })
+}
+
+fn deterministic_source_hold_names(
+    operation_key: &str,
+) -> Result<(std::ffi::OsString, std::ffi::OsString), RuntimeError> {
+    if operation_key.is_empty()
+        || operation_key.len() > 175
+        || operation_key.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
+    {
+        return Err(invalid("Source hold operation key is invalid"));
+    }
+    let base = format!(".gogglelab-held-{operation_key}");
+    Ok((
+        std::ffi::OsString::from(format!("{base}.data")),
+        std::ffi::OsString::from(format!("{base}.journal")),
+    ))
+}
+
+fn recover_source_hold_receipt(
+    directory: &secure_fs::Directory,
+    snapshot: &PhysicalSourceSnapshot,
+    journal_name: &std::ffi::OsStr,
+) -> Option<SourceHoldReceipt> {
+    let held = directory.recover_held_entry(journal_name).ok()?;
+    source_hold_receipt(snapshot, &held).ok()
+}
+
+fn source_hold_summary(holds: &[SourceHoldReceipt]) -> String {
+    holds
+        .iter()
+        .map(|hold| {
+            format!(
+                "model {} at {}:{} retained as {} ({})",
+                hold.model_id,
+                hold.root_handle_id,
+                hold.relative_path,
+                hold.hold_name,
+                hold.journal_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ManagedAssetSnapshot {
+    relative_path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanFileKind {
+    GeneratedThumbnail,
+    IndexedCache,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrphanFileSnapshot {
+    relative_path: PathBuf,
+    bytes: u64,
+    sha256: String,
+    kind: OrphanFileKind,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PurgeJournal {
+    version: u32,
+    root_path: String,
+    nonce: String,
+    staged_name: String,
+    previous_name: String,
+    #[serde(default)]
+    committed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreJournal {
+    version: u32,
+    root_path: String,
+    nonce: String,
+    staged_name: String,
+    previous_name: String,
+    failed_name: String,
+    #[serde(default)]
+    committed: bool,
+}
+
+struct OwnedDirectory {
+    path: PathBuf,
+    directory: secure_fs::Directory,
+    cleanup_on_drop: bool,
+    parent_directory: Option<secure_fs::Directory>,
+    child_name: Option<std::ffi::OsString>,
+}
+
+struct PurgeJournalGuard {
+    parent_directory: secure_fs::Directory,
+    file_name: std::ffi::OsString,
+    cleanup_on_drop: bool,
+}
+
+impl PurgeJournalGuard {
+    fn new(parent_directory: secure_fs::Directory, file_name: std::ffi::OsString) -> Self {
+        Self {
+            parent_directory,
+            file_name,
+            cleanup_on_drop: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+impl Drop for PurgeJournalGuard {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = clear_purge_journal_at(&self.parent_directory, &self.file_name);
+        }
+    }
+}
+
+impl OwnedDirectory {
+    fn create_at(parent: &secure_fs::Directory, name: &str) -> Result<Self, RuntimeError> {
+        let child_name = std::ffi::OsString::from(name);
+        parent
+            .create_child_directory(&child_name)
+            .map_err(|_| io_error())?;
+        let directory = parent.open_child(&child_name).map_err(|_| io_error())?;
+        let path = parent.child_path(&child_name).map_err(|_| io_error())?;
+        Ok(Self {
+            path,
+            directory,
+            cleanup_on_drop: true,
+            parent_directory: Some(parent.try_clone().map_err(|_| io_error())?),
+            child_name: Some(child_name),
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+fn create_scratch_directory(purpose: &str) -> Result<OwnedDirectory, RuntimeError> {
+    let parent_path = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|_| io_error())?;
+    let parent = secure_fs::Directory::open(&parent_path).map_err(|_| io_error())?;
+    if !parent.matches_path(&parent_path).map_err(|_| io_error())? {
+        return Err(stale("Scratch directory parent identity changed"));
+    }
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    OwnedDirectory::create_at(&parent, &format!(".gogglelab-{purpose}-{nonce}"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct GuardedBackupAssetSource {
+    directory: secure_fs::Directory,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAX_BACKUP_TREE_ENTRIES: usize = library_backup::MAX_BACKUP_TREE_ENTRY_COUNT;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAX_BACKUP_TREE_DEPTH: usize = library_backup::MAX_BACKUP_DIRECTORY_DEPTH;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl GuardedBackupAssetSource {
+    fn asset_paths_with_limits(
+        &self,
+        maximum_entries: usize,
+        maximum_depth: usize,
+        maximum_path_bytes: usize,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut paths = Vec::new();
+        let mut visited_entries = 0;
+        let mut visited_path_bytes = 0;
+        for namespace in ["originals", "manuals", "thumbnails", "trash"] {
+            match self.directory.open_child(std::ffi::OsStr::new(namespace)) {
+                Ok(_) => collect_guarded_backup_files(
+                    &self.directory,
+                    Path::new(namespace),
+                    &mut paths,
+                    &mut visited_entries,
+                    &mut visited_path_bytes,
+                    maximum_entries,
+                    maximum_depth,
+                    maximum_path_bytes,
+                )?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(paths)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl library_backup::BackupAssetSource for GuardedBackupAssetSource {
+    fn asset_paths(&self) -> Result<Vec<PathBuf>, String> {
+        self.asset_paths_with_limits(
+            MAX_BACKUP_TREE_ENTRIES,
+            MAX_BACKUP_TREE_DEPTH,
+            library_backup::MAX_BACKUP_PATH_BYTES,
+        )
+    }
+
+    fn open_asset(&self, relative_path: &Path) -> Result<File, String> {
+        self.directory
+            .open_relative_file(relative_path)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn collect_guarded_backup_files(
+    root: &secure_fs::Directory,
+    initial_directory: &Path,
+    output: &mut Vec<PathBuf>,
+    visited_entries: &mut usize,
+    visited_path_bytes: &mut usize,
+    maximum_entries: usize,
+    maximum_depth: usize,
+    maximum_path_bytes: usize,
+) -> Result<(), String> {
+    let mut pending = vec![(initial_directory.to_path_buf(), 0usize)];
+    while let Some((relative_directory, depth)) = pending.pop() {
+        if depth > maximum_depth {
+            return Err("Backup asset directory tree is too deep".into());
+        }
+        let directory = root
+            .open_relative(&relative_directory)
+            .map_err(|error| error.to_string())?;
+        let remaining_entries = maximum_entries.saturating_sub(*visited_entries);
+        let mut names = directory
+            .read_entry_names(remaining_entries)
+            .map_err(|error| error.to_string())?;
+        *visited_entries = visited_entries
+            .checked_add(names.len())
+            .ok_or("Backup asset entry count overflow")?;
+        names.sort();
+        for name in names {
+            let relative_path = relative_directory.join(&name);
+            let path_bytes = relative_path
+                .as_os_str()
+                .len()
+                .checked_mul(2)
+                .ok_or("Backup path size overflow")?;
+            *visited_path_bytes = visited_path_bytes
+                .checked_add(path_bytes)
+                .ok_or("Backup path size overflow")?;
+            if *visited_path_bytes > maximum_path_bytes {
+                return Err("Backup paths exceed total size limit".into());
+            }
+            match directory.open_child(&name) {
+                Ok(child) => {
+                    drop(child);
+                    if depth >= maximum_depth {
+                        return Err("Backup asset directory tree is too deep".into());
+                    }
+                    pending.push((relative_path, depth + 1));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                    let file = directory
+                        .open_file(&name)
+                        .map_err(|error| error.to_string())?;
+                    if !file
+                        .metadata()
+                        .map_err(|error| error.to_string())?
+                        .is_file()
+                    {
+                        return Err("Backup asset is not a regular file".into());
+                    }
+                    if output.len() >= library_backup::MAX_BACKUP_FILE_COUNT - 1 {
+                        return Err("Backup contains too many files".into());
+                    }
+                    output.push(relative_path);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates a backup with a platform-appropriate no-clobber publication path.
+/// macOS/Linux pin the destination directory and atomically rename a verified
+/// temporary archive; other targets use library-backup's path-based wrapper.
+#[doc(hidden)]
+pub fn create_backup_file(
+    library_root: &Path,
+    destination: &Path,
+) -> Result<library_backup::BackupResult, String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        create_backup_file_with_limit(
+            library_root,
+            destination,
+            library_backup::MAX_BACKUP_ARCHIVE_BYTES,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        library_backup::create_backup(library_root, destination)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn create_backup_file_with_limit(
+    library_root: &Path,
+    destination: &Path,
+    archive_limit: u64,
+) -> Result<library_backup::BackupResult, String> {
+    create_backup_file_with_limit_and_hook(library_root, destination, archive_limit, || {})
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn create_backup_file_with_limit_and_hook<F>(
+    library_root: &Path,
+    destination: &Path,
+    archive_limit: u64,
+    before_rename: F,
+) -> Result<library_backup::BackupResult, String>
+where
+    F: FnOnce(),
+{
+    if !destination.is_absolute() {
+        return Err("Backup destination must be an absolute path".into());
+    }
+    if !matches!(
+        std::fs::symlink_metadata(destination),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Err("Backup destination must be a new file".into());
+    }
+    let root_metadata =
+        std::fs::symlink_metadata(library_root).map_err(|error| error.to_string())?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("Library root is not a real directory".into());
+    }
+    let root = library_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let destination_parent_path = destination
+        .parent()
+        .ok_or("Backup destination has no parent")?
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if destination_parent_path.starts_with(&root) {
+        return Err("Backup destination must be outside the Library".into());
+    }
+    let source_directory = secure_fs::Directory::open(&root).map_err(|error| error.to_string())?;
+    if !source_directory
+        .matches_path(&root)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("Library source root changed before backup".into());
+    }
+    let asset_source = GuardedBackupAssetSource {
+        directory: source_directory
+            .try_clone()
+            .map_err(|error| error.to_string())?,
+    };
+    let destination_name = destination
+        .file_name()
+        .ok_or("Backup destination has no file name")?;
+    let destination_parent = GuardedDirectoryParent::open(&destination_parent_path)
+        .map_err(|error| error.to_string())?;
+    if !destination_parent
+        .matches_path(&destination_parent_path)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("Backup destination parent changed".into());
+    }
+
+    let temporary_name = std::ffi::OsString::from(format!(
+        ".gogglelab-backup-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut archive_file = destination_parent
+        .create_new_file_read_write(&temporary_name)
+        .map_err(|error| error.to_string())?;
+    let info = match library_backup::write_backup_archive_from_source_with_limit(
+        &root,
+        &asset_source,
+        &mut archive_file,
+        archive_limit,
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            cleanup_unpublished_backup_file(&destination_parent, &temporary_name, archive_file);
+            return Err(error);
+        }
+    };
+    let source_root_matches = match source_directory.matches_path(&root) {
+        Ok(matches) => matches,
+        Err(error) => {
+            cleanup_unpublished_backup_file(&destination_parent, &temporary_name, archive_file);
+            return Err(error.to_string());
+        }
+    };
+    if !source_root_matches {
+        cleanup_unpublished_backup_file(&destination_parent, &temporary_name, archive_file);
+        return Err("Library source root changed during backup".into());
+    }
+    if let Err(error) = archive_file.sync_all() {
+        cleanup_unpublished_backup_file(&destination_parent, &temporary_name, archive_file);
+        return Err(error.to_string());
+    }
+    if let Err(error) = archive_file.seek(std::io::SeekFrom::Start(0)) {
+        cleanup_unpublished_backup_file(&destination_parent, &temporary_name, archive_file);
+        return Err(error.to_string());
+    }
+    let (archive_bytes, archive_sha256) =
+        match secure_fs::hash_file(&mut archive_file, archive_limit) {
+            Ok(hash) if hash.1 == info.sha256 => hash,
+            Ok(_) => {
+                cleanup_unpublished_backup_file(&destination_parent, &temporary_name, archive_file);
+                return Err("Backup archive failed integrity verification".into());
+            }
+            Err(error) => {
+                cleanup_unpublished_backup_file(&destination_parent, &temporary_name, archive_file);
+                return Err(error.to_string());
+            }
+        };
+    drop(archive_file);
+    let parent_matches = match destination_parent.matches_path(&destination_parent_path) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let _ = destination_parent.remove_verified_file(
+                &temporary_name,
+                archive_bytes,
+                &archive_sha256,
+                archive_limit,
+            );
+            return Err(error.to_string());
+        }
+    };
+    if !parent_matches {
+        let _ = destination_parent.remove_verified_file(
+            &temporary_name,
+            archive_bytes,
+            &archive_sha256,
+            archive_limit,
+        );
+        return Err("Backup destination parent changed during creation".into());
+    }
+    before_rename();
+    if let Err(error) = destination_parent.rename_child_exclusive(&temporary_name, destination_name)
+    {
+        let _ = destination_parent.remove_verified_file(
+            &temporary_name,
+            archive_bytes,
+            &archive_sha256,
+            archive_limit,
+        );
+        return Err(error.to_string());
+    }
+    destination_parent
+        .sync()
+        .map_err(|error| error.to_string())?;
+    let parent_matches = match destination_parent.matches_path(&destination_parent_path) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let _ = destination_parent.remove_verified_file(
+                destination_name,
+                archive_bytes,
+                &archive_sha256,
+                archive_limit,
+            );
+            return Err(error.to_string());
+        }
+    };
+    if !parent_matches {
+        let _ = destination_parent.remove_verified_file(
+            destination_name,
+            archive_bytes,
+            &archive_sha256,
+            archive_limit,
+        );
+        return Err("Backup destination parent changed during publication".into());
+    }
+    let published_hash = match destination_parent.hash_file(destination_name, archive_limit) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = destination_parent.remove_verified_file(
+                destination_name,
+                archive_bytes,
+                &archive_sha256,
+                archive_limit,
+            );
+            return Err(error.to_string());
+        }
+    };
+    if published_hash != (archive_bytes, archive_sha256.clone()) {
+        let _ = destination_parent.remove_verified_file(
+            destination_name,
+            archive_bytes,
+            &archive_sha256,
+            archive_limit,
+        );
+        return Err("Published backup failed integrity verification".into());
+    }
+
+    Ok(library_backup::BackupResult {
+        path: destination.to_path_buf(),
+        files: info.files,
+        bytes: info.bytes,
+        sha256: archive_sha256,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cleanup_unpublished_backup_file(
+    parent: &GuardedDirectoryParent,
+    name: &std::ffi::OsStr,
+    file: File,
+) {
+    let _ = parent.remove_file_if_same(name, &file);
+}
+
+impl Drop for OwnedDirectory {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            if let (Some(parent), Some(name)) = (&self.parent_directory, &self.child_name) {
+                let _ = parent.remove_child_tree(name);
+            }
+        }
+    }
 }
 
 enum ReservationKind {
@@ -327,6 +1533,10 @@ pub struct LibraryRuntime {
     temp_limits: Mutex<TempResourceLimits>,
     temp_resources: Mutex<TempResourceState>,
     actions: Mutex<HashMap<String, PlannedAction>>,
+    #[cfg(test)]
+    before_action_dispatch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_guarded_catalog_open: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     self_weak: OnceLock<Weak<LibraryRuntime>>,
 }
 
@@ -348,6 +1558,8 @@ impl LibraryRuntime {
             validate_backup_root_separation(&roots, &config.library_root)?;
         }
         let ownership = CatalogLock::acquire(&config.library_root)?;
+        recover_interrupted_catalog_purge(&config.library_root)?;
+        recover_interrupted_library_restore(&config.library_root)?;
         let (db, root) = if config.local_catalog_root_access {
             let root = prepare_lazy_desktop_root(&config.library_root)?;
             validate_backup_root_separation(&roots, &root)?;
@@ -389,6 +1601,10 @@ impl LibraryRuntime {
             temp_limits: Mutex::new(TempResourceLimits::default()),
             temp_resources: Mutex::new(TempResourceState::default()),
             actions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            before_action_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            after_guarded_catalog_open: Mutex::new(None),
             self_weak: OnceLock::new(),
         });
         runtime
@@ -445,6 +1661,23 @@ impl LibraryRuntime {
         self.scan_completed_hooks.lock().unwrap().push(callback);
     }
 
+    #[cfg(test)]
+    fn install_before_action_dispatch_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_action_dispatch.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn install_after_guarded_catalog_open_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_guarded_catalog_open.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_guarded_catalog_open_hook(&self) {
+        if let Some(hook) = self.after_guarded_catalog_open.lock().unwrap().take() {
+            hook();
+        }
+    }
+
     pub(crate) fn notify_scan_completed(&self, root_id: &str) {
         for callback in self.scan_completed_hooks.lock().unwrap().iter() {
             callback(root_id);
@@ -470,6 +1703,7 @@ impl LibraryRuntime {
                 message: "Runtime shared state is already installed".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             }),
         }
     }
@@ -513,13 +1747,31 @@ impl LibraryRuntime {
     }
 
     pub fn begin_maintenance(self: &Arc<Self>) -> Result<RuntimeMaintenanceGuard, RuntimeError> {
+        self.begin_maintenance_mode(false)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_source_mutation_maintenance(
+        self: &Arc<Self>,
+    ) -> Result<RuntimeMaintenanceGuard, RuntimeError> {
+        self.begin_maintenance_mode(true)
+    }
+
+    fn begin_maintenance_mode(
+        self: &Arc<Self>,
+        preserve_catalog: bool,
+    ) -> Result<RuntimeMaintenanceGuard, RuntimeError> {
         if self.scan_control().status().running {
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Busy,
                 message: "Library scan is running".into(),
                 retryable: true,
                 current_version: None,
+                source_holds: Vec::new(),
             });
+        }
+        if preserve_catalog {
+            self.read_db(|_| Ok::<(), LibraryError>(()))?;
         }
         {
             let mut lifecycle = self.lifecycle.lock().unwrap();
@@ -529,15 +1781,25 @@ impl LibraryRuntime {
                     message: "Library I/O or maintenance is already running".into(),
                     retryable: true,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             lifecycle.maintenance = true;
             self.maintenance.store(true, Ordering::Release);
         }
-        *self.db.lock().unwrap() = None;
+        let catalog = {
+            let mut db = self.db.lock().unwrap();
+            if preserve_catalog {
+                db.take()
+            } else {
+                *db = None;
+                None
+            }
+        };
         Ok(RuntimeMaintenanceGuard {
             runtime: Arc::clone(self),
-            release_on_drop: true,
+            catalog,
+            release_on_drop: Cell::new(true),
         })
     }
 
@@ -557,7 +1819,17 @@ impl LibraryRuntime {
             cleanup_runtime_orphans(&self.root)?;
             *guard = Some(db);
         }
-        operation(guard.as_ref().unwrap()).map_err(runtime_library_error)
+        let db = guard.as_ref().unwrap();
+        if !db.catalog_path_matches() {
+            return Err(stale("Library catalog file identity changed"));
+        }
+        let result = operation(db).map_err(runtime_library_error);
+        if !db.catalog_path_matches() {
+            return Err(stale(
+                "Library catalog file identity changed during the operation",
+            ));
+        }
+        result
     }
 
     pub fn with_db<T, E>(&self, operation: impl FnOnce(&LibraryDb) -> Result<T, E>) -> Result<T, E>
@@ -579,8 +1851,16 @@ impl LibraryRuntime {
             *guard = Some(db);
         }
         let db = guard.as_ref().unwrap();
+        if !db.catalog_path_matches() {
+            return Err(E::from(stale("Library catalog file identity changed")));
+        }
         let before = db.total_changes();
         let result = operation(db);
+        if !db.catalog_path_matches() {
+            return Err(E::from(stale(
+                "Library catalog file identity changed during the operation",
+            )));
+        }
         let changed = db.total_changes() > before;
         drop(guard);
         if changed {
@@ -621,6 +1901,7 @@ impl LibraryRuntime {
                 message: "Root handle is not admitted for this operation".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         match required {
             RootAccess::ReadOnly | RootAccess::Inbox => {
@@ -644,6 +1925,7 @@ impl LibraryRuntime {
             message: "Index root is unavailable".into(),
             retryable: true,
             current_version: None,
+            source_holds: Vec::new(),
         })?;
         if canonical != root.path {
             return Err(RuntimeError {
@@ -651,6 +1933,7 @@ impl LibraryRuntime {
                 message: "Index root identity changed".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         if self.local_catalog_root_access {
@@ -668,6 +1951,7 @@ impl LibraryRuntime {
                 message: "Index root is not admitted by operator policy".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })
         }
     }
@@ -696,6 +1980,7 @@ impl LibraryRuntime {
                 message: "Indexed source root is not admitted".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })
         }
     }
@@ -730,6 +2015,7 @@ impl LibraryRuntime {
                 message: "Model source exceeds its admitted file limit".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         if let Some(member) = source.archive_member.as_deref() {
@@ -762,6 +2048,7 @@ impl LibraryRuntime {
                 message: "Principal lacks the required capability".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         Ok(())
@@ -782,6 +2069,7 @@ impl LibraryRuntime {
                 message: "Principal lacks backup write capability".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })
         }
     }
@@ -801,6 +2089,7 @@ impl LibraryRuntime {
                 message: "Principal lacks upload capability".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })
         }
     }
@@ -826,6 +2115,7 @@ impl LibraryRuntime {
                         message: "Bundle archive temporary storage is full".into(),
                         retryable: true,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 state.reserved_owned_bytes += bytes;
@@ -843,6 +2133,7 @@ impl LibraryRuntime {
                         message: "Generated content temporary storage is full".into(),
                         retryable: true,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 state.reserved_owned_bytes += bytes;
@@ -859,6 +2150,7 @@ impl LibraryRuntime {
                         message: "Upload temporary storage is full".into(),
                         retryable: true,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 state.reserved_upload_bytes += bytes;
@@ -883,7 +2175,7 @@ impl LibraryRuntime {
     }
 
     fn cleanup_upload(&self, upload: &UploadEntry) {
-        let _ = fs::remove_file(&upload.path);
+        let _ = hold_runtime_path(&upload.path);
         self.release_upload_bytes(upload.bytes);
     }
 
@@ -904,7 +2196,7 @@ impl LibraryRuntime {
 
     fn cleanup_content_lease(&self, lease: &ContentLeaseEntry) {
         if lease.remove_on_drop {
-            let _ = fs::remove_file(&lease.path);
+            let _ = hold_runtime_path(&lease.path);
             self.release_owned_bytes(lease.descriptor.bytes);
         }
     }
@@ -922,6 +2214,16 @@ impl LibraryRuntime {
             }
             keep
         });
+    }
+
+    /// Paths whose bytes are still backing valid content leases.
+    ///
+    /// Call while runtime maintenance is active before deleting files, so no new
+    /// lease can be admitted between this snapshot and cleanup.
+    pub fn active_content_lease_paths(&self) -> Vec<PathBuf> {
+        let mut leases = self.leases.lock().unwrap();
+        self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
+        leases.values().map(|lease| lease.path.clone()).collect()
     }
 
     #[cfg(test)]
@@ -952,7 +2254,7 @@ impl LibraryRuntime {
         self.bundle_previews.invalidate_all();
         let uploads = std::mem::take(&mut *self.uploads.lock().unwrap());
         for upload in uploads.into_values() {
-            let _ = fs::remove_file(upload.path);
+            let _ = hold_runtime_path(&upload.path);
         }
         self.temp_resources.lock().unwrap().staged_upload_bytes = 0;
         for callback in self.invalidators.lock().unwrap().iter() {
@@ -996,6 +2298,7 @@ impl TempReservation<'_> {
                         message: "Bundle archive temporary storage is full".into(),
                         retryable: true,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 state.owned_bytes += actual_bytes;
@@ -1013,6 +2316,7 @@ impl TempReservation<'_> {
                         message: "Generated content temporary storage is full".into(),
                         retryable: true,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 state.owned_bytes += actual_bytes;
@@ -1031,6 +2335,7 @@ impl TempReservation<'_> {
                         message: "Upload temporary storage is full".into(),
                         retryable: true,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 state.staged_upload_bytes += actual_bytes;
@@ -1096,8 +2401,10 @@ fn cleanup_runtime_orphans(root: &Path) -> Result<(), RuntimeError> {
                 message: "Runtime temporary namespace is unsafe".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
+        let directory_handle = secure_fs::Directory::open(&directory).map_err(|_| io_error())?;
         for (index, entry) in fs::read_dir(&directory)
             .map_err(|_| io_error())?
             .enumerate()
@@ -1108,6 +2415,7 @@ fn cleanup_runtime_orphans(root: &Path) -> Result<(), RuntimeError> {
                     message: "Runtime temporary namespace has too many entries".into(),
                     retryable: true,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             let entry = entry.map_err(|_| io_error())?;
@@ -1118,7 +2426,9 @@ fn cleanup_runtime_orphans(root: &Path) -> Result<(), RuntimeError> {
             }
             let metadata = fs::symlink_metadata(entry.path()).map_err(|_| io_error())?;
             if metadata.is_file() && !metadata.file_type().is_symlink() {
-                fs::remove_file(entry.path()).map_err(|_| io_error())?;
+                directory_handle
+                    .hold_entry(&entry.file_name())
+                    .map_err(|_| io_error())?;
             }
         }
     }
@@ -1186,6 +2496,7 @@ impl SettingsEngine for LibraryRuntime {
                 message: "Root handle is not admitted".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         let catalog_root_id = admitted
             .catalog_root_id
@@ -1195,6 +2506,7 @@ impl SettingsEngine for LibraryRuntime {
                 message: "Root handle is not a catalog root".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         let updated = self.mutate_db(|db| {
             let existing = db
@@ -1311,8 +2623,19 @@ impl ManagementEngine for LibraryRuntime {
                 self.require(context, Capability::PhysicalSourceWrite)?;
                 "moveLooseSources"
             }
-            ManagementAction::PurgeCatalog { .. } => return Err(unsupported_physical_management()),
-            ManagementAction::CleanupOrphans => return Err(unsupported_physical_management()),
+            ManagementAction::PurgeCatalog { .. } => {
+                require_durable_source_mutations()?;
+                self.require(context, Capability::CatalogWrite)?;
+                self.require(context, Capability::Maintenance)?;
+                self.require(context, Capability::BackupWrite)?;
+                "purgeCatalog"
+            }
+            ManagementAction::CleanupOrphans => {
+                require_durable_source_mutations()?;
+                self.require(context, Capability::Maintenance)?;
+                self.require(context, Capability::MediaWrite)?;
+                "cleanupOrphans"
+            }
         };
         let target_requests: Vec<VersionedTarget> = match &action {
             ManagementAction::RecoverableRemove { targets }
@@ -1390,6 +2713,16 @@ impl ManagementEngine for LibraryRuntime {
             }
             _ => Vec::new(),
         };
+        let managed_assets = if matches!(&action, ManagementAction::PurgeCatalog { .. }) {
+            snapshot_managed_library_assets(self)?
+        } else {
+            Vec::new()
+        };
+        let orphan_files = if matches!(&action, ManagementAction::CleanupOrphans) {
+            snapshot_orphan_files(self)?
+        } else {
+            Vec::new()
+        };
         if is_physical_batch {
             validate_physical_source_batch(&physical_sources)?;
         }
@@ -1436,8 +2769,22 @@ impl ManagementEngine for LibraryRuntime {
                 message: "Management plan limit reached".into(),
                 retryable: true,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
+        let impact = match &action {
+            ManagementAction::PurgeCatalog { .. } => vec![
+                "A verified backup is written before the active catalog is replaced".into(),
+                "Configured index roots and their original model files are preserved".into(),
+                "The previous managed Library directory is retained for recovery".into(),
+            ],
+            ManagementAction::CleanupOrphans => vec![format!(
+                "Remove {} verified, unreferenced app-owned files ({} bytes); configured model roots are not scanned or changed",
+                orphan_files.len(),
+                orphan_files.iter().map(|file| file.bytes).sum::<u64>()
+            )],
+            _ => vec!["The action will be rejected if the catalog changes before execution".into()],
+        };
         actions.insert(
             token.clone(),
             PlannedAction {
@@ -1449,6 +2796,8 @@ impl ManagementEngine for LibraryRuntime {
                 targets: targets.clone(),
                 input_fingerprint: input_fingerprint.clone(),
                 physical_sources,
+                managed_assets: managed_assets.clone(),
+                orphan_files: orphan_files.clone(),
             },
         );
         Ok(ActionPlan {
@@ -1458,9 +2807,7 @@ impl ManagementEngine for LibraryRuntime {
             library_epoch,
             catalog_revision,
             targets,
-            impact: vec![
-                "The action will be rejected if the catalog changes before execution".into(),
-            ],
+            impact,
             input_bytes: input_fingerprint.as_ref().map(|value| value.0),
             input_sha256: input_fingerprint.map(|value| value.1),
         })
@@ -1482,6 +2829,7 @@ impl ManagementEngine for LibraryRuntime {
                 message: "Management plan belongs to another principal".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         actions.remove(token);
@@ -1493,6 +2841,10 @@ impl ManagementEngine for LibraryRuntime {
             return Err(stale("Management plan is stale"));
         }
         revalidate_action_targets(self, &planned.targets)?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_action_dispatch.lock().unwrap().take() {
+            hook();
+        }
         match planned.action {
             ManagementAction::RecoverableRemove { targets } => {
                 self.require(context, Capability::CatalogWrite)?;
@@ -1623,9 +2975,25 @@ impl ManagementEngine for LibraryRuntime {
                 planned.library_epoch,
                 planned.catalog_revision,
             ),
-            ManagementAction::PurgeCatalog { .. } | ManagementAction::CleanupOrphans => {
-                Err(unsupported_physical_management())
-            }
+            ManagementAction::PurgeCatalog {
+                backup_destination_handle_id,
+                backup_file_name,
+            } => execute_purge_catalog(
+                self,
+                context,
+                &backup_destination_handle_id,
+                &backup_file_name,
+                &planned.managed_assets,
+                planned.library_epoch,
+                planned.catalog_revision,
+            ),
+            ManagementAction::CleanupOrphans => execute_cleanup_orphans(
+                self,
+                context,
+                &planned.orphan_files,
+                planned.library_epoch,
+                planned.catalog_revision,
+            ),
         }
     }
 
@@ -1852,6 +3220,8 @@ impl MetadataEngine for LibraryRuntime {
                 model_id: update.model_id,
                 expected_version: update.expected_version,
                 patch: core_metadata_patch(update.patch),
+                tags: update.tags,
+                filament_ids: update.filament_ids,
             })
             .collect::<Vec<_>>();
         self.mutate_db(|db| db.update_models_metadata(&updates))
@@ -2063,6 +3433,48 @@ impl FilamentEngine for LibraryRuntime {
     }
 }
 
+impl PartStockEngine for LibraryRuntime {
+    fn list_part_stock(&self, context: &RequestContext) -> Result<Vec<PartStock>, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.list_part_stock())
+            .map(|values| values.into_iter().map(part_stock).collect())
+    }
+
+    fn create_part_stock(
+        &self,
+        context: &RequestContext,
+        input: PartStockInput,
+    ) -> Result<PartStock, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = core_part_stock_input(input);
+        self.mutate_db(|db| db.create_part_stock(&input))
+            .map(part_stock)
+    }
+
+    fn update_part_stock(
+        &self,
+        context: &RequestContext,
+        part_id: &str,
+        expected_version: u64,
+        input: PartStockInput,
+    ) -> Result<PartStock, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = core_part_stock_input(input);
+        self.mutate_db(|db| db.update_part_stock(part_id, expected_version, &input))
+            .map(part_stock)
+    }
+
+    fn delete_part_stock(
+        &self,
+        context: &RequestContext,
+        part_id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| db.delete_part_stock(part_id, expected_version))
+    }
+}
+
 impl PrintHistoryEngine for LibraryRuntime {
     fn create_print_attempts(
         &self,
@@ -2104,6 +3516,18 @@ impl PrintHistoryEngine for LibraryRuntime {
             .map(print_attempt)
     }
 
+    fn create_print_attempt_with_printer(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        input: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = core_print_attempt_input_with_printer(input);
+        self.mutate_db(|db| db.create_print_attempt_with_printer(model_id, &input))
+            .map(print_attempt)
+    }
+
     fn update_print_attempt(
         &self,
         context: &RequestContext,
@@ -2113,6 +3537,18 @@ impl PrintHistoryEngine for LibraryRuntime {
         self.require(context, Capability::CatalogWrite)?;
         let input = core_print_attempt_input(input);
         self.mutate_db(|db| db.update_print_attempt(attempt_id, &input))
+            .map(print_attempt)
+    }
+
+    fn update_print_attempt_with_printer(
+        &self,
+        context: &RequestContext,
+        attempt_id: &str,
+        input: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = core_print_attempt_input_with_printer(input);
+        self.mutate_db(|db| db.update_print_attempt_with_printer(attempt_id, &input))
             .map(print_attempt)
     }
 
@@ -2198,6 +3634,7 @@ impl ScanEngine for LibraryRuntime {
                         message: "Catalog root is not admitted for scanning".into(),
                         retryable: false,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 vec![root_id]
@@ -2210,6 +3647,7 @@ impl ScanEngine for LibraryRuntime {
                     message: "No catalog roots are admitted for scanning".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             scanner::start_selected_scan(runtime, selected).map_err(scan_error)?;
@@ -2244,6 +3682,7 @@ impl ScanEngine for LibraryRuntime {
                     message: "Catalog root is not admitted for scanning".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
         }
@@ -2358,19 +3797,20 @@ impl BundleEngine for LibraryRuntime {
             expires_at: format_system_time(expires)?,
         };
         if let Err(error) = reservation.commit(archive.bytes) {
-            let _ = fs::remove_file(&archive.path);
+            let _ = hold_runtime_path(&archive.path);
             return Err(error);
         }
         let mut leases = self.leases.lock().unwrap();
         self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
         if leases.len() >= MAX_LEASES {
-            let _ = fs::remove_file(&archive.path);
+            let _ = hold_runtime_path(&archive.path);
             self.release_owned_bytes(archive.bytes);
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Busy,
                 message: "Content lease limit reached".into(),
                 retryable: true,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         leases.insert(
@@ -2405,6 +3845,7 @@ impl GeometryEngine for LibraryRuntime {
                 message: "Model was not found".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         if expected_hash.is_some_and(|hash| model.content_hash.as_deref() != Some(hash)) {
             return Err(stale("Model source hash changed"));
@@ -2424,19 +3865,20 @@ impl GeometryEngine for LibraryRuntime {
             expires_at: format_system_time(expires)?,
         };
         if let Err(error) = reservation.commit(prepared.bytes) {
-            let _ = fs::remove_file(&prepared.path);
+            let _ = hold_runtime_path(&prepared.path);
             return Err(error);
         }
         let mut leases = self.leases.lock().unwrap();
         self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
         if leases.len() >= MAX_LEASES {
-            let _ = fs::remove_file(&prepared.path);
+            let _ = hold_runtime_path(&prepared.path);
             self.release_owned_bytes(prepared.bytes);
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Busy,
                 message: "Content lease limit reached".into(),
                 retryable: true,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         leases.insert(
@@ -2515,6 +3957,7 @@ impl EmbeddedMetadataEngine for LibraryRuntime {
                 message: "Model was not found".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         let source_hash = model
             .content_hash
@@ -2573,6 +4016,7 @@ impl EmbeddedMetadataEngine for LibraryRuntime {
                 message: "Model was not found".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         if model.content_hash.as_deref() != Some(expected_source_hash) {
             return Err(stale("Model source hash changed"));
@@ -2632,6 +4076,7 @@ impl GalleryEngine for LibraryRuntime {
                         message: "Thumbnail asset is missing or unsafe".into(),
                         retryable: false,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
                 Ok(ThumbnailDescriptor {
@@ -2698,6 +4143,7 @@ impl GalleryEngine for LibraryRuntime {
                 message: "Upload token belongs to another principal".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         if let Some(upload) = uploads.remove(upload_token) {
@@ -2743,6 +4189,7 @@ impl GalleryEngine for LibraryRuntime {
                 message: "Upload token belongs to another principal".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         if let Some(upload) = uploads.remove(upload_token) {
@@ -2763,8 +4210,8 @@ impl GalleryEngine for LibraryRuntime {
         let (model, path) = self.mutate_db(|db| {
             db.delete_thumbnail_gallery_item(model_id, expected_version, thumbnail_id)
         })?;
-        match fs::remove_file(path) {
-            Ok(()) => {}
+        match hold_runtime_path(&path) {
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(io_error()),
         }
@@ -2788,6 +4235,7 @@ impl GalleryEngine for LibraryRuntime {
                 message: "Thumbnail was not found".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         let path = self.root.join(&item.relative_path);
         let metadata = fs::symlink_metadata(&path).map_err(|_| io_error())?;
@@ -2800,6 +4248,7 @@ impl GalleryEngine for LibraryRuntime {
                 message: "Thumbnail asset is missing or unsafe".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         verify_content_file(&path, metadata.len(), &item.content_hash)?;
@@ -2860,6 +4309,7 @@ impl UploadEngine for LibraryRuntime {
                     message: "Upload staging limit reached".into(),
                     retryable: true,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
         }
@@ -2876,6 +4326,7 @@ impl UploadEngine for LibraryRuntime {
                 message: "Runtime staging directory is unsafe".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
@@ -2911,7 +4362,7 @@ impl UploadEngine for LibraryRuntime {
         })();
         if let Err(error) = result {
             drop(file);
-            let _ = fs::remove_file(&path);
+            let _ = hold_runtime_path(&path);
             return Err(error);
         }
         let expires = SystemTime::now() + LEASE_TTL;
@@ -2927,16 +4378,17 @@ impl UploadEngine for LibraryRuntime {
         let epoch = self.library_epoch();
         self.prune_uploads(&mut uploads, now, epoch);
         if uploads.len() >= MAX_LEASES {
-            let _ = fs::remove_file(&path);
+            let _ = hold_runtime_path(&path);
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Busy,
                 message: "Upload staging limit reached".into(),
                 retryable: true,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         if let Err(error) = reservation.commit(intent.bytes) {
-            let _ = fs::remove_file(&path);
+            let _ = hold_runtime_path(&path);
             return Err(error);
         }
         uploads.insert(
@@ -2969,6 +4421,7 @@ impl UploadEngine for LibraryRuntime {
                 message: "Upload token belongs to another principal".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         if let Some(upload) = uploads.remove(upload_token) {
@@ -3011,6 +4464,7 @@ impl DownloadEngine for LibraryRuntime {
                         message: "Archive model has no outer fingerprint".into(),
                         retryable: false,
                         current_version: None,
+                        source_holds: Vec::new(),
                     })?,
                 &source.content_hash,
                 source.bytes,
@@ -3020,6 +4474,7 @@ impl DownloadEngine for LibraryRuntime {
                 message: "Archive member failed source verification".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?
         } else {
             source.outer_path
@@ -3139,6 +4594,7 @@ impl LibraryRuntime {
                 message: "Content lease belongs to another principal".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         if entry.expires <= SystemTime::now()
@@ -3240,6 +4696,7 @@ impl CaptureEngine for LibraryRuntime {
                 message: "Browser capture cannot supply server filesystem paths".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         let canonical = serde_json::to_vec(&envelope)
@@ -3382,6 +4839,7 @@ impl CaptureEngine for LibraryRuntime {
                 message: "Capture receipt was not found".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })?;
         Ok(capture_result(receipt, false))
     }
@@ -3414,13 +4872,13 @@ impl Drop for LibraryRuntime {
         if let Ok(leases) = self.leases.get_mut() {
             for lease in leases.drain().map(|(_, lease)| lease) {
                 if lease.remove_on_drop {
-                    let _ = fs::remove_file(lease.path);
+                    let _ = hold_runtime_path(&lease.path);
                 }
             }
         }
         if let Ok(uploads) = self.uploads.get_mut() {
             for upload in uploads.drain().map(|(_, upload)| upload) {
-                let _ = fs::remove_file(upload.path);
+                let _ = hold_runtime_path(&upload.path);
             }
         }
     }
@@ -3428,7 +4886,8 @@ impl Drop for LibraryRuntime {
 
 pub struct RuntimeMaintenanceGuard {
     runtime: Arc<LibraryRuntime>,
-    release_on_drop: bool,
+    catalog: Option<LibraryDb>,
+    release_on_drop: Cell<bool>,
 }
 
 impl RuntimeMaintenanceGuard {
@@ -3436,18 +4895,33 @@ impl RuntimeMaintenanceGuard {
         &self.runtime.root
     }
 
+    #[doc(hidden)]
+    pub fn catalog(&self) -> Result<&LibraryDb, RuntimeError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| internal("Maintenance guard has no pinned catalog connection"))?;
+        if !catalog.catalog_path_matches() {
+            return Err(stale("Library catalog file identity changed"));
+        }
+        Ok(catalog)
+    }
+
     pub fn invalidate(&self) -> u64 {
         self.runtime.advance_epoch()
     }
 
-    pub fn remain_armed(&mut self) {
-        self.release_on_drop = false;
+    pub fn remain_armed(&self) {
+        self.release_on_drop.set(false);
     }
 }
 
 impl Drop for RuntimeMaintenanceGuard {
     fn drop(&mut self) {
-        if self.release_on_drop {
+        if self.release_on_drop.get() {
+            if let Some(catalog) = self.catalog.take() {
+                *self.runtime.db.lock().unwrap() = Some(catalog);
+            }
             let mut lifecycle = self.runtime.lifecycle.lock().unwrap();
             lifecycle.maintenance = false;
             self.runtime.maintenance.store(false, Ordering::Release);
@@ -3593,6 +5067,7 @@ fn map_operator_catalog_roots(
                     message: "Configured catalog root ID does not match its admitted path".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 })?
         } else if let Some(existing) = catalog_roots
             .iter()
@@ -3674,6 +5149,7 @@ fn validate_management_action(
                     message: "Restore source handle is not admitted".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             let mut backup_ids = BTreeSet::new();
@@ -3724,6 +5200,7 @@ fn validate_management_action(
                     message: "Move destination must be an admitted writable catalog root".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             admitted_file(
@@ -3753,6 +5230,7 @@ fn validate_management_action(
                     message: "Move destination must be an admitted writable catalog root".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             let mut destination_names = BTreeSet::new();
@@ -3777,15 +5255,1386 @@ fn validate_management_action(
             backup_file_name,
         } => {
             validate_output_name(backup_file_name)?;
-            runtime.admitted_root_path(
+            admitted_file(
+                runtime,
                 context,
                 backup_destination_handle_id,
                 RootAccess::BackupOnly,
+                backup_file_name,
+                false,
             )?;
         }
         ManagementAction::CleanupOrphans => {}
     }
     Ok(())
+}
+
+fn snapshot_managed_library_assets(
+    runtime: &LibraryRuntime,
+) -> Result<Vec<ManagedAssetSnapshot>, RuntimeError> {
+    let root = runtime.root.canonicalize().map_err(|_| io_error())?;
+    let models_and_sources = runtime.read_db(|db| {
+        db.list_models(None, None)?
+            .into_iter()
+            .filter(|model| model.source_kind == "managed")
+            .map(|model| {
+                let source = db.resolve_model_source_ref(&model.id)?;
+                Ok((model, source))
+            })
+            .collect::<Result<Vec<_>, LibraryError>>()
+    })?;
+    if models_and_sources.len() > 100_000 {
+        return Err(invalid("Managed asset count exceeds the purge limit"));
+    }
+    let mut total = 0u64;
+    let mut snapshots = Vec::with_capacity(models_and_sources.len());
+    for (model, source) in models_and_sources {
+        if source.archive_member.is_some() {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Managed model unexpectedly references an archive member".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let relative = source
+            .outer_path
+            .strip_prefix(&root)
+            .map_err(|_| RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Managed model asset is outside the Library".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            })?
+            .to_path_buf();
+        validate_relative_source_path(&relative)?;
+        if relative.components().next() != Some(std::path::Component::Normal("originals".as_ref()))
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Managed model asset is outside the owned originals namespace".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let path = root.join(&relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| io_error())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || path.canonicalize().map_err(|_| io_error())? != path
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Managed model asset is not a regular owned file".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let (bytes, sha256) = hash_management_file(&path, library_core::MAX_INDEXED_FILE_BYTES)?;
+        if bytes != model.bytes
+            || bytes != source.bytes
+            || model.content_hash.as_deref() != Some(sha256.as_str())
+            || source.content_hash != sha256
+        {
+            return Err(stale("Managed model bytes do not match the catalog"));
+        }
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("Managed asset byte total is out of range"))?;
+        if total > MAX_ORPHAN_CLEANUP_TOTAL_BYTES {
+            return Err(invalid("Managed assets exceed the backup size limit"));
+        }
+        snapshots.push(ManagedAssetSnapshot {
+            relative_path: relative,
+            bytes,
+            sha256,
+        });
+    }
+    snapshots.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(snapshots)
+}
+
+fn verify_managed_asset_snapshots(
+    root: &Path,
+    snapshots: &[ManagedAssetSnapshot],
+) -> Result<(), RuntimeError> {
+    let root = root.canonicalize().map_err(|_| io_error())?;
+    for snapshot in snapshots {
+        validate_relative_source_path(&snapshot.relative_path)?;
+        if snapshot.relative_path.components().next()
+            != Some(std::path::Component::Normal("originals".as_ref()))
+        {
+            return Err(invalid("Managed asset snapshot is outside originals"));
+        }
+        let path = root.join(&snapshot.relative_path);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| stale("Managed asset changed"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || path.canonicalize().map_err(|_| io_error())? != path
+        {
+            return Err(stale("Managed asset path changed"));
+        }
+        let actual = hash_management_file(&path, library_core::MAX_INDEXED_FILE_BYTES)?;
+        if actual != (snapshot.bytes, snapshot.sha256.clone()) {
+            return Err(stale("Managed asset bytes changed after confirmation"));
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_orphan_files(
+    runtime: &LibraryRuntime,
+) -> Result<Vec<OrphanFileSnapshot>, RuntimeError> {
+    let (thumbnail_paths, content_hashes) =
+        runtime.read_db(|db| Ok((db.thumbnail_relative_paths()?, db.catalog_content_hashes()?)))?;
+    let protected_paths = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .values()
+        .map(|lease| lease.path.clone())
+        .collect::<Vec<_>>();
+    collect_orphan_files(
+        &runtime.root,
+        &thumbnail_paths,
+        &content_hashes,
+        &protected_paths,
+        !runtime.local_catalog_root_access,
+    )
+}
+
+fn collect_orphan_files(
+    library_root: &Path,
+    thumbnail_paths: &HashSet<String>,
+    content_hashes: &HashSet<String>,
+    protected_paths: &[PathBuf],
+    include_indexed_cache: bool,
+) -> Result<Vec<OrphanFileSnapshot>, RuntimeError> {
+    let root = library_root.canonicalize().map_err(|_| io_error())?;
+    let mut snapshots = Vec::new();
+    let mut total_bytes = 0u64;
+
+    let mut add_file = |path: &Path, kind: OrphanFileKind, cache_hash: Option<&str>| {
+        if snapshots.len() >= MAX_ORPHAN_CLEANUP_FILES {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Orphan cleanup contains too many files".into(),
+                retryable: true,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| invalid("Orphan candidate escaped the Library"))?
+            .to_path_buf();
+        validate_relative_source_path(&relative)?;
+        let canonical = path.canonicalize().map_err(|_| io_error())?;
+        if canonical != *path || !canonical.starts_with(&root) {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Orphan candidate is not inside an owned Library namespace".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Orphan candidate is not a regular file".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let (bytes, sha256) = hash_management_file(path, MAX_ORPHAN_CLEANUP_FILE_BYTES)?;
+        if cache_hash.is_some_and(|expected| sha256 != expected) {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Indexed cache file hash does not match its namespace".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("Orphan cleanup byte total is out of range"))?;
+        if total_bytes > MAX_ORPHAN_CLEANUP_TOTAL_BYTES {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Orphan cleanup exceeds its byte limit".into(),
+                retryable: true,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        snapshots.push(OrphanFileSnapshot {
+            relative_path: relative,
+            bytes,
+            sha256,
+            kind,
+        });
+        Ok(())
+    };
+
+    let thumbnails = root.join("thumbnails");
+    for entry in safe_optional_directory_entries(&root, &thumbnails)? {
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| io_error())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && is_generated_thumbnail_name(&name)
+        {
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(|_| invalid("Thumbnail path escaped the Library"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !thumbnail_paths.contains(&relative)
+                && !protected_paths
+                    .iter()
+                    .any(|protected| protected == &entry.path())
+            {
+                add_file(&entry.path(), OrphanFileKind::GeneratedThumbnail, None)?;
+            }
+        }
+    }
+
+    if include_indexed_cache {
+        let cache_root = root.join("indexed-cache");
+        for directory in safe_optional_directory_entries(&root, &cache_root)? {
+            let dir_path = directory.path();
+            let metadata = fs::symlink_metadata(&dir_path).map_err(|_| io_error())?;
+            let hash = directory.file_name().to_string_lossy().into_owned();
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || hash.len() != 64
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Indexed cache contains an unsafe entry".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+            if content_hashes.contains(&hash)
+                || protected_paths
+                    .iter()
+                    .any(|protected| protected.starts_with(&dir_path))
+            {
+                continue;
+            }
+            let children = fs::read_dir(&dir_path).map_err(|_| io_error())?;
+            let mut child_count = 0usize;
+            for child in children {
+                let child = child.map_err(|_| io_error())?;
+                child_count += 1;
+                if child_count > MAX_ORPHAN_CLEANUP_FILES {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Busy,
+                        message: "Indexed cache directory has too many entries".into(),
+                        retryable: true,
+                        current_version: None,
+                        source_holds: Vec::new(),
+                    });
+                }
+                let child_path = child.path();
+                let child_meta = fs::symlink_metadata(&child_path).map_err(|_| io_error())?;
+                if child_meta.file_type().is_symlink() || !child_meta.is_file() {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Corrupt,
+                        message: "Indexed cache hash directory is unsafe".into(),
+                        retryable: false,
+                        current_version: None,
+                        source_holds: Vec::new(),
+                    });
+                }
+                add_file(&child_path, OrphanFileKind::IndexedCache, Some(&hash))?;
+            }
+        }
+    }
+
+    snapshots.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(snapshots)
+}
+
+fn safe_optional_directory_entries(
+    root: &Path,
+    directory: &Path,
+) -> Result<Vec<fs::DirEntry>, RuntimeError> {
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(io_error()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || directory.canonicalize().map_err(|_| io_error())? != directory
+        || !directory.starts_with(root)
+    {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Orphan cleanup namespace is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|_| io_error())? {
+        if entries.len() >= MAX_ORPHAN_CLEANUP_FILES {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Orphan cleanup namespace has too many entries".into(),
+                retryable: true,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        entries.push(entry.map_err(|_| io_error())?);
+    }
+    Ok(entries)
+}
+
+fn purge_journal_path(root: &Path) -> Result<PathBuf, RuntimeError> {
+    let canonical = canonical_path_allow_missing_tail(root)?;
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| invalid("Library root has no parent directory"))?;
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(parent.join(format!(".gogglelab-purge-{suffix}.journal")))
+}
+
+#[cfg(test)]
+fn purge_journal_temp_path(journal_path: &Path) -> PathBuf {
+    let file_name = journal_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    journal_path.with_file_name(format!("{file_name}.tmp"))
+}
+
+#[cfg(test)]
+fn remove_purge_journal_temp(journal_path: &Path) -> Result<bool, RuntimeError> {
+    let temporary = purge_journal_temp_path(journal_path);
+    let metadata = match fs::symlink_metadata(&temporary) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(io_error()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > 8 * 1024
+        || temporary.canonicalize().map_err(|_| io_error())? != temporary
+    {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge journal temporary file is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    fs::remove_file(temporary).map_err(|_| io_error())?;
+    Ok(true)
+}
+
+#[cfg(test)]
+fn purge_stage_marker_path(root: &Path) -> PathBuf {
+    root.join(".gogglelab-purge-stage")
+}
+
+#[cfg(test)]
+fn write_purge_stage_marker(root: &Path, nonce: &str) -> Result<(), RuntimeError> {
+    let marker = purge_stage_marker_path(root);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&marker).map_err(|_| io_error())?;
+    file.write_all(nonce.as_bytes()).map_err(|_| io_error())?;
+    file.sync_all().map_err(|_| io_error())?;
+    sync_directory(root)
+}
+
+#[cfg(test)]
+fn purge_stage_marker_matches(root: &Path, nonce: &str) -> Result<bool, RuntimeError> {
+    let marker = purge_stage_marker_path(root);
+    let metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(io_error()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge staging marker is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let bytes = fs::read(&marker).map_err(|_| io_error())?;
+    Ok(bytes == nonce.as_bytes())
+}
+
+#[cfg(unix)]
+fn is_purge_marker_symlink_loop(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_purge_marker_symlink_loop(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn purge_stage_marker_matches_at(
+    root: &secure_fs::Directory,
+    nonce: &str,
+) -> Result<bool, RuntimeError> {
+    let name = std::ffi::OsStr::new(".gogglelab-purge-stage");
+    let mut marker = match root.open_file(name) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::InvalidInput
+                || error.kind() == std::io::ErrorKind::NotADirectory
+                || is_purge_marker_symlink_loop(&error) =>
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Purge staging marker is unsafe".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        Err(_) => return Err(io_error()),
+    };
+    if marker.metadata().map_err(|_| io_error())?.len() > 64 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge staging marker is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let mut bytes = Vec::new();
+    (&mut marker)
+        .take(65)
+        .read_to_end(&mut bytes)
+        .map_err(|_| io_error())?;
+    if bytes.len() > 64 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge staging marker is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    Ok(bytes == nonce.as_bytes())
+}
+
+fn write_purge_stage_marker_at(
+    root: &secure_fs::Directory,
+    nonce: &str,
+) -> Result<(), RuntimeError> {
+    let name = std::ffi::OsStr::new(".gogglelab-purge-stage");
+    let mut file = root.create_new_file(name).map_err(|_| io_error())?;
+    if file
+        .write_all(nonce.as_bytes())
+        .and_then(|()| file.sync_all())
+        .is_err()
+        || root.sync().is_err()
+    {
+        let _ = root.unlink_file(name);
+        return Err(io_error());
+    }
+    Ok(())
+}
+
+fn remove_purge_stage_marker_at(
+    root: &secure_fs::Directory,
+    nonce: &str,
+) -> Result<(), RuntimeError> {
+    let expected = (
+        nonce.len() as u64,
+        format!("{:x}", Sha256::digest(nonce.as_bytes())),
+    );
+    root.unlink_verified_file(
+        std::ffi::OsStr::new(".gogglelab-purge-stage"),
+        &expected,
+        64,
+    )
+    .map(|_| ())
+    .map_err(|_| stale("Purge staging marker changed before commit"))
+}
+
+#[cfg(test)]
+fn write_purge_journal(root: &Path, journal: &PurgeJournal) -> Result<PathBuf, RuntimeError> {
+    let canonical = canonical_path_allow_missing_tail(root)?;
+    let root_path = canonical
+        .to_str()
+        .ok_or_else(|| invalid("Purge requires a Unicode Library path"))?;
+    let root_name = canonical.file_name().unwrap_or_default().to_string_lossy();
+    if journal.root_path != root_path
+        || journal.version != 1
+        || journal.nonce.len() != 32
+        || !journal.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || journal.staged_name != format!(".gogglelab-empty-{}", journal.nonce)
+        || journal.previous_name != format!("{root_name}.previous-purge-{}", journal.nonce)
+        || journal.committed
+    {
+        return Err(invalid("Purge journal does not match the Library root"));
+    }
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| invalid("Library root has no parent directory"))?;
+    let path = purge_journal_path(&canonical)?;
+    let bytes =
+        serde_json::to_vec(journal).map_err(|_| internal("Purge journal encoding failed"))?;
+    if bytes.len() > 8 * 1024 {
+        return Err(invalid("Purge journal exceeds its size limit"));
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return Err(stale("A purge recovery journal already exists")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(io_error()),
+    }
+    if remove_purge_journal_temp(&path)? {
+        sync_directory(parent)?;
+    }
+    let temporary = purge_journal_temp_path(&path);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|_| io_error())?;
+    if file
+        .write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .is_err()
+    {
+        let _ = fs::remove_file(&temporary);
+        let _ = sync_directory(parent);
+        return Err(io_error());
+    }
+    drop(file);
+    if fs::hard_link(&temporary, &path).is_err() {
+        let _ = fs::remove_file(&temporary);
+        let _ = sync_directory(parent);
+        return Err(io_error());
+    }
+    if fs::remove_file(&temporary).is_err() || sync_directory(parent).is_err() {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&temporary);
+        let _ = sync_directory(parent);
+        return Err(io_error());
+    }
+    Ok(path)
+}
+
+fn write_purge_journal_at(
+    parent: &secure_fs::Directory,
+    root: &Path,
+    journal: &PurgeJournal,
+) -> Result<(PathBuf, std::ffi::OsString), RuntimeError> {
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| invalid("Library root name is invalid"))?
+        .to_string_lossy();
+    if journal.root_path != root.to_string_lossy()
+        || journal.version != 1
+        || journal.nonce.len() != 32
+        || !journal.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || journal.staged_name != format!(".gogglelab-empty-{}", journal.nonce)
+        || journal.previous_name != format!("{root_name}.previous-purge-{}", journal.nonce)
+        || journal.committed
+    {
+        return Err(invalid("Purge journal does not match the Library root"));
+    }
+    let path = purge_journal_path(root)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid("Purge journal name is invalid"))?
+        .to_os_string();
+    let temporary_name = std::ffi::OsString::from(format!("{}.tmp", file_name.to_string_lossy()));
+    let bytes =
+        serde_json::to_vec(journal).map_err(|_| internal("Purge journal encoding failed"))?;
+    if bytes.len() > 8 * 1024 {
+        return Err(invalid("Purge journal exceeds its size limit"));
+    }
+    let mut temporary = parent
+        .create_new_file(&temporary_name)
+        .map_err(|_| stale("A purge journal temporary path is already occupied"))?;
+    let write_result = temporary
+        .write_all(&bytes)
+        .and_then(|()| temporary.sync_all());
+    drop(temporary);
+    if write_result.is_err() {
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(io_error());
+    }
+    if parent.link_child(&temporary_name, &file_name).is_err() {
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(stale("A purge recovery journal already exists"));
+    }
+    if parent.unlink_file(&temporary_name).is_err() || parent.sync().is_err() {
+        let _ = parent.unlink_file(&file_name);
+        let _ = parent.unlink_file(&temporary_name);
+        let _ = parent.sync();
+        return Err(io_error());
+    }
+    Ok((path, file_name))
+}
+
+fn clear_purge_journal_at(
+    parent: &secure_fs::Directory,
+    file_name: &std::ffi::OsStr,
+) -> Result<(), RuntimeError> {
+    let temporary_name = std::ffi::OsString::from(format!("{}.tmp", file_name.to_string_lossy()));
+    let commit_name = std::ffi::OsString::from(format!("{}.commit", file_name.to_string_lossy()));
+    parent.unlink_file(file_name).map_err(|_| io_error())?;
+    for temporary in [&temporary_name, &commit_name] {
+        match parent.unlink_file(temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(io_error()),
+        }
+    }
+    parent.sync().map_err(|_| io_error())
+}
+
+fn mark_purge_journal_committed_at(
+    parent: &secure_fs::Directory,
+    root: &Path,
+    file_name: &std::ffi::OsStr,
+    nonce: &str,
+) -> Result<(), RuntimeError> {
+    let input = parent.open_file(file_name).map_err(|_| io_error())?;
+    let mut bytes = Vec::new();
+    input
+        .take(8 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| io_error())?;
+    if bytes.len() > 8 * 1024 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge journal exceeds its size limit".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let mut journal: PurgeJournal = serde_json::from_slice(&bytes).map_err(|_| RuntimeError {
+        code: RuntimeErrorCode::Corrupt,
+        message: "Purge journal is invalid at commit".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    })?;
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| invalid("Purge requires a Unicode Library path"))?;
+    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
+    if journal.version != 1
+        || journal.root_path != root_text
+        || journal.nonce != nonce
+        || journal.staged_name != format!(".gogglelab-empty-{nonce}")
+        || journal.previous_name != format!("{root_name}.previous-purge-{nonce}")
+        || journal.committed
+    {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge journal changed before commit".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    journal.committed = true;
+    let committed_bytes = serde_json::to_vec(&journal)
+        .map_err(|_| internal("Committed purge journal encoding failed"))?;
+    let temporary_name =
+        std::ffi::OsString::from(format!("{}.commit", file_name.to_string_lossy()));
+    let mut output = parent
+        .create_new_file(&temporary_name)
+        .map_err(|_| stale("Purge commit journal temporary path is occupied"))?;
+    if output
+        .write_all(&committed_bytes)
+        .and_then(|()| output.sync_all())
+        .is_err()
+    {
+        drop(output);
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(io_error());
+    }
+    drop(output);
+    if parent.sync().is_err() || parent.replace_child(&temporary_name, file_name).is_err() {
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(io_error());
+    }
+    Ok(())
+}
+
+fn finish_catalog_purge_commit<M, C>(
+    guard: &mut RuntimeMaintenanceGuard,
+    staged_root: &secure_fs::Directory,
+    parent: &secure_fs::Directory,
+    root: &Path,
+    journal_name: &std::ffi::OsStr,
+    nonce: &str,
+    remove_marker: M,
+    clear_journal: C,
+) -> Result<(), RuntimeError>
+where
+    M: FnOnce(&secure_fs::Directory, &str) -> Result<(), RuntimeError>,
+    C: FnOnce(&secure_fs::Directory, &std::ffi::OsStr) -> Result<(), RuntimeError>,
+{
+    let result = (|| {
+        mark_purge_journal_committed_at(parent, root, journal_name, nonce)?;
+        remove_marker(staged_root, nonce)?;
+        clear_journal(parent, journal_name)
+    })();
+    if let Err(error) = result {
+        guard.remain_armed();
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn restore_journal_path(root: &Path) -> Result<PathBuf, RuntimeError> {
+    let canonical = canonical_path_allow_missing_tail(root)?;
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| invalid("Library root has no parent directory"))?;
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(parent.join(format!(".gogglelab-restore-{suffix}.journal")))
+}
+
+fn restore_journal_temp_name(journal_name: &std::ffi::OsStr, suffix: &str) -> std::ffi::OsString {
+    std::ffi::OsString::from(format!("{}.{}", journal_name.to_string_lossy(), suffix))
+}
+
+fn write_restore_journal_at(
+    parent: &secure_fs::Directory,
+    root: &Path,
+    journal: &RestoreJournal,
+) -> Result<std::ffi::OsString, RuntimeError> {
+    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
+    if journal.version != 1
+        || journal.root_path != root.to_string_lossy()
+        || journal.nonce.len() != 32
+        || !journal.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || journal.staged_name != format!(".gogglelab-restore-{}", journal.nonce)
+        || journal.previous_name != format!("{root_name}.previous-{}", journal.nonce)
+        || journal.failed_name != format!(".gogglelab-failed-restore-{}", journal.nonce)
+        || journal.committed
+    {
+        return Err(invalid("Restore journal does not match the Library root"));
+    }
+    let path = restore_journal_path(root)?;
+    let journal_name = path
+        .file_name()
+        .ok_or_else(|| invalid("Restore journal name is invalid"))?
+        .to_os_string();
+    if parent.entry_exists(&journal_name).map_err(|_| io_error())? {
+        return Err(stale("A restore recovery journal already exists"));
+    }
+    let temporary_name = restore_journal_temp_name(&journal_name, "tmp");
+    let bytes =
+        serde_json::to_vec(journal).map_err(|_| internal("Restore journal encoding failed"))?;
+    if bytes.len() > 8 * 1024 {
+        return Err(invalid("Restore journal exceeds its size limit"));
+    }
+    let mut file = parent
+        .create_new_file(&temporary_name)
+        .map_err(|_| stale("Restore journal temporary path is occupied"))?;
+    if file
+        .write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(io_error());
+    }
+    drop(file);
+    if parent.link_child(&temporary_name, &journal_name).is_err() {
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(stale("A restore recovery journal already exists"));
+    }
+    if parent.unlink_file(&temporary_name).is_err() || parent.sync().is_err() {
+        let _ = parent.unlink_file(&journal_name);
+        let _ = parent.unlink_file(&temporary_name);
+        let _ = parent.sync();
+        return Err(io_error());
+    }
+    Ok(journal_name)
+}
+
+fn mark_restore_journal_committed_at(
+    parent: &secure_fs::Directory,
+    root: &Path,
+    journal_name: &std::ffi::OsStr,
+    nonce: &str,
+) -> Result<(), RuntimeError> {
+    let input = parent.open_file(journal_name).map_err(|_| io_error())?;
+    let mut bytes = Vec::new();
+    input
+        .take(8 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| io_error())?;
+    if bytes.len() > 8 * 1024 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Restore journal exceeds its size limit".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let mut journal: RestoreJournal = serde_json::from_slice(&bytes).map_err(|_| RuntimeError {
+        code: RuntimeErrorCode::Corrupt,
+        message: "Restore journal is invalid at commit".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    })?;
+    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
+    if journal.version != 1
+        || journal.root_path != root.to_string_lossy()
+        || journal.nonce != nonce
+        || journal.staged_name != format!(".gogglelab-restore-{nonce}")
+        || journal.previous_name != format!("{root_name}.previous-{nonce}")
+        || journal.failed_name != format!(".gogglelab-failed-restore-{nonce}")
+        || journal.committed
+    {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Restore journal changed before commit".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    journal.committed = true;
+    let committed_bytes = serde_json::to_vec(&journal)
+        .map_err(|_| internal("Committed restore journal encoding failed"))?;
+    let temporary_name = restore_journal_temp_name(journal_name, "commit");
+    let mut output = parent
+        .create_new_file(&temporary_name)
+        .map_err(|_| stale("Restore commit journal temporary path is occupied"))?;
+    if output
+        .write_all(&committed_bytes)
+        .and_then(|()| output.sync_all())
+        .is_err()
+    {
+        drop(output);
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(io_error());
+    }
+    drop(output);
+    if parent.sync().is_err() || parent.replace_child(&temporary_name, journal_name).is_err() {
+        let _ = parent.unlink_file(&temporary_name);
+        return Err(io_error());
+    }
+    Ok(())
+}
+
+fn clear_restore_journal_at(
+    parent: &secure_fs::Directory,
+    journal_name: &std::ffi::OsStr,
+) -> Result<(), RuntimeError> {
+    parent.unlink_file(journal_name).map_err(|_| io_error())?;
+    for suffix in ["tmp", "commit"] {
+        let temporary_name = restore_journal_temp_name(journal_name, suffix);
+        match parent.unlink_file(&temporary_name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(io_error()),
+        }
+    }
+    parent.sync().map_err(|_| io_error())
+}
+
+fn recover_interrupted_library_restore(configured_root: &Path) -> Result<(), RuntimeError> {
+    recover_interrupted_library_restore_with_hook(configured_root, || {})
+}
+
+fn recover_interrupted_library_restore_with_hook(
+    configured_root: &Path,
+    after_parent_open: impl FnOnce(),
+) -> Result<(), RuntimeError> {
+    let root = canonical_path_allow_missing_tail(configured_root)?;
+    let journal_path = restore_journal_path(&root)?;
+    let parent_path = root
+        .parent()
+        .ok_or_else(|| invalid("Library root has no parent directory"))?;
+    let parent = secure_fs::Directory::open(parent_path).map_err(|_| io_error())?;
+    let journal_name = journal_path
+        .file_name()
+        .ok_or_else(|| invalid("Restore journal name is invalid"))?
+        .to_os_string();
+    after_parent_open();
+    let journal_exists = parent.entry_exists(&journal_name).map_err(|_| io_error())?;
+    if !journal_exists {
+        let mut removed = false;
+        for suffix in ["tmp", "commit"] {
+            let temporary = restore_journal_temp_name(&journal_name, suffix);
+            match parent.unlink_file(&temporary) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(io_error()),
+            }
+        }
+        if removed {
+            parent.sync().map_err(|_| io_error())?;
+        }
+        return Ok(());
+    }
+    let journal_file = parent.open_file(&journal_name).map_err(|_| io_error())?;
+    let mut bytes = Vec::new();
+    journal_file
+        .take(8 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| io_error())?;
+    if bytes.len() > 8 * 1024 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Restore recovery journal is oversized".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let journal: RestoreJournal = serde_json::from_slice(&bytes).map_err(|_| RuntimeError {
+        code: RuntimeErrorCode::Corrupt,
+        message: "Restore recovery journal is invalid".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    })?;
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| invalid("Restore recovery requires a Unicode Library path"))?;
+    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
+    if journal.version != 1
+        || journal.root_path != root_text
+        || journal.nonce.len() != 32
+        || !journal.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || journal.staged_name != format!(".gogglelab-restore-{}", journal.nonce)
+        || journal.previous_name != format!("{root_name}.previous-{}", journal.nonce)
+        || journal.failed_name != format!(".gogglelab-failed-restore-{}", journal.nonce)
+    {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Restore recovery journal does not match the Library".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    require_durable_source_mutations()?;
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| invalid("Restore root name is invalid"))?;
+    let root_directory = open_optional_real_directory_at(&parent, root_name)?;
+    let previous_name = std::ffi::OsString::from(&journal.previous_name);
+    let staged_name = std::ffi::OsString::from(&journal.staged_name);
+    let previous_directory = open_optional_real_directory_at(&parent, &previous_name)?;
+    let staged_directory = open_optional_real_directory_at(&parent, &staged_name)?;
+    let root_exists = root_directory.is_some();
+    let previous_exists = previous_directory.is_some();
+    let staged_exists = staged_directory.is_some();
+    if journal.committed {
+        if !root_exists {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Committed restore has no current Library; previous Library was preserved"
+                    .into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        clear_restore_journal_at(&parent, &journal_name)?;
+        return Ok(());
+    }
+    if previous_exists {
+        if root_exists {
+            if parent
+                .entry_exists(std::ffi::OsStr::new(&journal.failed_name))
+                .map_err(|_| io_error())?
+            {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Restore recovery destination is already occupied".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+            parent
+                .rename_child_exclusive(root_name, std::ffi::OsStr::new(&journal.failed_name))
+                .map_err(|_| io_error())?;
+            parent.sync().map_err(|_| io_error())?;
+        }
+        parent
+            .rename_child_exclusive(std::ffi::OsStr::new(&journal.previous_name), root_name)
+            .map_err(|_| RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Previous Library could not be restored after interrupted restore".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            })?;
+        parent.sync().map_err(|_| io_error())?;
+    } else if !root_exists {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Interrupted restore has no recoverable Library".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    if staged_exists {
+        parent
+            .remove_child_tree(std::ffi::OsStr::new(&journal.staged_name))
+            .map_err(|_| io_error())?;
+        parent.sync().map_err(|_| io_error())?;
+    }
+    clear_restore_journal_at(&parent, &journal_name)
+}
+
+fn recover_interrupted_catalog_purge(configured_root: &Path) -> Result<(), RuntimeError> {
+    recover_interrupted_catalog_purge_with_hook(configured_root, || {})
+}
+
+fn recover_interrupted_catalog_purge_with_hook(
+    configured_root: &Path,
+    after_parent_open: impl FnOnce(),
+) -> Result<(), RuntimeError> {
+    let configured_entry = configured_root
+        .file_name()
+        .map(|name| {
+            configured_root
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(name)
+        })
+        .unwrap_or_else(|| configured_root.to_path_buf());
+    match fs::symlink_metadata(&configured_entry) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Library root cannot be a symlink during purge recovery".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Library root is not a directory during purge recovery".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(io_error()),
+    }
+
+    let root = canonical_path_allow_missing_tail(configured_root)?;
+    let parent_path = root
+        .parent()
+        .ok_or_else(|| invalid("Library root has no parent directory"))?;
+    let journal_path = purge_journal_path(&root)?;
+    let journal_name = journal_path
+        .file_name()
+        .ok_or_else(|| invalid("Purge recovery journal name is missing"))?
+        .to_os_string();
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| invalid("Library root name is missing"))?
+        .to_os_string();
+    let parent = secure_fs::Directory::open(parent_path).map_err(|_| io_error())?;
+    if !parent.matches_path(parent_path).map_err(|_| io_error())? {
+        return Err(stale("Purge recovery parent identity changed"));
+    }
+    after_parent_open();
+
+    let mut journal_file = match parent.open_file(&journal_name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let temporary_name =
+                std::ffi::OsString::from(format!("{}.tmp", journal_name.to_string_lossy()));
+            let commit_name =
+                std::ffi::OsString::from(format!("{}.commit", journal_name.to_string_lossy()));
+            let has_temporary = parent
+                .entry_exists(&temporary_name)
+                .map_err(|_| io_error())?;
+            let has_commit = parent.entry_exists(&commit_name).map_err(|_| io_error())?;
+            if has_temporary || has_commit {
+                require_durable_source_mutations()?;
+                remove_purge_journal_temporary_at(
+                    &parent,
+                    &temporary_name,
+                    "Purge journal temporary file is unsafe",
+                )?;
+                remove_purge_journal_temporary_at(
+                    &parent,
+                    &commit_name,
+                    "Purge commit temporary file is unsafe",
+                )?;
+                parent.sync().map_err(|_| io_error())?;
+            }
+            return Ok(());
+        }
+        Err(_) => {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Purge recovery journal is unsafe".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+    };
+    if journal_file.metadata().map_err(|_| io_error())?.len() > 8 * 1024 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge recovery journal is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let mut journal_bytes = Vec::new();
+    (&mut journal_file)
+        .take(8 * 1024 + 1)
+        .read_to_end(&mut journal_bytes)
+        .map_err(|_| io_error())?;
+    if journal_bytes.len() > 8 * 1024 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge recovery journal is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    let journal: PurgeJournal =
+        serde_json::from_slice(&journal_bytes).map_err(|_| RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge recovery journal is invalid".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })?;
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| invalid("Purge recovery requires a Unicode Library path"))?;
+    if journal.version != 1
+        || journal.root_path != root_text
+        || journal.nonce.len() != 32
+        || !journal.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || journal.staged_name != format!(".gogglelab-empty-{}", journal.nonce)
+        || journal.previous_name
+            != format!(
+                "{}.previous-purge-{}",
+                root.file_name().unwrap_or_default().to_string_lossy(),
+                journal.nonce
+            )
+        || journal
+            .previous_name
+            .as_bytes()
+            .iter()
+            .any(|byte| *byte == b'/' || *byte == b'\\' || *byte == 0)
+    {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Purge recovery journal does not match the Library".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+
+    let previous_name = std::ffi::OsString::from(&journal.previous_name);
+    let staged_name = std::ffi::OsString::from(&journal.staged_name);
+    let root_directory = open_optional_real_directory_at(&parent, &root_name)?;
+    let previous_directory = open_optional_real_directory_at(&parent, &previous_name)?;
+    let staged_directory = open_optional_real_directory_at(&parent, &staged_name)?;
+    require_durable_source_mutations()?;
+
+    if journal.committed {
+        let root_directory = root_directory.ok_or_else(|| RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Committed purge has no current Library; recovery data was preserved".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })?;
+        if root_directory
+            .entry_exists(std::ffi::OsStr::new(".gogglelab-purge-stage"))
+            .map_err(|_| io_error())?
+        {
+            remove_purge_stage_marker_at(&root_directory, &journal.nonce)?;
+        }
+        clear_purge_journal_at(&parent, &journal_name)?;
+        return Ok(());
+    }
+
+    if previous_directory.is_some() {
+        if root_directory.is_some() {
+            let failed_name =
+                std::ffi::OsString::from(format!(".gogglelab-interrupted-purge-{}", journal.nonce));
+            if parent.entry_exists(&failed_name).map_err(|_| io_error())? {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Purge recovery destination is already occupied".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+            parent
+                .rename_child_exclusive(&root_name, &failed_name)
+                .map_err(|_| io_error())?;
+            parent.sync().map_err(|_| io_error())?;
+        }
+        parent
+            .rename_child_exclusive(&previous_name, &root_name)
+            .map_err(|_| RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Previous Library could not be restored after interrupted purge".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            })?;
+        parent.sync().map_err(|_| io_error())?;
+    } else {
+        let root_directory = root_directory.as_ref().ok_or_else(|| RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Interrupted purge has no recoverable previous Library".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })?;
+        if purge_stage_marker_matches_at(root_directory, &journal.nonce)? {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Interrupted purge has no recoverable previous Library".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+    }
+
+    // A published journal owns this exact nonce-bound staging child.
+    if staged_directory.is_some() {
+        parent
+            .remove_child_tree(&staged_name)
+            .map_err(|_| io_error())?;
+        parent.sync().map_err(|_| io_error())?;
+    }
+    clear_purge_journal_at(&parent, &journal_name)
+}
+
+fn open_optional_real_directory_at(
+    parent: &secure_fs::Directory,
+    name: &std::ffi::OsStr,
+) -> Result<Option<secure_fs::Directory>, RuntimeError> {
+    match parent.open_child(name) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: "Recovery directory is unsafe".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        }),
+    }
+}
+
+fn remove_purge_journal_temporary_at(
+    parent: &secure_fs::Directory,
+    name: &std::ffi::OsStr,
+    unsafe_message: &str,
+) -> Result<bool, RuntimeError> {
+    if !parent.entry_exists(name).map_err(|_| io_error())? {
+        return Ok(false);
+    }
+    let file = parent.open_file(name).map_err(|_| RuntimeError {
+        code: RuntimeErrorCode::Corrupt,
+        message: unsafe_message.to_owned(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    })?;
+    if file.metadata().map_err(|_| io_error())?.len() > 8 * 1024 {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: unsafe_message.to_owned(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    drop(file);
+    parent.unlink_file(name).map_err(|_| io_error())?;
+    Ok(true)
+}
+
+fn is_generated_thumbnail_name(name: &str) -> bool {
+    let Some((hash, suffix)) = name
+        .strip_suffix(".png")
+        .and_then(|value| value.split_once("-isometric-v"))
+    else {
+        return false;
+    };
+    let parts = suffix.split('-').collect::<Vec<_>>();
+    hash.len() == 64
+        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && parts.len() == 3
+        && !parts[0].is_empty()
+        && parts[0].bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(parts[1], "128" | "256" | "512")
+        && parts[2].len() == 6
+        && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_physical_model_action(
@@ -3802,6 +6651,7 @@ fn validate_physical_model_action(
             message: "Model was not found".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })?;
     if model.source_kind != "indexed" || model.source_archive_member.is_some() {
         return Err(invalid("Physical action requires a loose indexed model"));
@@ -3822,6 +6672,7 @@ fn validate_physical_model_action(
             message: "Model source root is not admitted for writes".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })?;
     if admitted.path.canonicalize().map_err(|_| io_error())? != admitted.path {
         return Err(stale("Model source root identity changed"));
@@ -3925,6 +6776,7 @@ fn source_location_snapshot(
             message: "Model source root is not admitted for writes".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })?;
     let root_path = runtime.admitted_root_path(context, &root.handle.id, RootAccess::Writable)?;
     if root_path.canonicalize().map_err(|_| io_error())? != root_path {
@@ -3983,6 +6835,7 @@ fn snapshot_quarantine_sources(
             message: "Quarantine snapshot was not found".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         });
     }
     let mut snapshots = Vec::with_capacity(removed.len());
@@ -4021,6 +6874,7 @@ fn snapshot_quarantine_sources(
                     message: "Original source path is occupied by different bytes".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             Err(_) => return Err(io_error()),
@@ -4112,6 +6966,33 @@ fn verify_source_snapshot_file(snapshot: &PhysicalSourceSnapshot) -> Result<Path
     Ok(path)
 }
 
+fn open_physical_source_parent(
+    snapshot: &PhysicalSourceSnapshot,
+) -> Result<(secure_fs::Directory, std::ffi::OsString), RuntimeError> {
+    validate_relative_source_path(&snapshot.relative_path)?;
+    let root = secure_fs::Directory::open(&snapshot.root_path)
+        .map_err(|_| stale("Indexed source root is no longer a safe directory"))?;
+    if !root
+        .matches_path(&snapshot.root_path)
+        .map_err(|_| stale("Indexed source root identity changed"))?
+    {
+        return Err(stale("Indexed source root identity changed"));
+    }
+    let parent = snapshot
+        .relative_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let directory = root
+        .open_relative(parent)
+        .map_err(|_| stale("Indexed source parent changed"))?;
+    let name = snapshot
+        .relative_path
+        .file_name()
+        .ok_or_else(|| invalid("Indexed source path has no file name"))?
+        .to_os_string();
+    Ok((directory, name))
+}
+
 fn quarantine_source_for_model(
     library_root: &Path,
     snapshot_id: &str,
@@ -4130,6 +7011,7 @@ fn quarantine_source_for_model(
             message: "Quarantine model recovery path is occupied".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => Ok(model_file),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -4143,6 +7025,7 @@ fn quarantine_source_for_model(
                     message: "Quarantine model recovery file was not found".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 }),
             }
         }
@@ -4170,6 +7053,7 @@ fn quarantine_source_directory(
                 message: "Quarantine snapshot was not found".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         Err(_) => return Err(io_error()),
@@ -4187,6 +7071,7 @@ fn quarantine_source_directory(
                     message: "Quarantine snapshot directory already exists".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             Err(_) => return Err(io_error()),
@@ -4203,43 +7088,9 @@ fn quarantine_source_directory(
     Ok(owned)
 }
 
-fn clean_quarantine_sources(
-    library_root: &Path,
-    snapshot_id: &str,
-    snapshots: &[PhysicalSourceSnapshot],
-) {
-    let Ok(owned) = quarantine_source_directory(library_root, snapshot_id, false) else {
-        return;
-    };
-    let trash = library_root.join("trash");
-    if owned.parent().and_then(|parent| parent.canonicalize().ok()) != trash.canonicalize().ok() {
-        return;
-    }
-    for snapshot in snapshots {
-        let Ok(source) =
-            quarantine_source_for_model(library_root, snapshot_id, &snapshot.model_id, false)
-        else {
-            continue;
-        };
-        let expected = (snapshot.bytes, snapshot.sha256.clone());
-        if hash_management_file(&source, library_core::MAX_INDEXED_FILE_BYTES)
-            .is_ok_and(|fingerprint| fingerprint == expected)
-        {
-            let _ = fs::remove_file(source);
-        }
-    }
-    if fs::read_dir(&owned)
-        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
-        .is_ok_and(|entries| entries.is_empty())
-        && fs::remove_dir(&owned).is_ok()
-    {
-        let _ = sync_directory(&trash);
-    }
-}
-
-fn file_modified_seconds(path: &Path) -> u64 {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
+fn metadata_modified_seconds(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
@@ -4367,6 +7218,26 @@ fn sync_directory(path: &Path) -> Result<(), RuntimeError> {
         .map_err(|_| io_error())
 }
 
+/// Remove an entry from its active name without unlinking bytes. The hold and
+/// its durable journal remain beside the original path so cleanup and rollback
+/// do not race a same-UID replacement into deleting unrelated data.
+fn hold_runtime_path(path: &Path) -> std::io::Result<secure_fs::HeldEntry> {
+    let parent_path = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "entry has no parent")
+    })?;
+    let canonical_parent = parent_path.canonicalize()?;
+    if canonical_parent != parent_path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "entry parent is not canonical",
+        ));
+    }
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "entry has no name")
+    })?;
+    secure_fs::Directory::open(&canonical_parent)?.hold_entry(name)
+}
+
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> Result<(), RuntimeError> {
     Err(RuntimeError {
@@ -4374,81 +7245,24 @@ fn sync_directory(_path: &Path) -> Result<(), RuntimeError> {
         message: "Durable source mutations are unsupported on this host".into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn require_durable_source_mutations() -> Result<(), RuntimeError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn require_durable_source_mutations() -> Result<(), RuntimeError> {
-    sync_directory(Path::new("."))
-}
-
-fn sync_parent_directory(path: &Path) -> Result<(), RuntimeError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("Managed file has no parent directory"))?;
-    sync_directory(parent)
-}
-
-fn copy_verified_management_file(
-    source: &Path,
-    destination: &Path,
-    expected: &(u64, String),
-) -> Result<(), RuntimeError> {
-    let metadata = fs::symlink_metadata(source).map_err(|_| io_error())?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected.0 {
-        return Err(stale("Restore backup changed after planning"));
-    }
-    let mut input = File::open(source).map_err(|_| io_error())?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|_| io_error())?;
-    let result = (|| {
-        let mut digest = Sha256::new();
-        let mut copied = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = input.read(&mut buffer).map_err(|_| io_error())?;
-            if count == 0 {
-                break;
-            }
-            copied = copied
-                .checked_add(count as u64)
-                .ok_or_else(|| stale("Restore backup size overflowed"))?;
-            if copied > expected.0 {
-                return Err(stale("Restore backup changed after planning"));
-            }
-            digest.update(&buffer[..count]);
-            output.write_all(&buffer[..count]).map_err(|_| io_error())?;
-        }
-        if copied != expected.0 || format!("{:x}", digest.finalize()) != expected.1 {
-            return Err(stale("Restore backup changed after planning"));
-        }
-        output.sync_all().map_err(|_| io_error())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(destination);
-    }
-    result
-}
-
-fn copy_verified_source_file(
-    source: &Path,
-    destination: &Path,
-    expected: &(u64, String),
-) -> Result<(), RuntimeError> {
-    copy_verified_management_file(source, destination, expected)?;
-    if let Err(error) = sync_parent_directory(destination) {
-        remove_file_if_verified(destination, expected);
-        return Err(error);
-    }
-    Ok(())
+    Err(RuntimeError {
+        code: RuntimeErrorCode::Unsupported,
+        message: "Guarded source mutations are unavailable on this platform".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    })
 }
 
 fn execute_quarantine_batch(
@@ -4459,6 +7273,7 @@ fn execute_quarantine_batch(
     expected_epoch: u64,
     expected_revision: u64,
 ) -> Result<ManagementResult, RuntimeError> {
+    require_durable_source_mutations()?;
     runtime.require(context, Capability::CatalogWrite)?;
     runtime.require(context, Capability::PhysicalSourceWrite)?;
     validate_physical_targets(targets.iter().map(|target| target.model_id.as_str()))?;
@@ -4476,24 +7291,78 @@ fn execute_quarantine_batch(
         .get()
         .and_then(Weak::upgrade)
         .ok_or_else(|| internal("Runtime owner is unavailable"))?;
-    let mut guard = runtime_arc.begin_maintenance()?;
+    let guard = runtime_arc.begin_source_mutation_maintenance()?;
     recheck_management_plan(runtime, expected_epoch, expected_revision)?;
-    let db = LibraryDb::open(guard.root()).map_err(runtime_library_error)?;
+    let library_root = guard.root().to_path_buf();
+    let library_directory = secure_fs::Directory::open(&library_root)
+        .map_err(|_| stale("Library root is no longer a safe directory"))?;
+    if !library_directory
+        .matches_path(&library_root)
+        .map_err(|_| stale("Library root identity changed"))?
+    {
+        return Err(stale("Library root identity changed"));
+    }
+    let db = guard.catalog()?;
+    #[cfg(test)]
+    runtime.run_after_guarded_catalog_open_hook();
+    if !db.catalog_path_matches() {
+        return Err(stale(
+            "Library catalog identity changed during quarantine setup",
+        ));
+    }
+    if db.root() != library_root {
+        return Err(stale("Library root identity changed before quarantine"));
+    }
     let source_paths = targets
         .iter()
         .zip(snapshots)
-        .map(|(target, snapshot)| revalidate_active_source(&db, runtime, context, target, snapshot))
+        .map(|(target, snapshot)| revalidate_active_source(db, runtime, context, target, snapshot))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_directories = snapshots
+        .iter()
+        .map(open_physical_source_parent)
         .collect::<Result<Vec<_>, _>>()?;
     let snapshot_id = format!("removal-{}", uuid::Uuid::new_v4().simple());
-    let owned = quarantine_source_directory(guard.root(), &snapshot_id, true)?;
-    for (snapshot, source_path) in snapshots.iter().zip(&source_paths) {
+    let trash_directory = library_directory
+        .open_child(std::ffi::OsStr::new("trash"))
+        .map_err(|_| invalid("Quarantine directory is unsafe"))?;
+    let owned_name = std::ffi::OsString::from(format!("source-{snapshot_id}"));
+    trash_directory
+        .create_child_directory(&owned_name)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                stale("Quarantine snapshot directory already exists")
+            } else {
+                io_error()
+            }
+        })?;
+    let owned_directory = trash_directory
+        .open_child(&owned_name)
+        .map_err(|_| io_error())?;
+    for (index, snapshot) in snapshots.iter().enumerate() {
         validate_plain_id_text(&snapshot.model_id, "Quarantine model")?;
-        let recovery_path = owned.join(format!("{}.bin", snapshot.model_id));
+        let recovery_name = std::ffi::OsString::from(format!("{}.bin", snapshot.model_id));
         let expected = (snapshot.bytes, snapshot.sha256.clone());
-        if let Err(error) = copy_verified_source_file(source_path, &recovery_path, &expected) {
-            clean_quarantine_sources(guard.root(), &snapshot_id, snapshots);
-            return Err(error);
+        if secure_fs::copy_verified_into_directory(
+            &source_directories[index].0,
+            &source_directories[index].1,
+            &owned_directory,
+            &recovery_name,
+            &expected,
+            library_core::MAX_INDEXED_FILE_BYTES,
+        )
+        .is_err()
+        {
+            let _ = trash_directory.remove_child_tree(&owned_name);
+            return Err(stale(
+                "Quarantine source changed while copying recovery bytes",
+            ));
         }
+    }
+    if !db.catalog_path_matches() {
+        return Err(stale(
+            "Library catalog identity changed before quarantine commit; original sources remain active",
+        ));
     }
     let removal_targets = targets
         .iter()
@@ -4505,37 +7374,121 @@ fn execute_quarantine_batch(
     if let Err(error) =
         db.remove_models_recoverably_with_snapshot_id(&removal_targets, &snapshot_id)
     {
-        clean_quarantine_sources(guard.root(), &snapshot_id, snapshots);
+        let _ = trash_directory.remove_child_tree(&owned_name);
         return Err(runtime_library_error(error));
     }
-    let removal_error = source_paths
-        .iter()
-        .zip(snapshots)
-        .find_map(|(source_path, snapshot)| {
-            let expected = (snapshot.bytes, snapshot.sha256.clone());
-            let recovery_path = owned.join(format!("{}.bin", snapshot.model_id));
-            if !hash_management_file(source_path, library_core::MAX_INDEXED_FILE_BYTES)
-                .is_ok_and(|fingerprint| fingerprint == expected)
-                || !hash_management_file(&recovery_path, library_core::MAX_INDEXED_FILE_BYTES)
-                    .is_ok_and(|fingerprint| fingerprint == expected)
-            {
-                return Some(stale("Source or recovery bytes changed during quarantine"));
-            }
-            match fs::remove_file(source_path) {
-                Ok(()) => sync_parent_directory(source_path).err(),
-                Err(_) => Some(io_error()),
-            }
-        });
-    if let Some(error) = removal_error {
-        if let Err(rollback_error) =
-            rollback_quarantine_batch(&db, &mut guard, &snapshot_id, snapshots, &source_paths)
-        {
-            guard.remain_armed();
-            return Err(rollback_error);
+    if !db.catalog_path_matches() {
+        if db.restore_removal(&snapshot_id).is_ok() {
+            return Err(stale(
+                "Library catalog identity changed during quarantine; original sources remain active",
+            ));
         }
-        return Err(error);
+        guard.remain_armed();
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Corrupt,
+            message: format!(
+                "Library catalog identity changed during quarantine and its database rollback failed; original sources remain active and recovery bytes remain in trash/source-{snapshot_id}"
+            ),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
     }
-    drop(db);
+    let mut source_holds = Vec::with_capacity(snapshots.len());
+    let mut removal_error = None;
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let expected = (snapshot.bytes, snapshot.sha256.clone());
+        let recovery_name = std::ffi::OsString::from(format!("{}.bin", snapshot.model_id));
+        let source_matches = source_directories[index]
+            .0
+            .open_file(&source_directories[index].1)
+            .and_then(|mut file| {
+                secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
+            })
+            .is_ok_and(|fingerprint| fingerprint == expected);
+        let recovery_matches = owned_directory
+            .hash_file(&recovery_name, library_core::MAX_INDEXED_FILE_BYTES)
+            .is_ok_and(|fingerprint| fingerprint == expected);
+        if !source_matches
+            || !recovery_matches
+            || !source_directories[index]
+                .0
+                .matches_path(source_paths[index].parent().unwrap())
+                .is_ok_and(|matches| matches)
+        {
+            removal_error = Some(stale("Source or recovery bytes changed during quarantine"));
+            break;
+        }
+        let operation_key = format!("{snapshot_id}-{}", snapshot.model_id);
+        let (hold_name, journal_name) = deterministic_source_hold_names(&operation_key)?;
+        match source_directories[index].0.hold_verified_file_as(
+            &source_directories[index].1,
+            &expected,
+            library_core::MAX_INDEXED_FILE_BYTES,
+            &hold_name,
+            &journal_name,
+        ) {
+            Ok(held) => source_holds.push(source_hold_receipt(snapshot, &held)?),
+            Err(error) => {
+                if let Some(receipt) = recover_source_hold_receipt(
+                    &source_directories[index].0,
+                    snapshot,
+                    &journal_name,
+                ) {
+                    source_holds.push(receipt);
+                }
+                removal_error = Some(RuntimeError {
+                    code: RuntimeErrorCode::Io,
+                    message: format!(
+                        "Quarantine stopped while retaining source bytes: {error}; earlier source holds: {}",
+                        source_hold_summary(&source_holds)
+                    ),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: source_holds.clone(),
+                });
+                break;
+            }
+        }
+    }
+    if removal_error.is_none() && !db.catalog_path_matches() {
+        removal_error = Some(stale(
+            "Library catalog identity changed during source quarantine",
+        ));
+    }
+    if let Some(error) = removal_error {
+        if let Err(rollback_error) = rollback_quarantine_batch(
+            db,
+            &guard,
+            &snapshot_id,
+            snapshots,
+            &source_directories,
+            &source_paths,
+            &trash_directory,
+            &owned_name,
+            &owned_directory,
+        ) {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                message: format!(
+                    "{}; source recovery holds: {}",
+                    rollback_error.message,
+                    source_hold_summary(&source_holds)
+                ),
+                source_holds: source_holds.clone(),
+                ..rollback_error
+            });
+        }
+        return Err(RuntimeError {
+            message: format!(
+                "{}; source recovery holds: {}",
+                error.message,
+                source_hold_summary(&source_holds)
+            ),
+            source_holds: source_holds.clone(),
+            ..error
+        });
+    }
     guard.invalidate();
     let model_ids = targets
         .iter()
@@ -4545,27 +7498,33 @@ fn execute_quarantine_batch(
         Ok(ManagementResult::Quarantined {
             snapshot_id,
             model_id: model_ids[0].clone(),
+            source_holds,
         })
     } else {
         Ok(ManagementResult::QuarantinedBatch {
             snapshot_id,
             models: model_ids,
+            source_holds,
         })
     }
 }
 
 fn rollback_quarantine_batch(
     db: &LibraryDb,
-    guard: &mut RuntimeMaintenanceGuard,
+    guard: &RuntimeMaintenanceGuard,
     snapshot_id: &str,
     snapshots: &[PhysicalSourceSnapshot],
+    source_directories: &[(secure_fs::Directory, std::ffi::OsString)],
     source_paths: &[PathBuf],
+    trash_directory: &secure_fs::Directory,
+    owned_name: &std::ffi::OsStr,
+    owned_directory: &secure_fs::Directory,
 ) -> Result<(), RuntimeError> {
-    for (snapshot, source_path) in snapshots.iter().zip(source_paths) {
-        let recovery_path =
-            quarantine_source_for_model(guard.root(), snapshot_id, &snapshot.model_id, false)?;
+    for (index, snapshot) in snapshots.iter().enumerate() {
         let expected = (snapshot.bytes, snapshot.sha256.clone());
-        if !hash_management_file(&recovery_path, library_core::MAX_INDEXED_FILE_BYTES)
+        let recovery_name = std::ffi::OsString::from(format!("{}.bin", snapshot.model_id));
+        if !owned_directory
+            .hash_file(&recovery_name, library_core::MAX_INDEXED_FILE_BYTES)
             .is_ok_and(|fingerprint| fingerprint == expected)
         {
             return Err(RuntimeError {
@@ -4573,11 +7532,22 @@ fn rollback_quarantine_batch(
                 message: "Quarantine recovery bytes changed; originals were preserved".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
-        match fs::symlink_metadata(source_path) {
-            Ok(_) => {
-                if !hash_management_file(source_path, library_core::MAX_INDEXED_FILE_BYTES)
+        if !source_directories[index]
+            .0
+            .matches_path(source_paths[index].parent().unwrap())
+            .is_ok_and(|matches| matches)
+        {
+            return Err(stale("Source root changed and blocks quarantine rollback"));
+        }
+        match source_directories[index]
+            .0
+            .open_file(&source_directories[index].1)
+        {
+            Ok(mut file) => {
+                if !secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
                     .is_ok_and(|fingerprint| fingerprint == expected)
                 {
                     return Err(RuntimeError {
@@ -4585,36 +7555,121 @@ fn rollback_quarantine_batch(
                         message: "A changed source path blocks quarantine rollback".into(),
                         retryable: false,
                         current_version: None,
+                        source_holds: Vec::new(),
                     });
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                copy_verified_source_file(&recovery_path, source_path, &expected)?;
+                secure_fs::copy_verified_into_directory(
+                    owned_directory,
+                    &recovery_name,
+                    &source_directories[index].0,
+                    &source_directories[index].1,
+                    &expected,
+                    library_core::MAX_INDEXED_FILE_BYTES,
+                )
+                .map_err(|_| stale("Quarantine recovery copy could not be restored"))?;
             }
             Err(_) => return Err(io_error()),
         }
     }
-    restore_quarantine_catalog(db, snapshot_id, guard)?;
-    clean_quarantine_sources(guard.root(), snapshot_id, snapshots);
+    restore_quarantine_catalog(db, snapshot_id)?;
+    trash_directory
+        .remove_child_tree(owned_name)
+        .map_err(|_| io_error())?;
     guard.invalidate();
     Ok(())
 }
 
-fn restore_quarantine_catalog(
-    db: &LibraryDb,
-    snapshot_id: &str,
-    guard: &mut RuntimeMaintenanceGuard,
-) -> Result<(), RuntimeError> {
+fn restore_quarantine_catalog(db: &LibraryDb, snapshot_id: &str) -> Result<(), RuntimeError> {
     if db.restore_removal(snapshot_id).is_ok() {
         return Ok(());
     }
-    guard.remain_armed();
     Err(RuntimeError {
         code: RuntimeErrorCode::Corrupt,
         message: "Quarantine failed and the catalog rollback did not complete".into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     })
+}
+
+fn retain_created_quarantine_source_files(
+    source_directories: &[(secure_fs::Directory, std::ffi::OsString)],
+    expected_files: &[(u64, String)],
+    created: &[bool],
+    snapshots: &[PhysicalSourceSnapshot],
+    snapshot_id: &str,
+) -> (Vec<SourceHoldReceipt>, Vec<String>) {
+    let mut source_holds = Vec::new();
+    let mut failures = Vec::new();
+    for (index, created) in created.iter().enumerate() {
+        if !created {
+            continue;
+        }
+        let operation_key = format!("undo-{snapshot_id}-{}", snapshots[index].model_id);
+        let (hold_name, journal_name) = match deterministic_source_hold_names(&operation_key) {
+            Ok(names) => names,
+            Err(error) => {
+                failures.push(format!("{}: {error}", snapshots[index].model_id));
+                continue;
+            }
+        };
+        match source_directories[index].0.hold_verified_file_as(
+            &source_directories[index].1,
+            &expected_files[index],
+            library_core::MAX_INDEXED_FILE_BYTES,
+            &hold_name,
+            &journal_name,
+        ) {
+            Ok(held) => match source_hold_receipt(&snapshots[index], &held) {
+                Ok(receipt) => source_holds.push(receipt),
+                Err(error) => failures.push(format!("{}: {}", snapshots[index].model_id, error)),
+            },
+            Err(error) => {
+                if let Some(receipt) = recover_source_hold_receipt(
+                    &source_directories[index].0,
+                    &snapshots[index],
+                    &journal_name,
+                ) {
+                    source_holds.push(receipt);
+                }
+                failures.push(format!("{}: {error}", snapshots[index].model_id));
+            }
+        }
+    }
+    (source_holds, failures)
+}
+
+fn quarantine_undo_cleanup_error(
+    message: &str,
+    source_holds: Vec<SourceHoldReceipt>,
+    hold_failures: Vec<String>,
+) -> RuntimeError {
+    let code = if hold_failures.is_empty() {
+        RuntimeErrorCode::Stale
+    } else {
+        RuntimeErrorCode::Corrupt
+    };
+    let details = if hold_failures.is_empty() {
+        format!(
+            "recoverable source holds: {}",
+            source_hold_summary(&source_holds)
+        )
+    } else {
+        format!(
+            "hold failures: {}; successful source holds: {}",
+            hold_failures.join(", "),
+            source_hold_summary(&source_holds)
+        )
+    };
+    RuntimeError {
+        code,
+        message: format!("{message}; {details}"),
+        retryable: false,
+        current_version: None,
+        source_holds,
+    }
 }
 
 fn execute_undo_quarantine_batch(
@@ -4625,6 +7680,7 @@ fn execute_undo_quarantine_batch(
     expected_epoch: u64,
     expected_revision: u64,
 ) -> Result<ManagementResult, RuntimeError> {
+    require_durable_source_mutations()?;
     runtime.require(context, Capability::CatalogWrite)?;
     runtime.require(context, Capability::PhysicalSourceWrite)?;
     validate_plain_id_text(snapshot_id, "Quarantine snapshot")?;
@@ -4634,9 +7690,30 @@ fn execute_undo_quarantine_batch(
         .get()
         .and_then(Weak::upgrade)
         .ok_or_else(|| internal("Runtime owner is unavailable"))?;
-    let mut guard = runtime_arc.begin_maintenance()?;
+    let guard = runtime_arc.begin_source_mutation_maintenance()?;
     recheck_management_plan(runtime, expected_epoch, expected_revision)?;
-    let db = LibraryDb::open(guard.root()).map_err(runtime_library_error)?;
+    let library_root = guard.root().to_path_buf();
+    let library_directory = secure_fs::Directory::open(&library_root)
+        .map_err(|_| stale("Library root is no longer a safe directory"))?;
+    if !library_directory
+        .matches_path(&library_root)
+        .map_err(|_| stale("Library root identity changed"))?
+    {
+        return Err(stale("Library root identity changed"));
+    }
+    let db = guard.catalog()?;
+    #[cfg(test)]
+    runtime.run_after_guarded_catalog_open_hook();
+    if !db.catalog_path_matches() {
+        return Err(stale(
+            "Library catalog identity changed during quarantine undo setup",
+        ));
+    }
+    if db.root() != library_root {
+        return Err(stale(
+            "Library root identity changed before quarantine undo",
+        ));
+    }
     let removed = db
         .list_removed_models()
         .map_err(runtime_library_error)?
@@ -4646,8 +7723,19 @@ fn execute_undo_quarantine_batch(
     if removed.len() != snapshots.len() {
         return Err(stale("Quarantine snapshot membership changed"));
     }
-    let mut destinations = Vec::with_capacity(snapshots.len());
-    let mut created: Vec<(PathBuf, (u64, String))> = Vec::with_capacity(snapshots.len());
+    let trash_directory = library_directory
+        .open_child(std::ffi::OsStr::new("trash"))
+        .map_err(|_| stale("Quarantine recovery namespace is unsafe"))?;
+    let owned_name = std::ffi::OsString::from(format!("source-{snapshot_id}"));
+    let owned_directory = trash_directory
+        .open_child(&owned_name)
+        .map_err(|_| stale("Quarantine recovery directory is unavailable"))?;
+    let source_directories = snapshots
+        .iter()
+        .map(open_physical_source_parent)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut already_present = Vec::with_capacity(snapshots.len());
+    let mut expected_files = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
         let item = removed
             .iter()
@@ -4659,66 +7747,232 @@ fn execute_undo_quarantine_batch(
         {
             return Err(stale("Quarantine catalog record changed"));
         }
-        let recovery_path =
-            quarantine_source_for_model(guard.root(), snapshot_id, &snapshot.model_id, false)?;
         let expected = (snapshot.bytes, snapshot.sha256.clone());
-        if !hash_management_file(&recovery_path, library_core::MAX_INDEXED_FILE_BYTES)
+        let recovery_name = std::ffi::OsString::from(format!("{}.bin", snapshot.model_id));
+        if !owned_directory
+            .hash_file(&recovery_name, library_core::MAX_INDEXED_FILE_BYTES)
             .is_ok_and(|fingerprint| fingerprint == expected)
         {
             return Err(stale("Quarantine recovery bytes changed"));
         }
         let destination = revalidate_removed_destination(runtime, context, &item.model, snapshot)?;
-        let already_present = match fs::symlink_metadata(&destination) {
+        if destination != snapshot.root_path.join(&snapshot.relative_path)
+            || !source_directories[expected_files.len()]
+                .0
+                .matches_path(destination.parent().unwrap())
+                .is_ok_and(|matches| matches)
+        {
+            return Err(stale("Quarantine destination root changed"));
+        }
+        let source_name = &source_directories[expected_files.len()].1;
+        let exists = match source_directories[expected_files.len()]
+            .0
+            .open_file(source_name)
+        {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Ok(metadata)
-                if metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && hash_management_file(&destination, library_core::MAX_INDEXED_FILE_BYTES)
-                        .is_ok_and(|fingerprint| fingerprint == expected) =>
-            {
-                true
+            Ok(mut file) => {
+                if secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
+                    .is_ok_and(|fingerprint| fingerprint == expected)
+                {
+                    true
+                } else {
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Conflict,
+                        message: "Original source path is occupied by different bytes".into(),
+                        retryable: false,
+                        current_version: None,
+                        source_holds: Vec::new(),
+                    });
+                }
             }
-            Ok(_) => {
-                return Err(RuntimeError {
-                    code: RuntimeErrorCode::Conflict,
-                    message: "Original source path is occupied by different bytes".into(),
-                    retryable: false,
-                    current_version: None,
-                });
-            }
-            Err(_) => return Err(io_error()),
+            Err(_) => return Err(stale("Original source path is unsafe or unavailable")),
         };
-        destinations.push((recovery_path, destination, expected, already_present));
+        already_present.push(exists);
+        expected_files.push(expected);
     }
-    for (recovery_path, destination, expected, already_present) in &destinations {
-        if *already_present {
+    let mut created = Vec::with_capacity(snapshots.len());
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        if already_present[index] {
+            created.push(false);
             continue;
         }
-        if let Err(error) = copy_verified_source_file(recovery_path, destination, expected) {
-            if !remove_verified_batch_files(&created) {
+        if !source_directories[index]
+            .0
+            .matches_path(
+                snapshot
+                    .root_path
+                    .join(&snapshot.relative_path)
+                    .parent()
+                    .unwrap(),
+            )
+            .is_ok_and(|matches| matches)
+        {
+            let (source_holds, hold_failures) = retain_created_quarantine_source_files(
+                &source_directories,
+                &expected_files,
+                &created,
+                snapshots,
+                snapshot_id,
+            );
+            if !hold_failures.is_empty() {
                 guard.remain_armed();
-                return Err(RuntimeError {
-                    code: RuntimeErrorCode::Corrupt,
-                    message: "Quarantine undo copy failed and restored source copies remain".into(),
-                    retryable: false,
-                    current_version: None,
-                });
             }
-            return Err(error);
+            return Err(quarantine_undo_cleanup_error(
+                "Quarantine destination root changed before catalog recovery",
+                source_holds,
+                hold_failures,
+            ));
         }
-        created.push((destination.clone(), expected.clone()));
+        let recovery_name = std::ffi::OsString::from(format!("{}.bin", snapshot.model_id));
+        if let Err(copy_error) = secure_fs::copy_verified_into_directory(
+            &owned_directory,
+            &recovery_name,
+            &source_directories[index].0,
+            &source_directories[index].1,
+            &expected_files[index],
+            library_core::MAX_INDEXED_FILE_BYTES,
+        ) {
+            let (source_holds, hold_failures) = retain_created_quarantine_source_files(
+                &source_directories,
+                &expected_files,
+                &created,
+                snapshots,
+                snapshot_id,
+            );
+            if !hold_failures.is_empty() {
+                guard.remain_armed();
+            }
+            return Err(quarantine_undo_cleanup_error(
+                &format!("Quarantine recovery copy could not be restored: {copy_error}"),
+                source_holds,
+                hold_failures,
+            ));
+        }
+        created.push(true);
+    }
+    if source_directories
+        .iter()
+        .enumerate()
+        .any(|(index, directory)| {
+            !directory
+                .0
+                .matches_path(
+                    snapshots[index]
+                        .root_path
+                        .join(&snapshots[index].relative_path)
+                        .parent()
+                        .unwrap(),
+                )
+                .is_ok_and(|matches| matches)
+        })
+        || !library_directory
+            .matches_path(&library_root)
+            .is_ok_and(|matches| matches)
+    {
+        let (source_holds, hold_failures) = retain_created_quarantine_source_files(
+            &source_directories,
+            &expected_files,
+            &created,
+            snapshots,
+            snapshot_id,
+        );
+        if !hold_failures.is_empty() {
+            guard.remain_armed();
+        }
+        return Err(quarantine_undo_cleanup_error(
+            "Quarantine destination root changed before catalog recovery",
+            source_holds,
+            hold_failures,
+        ));
+    }
+    let source_preflight_matches =
+        source_directories
+            .iter()
+            .enumerate()
+            .all(|(index, directory)| {
+                directory
+                    .0
+                    .open_file(&directory.1)
+                    .and_then(|mut file| {
+                        secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
+                    })
+                    .is_ok_and(|fingerprint| fingerprint == expected_files[index])
+            });
+    if !source_preflight_matches {
+        let (source_holds, hold_failures) = retain_created_quarantine_source_files(
+            &source_directories,
+            &expected_files,
+            &created,
+            snapshots,
+            snapshot_id,
+        );
+        if !hold_failures.is_empty() {
+            guard.remain_armed();
+        }
+        return Err(quarantine_undo_cleanup_error(
+            "Quarantine source changed before catalog recovery",
+            source_holds,
+            hold_failures,
+        ));
+    }
+    if !db.catalog_path_matches() {
+        let (source_holds, hold_failures) = retain_created_quarantine_source_files(
+            &source_directories,
+            &expected_files,
+            &created,
+            snapshots,
+            snapshot_id,
+        );
+        if !hold_failures.is_empty() {
+            guard.remain_armed();
+        }
+        return Err(quarantine_undo_cleanup_error(
+            "Library catalog identity changed before quarantine catalog recovery",
+            source_holds,
+            hold_failures,
+        ));
     }
     if let Err(error) = db.restore_removal(snapshot_id) {
-        if !remove_verified_batch_files(&created) {
+        let (source_holds, hold_failures) = retain_created_quarantine_source_files(
+            &source_directories,
+            &expected_files,
+            &created,
+            snapshots,
+            snapshot_id,
+        );
+        if !hold_failures.is_empty() {
             guard.remain_armed();
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Quarantine undo failed and restored source copies remain".into(),
-                retryable: false,
-                current_version: None,
-            });
+            return Err(quarantine_undo_cleanup_error(
+                &format!("Quarantine catalog rollback failed: {error}"),
+                source_holds,
+                hold_failures,
+            ));
         }
-        return Err(runtime_library_error(error));
+        return Err(RuntimeError {
+            message: format!(
+                "Quarantine catalog rollback failed: {error}; recovery source copies were moved into holds: {}",
+                source_hold_summary(&source_holds)
+            ),
+            source_holds,
+            ..runtime_library_error(error)
+        });
+    }
+    if !db.catalog_path_matches() {
+        let (source_holds, hold_failures) = retain_created_quarantine_source_files(
+            &source_directories,
+            &expected_files,
+            &created,
+            snapshots,
+            snapshot_id,
+        );
+        if !hold_failures.is_empty() {
+            guard.remain_armed();
+        }
+        return Err(quarantine_undo_cleanup_error(
+            "Library catalog identity changed during quarantine recovery",
+            source_holds,
+            hold_failures,
+        ));
     }
     let models = snapshots
         .iter()
@@ -4727,9 +7981,24 @@ fn execute_undo_quarantine_batch(
             metadata_version: snapshot.metadata_version.saturating_add(1),
         })
         .collect::<Vec<_>>();
-    for (_, destination, expected, _) in &destinations {
-        if !hash_management_file(destination, library_core::MAX_INDEXED_FILE_BYTES)
+    for (index, expected) in expected_files.iter().enumerate() {
+        if !source_directories[index]
+            .0
+            .open_file(&source_directories[index].1)
+            .and_then(|mut file| {
+                secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
+            })
             .is_ok_and(|fingerprint| fingerprint == *expected)
+            || !source_directories[index]
+                .0
+                .matches_path(
+                    snapshots[index]
+                        .root_path
+                        .join(&snapshots[index].relative_path)
+                        .parent()
+                        .unwrap(),
+                )
+                .is_ok_and(|matches| matches)
         {
             guard.invalidate();
             guard.remain_armed();
@@ -4738,7 +8007,9 @@ fn execute_undo_quarantine_batch(
             ));
         }
     }
-    clean_quarantine_sources(guard.root(), snapshot_id, snapshots);
+    trash_directory
+        .remove_child_tree(&owned_name)
+        .map_err(|_| io_error())?;
     guard.invalidate();
     if models.len() == 1 {
         Ok(ManagementResult::QuarantineUndone {
@@ -4758,6 +8029,7 @@ fn execute_move_batch(
     expected_epoch: u64,
     expected_revision: u64,
 ) -> Result<ManagementResult, RuntimeError> {
+    require_durable_source_mutations()?;
     runtime.require(context, Capability::CatalogWrite)?;
     runtime.require(context, Capability::PhysicalSourceWrite)?;
     validate_physical_targets(targets.iter().map(|target| target.model_id.as_str()))?;
@@ -4778,15 +8050,20 @@ fn execute_move_batch(
         .get()
         .and_then(Weak::upgrade)
         .ok_or_else(|| internal("Runtime owner is unavailable"))?;
-    let mut guard = runtime_arc.begin_maintenance()?;
+    let guard = runtime_arc.begin_source_mutation_maintenance()?;
     recheck_management_plan(runtime, expected_epoch, expected_revision)?;
-    let db = LibraryDb::open(guard.root()).map_err(runtime_library_error)?;
+    let db = guard.catalog()?;
+    #[cfg(test)]
+    runtime.run_after_guarded_catalog_open_hook();
+    if !db.catalog_path_matches() {
+        return Err(stale("Library catalog identity changed during move setup"));
+    }
     let source_paths = targets
         .iter()
         .zip(snapshots)
         .map(|(target, snapshot)| {
             revalidate_active_source(
-                &db,
+                db,
                 runtime,
                 context,
                 &VersionedTarget {
@@ -4802,6 +8079,38 @@ fn execute_move_batch(
     if destination_root.canonicalize().map_err(|_| io_error())? != destination_root {
         return Err(stale("Move destination root identity changed"));
     }
+    let destination_directory = secure_fs::Directory::open(&destination_root)
+        .map_err(|_| stale("Move destination root is no longer a safe directory"))?;
+    if !destination_directory
+        .matches_path(&destination_root)
+        .map_err(|_| stale("Move destination root identity changed"))?
+    {
+        return Err(stale("Move destination root identity changed"));
+    }
+    let source_directories = snapshots
+        .iter()
+        .map(|snapshot| {
+            let source_root = secure_fs::Directory::open(&snapshot.root_path)
+                .map_err(|_| stale("Move source root is no longer a safe directory"))?;
+            let parent = snapshot
+                .relative_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            source_root
+                .open_relative(parent)
+                .map_err(|_| stale("Move source parent changed"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_names = snapshots
+        .iter()
+        .map(|snapshot| {
+            snapshot
+                .relative_path
+                .file_name()
+                .map(|name| name.to_os_string())
+                .ok_or_else(|| invalid("Move source path has no file name"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let destination_catalog_root_id = runtime
         .roots
         .iter()
@@ -4839,47 +8148,96 @@ fn execute_move_batch(
         .map(|snapshot| (snapshot.bytes, snapshot.sha256.clone()))
         .collect::<Vec<_>>();
     let mut copied = Vec::new();
-    for ((source, destination), fingerprint) in
-        source_paths.iter().zip(&destinations).zip(&expected)
-    {
-        if let Err(error) = copy_verified_source_file(source, destination, fingerprint) {
-            let cleanup_ok = remove_verified_batch_files(&copied);
-            if !cleanup_ok {
-                guard.remain_armed();
-                return Err(RuntimeError {
-                    code: RuntimeErrorCode::Corrupt,
-                    message: "Move copy failed and verified destination copies remain".into(),
-                    retryable: false,
-                    current_version: None,
-                });
-            }
-            return Err(error);
+    let mut destination_metadata = Vec::with_capacity(targets.len());
+    for (index, fingerprint) in expected.iter().enumerate() {
+        if !source_directories[index]
+            .matches_path(source_paths[index].parent().unwrap())
+            .is_ok_and(|matches| matches)
+            || !destination_directory
+                .matches_path(&destination_root)
+                .is_ok_and(|matches| matches)
+        {
+            return Err(stale("Move source or destination root identity changed"));
         }
-        copied.push((destination.clone(), fingerprint.clone()));
+        let destination_name = std::ffi::OsStr::new(&targets[index].file_name);
+        let result = secure_fs::copy_verified_into_directory(
+            &source_directories[index],
+            &source_names[index],
+            &destination_directory,
+            destination_name,
+            fingerprint,
+            library_core::MAX_INDEXED_FILE_BYTES,
+        );
+        match result {
+            Ok(metadata) => {
+                copied.push((targets[index].file_name.clone(), fingerprint.clone()));
+                destination_metadata.push(metadata);
+            }
+            Err(_) => {
+                let cleanup_ok = copied.iter().all(|(name, expected)| {
+                    destination_directory
+                        .unlink_verified_file(
+                            std::ffi::OsStr::new(name),
+                            expected,
+                            library_core::MAX_INDEXED_FILE_BYTES,
+                        )
+                        .is_ok()
+                });
+                if !cleanup_ok {
+                    guard.remain_armed();
+                    return Err(RuntimeError {
+                        code: RuntimeErrorCode::Corrupt,
+                        message: "Move copy failed and verified destination copies remain".into(),
+                        retryable: false,
+                        current_version: None,
+                        source_holds: Vec::new(),
+                    });
+                }
+                return Err(io_error());
+            }
+        }
     }
-    let sources_match = source_paths
-        .iter()
-        .zip(&expected)
-        .all(|(source, fingerprint)| {
-            hash_management_file(source, library_core::MAX_INDEXED_FILE_BYTES)
-                .is_ok_and(|actual| actual == *fingerprint)
-        });
-    let destinations_match =
-        destinations
+    let sources_match =
+        source_paths
             .iter()
             .zip(&expected)
-            .all(|(destination, fingerprint)| {
-                hash_management_file(destination, library_core::MAX_INDEXED_FILE_BYTES)
+            .enumerate()
+            .all(|(index, (_source, fingerprint))| {
+                source_directories[index]
+                    .open_file(&source_names[index])
+                    .and_then(|mut file| {
+                        secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
+                    })
                     .is_ok_and(|actual| actual == *fingerprint)
             });
+    let destinations_match = expected.iter().enumerate().all(|(index, fingerprint)| {
+        destination_directory
+            .open_file(std::ffi::OsStr::new(&targets[index].file_name))
+            .and_then(|mut file| {
+                secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
+            })
+            .is_ok_and(|actual| actual == *fingerprint)
+    }) && destination_directory
+        .matches_path(&destination_root)
+        .is_ok_and(|matches| matches);
     if !sources_match || !destinations_match {
-        if !remove_verified_batch_files(&copied) {
+        let cleanup_ok = copied.iter().all(|(name, expected)| {
+            destination_directory
+                .unlink_verified_file(
+                    std::ffi::OsStr::new(name),
+                    expected,
+                    library_core::MAX_INDEXED_FILE_BYTES,
+                )
+                .is_ok()
+        });
+        if !cleanup_ok {
             guard.remain_armed();
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Corrupt,
                 message: "Move preflight changed and verified destination copies remain".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         return Err(stale(
@@ -4888,19 +8246,33 @@ fn execute_move_batch(
     }
     let core_moves = targets
         .iter()
-        .zip(&destinations)
-        .map(|(target, destination)| CoreIndexedModelMove {
+        .zip(&destination_metadata)
+        .map(|(target, metadata)| CoreIndexedModelMove {
             model_id: target.model_id.clone(),
             expected_version: target.expected_version,
             destination_root_id: destination_catalog_root.id.clone(),
             destination_relative_path: PathBuf::from(&target.file_name),
-            modified_at: file_modified_seconds(destination),
+            modified_at: metadata_modified_seconds(metadata),
         })
         .collect::<Vec<_>>();
+    if !db.catalog_path_matches() {
+        return Err(stale(
+            "Library catalog identity changed before move commit; original sources remain active",
+        ));
+    }
     let moved = match db.move_loose_indexed_models(&core_moves) {
         Ok(moved) => moved,
         Err(error) => {
-            if !remove_verified_batch_files(&copied) {
+            let cleanup_ok = copied.iter().all(|(name, expected)| {
+                destination_directory
+                    .unlink_verified_file(
+                        std::ffi::OsStr::new(name),
+                        expected,
+                        library_core::MAX_INDEXED_FILE_BYTES,
+                    )
+                    .is_ok()
+            });
+            if !cleanup_ok {
                 guard.remain_armed();
                 return Err(RuntimeError {
                     code: RuntimeErrorCode::Corrupt,
@@ -4909,57 +8281,102 @@ fn execute_move_batch(
                             .into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
             }
             return Err(runtime_library_error(error));
         }
     };
+    if !db.catalog_path_matches() {
+        return Err(stale(
+            "Library catalog identity changed during move; original sources remain active and verified destination copies were retained",
+        ));
+    }
     guard.invalidate();
-    let all_destinations_verified =
-        destinations
-            .iter()
-            .zip(&expected)
-            .all(|(destination, fingerprint)| {
-                hash_management_file(destination, library_core::MAX_INDEXED_FILE_BYTES)
-                    .is_ok_and(|actual| actual == *fingerprint)
-            });
+    let all_destinations_verified = expected.iter().enumerate().all(|(index, fingerprint)| {
+        destination_directory
+            .open_file(std::ffi::OsStr::new(&targets[index].file_name))
+            .and_then(|mut file| {
+                secure_fs::hash_file(&mut file, library_core::MAX_INDEXED_FILE_BYTES)
+            })
+            .is_ok_and(|actual| actual == *fingerprint)
+    }) && destination_directory
+        .matches_path(&destination_root)
+        .is_ok_and(|matches| matches);
     if !all_destinations_verified {
         return Err(RuntimeError {
             code: RuntimeErrorCode::Corrupt,
             message: "Move catalog update committed, but a destination changed; original sources were retained".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         });
     }
-    for (source, fingerprint) in source_paths.iter().zip(&expected) {
-        if !hash_management_file(source, library_core::MAX_INDEXED_FILE_BYTES)
-            .is_ok_and(|actual| actual == *fingerprint)
+    let mut source_holds = Vec::with_capacity(expected.len());
+    for (index, fingerprint) in expected.iter().enumerate() {
+        let source_parent_path = source_paths[index].parent().unwrap();
+        if !source_directories[index]
+            .matches_path(source_parent_path)
+            .is_ok_and(|matches| matches)
         {
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Corrupt,
-                message: "Move catalog update committed, but a source changed; remaining originals were preserved".into(),
+                message: format!(
+                    "Move catalog update committed, but a source changed; remaining originals were preserved. Source recovery holds: {}",
+                    source_hold_summary(&source_holds)
+                ),
                 retryable: false,
                 current_version: None,
+                source_holds: source_holds.clone(),
             });
         }
-        if fs::remove_file(source).is_err() {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Move catalog update committed, but an original source remains".into(),
-                retryable: false,
-                current_version: None,
-            });
-        }
-        if sync_parent_directory(source).is_err() {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Move catalog update committed, but source directory cleanup could not be synced".into(),
-                retryable: false,
-                current_version: None,
-            });
-        }
+        let hold_key = format!(
+            "move-{}-v{}",
+            snapshots[index].model_id, snapshots[index].metadata_version
+        );
+        let (hold_name, journal_name) = deterministic_source_hold_names(&hold_key)?;
+        let hold = match source_directories[index].hold_verified_file_as(
+            &source_names[index],
+            fingerprint,
+            library_core::MAX_INDEXED_FILE_BYTES,
+            &hold_name,
+            &journal_name,
+        ) {
+            Ok(hold) => hold,
+            Err(error) => {
+                if let Some(receipt) = recover_source_hold_receipt(
+                    &source_directories[index],
+                    &snapshots[index],
+                    &journal_name,
+                ) {
+                    source_holds.push(receipt);
+                }
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: format!(
+                        "Move catalog update committed, but source retention was interrupted: {error}. Source recovery holds: {}",
+                        source_hold_summary(&source_holds)
+                    ),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: source_holds.clone(),
+                });
+            }
+        };
+        source_holds.push(source_hold_receipt(&snapshots[index], &hold)?);
     }
-    drop(db);
+    if !db.catalog_path_matches() {
+        return Err(RuntimeError {
+            code: RuntimeErrorCode::Stale,
+            message: format!(
+                "Library catalog identity changed during move; source recovery holds: {}",
+                source_hold_summary(&source_holds)
+            ),
+            retryable: false,
+            current_version: None,
+            source_holds,
+        });
+    }
     let models = moved
         .iter()
         .cloned()
@@ -4968,25 +8385,14 @@ fn execute_move_batch(
     if models.len() == 1 {
         Ok(ManagementResult::Moved {
             model: models[0].clone(),
+            source_holds,
         })
     } else {
-        Ok(ManagementResult::MovedBatch { models })
-    }
-}
-
-fn remove_verified_batch_files(files: &[(PathBuf, (u64, String))]) -> bool {
-    files
-        .iter()
-        .all(|(path, expected)| match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-            Ok(_)
-                if hash_management_file(path, library_core::MAX_INDEXED_FILE_BYTES)
-                    .is_ok_and(|actual| actual == *expected) =>
-            {
-                fs::remove_file(path).is_ok()
-            }
-            _ => false,
+        Ok(ManagementResult::MovedBatch {
+            models,
+            source_holds,
         })
+    }
 }
 
 fn revalidate_active_source(
@@ -5046,14 +8452,6 @@ fn revalidate_removed_destination(
     validate_relative_target(&snapshot.root_path, &snapshot.relative_path, false)
 }
 
-fn remove_file_if_verified(path: &Path, expected: &(u64, String)) {
-    if hash_management_file(path, library_core::MAX_INDEXED_FILE_BYTES)
-        .is_ok_and(|fingerprint| fingerprint == *expected)
-    {
-        let _ = fs::remove_file(path);
-    }
-}
-
 fn execute_backup(
     runtime: &LibraryRuntime,
     context: &RequestContext,
@@ -5080,7 +8478,7 @@ fn execute_backup(
         .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
     let _guard = runtime_arc.begin_maintenance()?;
     recheck_management_plan(runtime, expected_epoch, expected_revision)?;
-    let result = library_backup::create_backup(&runtime.root, &destination)
+    let result = create_backup_file(&runtime.root, &destination)
         .map_err(|_| invalid("Library backup could not be created"))?;
     Ok(ManagementResult::BackupCreated {
         destination_handle_id: handle_id.into(),
@@ -5088,6 +8486,571 @@ fn execute_backup(
         files: result.files,
         bytes: result.bytes,
         sha256: result.sha256,
+    })
+}
+
+fn execute_purge_catalog(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    backup_handle_id: &str,
+    backup_file_name: &str,
+    managed_assets: &[ManagedAssetSnapshot],
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<ManagementResult, RuntimeError> {
+    runtime.require(context, Capability::CatalogWrite)?;
+    runtime.require(context, Capability::Maintenance)?;
+    require_durable_source_mutations()?;
+    runtime.require(context, Capability::BackupWrite)?;
+    let (backup_root, _backup_path) = admitted_file(
+        runtime,
+        context,
+        backup_handle_id,
+        RootAccess::BackupOnly,
+        backup_file_name,
+        false,
+    )?;
+    let backup_directory = secure_fs::Directory::open(&backup_root)
+        .map_err(|_| stale("Backup destination root is no longer a safe directory"))?;
+    if !backup_directory
+        .matches_path(&backup_root)
+        .map_err(|_| stale("Backup destination root identity changed"))?
+    {
+        return Err(stale("Backup destination root identity changed"));
+    }
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
+    let mut guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let configured_root = runtime.root.clone();
+    let parent = configured_root
+        .parent()
+        .ok_or_else(|| invalid("Library root has no parent directory"))?
+        .to_path_buf();
+    let root_name = configured_root
+        .file_name()
+        .ok_or_else(|| invalid("Library root name is invalid"))?
+        .to_os_string();
+    let parent_directory = secure_fs::Directory::open(&parent)
+        .map_err(|_| stale("Library parent is no longer a safe directory"))?;
+    if !parent_directory
+        .matches_path(&parent)
+        .map_err(|_| stale("Library parent identity changed"))?
+    {
+        return Err(stale("Library parent identity changed"));
+    }
+    let root_directory = parent_directory
+        .open_child(&root_name)
+        .map_err(|_| stale("Library root is no longer a safe directory"))?;
+    if !root_directory
+        .matches_path(&configured_root)
+        .map_err(|_| stale("Library root identity changed"))?
+    {
+        return Err(stale("Library root identity changed"));
+    }
+    let root_handle_path = root_directory
+        .path()
+        .map_err(|_| RuntimeError {
+            code: RuntimeErrorCode::Unsupported,
+            message: "Pinned Library paths are unavailable on this Unix host".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })?
+        .join(".");
+    verify_managed_asset_snapshots(&root_handle_path, managed_assets)?;
+
+    let active_db = LibraryDb::open(&root_handle_path).map_err(runtime_library_error)?;
+    if active_db.root() != configured_root {
+        return Err(stale("Library root identity changed before purge"));
+    }
+    let expected_model_count = active_db
+        .list_models(None, None)
+        .map_err(runtime_library_error)?
+        .len();
+    let expected_roots = active_db
+        .list_index_roots()
+        .map_err(runtime_library_error)?;
+    let root = active_db.root().to_path_buf();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let scratch_backup_directory = create_scratch_directory("purge-backup")?;
+    let scratch_backup_parent = scratch_backup_directory.path.clone();
+    let scratch_backup = scratch_backup_parent.join(backup_file_name);
+    let scratch_backup_result = create_backup_file(&root_handle_path, &scratch_backup)
+        .map_err(|_| invalid("Library backup could not be created"))?;
+    let (backup_bytes, backup_sha256) = scratch_backup_directory
+        .directory
+        .hash_file(
+            std::ffi::OsStr::new(backup_file_name),
+            library_backup::MAX_BACKUP_ARCHIVE_BYTES,
+        )
+        .map_err(|_| io_error())?;
+    if scratch_backup_result.files == 0
+        || backup_bytes == 0
+        || backup_sha256 != scratch_backup_result.sha256
+    {
+        return Err(invalid("Library backup failed integrity verification"));
+    }
+    let scratch_backup_parent =
+        secure_fs::Directory::open(&scratch_backup_parent).map_err(|_| io_error())?;
+    secure_fs::copy_verified_into_directory(
+        &scratch_backup_parent,
+        std::ffi::OsStr::new(backup_file_name),
+        &backup_directory,
+        std::ffi::OsStr::new(backup_file_name),
+        &(backup_bytes, backup_sha256.clone()),
+        MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024,
+    )
+    .map_err(|_| stale("Backup destination changed before purge"))?;
+    let backup_at_destination = backup_directory
+        .open_file(std::ffi::OsStr::new(backup_file_name))
+        .and_then(|mut file| {
+            secure_fs::hash_file(&mut file, MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024)
+        })
+        .map_err(|_| stale("Purge backup changed after creation"))?;
+    if backup_at_destination != (backup_bytes, backup_sha256.clone())
+        || !backup_directory
+            .matches_path(&backup_root)
+            .is_ok_and(|matches| matches)
+    {
+        let _ = backup_directory.unlink_verified_file(
+            std::ffi::OsStr::new(backup_file_name),
+            &(backup_bytes, backup_sha256.clone()),
+            MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024,
+        );
+        return Err(stale("Backup destination root identity changed"));
+    }
+    // Read the generated archive back into isolated staging and open its database
+    // before replacing the active catalog. A backup that cannot be restored never
+    // authorizes the purge.
+    let verification_temp = create_scratch_directory("purge-verify")?;
+    let verification_name = std::ffi::OsString::from("restored-library");
+    verification_temp
+        .directory
+        .create_child_directory(&verification_name)
+        .map_err(|_| io_error())?;
+    let verification_directory = verification_temp
+        .directory
+        .open_child(&verification_name)
+        .map_err(|_| io_error())?;
+    let mut verification_target = GuardedDirectory(verification_directory);
+    let verification_archive = scratch_backup_directory
+        .directory
+        .open_file(std::ffi::OsStr::new(backup_file_name))
+        .map_err(|_| stale("Purge verification archive is unavailable"))?;
+    library_backup::restore_backup_from_reader(verification_archive, &mut verification_target)
+        .map_err(|_| invalid("Library backup failed restore verification"))?;
+    let verification_root = verification_target.io_path().map_err(|_| io_error())?;
+    let verified_db = LibraryDb::open(&verification_root)
+        .map_err(|_| invalid("Library backup database failed verification"))?;
+    if verified_db
+        .list_models(None, None)
+        .map_err(|_| invalid("Library backup database failed verification"))?
+        .len()
+        != expected_model_count
+    {
+        return Err(invalid(
+            "Library backup model count does not match the catalog",
+        ));
+    }
+    drop(verified_db);
+    drop(verification_temp);
+    verify_managed_asset_snapshots(&root_handle_path, managed_assets)?;
+
+    let root_name_text = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("Library root name is invalid"))?;
+    let previous_name =
+        std::ffi::OsString::from(format!("{root_name_text}.previous-purge-{nonce}"));
+    let staged_name = std::ffi::OsString::from(format!(".gogglelab-empty-{nonce}"));
+    if parent_directory
+        .entry_exists(&previous_name)
+        .map_err(|_| io_error())?
+        || parent_directory
+            .entry_exists(&staged_name)
+            .map_err(|_| io_error())?
+    {
+        return Err(stale("Purge staging or recovery path is already occupied"));
+    }
+    let journal = PurgeJournal {
+        version: 1,
+        root_path: root
+            .to_str()
+            .ok_or_else(|| invalid("Purge requires a Unicode Library path"))?
+            .to_owned(),
+        nonce: nonce.clone(),
+        staged_name: staged_name.to_string_lossy().into_owned(),
+        previous_name: previous_name.to_string_lossy().into_owned(),
+        committed: false,
+    };
+    let (_journal_path, journal_name) = write_purge_journal_at(&parent_directory, &root, &journal)?;
+    let mut journal_guard = PurgeJournalGuard::new(
+        parent_directory.try_clone().map_err(|_| io_error())?,
+        journal_name.clone(),
+    );
+
+    let mut staged_temp =
+        OwnedDirectory::create_at(&parent_directory, &staged_name.to_string_lossy())?;
+    let staged_directory = parent_directory
+        .open_child(&staged_name)
+        .map_err(|_| io_error())?;
+    let template_temp = create_scratch_directory("purge-empty-library")?;
+    let template_root = template_temp.path.clone();
+    let staged_db = LibraryDb::open(&template_root).map_err(runtime_library_error)?;
+    staged_db
+        .copy_catalog_configuration_from(&active_db)
+        .map_err(runtime_library_error)?;
+    let staged_models = staged_db
+        .list_models(None, None)
+        .map_err(runtime_library_error)?;
+    let staged_roots = staged_db
+        .list_index_roots()
+        .map_err(runtime_library_error)?;
+    if !staged_models.is_empty()
+        || staged_roots.len() != expected_roots.len()
+        || staged_roots.iter().any(|root| {
+            !expected_roots.iter().any(|expected| {
+                root.id == expected.id
+                    && root.path == expected.path
+                    && root.enabled == expected.enabled
+                    && root.scan_interval_minutes == expected.scan_interval_minutes
+                    && root.max_file_bytes == expected.max_file_bytes
+                    && root.scan_zip == expected.scan_zip
+            })
+        })
+    {
+        return Err(invalid(
+            "Purged Library staging configuration failed validation",
+        ));
+    }
+    drop(staged_db);
+    for name in ["originals", "manuals", "thumbnails", "staging", "trash"] {
+        staged_directory
+            .create_child_directory(std::ffi::OsStr::new(name))
+            .map_err(|_| io_error())?;
+    }
+    let template_directory =
+        secure_fs::Directory::open(&template_root).map_err(|error| RuntimeError {
+            code: RuntimeErrorCode::Io,
+            message: format!("Purge staging template directory could not be opened: {error}"),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })?;
+    let (template_bytes, template_hash) = secure_fs::hash_file(
+        &mut template_directory
+            .open_file(std::ffi::OsStr::new("library.sqlite3"))
+            .map_err(|_| io_error())?,
+        16 * 1024 * 1024,
+    )
+    .map_err(|_| io_error())?;
+    secure_fs::copy_verified_into_directory(
+        &template_directory,
+        std::ffi::OsStr::new("library.sqlite3"),
+        &staged_directory,
+        std::ffi::OsStr::new("library.sqlite3"),
+        &(template_bytes, template_hash),
+        16 * 1024 * 1024,
+    )
+    .map_err(|_| io_error())?;
+    write_purge_stage_marker_at(&staged_directory, &nonce)?;
+    drop(active_db);
+    if !root_directory
+        .matches_path(&configured_root)
+        .is_ok_and(|matches| matches)
+        || !backup_directory
+            .matches_path(&backup_root)
+            .is_ok_and(|matches| matches)
+    {
+        return Err(stale(
+            "Library or backup destination identity changed before purge",
+        ));
+    }
+    verify_managed_asset_snapshots(&root_handle_path, managed_assets)?;
+
+    let epoch = guard.invalidate();
+    parent_directory
+        .rename_child_exclusive(&root_name, &previous_name)
+        .map_err(|_| stale("Library root changed before purge"))?;
+    journal_guard.disarm();
+    if parent_directory.sync().is_err() {
+        guard.remain_armed();
+        return Err(io_error());
+    }
+    if parent_directory
+        .rename_child_exclusive(&staged_name, &root_name)
+        .is_err()
+    {
+        if parent_directory
+            .rename_child_exclusive(&previous_name, &root_name)
+            .is_err()
+        {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Could not install the empty Library or restore the previous Library"
+                    .into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        if parent_directory.sync().is_err() {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Purge failed and the previous Library was restored, but the recovery journal could not be committed".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        if let Err(error) = clear_purge_journal_at(&parent_directory, &journal_name) {
+            guard.remain_armed();
+            return Err(error);
+        }
+        return Err(io_error());
+    }
+    staged_temp.disarm();
+    if parent_directory.sync().is_err() {
+        guard.remain_armed();
+        return Err(io_error());
+    }
+
+    let validation = LibraryDb::open(
+        staged_directory
+            .path()
+            .map_err(|_| invalid("Pinned staged Library path is unavailable"))?
+            .join("."),
+    )
+    .and_then(|db| {
+        let models = db.list_models(None, None)?;
+        let roots = db.list_index_roots()?;
+        if !models.is_empty()
+            || roots.len() != expected_roots.len()
+            || roots.iter().any(|root| {
+                !expected_roots.iter().any(|expected| {
+                    root.id == expected.id
+                        && root.path == expected.path
+                        && root.enabled == expected.enabled
+                        && root.scan_interval_minutes == expected.scan_interval_minutes
+                        && root.max_file_bytes == expected.max_file_bytes
+                        && root.scan_zip == expected.scan_zip
+                })
+            })
+        {
+            return Err(LibraryError::InvalidInput(
+                "Purged Library failed validation".into(),
+            ));
+        }
+        Ok(())
+    });
+    if validation.is_err()
+        || !staged_directory
+            .matches_path(&configured_root)
+            .is_ok_and(|matches| matches)
+    {
+        let failed_name = std::ffi::OsString::from(format!(".gogglelab-failed-purge-{nonce}"));
+        if parent_directory
+            .rename_child_exclusive(&root_name, &failed_name)
+            .is_err()
+            || parent_directory.sync().is_err()
+        {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Purged Library failed validation; recovery data remains under the pinned parent".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        if parent_directory
+            .rename_child_exclusive(&previous_name, &root_name)
+            .is_err()
+            || parent_directory.sync().is_err()
+        {
+            guard.remain_armed();
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Corrupt,
+                message: "Purged Library failed validation; recovery data remains under the pinned parent".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        if let Err(error) = clear_purge_journal_at(&parent_directory, &journal_name) {
+            guard.remain_armed();
+            return Err(error);
+        }
+        return Err(invalid(
+            "Purged Library failed validation and was rolled back",
+        ));
+    }
+
+    finish_catalog_purge_commit(
+        &mut guard,
+        &staged_directory,
+        &parent_directory,
+        &root,
+        &journal_name,
+        &nonce,
+        remove_purge_stage_marker_at,
+        clear_purge_journal_at,
+    )?;
+
+    Ok(ManagementResult::Purged {
+        backup_destination_handle_id: backup_handle_id.into(),
+        backup_file_name: backup_file_name.into(),
+        library_epoch: epoch,
+    })
+}
+
+fn execute_cleanup_orphans(
+    runtime: &LibraryRuntime,
+    context: &RequestContext,
+    planned_orphans: &[OrphanFileSnapshot],
+    expected_epoch: u64,
+    expected_revision: u64,
+) -> Result<ManagementResult, RuntimeError> {
+    require_durable_source_mutations()?;
+    runtime.require(context, Capability::Maintenance)?;
+    runtime.require(context, Capability::MediaWrite)?;
+    let runtime_arc = runtime
+        .self_weak
+        .get()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
+    let _guard = runtime_arc.begin_maintenance()?;
+    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let root = runtime.root.clone();
+    let root_directory = secure_fs::Directory::open(&root)
+        .map_err(|_| stale("Library root is no longer a safe directory"))?;
+    if !root_directory
+        .matches_path(&root)
+        .map_err(|_| stale("Library root identity changed"))?
+    {
+        return Err(stale("Library root identity changed"));
+    }
+    if planned_orphans.is_empty() {
+        return Ok(ManagementResult::CleanupCompleted { files: 0, bytes: 0 });
+    }
+
+    let db = LibraryDb::open(&root).map_err(runtime_library_error)?;
+    if db.root() != root
+        || !root_directory
+            .matches_path(&root)
+            .is_ok_and(|matches| matches)
+    {
+        return Err(stale("Library root identity changed during cleanup"));
+    }
+    let thumbnail_paths = db
+        .thumbnail_relative_paths()
+        .map_err(runtime_library_error)?;
+    let content_hashes = db.catalog_content_hashes().map_err(runtime_library_error)?;
+    drop(db);
+    let protected_paths = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .values()
+        .map(|lease| lease.path.clone())
+        .collect::<Vec<_>>();
+    let current_orphans = collect_orphan_files(
+        &root,
+        &thumbnail_paths,
+        &content_hashes,
+        &protected_paths,
+        !runtime.local_catalog_root_access,
+    )?;
+    if !root_directory
+        .matches_path(&root)
+        .is_ok_and(|matches| matches)
+    {
+        return Err(stale("Library root identity changed during cleanup"));
+    }
+    if planned_orphans
+        .iter()
+        .any(|planned| !current_orphans.contains(planned))
+    {
+        return Err(stale(
+            "An orphan changed or became referenced after confirmation",
+        ));
+    }
+
+    for snapshot in planned_orphans {
+        validate_relative_source_path(&snapshot.relative_path)?;
+        let actual = root_directory
+            .hash_relative_file(&snapshot.relative_path, MAX_ORPHAN_CLEANUP_FILE_BYTES)
+            .map_err(|_| stale("Orphan file changed"))?;
+        if actual != (snapshot.bytes, snapshot.sha256.clone()) {
+            return Err(stale("Orphan file bytes changed after confirmation"));
+        }
+    }
+
+    let mut deleted_files = 0_u64;
+    let mut bytes = 0u64;
+    let mut cache_directories = BTreeSet::new();
+    for snapshot in planned_orphans {
+        if !root_directory
+            .matches_path(&root)
+            .is_ok_and(|matches| matches)
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Io,
+                message: format!(
+                    "Orphan cleanup stopped after deleting {deleted_files} of {} generated files ({bytes} bytes); original model files were not touched, and a new plan is required. Root identity changed before the next file.",
+                    planned_orphans.len()
+                ),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let expected = (snapshot.bytes, snapshot.sha256.clone());
+        if let Err(error) = root_directory.delete_verified_relative_file(
+            &snapshot.relative_path,
+            &expected,
+            MAX_ORPHAN_CLEANUP_FILE_BYTES,
+        ) {
+            if root_directory
+                .relative_file_exists(&snapshot.relative_path)
+                .is_ok_and(|exists| !exists)
+            {
+                deleted_files += 1;
+                bytes = bytes.saturating_add(snapshot.bytes);
+            }
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Io,
+                message: format!(
+                    "Orphan cleanup stopped after deleting {deleted_files} of {} generated files ({bytes} bytes); original model files were not touched, and a new plan is required. Current file error: {error}",
+                    planned_orphans.len()
+                ),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        deleted_files += 1;
+        bytes = bytes
+            .checked_add(snapshot.bytes)
+            .ok_or_else(|| internal("Orphan cleanup byte count overflow"))?;
+        if snapshot.kind == OrphanFileKind::IndexedCache {
+            if let Some(parent) = snapshot.relative_path.parent() {
+                cache_directories.insert(parent.to_path_buf());
+            }
+        }
+    }
+    for directory in cache_directories {
+        let _ = root_directory.remove_empty_relative_directory(&directory);
+    }
+    Ok(ManagementResult::CleanupCompleted {
+        files: deleted_files,
+        bytes,
     })
 }
 
@@ -5150,6 +9113,7 @@ fn resolve_library_export_destination(
             message: "A backup-only destination is required for library export".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         });
     }
 
@@ -5193,6 +9157,7 @@ fn resolve_library_export_destination(
                     message: "destPath must be directly inside an admitted backup-only root".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 })?;
             (root, file_name.to_owned())
         }
@@ -5214,6 +9179,7 @@ fn resolve_library_export_destination(
                     message: "destPath backup handle is not admitted".into(),
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 })?;
             (root, file_name.to_owned())
         }
@@ -5279,38 +9245,259 @@ fn export_print_outcome(outcome: &CorePrintOutcome) -> &'static str {
     match outcome {
         CorePrintOutcome::Printed => "printed",
         CorePrintOutcome::Failed => "failed",
+        CorePrintOutcome::Cancelled => "cancelled",
     }
 }
 
+fn export_part_stock_value(part: &CorePartStock) -> serde_json::Value {
+    serde_json::json!({
+        "gogglelab_part_id": part.id,
+        "name": part.name,
+        "category": part.category,
+        "quantity": part.quantity,
+        "unit": part.unit,
+        "notes": part.notes,
+        "low_stock": part.low_stock,
+    })
+}
+
+fn export_print_attempt_parts(parts: &[CorePrintAttemptPart]) -> Vec<serde_json::Value> {
+    parts
+        .iter()
+        .map(|part| {
+            serde_json::json!({
+                "id": part.id,
+                "name": part.name,
+                "category": part.category,
+                "unit": part.unit,
+                "quantity": part.quantity,
+                "quantityPerCopy": part.quantity_per_copy,
+            })
+        })
+        .collect()
+}
+
+fn export_rfc3339_timestamp(value: &str, field: &'static str) -> Result<String, LibraryError> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    if let Ok(seconds) = value.parse::<i64>() {
+        return OffsetDateTime::from_unix_timestamp(seconds)
+            .map_err(|_| {
+                LibraryError::InvalidInput(format!(
+                    "{field} timestamp is outside the supported range"
+                ))
+            })?
+            .format(&Rfc3339)
+            .map_err(|_| {
+                LibraryError::InvalidInput(format!("{field} timestamp could not be formatted"))
+            });
+    }
+
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| LibraryError::InvalidInput(format!("{field} timestamp is invalid")))?;
+    Ok(value.to_owned())
+}
+
+const MAX_PRINTVENTORY_JSON_BYTES: usize = 25 * 1024 * 1024;
+const PRINTVENTORY_JSON_PAGE_ROWS: u16 = 50;
+const PRINTVENTORY_JSON_MODEL_PAGE_ROWS: u16 = 1;
+
+fn export_printer_value(
+    printer: &library_core::models::Printer,
+) -> Result<serde_json::Value, LibraryError> {
+    let web_url = library_core::normalize_printer_web_url(printer.web_url.as_deref())?;
+    let created_at = export_rfc3339_timestamp(&printer.created_at, "Printer creation")?;
+    let updated_at = export_rfc3339_timestamp(&printer.updated_at, "Printer update")?;
+    Ok(serde_json::json!({
+        "gogglelab_printer_id": printer.id.as_str(),
+        "nickname": printer.nickname.as_str(),
+        "manufacturer": printer.make.as_deref(),
+        "model": printer.model.as_deref(),
+        "printer_type": printer.printer_type.as_deref(),
+        "firmware_type": printer.firmware.as_deref(),
+        "host": printer.host.as_deref(),
+        "web_url": web_url,
+        "bed_mm": printer.bed_mm,
+        "notes": printer.notes.as_str(),
+        "source_kind": export_printer_source_kind(printer.source_kind),
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }))
+}
+
+fn export_printer_source_kind(source: library_core::models::PrinterSourceKind) -> &'static str {
+    match source {
+        library_core::models::PrinterSourceKind::Manual => "manual",
+        library_core::models::PrinterSourceKind::Discovered => "discovered",
+        library_core::models::PrinterSourceKind::Imported => "imported",
+    }
+}
+
+fn export_printer_reminder_status(
+    status: library_core::models::PrinterReminderStatus,
+) -> &'static str {
+    match status {
+        library_core::models::PrinterReminderStatus::Active => "active",
+        library_core::models::PrinterReminderStatus::Paused => "paused",
+        library_core::models::PrinterReminderStatus::Completed => "completed",
+    }
+}
+
+/// Portable slicer metadata. Local executable identity and trust are deliberately
+/// excluded: an importing workstation must select and trust its own executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlicerJsonExportEntry {
+    pub name: String,
+    pub path: String,
+}
+
+fn validate_slicer_json_export(slicers: &[SlicerJsonExportEntry]) -> Result<(), LibraryError> {
+    if slicers.len() > 64 {
+        return Err(LibraryError::InvalidInput(
+            "At most 64 slicer profiles can be exported".into(),
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut paths = std::collections::HashSet::new();
+    for slicer in slicers {
+        if slicer.name.trim().is_empty()
+            || slicer.name.chars().count() > 128
+            || slicer.name.chars().any(char::is_control)
+            || slicer.path.trim().is_empty()
+            || slicer.path.chars().count() > 4096
+            || slicer.path.chars().any(char::is_control)
+        {
+            return Err(LibraryError::InvalidInput("Slicer export requires bounded, non-empty names and paths without control characters".into()));
+        }
+        if !names.insert(slicer.name.trim().to_lowercase())
+            || !paths.insert(
+                slicer
+                    .path
+                    .trim()
+                    .replace('\\', "/")
+                    .trim_end_matches('/')
+                    .to_lowercase(),
+            )
+        {
+            return Err(LibraryError::InvalidInput(
+                "Slicer export contains duplicate names or paths".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn build_library_export_value(
     db: &LibraryDb,
     export_date: &str,
 ) -> Result<(serde_json::Value, usize), LibraryError> {
-    let models = db.list_models(None, None)?;
+    build_library_export_value_with_slicers(db, export_date, &[])
+}
+
+fn build_library_export_value_with_slicers(
+    db: &LibraryDb,
+    export_date: &str,
+    slicers: &[SlicerJsonExportEntry],
+) -> Result<(serde_json::Value, usize), LibraryError> {
+    validate_slicer_json_export(slicers)?;
+    let models = db.list_models_for_json_export()?;
     let model_count = models.len();
+    let parts = db.list_part_stock()?;
+    let model_names = models
+        .iter()
+        .map(|model| (model.id.clone(), model.display_name.clone()))
+        .collect::<HashMap<_, _>>();
+    let tag_categories = db
+        .list_tags()?
+        .into_iter()
+        .map(|tag| (tag.name, tag.category))
+        .collect::<HashMap<_, _>>();
     let filaments = db
         .list_filaments(true)?
         .into_iter()
         .map(|filament| (filament.id.clone(), export_filament_value(&filament)))
         .collect::<HashMap<_, _>>();
+    let printer_snapshot = db.export_printer_data_snapshot()?;
+    let printers = printer_snapshot.printers;
+    let printers_by_id = printers
+        .iter()
+        .map(|printer| (printer.id.as_str(), printer))
+        .collect::<HashMap<_, _>>();
+    let exported_printers = printers
+        .iter()
+        .map(export_printer_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let exported_maintenance_logs = printer_snapshot
+        .maintenance_logs
+        .iter()
+        .map(|log| {
+            let created_at = export_rfc3339_timestamp(&log.created_at, "Maintenance log creation")?;
+            Ok(serde_json::json!({
+                "gogglelab_maintenance_log_id": log.id.as_str(),
+                "gogglelab_printer_id": log.printer_id.as_deref(),
+                "printer_nickname": log.printer_nickname.as_str(),
+                "title": log.title.as_str(),
+                "notes": log.notes.as_str(),
+                "performed_at": log.performed_at.as_str(),
+                "created_at": created_at,
+            }))
+        })
+        .collect::<Result<Vec<_>, LibraryError>>()?;
+    let exported_maintenance_reminders = printer_snapshot
+        .reminders
+        .iter()
+        .map(|reminder| {
+            let created_at = export_rfc3339_timestamp(&reminder.created_at, "Reminder creation")?;
+            let updated_at = export_rfc3339_timestamp(&reminder.updated_at, "Reminder update")?;
+            Ok(serde_json::json!({
+                "gogglelab_printer_reminder_id": reminder.id.as_str(),
+                "gogglelab_printer_id": reminder.printer_id.as_deref(),
+                "printer_nickname": reminder.printer_nickname.as_str(),
+                "title": reminder.title.as_str(),
+                "notes": reminder.notes.as_str(),
+                "due_at": reminder.due_at.as_str(),
+                "interval_days": reminder.interval_days,
+                "status": export_printer_reminder_status(reminder.status),
+                "last_completed_at": reminder.last_completed_at.as_deref(),
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }))
+        })
+        .collect::<Result<Vec<_>, LibraryError>>()?;
     let mut exported_models = Vec::with_capacity(model_count);
 
     for model in models {
         let mut print_events = Vec::new();
         for attempt in db.list_print_attempts(&model.id)? {
             let attempt_filaments = export_filaments(&attempt.filament_ids, &filaments)?;
+            let created_at = export_rfc3339_timestamp(&attempt.created_at, "Print event creation")?;
+            let printer = attempt
+                .printer_id
+                .as_deref()
+                .and_then(|id| printers_by_id.get(id).copied());
+            let printer_nickname = attempt
+                .printer_name
+                .clone()
+                .or_else(|| printer.map(|record| record.nickname.clone()));
+            let printer_manufacturer = printer.and_then(|record| record.make.clone());
+            let printer_model = printer.and_then(|record| record.model.clone());
+            let printer_type = printer.and_then(|record| record.printer_type.clone());
+            let gogglelab_printer_id = attempt.printer_id.clone();
             print_events.push(serde_json::json!({
                 "printed_at": attempt.printed_at,
                 "outcome": export_print_outcome(&attempt.outcome),
                 "quantity": attempt.quantity,
                 "notes": attempt.notes,
-                "created_at": attempt.created_at,
-                "printer_nickname": null,
-                "printer_manufacturer": null,
-                "printer_model": null,
-                "printer_type": null,
+                "created_at": created_at,
+                "printer_nickname": printer_nickname,
+                "printer_manufacturer": printer_manufacturer,
+                "printer_model": printer_model,
+                "printer_type": printer_type,
+                "gogglelab_printer_id": gogglelab_printer_id,
                 "filaments": attempt_filaments,
-                "parts": []
+                "parts": export_print_attempt_parts(&attempt.parts)
             }));
         }
         let model_filaments = export_filaments(&model.filament_ids, &filaments)?;
@@ -5320,6 +9507,22 @@ fn build_library_export_value(
             .or(model.storage_path.as_deref())
             .unwrap_or_default();
         let print_status = export_print_status(&model.metadata.print_status);
+        let parent_model = model
+            .metadata
+            .parent_model_id
+            .as_ref()
+            .and_then(|id| model_names.get(id))
+            .map(String::as_str);
+        let categorized_tags = model
+            .tags
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "category": tag_categories.get(name).cloned().flatten()
+                })
+            })
+            .collect::<Vec<_>>();
         exported_models.push(serde_json::json!({
             "filePath": file_path,
             "fileName": model.original_name.as_deref().unwrap_or(&model.display_name),
@@ -5330,11 +9533,13 @@ fn build_library_export_value(
             "print_status": print_status,
             "print_count": model.metadata.print_count,
             "last_printed_at": model.metadata.last_printed_at,
-            "parentModel": model.metadata.parent_model_id,
+            "parentModel": parent_model,
+            "gogglelabParentModelId": model.metadata.parent_model_id,
             "license": model.metadata.model_license,
             "rating": model.metadata.rating,
             "favorite": model.metadata.favorite,
             "tags": model.tags,
+            "gogglelabTags": categorized_tags,
             "filaments": model_filaments,
             "printEvents": print_events
         }));
@@ -5344,13 +9549,1218 @@ fn build_library_export_value(
         serde_json::json!({
             "version": "1.0",
             "exportDate": export_date,
-            "printers": [],
-            "parts": [],
-            "slicers": [],
+            "printers": exported_printers,
+            "printer_maintenance_logs": exported_maintenance_logs,
+            "printer_maintenance_reminders": exported_maintenance_reminders,
+            "parts": parts.iter().map(export_part_stock_value).collect::<Vec<_>>(),
+            "slicers": slicers,
             "models": exported_models
         }),
         model_count,
     ))
+}
+
+struct CappedJsonWriter<W> {
+    inner: W,
+    limit: usize,
+    bytes_written: usize,
+    exceeded: bool,
+}
+
+impl<W> CappedJsonWriter<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        Self {
+            inner,
+            limit,
+            bytes_written: 0,
+            exceeded: false,
+        }
+    }
+
+    fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CappedJsonWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes_written) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Printventory JSON byte limit exceeded",
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.bytes_written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn library_json_export_size_error(limit: usize) -> LibraryError {
+    if limit == MAX_PRINTVENTORY_JSON_BYTES {
+        LibraryError::InvalidInput(
+            "Library JSON export exceeds the 25 MiB Printventory limit".into(),
+        )
+    } else {
+        LibraryError::InvalidInput(format!(
+            "Library JSON export exceeds its {limit}-byte limit"
+        ))
+    }
+}
+
+fn library_json_export_writer_error<W>(writer: &CappedJsonWriter<W>) -> LibraryError {
+    if writer.exceeded {
+        library_json_export_size_error(writer.limit)
+    } else {
+        LibraryError::InvalidInput("Library JSON export could not be saved".into())
+    }
+}
+
+struct JsonExportContext<'a> {
+    db: &'a LibraryDb,
+    failure: std::cell::RefCell<Option<LibraryError>>,
+    model_count: Cell<usize>,
+    parts: Vec<CorePartStock>,
+    printer_counts: library_core::PrinterDataExportCounts,
+    printers_by_id: HashMap<String, library_core::PrinterExportAttribution>,
+}
+
+impl<'a> JsonExportContext<'a> {
+    fn new(db: &'a LibraryDb) -> Result<Self, LibraryError> {
+        let printer_counts = db.printer_data_export_counts()?;
+        let printers = db.list_printer_export_attributions()?;
+        if printers.len() != printer_counts.printers {
+            return Err(LibraryError::InvalidInput(
+                "printer export snapshot did not read every counted profile".into(),
+            ));
+        }
+        let printers_by_id = printers
+            .into_iter()
+            .map(|printer| (printer.id.clone(), printer))
+            .collect();
+        let parts = db.list_part_stock()?;
+        Ok(Self {
+            db,
+            failure: std::cell::RefCell::new(None),
+            model_count: Cell::new(0),
+            parts,
+            printer_counts,
+            printers_by_id,
+        })
+    }
+
+    fn serialization_failure<E: serde::ser::Error>(&self, error: LibraryError) -> E {
+        let mut failure = self.failure.borrow_mut();
+        if failure.is_none() {
+            *failure = Some(error);
+        }
+        E::custom("Printventory export could not be serialized")
+    }
+
+    fn serialize_result<T, E: serde::ser::Error>(
+        &self,
+        result: Result<T, LibraryError>,
+    ) -> Result<T, E> {
+        result.map_err(|error| self.serialization_failure(error))
+    }
+}
+
+struct LibraryJsonExportView<'a> {
+    context: &'a JsonExportContext<'a>,
+    export_date: &'a str,
+    slicers: &'a [SlicerJsonExportEntry],
+}
+
+impl Serialize for LibraryJsonExportView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let context = self.context;
+        let mut map = serializer.serialize_map(Some(8))?;
+        map.serialize_entry("exportDate", self.export_date)?;
+        map.serialize_entry("models", &ExportModels { context })?;
+        map.serialize_entry("parts", &ExportPartStocks { context })?;
+        map.serialize_entry(
+            "printer_maintenance_logs",
+            &ExportMaintenanceLogs { context },
+        )?;
+        map.serialize_entry(
+            "printer_maintenance_reminders",
+            &ExportReminders { context },
+        )?;
+        map.serialize_entry("printers", &ExportPrinters { context })?;
+        map.serialize_entry("slicers", self.slicers)?;
+        map.serialize_entry("version", "1.0")?;
+        map.end()
+    }
+}
+
+struct ExportPartStocks<'a> {
+    context: &'a JsonExportContext<'a>,
+}
+
+impl Serialize for ExportPartStocks<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.context.parts.len()))?;
+        for part in &self.context.parts {
+            sequence.serialize_element(&export_part_stock_value(part))?;
+        }
+        sequence.end()
+    }
+}
+
+struct ExportPrinters<'a> {
+    context: &'a JsonExportContext<'a>,
+}
+
+impl Serialize for ExportPrinters<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let expected = self.context.printer_counts.printers;
+        let mut sequence = serializer.serialize_seq(Some(expected))?;
+        let mut after_id: Option<String> = None;
+        let mut rows = 0usize;
+        loop {
+            let page = self.context.serialize_result::<_, S::Error>(
+                self.context.db.list_printers_for_json_export_page(
+                    after_id.as_deref(),
+                    PRINTVENTORY_JSON_PAGE_ROWS,
+                ),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for printer in &page {
+                let value = self
+                    .context
+                    .serialize_result::<_, S::Error>(export_printer_value(printer))?;
+                sequence.serialize_element(&value)?;
+            }
+            rows += page.len();
+            after_id = page.last().map(|printer| printer.id.clone());
+            if rows > expected {
+                return Err(self
+                    .context
+                    .serialization_failure(LibraryError::InvalidInput(
+                        "printer export read more profiles than counted".into(),
+                    )));
+            }
+        }
+        if rows != expected {
+            return Err(self
+                .context
+                .serialization_failure(LibraryError::InvalidInput(
+                    "printer export did not read every counted profile".into(),
+                )));
+        }
+        sequence.end()
+    }
+}
+
+struct ExportMaintenanceLogs<'a> {
+    context: &'a JsonExportContext<'a>,
+}
+
+impl Serialize for ExportMaintenanceLogs<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let expected = self.context.printer_counts.maintenance_logs;
+        let mut sequence = serializer.serialize_seq(Some(expected))?;
+        let mut after_id: Option<String> = None;
+        let mut rows = 0usize;
+        loop {
+            let page = self.context.serialize_result::<_, S::Error>(
+                self.context
+                    .db
+                    .list_printer_maintenance_logs_for_json_export_page(
+                        after_id.as_deref(),
+                        PRINTVENTORY_JSON_PAGE_ROWS,
+                    ),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for log in &page {
+                let created_at =
+                    self.context
+                        .serialize_result::<_, S::Error>(export_rfc3339_timestamp(
+                            &log.created_at,
+                            "Maintenance log creation",
+                        ))?;
+                let value = serde_json::json!({
+                    "gogglelab_maintenance_log_id": log.id,
+                    "gogglelab_printer_id": log.printer_id,
+                    "printer_nickname": log.printer_nickname,
+                    "title": log.title,
+                    "notes": log.notes,
+                    "performed_at": log.performed_at,
+                    "created_at": created_at,
+                });
+                sequence.serialize_element(&value)?;
+            }
+            rows += page.len();
+            after_id = page.last().map(|log| log.id.clone());
+            if rows > expected {
+                return Err(self
+                    .context
+                    .serialization_failure(LibraryError::InvalidInput(
+                        "printer export read more maintenance logs than counted".into(),
+                    )));
+            }
+        }
+        if rows != expected {
+            return Err(self
+                .context
+                .serialization_failure(LibraryError::InvalidInput(
+                    "printer export did not read every counted maintenance log".into(),
+                )));
+        }
+        sequence.end()
+    }
+}
+
+struct ExportReminders<'a> {
+    context: &'a JsonExportContext<'a>,
+}
+
+impl Serialize for ExportReminders<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let expected = self.context.printer_counts.reminders;
+        let mut sequence = serializer.serialize_seq(Some(expected))?;
+        let mut after_id: Option<String> = None;
+        let mut rows = 0usize;
+        loop {
+            let page = self.context.serialize_result::<_, S::Error>(
+                self.context.db.list_printer_reminders_for_json_export_page(
+                    after_id.as_deref(),
+                    PRINTVENTORY_JSON_PAGE_ROWS,
+                ),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for reminder in &page {
+                let created_at =
+                    self.context
+                        .serialize_result::<_, S::Error>(export_rfc3339_timestamp(
+                            &reminder.created_at,
+                            "Reminder creation",
+                        ))?;
+                let updated_at =
+                    self.context
+                        .serialize_result::<_, S::Error>(export_rfc3339_timestamp(
+                            &reminder.updated_at,
+                            "Reminder update",
+                        ))?;
+                let value = serde_json::json!({
+                    "gogglelab_printer_reminder_id": reminder.id,
+                    "gogglelab_printer_id": reminder.printer_id,
+                    "printer_nickname": reminder.printer_nickname,
+                    "title": reminder.title,
+                    "notes": reminder.notes,
+                    "due_at": reminder.due_at,
+                    "interval_days": reminder.interval_days,
+                    "status": export_printer_reminder_status(reminder.status),
+                    "last_completed_at": reminder.last_completed_at,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                });
+                sequence.serialize_element(&value)?;
+            }
+            rows += page.len();
+            after_id = page.last().map(|reminder| reminder.id.clone());
+            if rows > expected {
+                return Err(self
+                    .context
+                    .serialization_failure(LibraryError::InvalidInput(
+                        "printer export read more reminders than counted".into(),
+                    )));
+            }
+        }
+        if rows != expected {
+            return Err(self
+                .context
+                .serialization_failure(LibraryError::InvalidInput(
+                    "printer export did not read every counted reminder".into(),
+                )));
+        }
+        sequence.end()
+    }
+}
+
+struct ExportModels<'a> {
+    context: &'a JsonExportContext<'a>,
+}
+
+impl Serialize for ExportModels<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let expected = self
+            .context
+            .serialize_result::<_, S::Error>(self.context.db.count_models_for_json_export())?;
+        self.context.model_count.set(expected);
+        let mut sequence = serializer.serialize_seq(Some(expected))?;
+        let mut rows = 0usize;
+        while rows < expected {
+            let page = self.context.serialize_result::<_, S::Error>(
+                self.context
+                    .db
+                    .list_models_for_json_export_page(rows, PRINTVENTORY_JSON_MODEL_PAGE_ROWS),
+            )?;
+            if page.is_empty() {
+                return Err(self
+                    .context
+                    .serialization_failure(LibraryError::InvalidInput(
+                        "JSON export did not read every counted model".into(),
+                    )));
+            }
+            for model in &page {
+                sequence.serialize_element(&ExportModel {
+                    context: self.context,
+                    model,
+                })?;
+            }
+            rows += page.len();
+            if rows > expected {
+                return Err(self
+                    .context
+                    .serialization_failure(LibraryError::InvalidInput(
+                        "JSON export read more models than counted".into(),
+                    )));
+            }
+        }
+        sequence.end()
+    }
+}
+
+struct ExportModel<'a> {
+    context: &'a JsonExportContext<'a>,
+    model: &'a Model,
+}
+
+impl Serialize for ExportModel<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let model = self.model;
+        let context = self.context;
+        let file_path = model
+            .source_path
+            .as_deref()
+            .or(model.storage_path.as_deref())
+            .unwrap_or_default();
+        let print_status = export_print_status(&model.metadata.print_status);
+        let parent_model = if let Some(id) = model.metadata.parent_model_id.as_deref() {
+            context.serialize_result::<_, S::Error>(
+                context.db.active_model_display_name_for_json_export(id),
+            )?
+        } else {
+            None
+        };
+
+        let mut map = serializer.serialize_map(Some(18))?;
+        map.serialize_entry("designer", &model.metadata.designer)?;
+        map.serialize_entry("favorite", &model.metadata.favorite)?;
+        map.serialize_entry(
+            "filaments",
+            &ExportFilaments {
+                context,
+                ids: &model.filament_ids,
+            },
+        )?;
+        map.serialize_entry(
+            "fileName",
+            model
+                .original_name
+                .as_deref()
+                .unwrap_or(&model.display_name),
+        )?;
+        map.serialize_entry("filePath", file_path)?;
+        map.serialize_entry("gogglelabParentModelId", &model.metadata.parent_model_id)?;
+        map.serialize_entry(
+            "gogglelabTags",
+            &ExportCategorizedTags {
+                context,
+                tags: &model.tags,
+            },
+        )?;
+        map.serialize_entry("last_printed_at", &model.metadata.last_printed_at)?;
+        map.serialize_entry("license", &model.metadata.model_license)?;
+        map.serialize_entry("notes", &model.metadata.notes)?;
+        map.serialize_entry("parentModel", &parent_model)?;
+        map.serialize_entry(
+            "printEvents",
+            &ExportPrintEvents {
+                context,
+                model_id: &model.id,
+            },
+        )?;
+        map.serialize_entry("print_count", &model.metadata.print_count)?;
+        map.serialize_entry("print_status", print_status)?;
+        map.serialize_entry(
+            "printed",
+            &(model.metadata.print_count > 0 || print_status == "printed"),
+        )?;
+        map.serialize_entry("rating", &model.metadata.rating)?;
+        map.serialize_entry("source", &model.metadata.source_url)?;
+        map.serialize_entry("tags", &model.tags)?;
+        map.end()
+    }
+}
+
+struct ExportCategorizedTags<'a> {
+    context: &'a JsonExportContext<'a>,
+    tags: &'a [String],
+}
+
+impl Serialize for ExportCategorizedTags<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.tags.len()))?;
+        for tag in self.tags {
+            let category = self.context.serialize_result::<_, S::Error>(
+                self.context.db.tag_category_for_json_export(tag),
+            )?;
+            let value = serde_json::json!({ "name": tag, "category": category });
+            sequence.serialize_element(&value)?;
+        }
+        sequence.end()
+    }
+}
+
+struct ExportFilaments<'a> {
+    context: &'a JsonExportContext<'a>,
+    ids: &'a [String],
+}
+
+impl Serialize for ExportFilaments<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.ids.len()))?;
+        for id in self.ids {
+            let value = self
+                .context
+                .serialize_result::<_, S::Error>(export_filament_from_db(self.context.db, id))?;
+            sequence.serialize_element(&value)?;
+        }
+        sequence.end()
+    }
+}
+
+struct ExportPrintEvents<'a> {
+    context: &'a JsonExportContext<'a>,
+    model_id: &'a str,
+}
+
+impl Serialize for ExportPrintEvents<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(None)?;
+        let mut after_printed_at: Option<String> = None;
+        let mut after_id: Option<String> = None;
+        loop {
+            let page = self.context.serialize_result::<_, S::Error>(
+                self.context.db.list_print_attempts_for_json_export_page(
+                    self.model_id,
+                    after_printed_at.as_deref(),
+                    after_id.as_deref(),
+                    PRINTVENTORY_JSON_PAGE_ROWS,
+                ),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for attempt in &page {
+                sequence.serialize_element(&ExportPrintEvent {
+                    context: self.context,
+                    attempt,
+                })?;
+            }
+            let last = page.last().expect("non-empty print event page");
+            after_printed_at = Some(last.printed_at.clone());
+            after_id = Some(last.id.clone());
+        }
+        sequence.end()
+    }
+}
+
+struct ExportPrintEvent<'a> {
+    context: &'a JsonExportContext<'a>,
+    attempt: &'a CorePrintAttempt,
+}
+
+impl Serialize for ExportPrintEvent<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let attempt = self.attempt;
+        let printer = attempt
+            .printer_id
+            .as_ref()
+            .and_then(|id| self.context.printers_by_id.get(id));
+        let printer_nickname = attempt
+            .printer_name
+            .clone()
+            .or_else(|| printer.map(|value| value.nickname.clone()));
+        let created_at = self
+            .context
+            .serialize_result::<_, S::Error>(export_rfc3339_timestamp(
+                &attempt.created_at,
+                "Print event creation",
+            ))?;
+        let parts = export_print_attempt_parts(&attempt.parts);
+        let mut map = serializer.serialize_map(Some(12))?;
+        map.serialize_entry("created_at", &created_at)?;
+        map.serialize_entry(
+            "filaments",
+            &ExportFilaments {
+                context: self.context,
+                ids: &attempt.filament_ids,
+            },
+        )?;
+        map.serialize_entry("gogglelab_printer_id", &attempt.printer_id)?;
+        map.serialize_entry("notes", &attempt.notes)?;
+        map.serialize_entry("outcome", export_print_outcome(&attempt.outcome))?;
+        map.serialize_entry("parts", &parts)?;
+        map.serialize_entry("printed_at", &attempt.printed_at)?;
+        map.serialize_entry(
+            "printer_manufacturer",
+            &printer.and_then(|value| value.make.as_ref()),
+        )?;
+        map.serialize_entry(
+            "printer_model",
+            &printer.and_then(|value| value.model.as_ref()),
+        )?;
+        map.serialize_entry("printer_nickname", &printer_nickname)?;
+        map.serialize_entry(
+            "printer_type",
+            &printer.and_then(|value| value.printer_type.as_ref()),
+        )?;
+        map.serialize_entry("quantity", &attempt.quantity)?;
+        map.end()
+    }
+}
+
+fn export_filament_from_db(db: &LibraryDb, id: &str) -> Result<serde_json::Value, LibraryError> {
+    let filament = db.get_filament(id)?.ok_or_else(|| {
+        LibraryError::InvalidInput(
+            "Library JSON export cannot preserve an unresolved filament reference".into(),
+        )
+    })?;
+    Ok(export_filament_value(&filament))
+}
+
+#[cfg(test)]
+fn stream_library_json_export<W: Write>(
+    db: &LibraryDb,
+    export_date: &str,
+    writer: &mut CappedJsonWriter<W>,
+) -> Result<usize, LibraryError> {
+    stream_library_json_export_with_slicers(db, export_date, writer, &[])
+}
+
+fn stream_library_json_export_with_slicers<W: Write>(
+    db: &LibraryDb,
+    export_date: &str,
+    writer: &mut CappedJsonWriter<W>,
+    slicers: &[SlicerJsonExportEntry],
+) -> Result<usize, LibraryError> {
+    validate_slicer_json_export(slicers)?;
+    let context = JsonExportContext::new(db)?;
+    let view = LibraryJsonExportView {
+        context: &context,
+        export_date,
+        slicers,
+    };
+    let serialization = {
+        let mut serializer = serde_json::Serializer::pretty(&mut *writer);
+        view.serialize(&mut serializer)
+    };
+    if serialization.is_err() {
+        if writer.exceeded {
+            return Err(library_json_export_size_error(writer.limit));
+        }
+        if let Some(error) = context.failure.into_inner() {
+            return Err(error);
+        }
+        return Err(LibraryError::InvalidInput(
+            "Library JSON export could not be encoded or saved".into(),
+        ));
+    }
+    Ok(context.model_count.get())
+}
+
+#[derive(Debug, Clone)]
+pub struct LibraryJsonExportResult {
+    pub models: usize,
+    pub bytes: u64,
+}
+
+struct ExportDestination {
+    path: PathBuf,
+    parent_path: PathBuf,
+    name: std::ffi::OsString,
+    #[cfg(unix)]
+    directory: GuardedDirectory,
+}
+
+fn export_destination(destination: &Path) -> Result<ExportDestination, LibraryError> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_path = parent.canonicalize().map_err(|_| {
+        LibraryError::InvalidInput("Library JSON export destination is unavailable".into())
+    })?;
+    let name = destination.file_name().ok_or_else(|| {
+        LibraryError::InvalidInput("Library JSON export destination is unavailable".into())
+    })?;
+    #[cfg(unix)]
+    let directory = GuardedDirectory::open(&parent_path).map_err(|_| {
+        LibraryError::InvalidInput("Library JSON export destination is unavailable".into())
+    })?;
+    Ok(ExportDestination {
+        path: parent_path.join(name),
+        parent_path,
+        name: name.to_os_string(),
+        #[cfg(unix)]
+        directory,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportFingerprint {
+    bytes: u64,
+    sha256: String,
+}
+
+struct FingerprintedWriter<'a, W> {
+    inner: &'a mut W,
+    bytes: u64,
+    digest: Sha256,
+}
+
+impl<W> FingerprintedWriter<'_, W> {
+    fn fingerprint(&self) -> ExportFingerprint {
+        ExportFingerprint {
+            bytes: self.bytes,
+            sha256: format!("{:x}", self.digest.clone().finalize()),
+        }
+    }
+}
+
+impl<W: Write> Write for FingerprintedWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("export byte count overflow"))?;
+        self.digest.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_export_bytes<W: Write>(
+    output: &mut W,
+    bytes: &[u8],
+) -> Result<ExportFingerprint, (std::io::Error, ExportFingerprint)> {
+    let mut writer = FingerprintedWriter {
+        inner: output,
+        bytes: 0,
+        digest: Sha256::new(),
+    };
+    let write_result = writer.write_all(bytes);
+    let fingerprint = writer.fingerprint();
+    match write_result {
+        Ok(()) => Ok(fingerprint),
+        Err(error) => Err((error, fingerprint)),
+    }
+}
+
+struct FailAfterWriter<'a> {
+    file: &'a mut File,
+    remaining: usize,
+}
+
+impl Write for FailAfterWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::other("injected export write failure"));
+        }
+        let limit = buffer.len().min(self.remaining);
+        let written = self.file.write(&buffer[..limit])?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn same_export_file_identity(expected: &File, current: &fs::Metadata) -> bool {
+    let Ok(expected_metadata) = expected.metadata() else {
+        return false;
+    };
+    if !expected_metadata.is_file() || !current.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        expected_metadata.dev() == current.dev() && expected_metadata.ino() == current.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        expected_metadata.volume_serial_number() == current.volume_serial_number()
+            && expected_metadata.file_index() == current.file_index()
+            && expected_metadata.volume_serial_number().is_some()
+            && expected_metadata.file_index().is_some()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn file_fingerprint(file: &File) -> std::io::Result<ExportFingerprint> {
+    let mut input = file.try_clone()?;
+    input.seek(std::io::SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("export byte count overflow"))?;
+        digest.update(&buffer[..read]);
+    }
+    Ok(ExportFingerprint {
+        bytes,
+        sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+fn destination_matches_open_file(
+    destination: &ExportDestination,
+    output: &File,
+    fingerprint: &ExportFingerprint,
+) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(mut current) = destination.directory.open_file_handle(&destination.name) else {
+            return false;
+        };
+        let same_handle = current
+            .metadata()
+            .ok()
+            .is_some_and(|metadata| same_export_file_identity(output, &metadata));
+        if !same_handle {
+            return false;
+        }
+        return secure_fs::hash_file(&mut current, MAX_PRINTVENTORY_JSON_BYTES as u64)
+            .map(|(bytes, sha256)| bytes == fingerprint.bytes && sha256 == fingerprint.sha256)
+            .unwrap_or(false);
+    }
+    #[cfg(windows)]
+    {
+        let Ok(metadata) = fs::symlink_metadata(&destination.path) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !same_export_file_identity(output, &metadata) {
+            return false;
+        }
+        return file_fingerprint(output).ok().as_ref() == Some(fingerprint);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (destination, output, fingerprint);
+        false
+    }
+}
+
+#[derive(Debug)]
+pub struct StagedLibraryJsonExport {
+    destination: ExportDestination,
+    bytes: Vec<u8>,
+    fingerprint: ExportFingerprint,
+    result: LibraryJsonExportResult,
+}
+
+impl std::fmt::Debug for ExportDestination {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExportDestination")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StagedLibraryJsonExport {
+    pub fn result(&self) -> &LibraryJsonExportResult {
+        &self.result
+    }
+
+    /// Creates the selected path exclusively, then writes the bounded export.
+    /// Overflow is detected before this method is called.
+    pub fn publish(self, destination: &Path) -> Result<LibraryJsonExportResult, LibraryError> {
+        self.publish_with_writer(
+            destination,
+            |file, bytes| write_export_to_file(file, bytes, None),
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn publish_with_failure_after(
+        self,
+        destination: &Path,
+        fail_after: usize,
+    ) -> Result<LibraryJsonExportResult, LibraryError> {
+        self.publish_with_writer(
+            destination,
+            |file, bytes| write_export_to_file(file, bytes, Some(fail_after)),
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn publish_with_sync_failure(
+        self,
+        destination: &Path,
+    ) -> Result<LibraryJsonExportResult, LibraryError> {
+        self.publish_with_writer(
+            destination,
+            |file, bytes| write_export_to_file(file, bytes, None),
+            true,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    fn publish_with_replacement_during_write(
+        self,
+        destination: &Path,
+        replace_after: usize,
+        replacement: &[u8],
+        displaced_path: &Path,
+    ) -> Result<LibraryJsonExportResult, LibraryError> {
+        let destination_path = self.destination.path.clone();
+        let displaced_path = displaced_path.to_path_buf();
+        let replacement = replacement.to_vec();
+        self.publish_with_writer(
+            destination,
+            move |file, bytes| {
+                let mut writer = ReplaceDuringWriteWriter {
+                    file,
+                    remaining: replace_after,
+                    destination_path,
+                    displaced_path,
+                    replacement,
+                    replaced: false,
+                };
+                write_export_bytes(&mut writer, bytes)
+            },
+            false,
+        )
+    }
+
+    fn publish_with_writer<F>(
+        self,
+        destination: &Path,
+        write_output: F,
+        inject_sync_failure: bool,
+    ) -> Result<LibraryJsonExportResult, LibraryError>
+    where
+        F: FnOnce(
+            &mut File,
+            &[u8],
+        ) -> Result<ExportFingerprint, (std::io::Error, ExportFingerprint)>,
+    {
+        let selected = export_destination(destination)?;
+        if selected.path != self.destination.path {
+            return Err(LibraryError::InvalidInput(
+                "Library export destination changed before publication".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let parent_matches = self
+                .destination
+                .directory
+                .0
+                .matches_path(&self.destination.parent_path)
+                .unwrap_or(false);
+            if !parent_matches {
+                return Err(LibraryError::InvalidInput(
+                    "Library export destination changed before publication".into(),
+                ));
+            }
+            let mut file = self
+                .destination
+                .directory
+                .0
+                .create_new_file_read_write(&self.destination.name)
+                .map_err(|_| {
+                    LibraryError::InvalidInput(
+                        "Library export destination already exists or is unavailable".into(),
+                    )
+                })?;
+            let fingerprint = match write_output(&mut file, &self.bytes) {
+                Ok(fingerprint) if fingerprint == self.fingerprint => fingerprint,
+                Ok(_) | Err(_) => return Err(export_write_failure()),
+            };
+            if inject_sync_failure || file.sync_all().is_err() {
+                return Err(export_write_failure());
+            }
+            if self.destination.directory.0.sync().is_err() {
+                return Err(export_write_failure());
+            }
+            if !destination_matches_open_file(&self.destination, &file, &fingerprint) {
+                return Err(export_verify_failure());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.access_mode(0x8000_0000 | 0x4000_0000);
+                options.share_mode(0x0000_0001);
+            }
+            let mut file = options.open(&self.destination.path).map_err(|_| {
+                LibraryError::InvalidInput(
+                    "Library export destination already exists or is unavailable".into(),
+                )
+            })?;
+            let fingerprint = match write_output(&mut file, &self.bytes) {
+                Ok(fingerprint) if fingerprint == self.fingerprint => fingerprint,
+                Ok(_) | Err(_) => return Err(export_write_failure()),
+            };
+            if inject_sync_failure || file.sync_all().is_err() {
+                return Err(export_write_failure());
+            }
+            if !destination_matches_open_file(&self.destination, &file, &fingerprint) {
+                return Err(export_verify_failure());
+            }
+        }
+        Ok(self.result)
+    }
+}
+
+fn export_write_failure() -> LibraryError {
+    LibraryError::InvalidInput(
+        "Library JSON export could not be saved; a partial file may remain at the chosen destination. Review or remove it before retrying.".into(),
+    )
+}
+
+fn export_verify_failure() -> LibraryError {
+    LibraryError::InvalidInput(
+        "Library JSON export could not be verified; a file may remain at the chosen destination. Review or remove it before retrying.".into(),
+    )
+}
+
+fn write_export_to_file(
+    file: &mut File,
+    bytes: &[u8],
+    fail_after: Option<usize>,
+) -> Result<ExportFingerprint, (std::io::Error, ExportFingerprint)> {
+    if let Some(remaining) = fail_after {
+        let mut limited = FailAfterWriter { file, remaining };
+        write_export_bytes(&mut limited, bytes)
+    } else {
+        write_export_bytes(file, bytes)
+    }
+}
+
+#[cfg(all(test, unix))]
+struct ReplaceDuringWriteWriter<'a> {
+    file: &'a mut File,
+    remaining: usize,
+    destination_path: PathBuf,
+    displaced_path: PathBuf,
+    replacement: Vec<u8>,
+    replaced: bool,
+}
+
+#[cfg(all(test, unix))]
+impl Write for ReplaceDuringWriteWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.replaced {
+            return self.file.write(buffer);
+        }
+        if self.remaining == 0 {
+            self.replace_path()?;
+            return self.file.write(buffer);
+        }
+        let count = buffer.len().min(self.remaining);
+        let written = self.file.write(&buffer[..count])?;
+        self.remaining -= written;
+        if self.remaining == 0 {
+            self.replace_path()?;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(all(test, unix))]
+impl ReplaceDuringWriteWriter<'_> {
+    fn replace_path(&mut self) -> std::io::Result<()> {
+        std::fs::rename(&self.destination_path, &self.displaced_path)?;
+        std::fs::write(&self.destination_path, &self.replacement)?;
+        self.replaced = true;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn stage_library_json_export_with_limit(
+    db: &LibraryDb,
+    export_date: &str,
+    destination: &Path,
+    limit: usize,
+) -> Result<StagedLibraryJsonExport, LibraryError> {
+    stage_library_json_export_with_limit_and_slicers(db, export_date, destination, limit, &[])
+}
+
+fn stage_library_json_export_with_limit_and_slicers(
+    db: &LibraryDb,
+    export_date: &str,
+    destination: &Path,
+    limit: usize,
+    slicers: &[SlicerJsonExportEntry],
+) -> Result<StagedLibraryJsonExport, LibraryError> {
+    validate_slicer_json_export(slicers)?;
+    let destination = export_destination(destination)?;
+    let mut writer = CappedJsonWriter::new(Vec::new(), limit);
+    let models = db.with_json_export_snapshot(|db| {
+        stream_library_json_export_with_slicers(db, export_date, &mut writer, slicers)
+    })?;
+    writer
+        .flush()
+        .map_err(|_| library_json_export_writer_error(&writer))?;
+    let bytes = writer.bytes_written() as u64;
+    let content = writer.into_inner();
+    let fingerprint = ExportFingerprint {
+        bytes,
+        sha256: format!("{:x}", Sha256::digest(&content)),
+    };
+    Ok(StagedLibraryJsonExport {
+        destination,
+        bytes: content,
+        fingerprint,
+        result: LibraryJsonExportResult { models, bytes },
+    })
+}
+
+pub fn stage_library_json_export(
+    db: &LibraryDb,
+    destination: &Path,
+) -> Result<StagedLibraryJsonExport, LibraryError> {
+    stage_library_json_export_with_slicers(db, destination, &[])
+}
+
+/// Desktop callers provide a snapshot of saved name/path metadata. Headless
+/// exports use the empty default because slicer applications are workstation-local.
+pub fn stage_library_json_export_with_slicers(
+    db: &LibraryDb,
+    destination: &Path,
+    slicers: &[SlicerJsonExportEntry],
+) -> Result<StagedLibraryJsonExport, LibraryError> {
+    let export_date = format_system_time(SystemTime::now()).map_err(|_| {
+        LibraryError::InvalidInput("Library JSON export timestamp could not be formatted".into())
+    })?;
+    stage_library_json_export_with_limit_and_slicers(
+        db,
+        &export_date,
+        destination,
+        MAX_PRINTVENTORY_JSON_BYTES,
+        slicers,
+    )
+}
+
+/// Builds a compatible library JSON value with a fresh UTC date.
+pub fn export_library_json_value(
+    db: &LibraryDb,
+) -> Result<(serde_json::Value, usize), LibraryError> {
+    let (export, model_count, _) = export_library_json_value_with_bytes(db)?;
+    Ok((export, model_count))
+}
+
+pub fn export_library_json_value_with_slicers(
+    db: &LibraryDb,
+    slicers: &[SlicerJsonExportEntry],
+) -> Result<(serde_json::Value, usize), LibraryError> {
+    let (export, model_count, _) = export_library_json_value_with_bytes_and_slicers(db, slicers)?;
+    Ok((export, model_count))
+}
+
+fn export_library_json_value_with_bytes(
+    db: &LibraryDb,
+) -> Result<(serde_json::Value, usize, Vec<u8>), LibraryError> {
+    export_library_json_value_with_bytes_and_slicers(db, &[])
+}
+
+fn export_library_json_value_with_bytes_and_slicers(
+    db: &LibraryDb,
+    slicers: &[SlicerJsonExportEntry],
+) -> Result<(serde_json::Value, usize, Vec<u8>), LibraryError> {
+    validate_slicer_json_export(slicers)?;
+    let export_date = format_system_time(SystemTime::now()).map_err(|_| {
+        LibraryError::InvalidInput("Library JSON export timestamp could not be formatted".into())
+    })?;
+    db.with_json_export_snapshot(|db| {
+        let mut preflight = CappedJsonWriter::new(std::io::sink(), MAX_PRINTVENTORY_JSON_BYTES);
+        stream_library_json_export_with_slicers(db, &export_date, &mut preflight, slicers)?;
+        let (export, model_count) =
+            build_library_export_value_with_slicers(db, &export_date, slicers)?;
+        let bytes = serialize_library_json_export(&export)?;
+        Ok((export, model_count, bytes))
+    })
+}
+
+fn serialize_library_json_export(export: &serde_json::Value) -> Result<Vec<u8>, LibraryError> {
+    let mut writer = CappedJsonWriter::new(Vec::new(), MAX_PRINTVENTORY_JSON_BYTES);
+    serde_json::to_writer_pretty(&mut writer, export).map_err(|_| {
+        if writer.exceeded {
+            library_json_export_size_error(writer.limit)
+        } else {
+            LibraryError::InvalidInput("Library JSON export could not be encoded".into())
+        }
+    })?;
+    Ok(writer.into_inner())
 }
 
 fn execute_library_export(
@@ -5371,10 +10781,7 @@ fn execute_library_export(
         file_name,
         false,
     )?;
-    let export_date = format_system_time(SystemTime::now())?;
-    let (export, models) = runtime.read_db(|db| build_library_export_value(db, &export_date))?;
-    let bytes = serde_json::to_vec_pretty(&export)
-        .map_err(|_| internal("Library JSON export could not be encoded"))?;
+    let stage = runtime.read_db(|db| stage_library_json_export(db, &destination))?;
     let runtime_arc = runtime
         .self_weak
         .get()
@@ -5382,6 +10789,28 @@ fn execute_library_export(
         .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
     let _guard = runtime_arc.begin_maintenance()?;
     recheck_management_plan(runtime, expected_epoch, expected_revision)?;
+    let result = stage.publish(&destination).map_err(runtime_library_error)?;
+    Ok(ManagementResult::LibraryExported {
+        destination_handle_id: destination_handle_id.into(),
+        file_name: file_name.into(),
+        models: result.models,
+        bytes: result.bytes,
+    })
+}
+
+#[cfg(test)]
+fn write_library_json_export(
+    destination: &Path,
+    export: &serde_json::Value,
+) -> Result<usize, RuntimeError> {
+    let bytes = serialize_library_json_export(export).map_err(runtime_library_error)?;
+    let byte_count = bytes.len();
+    write_library_json_export_bytes(destination, &bytes)?;
+    Ok(byte_count)
+}
+
+#[cfg(test)]
+fn write_library_json_export_bytes(destination: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -5393,15 +10822,10 @@ fn execute_library_export(
         .map_err(|_| io_error());
     drop(output);
     if write_result.is_err() {
-        let _ = fs::remove_file(&destination);
+        let _ = hold_runtime_path(destination);
     }
     write_result?;
-    Ok(ManagementResult::LibraryExported {
-        destination_handle_id: destination_handle_id.into(),
-        file_name: file_name.into(),
-        models,
-        bytes: bytes.len() as u64,
-    })
+    Ok(())
 }
 
 struct RestoreExecution<'a> {
@@ -5413,11 +10837,234 @@ struct RestoreExecution<'a> {
     expected_revision: u64,
 }
 
+#[derive(Debug)]
+struct RestoreSwapFailure {
+    message: String,
+    recovered: bool,
+}
+
+fn restore_swap_failure(message: impl Into<String>, recovered: bool) -> RestoreSwapFailure {
+    RestoreSwapFailure {
+        message: message.into(),
+        recovered,
+    }
+}
+
+fn rollback_restore_before_install(
+    parent: &secure_fs::Directory,
+    root_name: &std::ffi::OsStr,
+    previous_name: &std::ffi::OsStr,
+) -> Result<(), String> {
+    parent
+        .rename_child_exclusive(previous_name, root_name)
+        .and_then(|()| parent.sync())
+        .map_err(|error| error.to_string())
+}
+
+fn rollback_restore_after_install(
+    parent: &secure_fs::Directory,
+    root_name: &std::ffi::OsStr,
+    failed_name: &std::ffi::OsStr,
+    previous_name: &std::ffi::OsStr,
+) -> Result<(), String> {
+    parent
+        .rename_child_exclusive(root_name, failed_name)
+        .and_then(|()| parent.sync())
+        .and_then(|()| parent.rename_child_exclusive(previous_name, root_name))
+        .and_then(|()| parent.sync())
+        .map_err(|error| error.to_string())
+}
+
+fn swap_restored_library_with<F, V>(
+    parent: &secure_fs::Directory,
+    original: &secure_fs::Directory,
+    staged: &secure_fs::Directory,
+    root_name: &std::ffi::OsStr,
+    staged_name: &std::ffi::OsStr,
+    previous_name: &std::ffi::OsStr,
+    failed_name: &std::ffi::OsStr,
+    after_original_saved: F,
+    validate_installed: V,
+) -> Result<(), RestoreSwapFailure>
+where
+    F: FnOnce(),
+    V: FnOnce(&Path) -> Result<(), String>,
+{
+    let root_path = parent
+        .child_path(root_name)
+        .map_err(|error| restore_swap_failure(error.to_string(), true))?;
+    let staged_path = parent
+        .child_path(staged_name)
+        .map_err(|error| restore_swap_failure(error.to_string(), true))?;
+    if !original
+        .matches_path(&root_path)
+        .map_err(|error| restore_swap_failure(error.to_string(), true))?
+        || !staged
+            .matches_path(&staged_path)
+            .map_err(|error| restore_swap_failure(error.to_string(), true))?
+    {
+        return Err(restore_swap_failure(
+            "Library or restore staging directory identity changed before swap",
+            true,
+        ));
+    }
+    if parent
+        .entry_exists(previous_name)
+        .map_err(|error| restore_swap_failure(error.to_string(), true))?
+    {
+        return Err(restore_swap_failure(
+            "Previous Library destination is already occupied",
+            true,
+        ));
+    }
+    parent
+        .rename_child_exclusive(root_name, previous_name)
+        .map_err(|error| restore_swap_failure(error.to_string(), true))?;
+    if let Err(error) = parent.sync() {
+        return match rollback_restore_before_install(parent, root_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                format!("Could not sync the saved Library directory: {error}"),
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!(
+                    "Could not sync or restore the saved Library directory: {error}; {rollback}"
+                ),
+                false,
+            )),
+        };
+    }
+    let previous_matches = parent
+        .child_path(previous_name)
+        .ok()
+        .and_then(|path| original.matches_path(&path).ok())
+        .unwrap_or(false);
+    if !previous_matches {
+        return match rollback_restore_before_install(parent, root_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                "Saved Library identity changed during restore swap",
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!("Saved Library identity changed and rollback failed: {rollback}"),
+                false,
+            )),
+        };
+    }
+
+    after_original_saved();
+    let staged_still_named = parent
+        .child_path(staged_name)
+        .ok()
+        .and_then(|path| staged.matches_path(&path).ok())
+        .unwrap_or(false);
+    if !staged_still_named {
+        return match rollback_restore_before_install(parent, root_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                "Restore staging directory changed before installation",
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!("Restore staging changed and Library rollback failed: {rollback}"),
+                false,
+            )),
+        };
+    }
+    if let Err(error) = parent.rename_child_exclusive(staged_name, root_name) {
+        return match rollback_restore_before_install(parent, root_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                format!("Library replacement failed: {error}"),
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!("Library replacement failed: {error}; rollback failed: {rollback}"),
+                false,
+            )),
+        };
+    }
+    if let Err(error) = parent.sync() {
+        return match rollback_restore_after_install(parent, root_name, failed_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                format!("Could not sync the installed Library directory: {error}"),
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!("Could not sync installed Library or roll back: {error}; {rollback}"),
+                false,
+            )),
+        };
+    }
+    let root_path = match parent.child_path(root_name) {
+        Ok(path) => path,
+        Err(error) => {
+            return match rollback_restore_after_install(
+                parent,
+                root_name,
+                failed_name,
+                previous_name,
+            ) {
+                Ok(()) => Err(restore_swap_failure(
+                    format!("Could not resolve installed Library path: {error}"),
+                    true,
+                )),
+                Err(rollback) => Err(restore_swap_failure(
+                    format!(
+                        "Could not resolve or roll back installed Library: {error}; {rollback}"
+                    ),
+                    false,
+                )),
+            };
+        }
+    };
+    if !staged.matches_path(&root_path).unwrap_or(false) {
+        return match rollback_restore_after_install(parent, root_name, failed_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                "Restored Library path changed after installation",
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!("Restored Library identity changed and rollback failed: {rollback}"),
+                false,
+            )),
+        };
+    }
+    if let Err(validation) = validate_installed(&root_path) {
+        return match rollback_restore_after_install(parent, root_name, failed_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                format!(
+                    "Restored Library failed validation; previous Library recovered: {validation}"
+                ),
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!(
+                    "Restored Library failed validation and rollback failed: {validation}; {rollback}"
+                ),
+                false,
+            )),
+        };
+    }
+    if !staged.matches_path(&root_path).unwrap_or(false) {
+        return match rollback_restore_after_install(parent, root_name, failed_name, previous_name) {
+            Ok(()) => Err(restore_swap_failure(
+                "Restored Library identity changed during final validation",
+                true,
+            )),
+            Err(rollback) => Err(restore_swap_failure(
+                format!("Restored Library identity changed and rollback failed: {rollback}"),
+                false,
+            )),
+        };
+    }
+    Ok(())
+}
+
 fn execute_restore(
     runtime: &LibraryRuntime,
     context: &RequestContext,
     execution: RestoreExecution<'_>,
 ) -> Result<ManagementResult, RuntimeError> {
+    require_durable_source_mutations()?;
     runtime.require(context, Capability::Maintenance)?;
     let (_, source) = admitted_file(
         runtime,
@@ -5443,7 +11090,7 @@ fn execute_restore(
         .get()
         .and_then(Weak::upgrade)
         .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
-    let mut guard = runtime_arc.begin_maintenance()?;
+    let guard = runtime_arc.begin_maintenance()?;
     recheck_management_plan(
         runtime,
         execution.expected_epoch,
@@ -5453,16 +11100,117 @@ fn execute_restore(
     let parent = root
         .parent()
         .ok_or_else(|| invalid("Library root has no stable parent"))?;
+    let parent_directory = secure_fs::Directory::open(parent)
+        .map_err(|_| stale("Library parent is no longer a safe directory"))?;
+    if !parent_directory
+        .matches_path(parent)
+        .map_err(|_| stale("Library parent identity changed"))?
+    {
+        return Err(stale("Library parent identity changed"));
+    }
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| invalid("Library root name is invalid"))?
+        .to_os_string();
+    let original = parent_directory
+        .open_child(&root_name)
+        .map_err(|_| stale("Library root is no longer a safe directory"))?;
+    if !original
+        .matches_path(&root)
+        .map_err(|_| stale("Library root identity changed"))?
+    {
+        return Err(stale("Library root identity changed"));
+    }
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let stable_source = parent.join(format!(".gogglelab-restore-input-{suffix}.zip"));
-    copy_verified_management_file(&source, &stable_source, execution.expected_input)?;
-    let staged = parent.join(format!(".gogglelab-restore-{suffix}"));
-    let previous = parent.join(format!("library.previous-{suffix}"));
-    let previous_backup = parent.join(format!("library.previous-{suffix}.zip"));
+    let stable_source_name = std::ffi::OsString::from(format!(".restore-input-{suffix}.zip"));
+    let staged_name = std::ffi::OsString::from(format!(".gogglelab-restore-{suffix}"));
+    let previous_name = std::ffi::OsString::from(format!("library.previous-{suffix}"));
+    let previous_backup_name = std::ffi::OsString::from(format!("library.previous-{suffix}.zip"));
+    let failed_name = std::ffi::OsString::from(format!(".gogglelab-failed-restore-{suffix}"));
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| invalid("Restore archive has no parent directory"))?;
+    let source_directory = secure_fs::Directory::open(source_parent)
+        .map_err(|_| stale("Restore archive parent changed"))?;
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| invalid("Restore archive name is invalid"))?;
+    let input_scratch = create_scratch_directory("restore-input")?;
+    secure_fs::copy_verified_into_directory(
+        &source_directory,
+        source_name,
+        &input_scratch.directory,
+        &stable_source_name,
+        execution.expected_input,
+        MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024,
+    )
+    .map_err(|_| stale("Restore backup changed after planning"))?;
+    let mut stable_source = input_scratch
+        .directory
+        .open_file(&stable_source_name)
+        .map_err(|_| io_error())?;
+    if secure_fs::hash_file(
+        &mut stable_source,
+        MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024,
+    )
+    .map_err(|_| io_error())?
+        != *execution.expected_input
+    {
+        return Err(stale("Restore backup changed after planning"));
+    }
+    stable_source.rewind().map_err(|_| io_error())?;
+    parent_directory
+        .create_child_directory(&staged_name)
+        .map_err(|_| io_error())?;
+    let staged = parent_directory
+        .open_child(&staged_name)
+        .map_err(|_| io_error())?;
+    let restore_journal = RestoreJournal {
+        version: 1,
+        root_path: root.to_string_lossy().into_owned(),
+        nonce: suffix.clone(),
+        staged_name: staged_name.to_string_lossy().into_owned(),
+        previous_name: previous_name.to_string_lossy().into_owned(),
+        failed_name: failed_name.to_string_lossy().into_owned(),
+        committed: false,
+    };
+    let journal_name = match write_restore_journal_at(&parent_directory, &root, &restore_journal) {
+        Ok(name) => name,
+        Err(error) => {
+            let stage_still_owned = parent_directory
+                .child_path(&staged_name)
+                .ok()
+                .and_then(|path| staged.matches_path(&path).ok())
+                .unwrap_or(false);
+            if stage_still_owned && parent_directory.remove_child_tree(&staged_name).is_err() {
+                guard.remain_armed();
+            }
+            return Err(error);
+        }
+    };
+    let mut swap_started = false;
     let result = (|| {
-        library_backup::restore_backup_to_staging(&stable_source, &staged)
+        let mut staged_target = GuardedDirectory(staged.try_clone().map_err(|_| io_error())?);
+        library_backup::restore_backup_from_reader(stable_source, &mut staged_target)
             .map_err(|_| invalid("Backup could not be restored to staging"))?;
-        let staged_db = LibraryDb::open(&staged).map_err(runtime_library_error)?;
+        let staged_path = parent_directory
+            .child_path(&staged_name)
+            .map_err(|_| io_error())?;
+        if !parent_directory
+            .matches_path(parent)
+            .map_err(|_| stale("Library parent identity changed during restore"))?
+            || !staged
+                .matches_path(&staged_path)
+                .map_err(|_| stale("Restore staging identity changed"))?
+        {
+            return Err(stale("Restore staging or parent identity changed"));
+        }
+        let staged_db = LibraryDb::open(&staged_path).map_err(runtime_library_error)?;
+        if !staged.matches_path(&staged_path).map_err(|_| io_error())? {
+            return Err(stale(
+                "Restore staging identity changed during database open",
+            ));
+        }
         let mappings = execution
             .root_mappings
             .iter()
@@ -5490,65 +11238,156 @@ fn execute_restore(
         staged_db
             .remap_restored_index_roots(&mappings)
             .map_err(runtime_library_error)?;
+        if !staged.matches_path(&staged_path).map_err(|_| io_error())? {
+            return Err(stale(
+                "Restore staging identity changed during index-root remapping",
+            ));
+        }
         staged_db
             .bump_all_metadata_versions_above(floor)
             .map_err(runtime_library_error)?;
+        if !staged.matches_path(&staged_path).map_err(|_| io_error())? {
+            return Err(stale(
+                "Restore staging identity changed during metadata update",
+            ));
+        }
         let models = staged_db
             .list_models(None, None)
             .map_err(runtime_library_error)?
             .len();
         drop(staged_db);
-        library_backup::create_backup(&root, &previous_backup)
+        let backup_scratch = create_scratch_directory("restore-previous-backup")?;
+        let backup_name = std::ffi::OsString::from("previous-library.zip");
+        let backup_path = backup_scratch.path.join(&backup_name);
+        let root_handle_path = original.path().map_err(|_| io_error())?;
+        if !original.matches_path(&root).map_err(|_| io_error())? {
+            return Err(stale("Library root identity changed before backup"));
+        }
+        let previous_backup = library_backup::create_backup(&root_handle_path, &backup_path)
             .map_err(|_| invalid("Pre-restore backup could not be created"))?;
+        let mut backup_file = backup_scratch
+            .directory
+            .open_file(&backup_name)
+            .map_err(|_| io_error())?;
+        let backup_fingerprint = secure_fs::hash_file(
+            &mut backup_file,
+            MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024,
+        )
+        .map_err(|_| io_error())?;
+        if backup_fingerprint.0 == 0 || backup_fingerprint.1 != previous_backup.sha256 {
+            return Err(invalid("Pre-restore backup failed integrity verification"));
+        }
+        secure_fs::copy_verified_into_directory(
+            &backup_scratch.directory,
+            &backup_name,
+            &parent_directory,
+            &previous_backup_name,
+            &backup_fingerprint,
+            MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024,
+        )
+        .map_err(|_| stale("Pre-restore backup destination changed"))?;
+        let mut copied_backup = parent_directory
+            .open_file(&previous_backup_name)
+            .map_err(|_| io_error())?;
+        if secure_fs::hash_file(
+            &mut copied_backup,
+            MAX_ORPHAN_CLEANUP_TOTAL_BYTES + 16 * 1024 * 1024,
+        )
+        .map_err(|_| io_error())?
+            != backup_fingerprint
+            || !parent_directory
+                .matches_path(parent)
+                .map_err(|_| stale("Library parent identity changed during backup"))?
+        {
+            return Err(stale("Pre-restore backup changed after writing"));
+        }
+        staged.sync_tree().map_err(|_| io_error())?;
+        parent_directory.sync().map_err(|_| io_error())?;
         let epoch = guard.invalidate();
-        fs::rename(&root, &previous).map_err(|_| io_error())?;
-        if let Err(error) = fs::rename(&staged, &root) {
-            if fs::rename(&previous, &root).is_err() {
+        swap_started = true;
+        if let Err(failure) = swap_restored_library_with(
+            &parent_directory,
+            &original,
+            &staged,
+            &root_name,
+            &staged_name,
+            &previous_name,
+            &failed_name,
+            || {},
+            |installed_path| {
+                if !staged.matches_path(installed_path).unwrap_or(false) {
+                    return Err("Restored Library identity changed before validation".into());
+                }
+                let db = LibraryDb::open(installed_path).map_err(|error| error.to_string())?;
+                let result = db
+                    .list_models(None, None)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                drop(db);
+                if !staged.matches_path(installed_path).unwrap_or(false) {
+                    return Err("Restored Library identity changed during validation".into());
+                }
+                result
+            },
+        ) {
+            if !failure.recovered {
                 guard.remain_armed();
                 return Err(RuntimeError {
                     code: RuntimeErrorCode::Corrupt,
-                    message: "Library replacement and rollback both failed".into(),
+                    message: failure.message,
                     retryable: false,
                     current_version: None,
+                    source_holds: Vec::new(),
                 });
+            }
+            if let Err(cleanup_error) = clear_restore_journal_at(&parent_directory, &journal_name) {
+                guard.remain_armed();
+                return Err(cleanup_error);
+            }
+            let stage_still_owned = parent_directory
+                .child_path(&staged_name)
+                .ok()
+                .and_then(|path| staged.matches_path(&path).ok())
+                .unwrap_or(false);
+            if stage_still_owned {
+                let _ = parent_directory.remove_child_tree(&staged_name);
             }
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Io,
-                message: format!("Library replacement failed: {error}"),
+                message: failure.message,
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
-        if LibraryDb::open(&root)
-            .and_then(|db| db.list_models(None, None).map(|_| ()))
-            .is_err()
+        if let Err(error) =
+            mark_restore_journal_committed_at(&parent_directory, &root, &journal_name, &suffix)
         {
-            let failed = parent.join(format!(".gogglelab-failed-{suffix}"));
-            if fs::rename(&root, &failed).is_err() || fs::rename(&previous, &root).is_err() {
-                guard.remain_armed();
-                return Err(RuntimeError {
-                    code: RuntimeErrorCode::Corrupt,
-                    message: "Restored Library failed validation and rollback failed".into(),
-                    retryable: false,
-                    current_version: None,
-                });
-            }
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Restored Library failed validation; previous Library recovered".into(),
-                retryable: false,
-                current_version: None,
-            });
+            guard.remain_armed();
+            return Err(error);
+        }
+        if let Err(error) = clear_restore_journal_at(&parent_directory, &journal_name) {
+            guard.remain_armed();
+            return Err(error);
         }
         Ok(ManagementResult::BackupRestored {
             models,
             library_epoch: epoch,
         })
     })();
-    if result.is_err() && staged.exists() {
-        let _ = fs::remove_dir_all(&staged);
+    if result.is_err() && !swap_started {
+        let stage_still_owned = parent_directory
+            .child_path(&staged_name)
+            .ok()
+            .and_then(|path| staged.matches_path(&path).ok())
+            .unwrap_or(false);
+        if stage_still_owned && parent_directory.remove_child_tree(&staged_name).is_err() {
+            guard.remain_armed();
+        }
+        if clear_restore_journal_at(&parent_directory, &journal_name).is_err() {
+            guard.remain_armed();
+        }
     }
-    let _ = fs::remove_file(stable_source);
     result
 }
 
@@ -5589,17 +11428,24 @@ fn runtime_library_error(error: LibraryError) -> RuntimeError {
             actual,
             expected: _,
             filament_id: _,
+        }
+        | LibraryError::PartStockVersionConflict {
+            actual,
+            expected: _,
+            part_id: _,
         } => RuntimeError {
             code: RuntimeErrorCode::Conflict,
             message: "Stored version changed".into(),
             retryable: true,
             current_version: Some(actual),
+            source_holds: Vec::new(),
         },
         LibraryError::IdempotencyConflict(_) => RuntimeError {
             code: RuntimeErrorCode::Conflict,
             message: "Idempotency key conflicts with another payload".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         },
         LibraryError::ModelNotFound(_)
         | LibraryError::FolderNotFound(_)
@@ -5608,12 +11454,14 @@ fn runtime_library_error(error: LibraryError) -> RuntimeError {
             message: "Library record was not found".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         },
         LibraryError::SchemaTooNew { .. } | LibraryError::UnsupportedFormat(_) => RuntimeError {
             code: RuntimeErrorCode::Unsupported,
             message: "Library format is unsupported".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         },
         LibraryError::Io { .. } => io_error(),
         LibraryError::Database(_) => RuntimeError {
@@ -5621,12 +11469,14 @@ fn runtime_library_error(error: LibraryError) -> RuntimeError {
             message: "Library database could not be read safely".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         },
         other => RuntimeError {
             code: RuntimeErrorCode::InvalidInput,
             message: other.to_string(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         },
     }
 }
@@ -5775,7 +11625,57 @@ fn core_print_attempt_input(input: PrintAttemptInput) -> CorePrintAttemptInput {
         outcome: match input.outcome {
             PrintOutcome::Printed => CorePrintOutcome::Printed,
             PrintOutcome::Failed => CorePrintOutcome::Failed,
+            PrintOutcome::Cancelled => CorePrintOutcome::Cancelled,
         },
+        parts: input.parts.map(|parts| {
+            parts
+                .into_iter()
+                .map(|part| CorePartUsageInput {
+                    id: part.id,
+                    quantity: part.quantity,
+                    snapshot: part.snapshot.map(|snapshot| CorePartUsageSnapshot {
+                        name: snapshot.name,
+                        category: snapshot.category,
+                        unit: snapshot.unit,
+                    }),
+                })
+                .collect()
+        }),
+    }
+}
+
+fn core_part_stock_input(input: PartStockInput) -> CorePartStockInput {
+    CorePartStockInput {
+        name: input.name,
+        category: input.category,
+        quantity: input.quantity,
+        unit: input.unit,
+        notes: input.notes,
+        low_stock: input.low_stock,
+    }
+}
+
+fn part_stock(value: CorePartStock) -> PartStock {
+    PartStock {
+        id: value.id,
+        metadata_version: value.metadata_version,
+        name: value.name,
+        category: value.category,
+        quantity: value.quantity,
+        unit: value.unit,
+        notes: value.notes,
+        low_stock: value.low_stock,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+    }
+}
+
+fn core_print_attempt_input_with_printer(
+    input: PrintAttemptInputWithPrinter,
+) -> CorePrintAttemptInputWithPrinter {
+    CorePrintAttemptInputWithPrinter {
+        input: core_print_attempt_input(input.input),
+        printer_id: input.printer_id,
     }
 }
 
@@ -5787,10 +11687,26 @@ fn print_attempt(value: CorePrintAttempt) -> PrintAttempt {
         quantity: value.quantity,
         notes: value.notes,
         filament_ids: value.filament_ids,
+        parts: value
+            .parts
+            .into_iter()
+            .map(|part| PrintAttemptPart {
+                id: part.id,
+                name: part.name,
+                category: part.category,
+                unit: part.unit,
+                quantity_per_copy: part.quantity_per_copy,
+                quantity: part.quantity,
+            })
+            .collect(),
         outcome: match value.outcome {
             CorePrintOutcome::Printed => PrintOutcome::Printed,
             CorePrintOutcome::Failed => PrintOutcome::Failed,
+            CorePrintOutcome::Cancelled => PrintOutcome::Cancelled,
         },
+        stock_adjusted: value.stock_adjusted,
+        printer_id: value.printer_id,
+        printer_name: value.printer_name,
         created_at: value.created_at,
         updated_at: value.updated_at,
     }
@@ -6040,7 +11956,7 @@ fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &s
                 })?;
                 Ok(())
             })();
-            let _ = fs::remove_file(temporary);
+            let _ = hold_runtime_path(&temporary);
             render
         })();
         if let Err(error) = result {
@@ -6065,6 +11981,7 @@ fn scan_error(message: String) -> RuntimeError {
         message,
         retryable: true,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -6165,6 +12082,7 @@ fn stream_verified_file(
             message: "Content exceeds its lease type limit".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         });
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
@@ -6207,6 +12125,7 @@ fn read_verified_content(
             message: "Model source exceeds the runtime download limit".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         });
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
@@ -6234,15 +12153,7 @@ fn invalid(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: false,
         current_version: None,
-    }
-}
-
-fn unsupported_physical_management() -> RuntimeError {
-    RuntimeError {
-        code: RuntimeErrorCode::Unsupported,
-        message: "Physical source management requires explicit host authorization".into(),
-        retryable: false,
-        current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -6252,6 +12163,7 @@ fn io_error() -> RuntimeError {
         message: "Library filesystem operation failed".into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -6261,6 +12173,7 @@ fn maintenance_error() -> RuntimeError {
         message: "Library maintenance is in progress".into(),
         retryable: true,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -6270,6 +12183,7 @@ fn stale(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: true,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -6279,6 +12193,7 @@ fn internal(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -6292,12 +12207,1576 @@ mod tests {
         CAPTURE_ENVELOPE_VERSION,
     };
 
+    #[test]
+    fn protocol_print_history_cannot_set_local_creation_time() {
+        let protocol_input: PrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-10T12:00:00Z",
+            "createdAt": "2020-01-01T00:00:00Z",
+            "quantity": 1,
+            "notes": "external protocol input",
+            "filamentIds": [],
+            "outcome": "printed"
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(&protocol_input).unwrap();
+        assert!(serialized.get("createdAt").is_none());
+
+        let local_input = core_print_attempt_input(protocol_input);
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Protocol print history", None).unwrap();
+        let attempt = db.create_print_attempt(&model.id, &local_input).unwrap();
+        assert_ne!(attempt.created_at, "2020-01-01T00:00:00Z");
+        assert_eq!(attempt.created_at, attempt.updated_at);
+    }
+
+    #[test]
+    fn print_history_printer_patch_round_trips_and_unknown_ids_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("Printer-attributed print", None).unwrap();
+        let printer = db
+            .create_printer(
+                &library_core::models::PrinterInput {
+                    nickname: "Workshop printer".into(),
+                    make: None,
+                    model: None,
+                    printer_type: None,
+                    firmware: None,
+                    host: None,
+                    web_url: None,
+                    bed_mm: None,
+                    notes: String::new(),
+                },
+                false,
+            )
+            .unwrap();
+        drop(db);
+
+        let runtime = LibraryRuntime::open(config(root)).unwrap();
+        let context = RequestContext {
+            principal_id: "test".into(),
+            capabilities: [Capability::CatalogRead, Capability::CatalogWrite]
+                .into_iter()
+                .collect(),
+            request_id: "printer-history-test".into(),
+        };
+        let linked: PrintAttemptInputWithPrinter = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-14T12:00:00Z",
+            "quantity": 1,
+            "notes": "Initial",
+            "filamentIds": [],
+            "outcome": "printed",
+            "printerId": printer.id
+        }))
+        .unwrap();
+        let created = runtime
+            .create_print_attempt_with_printer(&context, &model.id, linked)
+            .unwrap();
+        assert_eq!(created.printer_id.as_deref(), Some(printer.id.as_str()));
+        assert_eq!(created.printer_name.as_deref(), Some("Workshop printer"));
+
+        let omitted: PrintAttemptInputWithPrinter = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-14T12:00:00Z",
+            "quantity": 2,
+            "notes": "Keep printer",
+            "filamentIds": [],
+            "outcome": "printed"
+        }))
+        .unwrap();
+        let preserved = runtime
+            .update_print_attempt_with_printer(&context, &created.id, omitted)
+            .unwrap();
+        assert_eq!(preserved.printer_id.as_deref(), Some(printer.id.as_str()));
+        assert_eq!(preserved.printer_name.as_deref(), Some("Workshop printer"));
+
+        let invalid_link: PrintAttemptInputWithPrinter =
+            serde_json::from_value(serde_json::json!({
+                "printedAt": "2026-10-14T12:00:00Z",
+                "quantity": 3,
+                "notes": "Must roll back",
+                "filamentIds": [],
+                "outcome": "printed",
+                "printerId": "not-a-catalog-printer"
+            }))
+            .unwrap();
+        let error = runtime
+            .update_print_attempt_with_printer(&context, &created.id, invalid_link)
+            .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::InvalidInput);
+        let unchanged = runtime
+            .list_print_attempts(&context, &model.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(unchanged.notes, "Keep printer");
+        assert_eq!(unchanged.printer_id.as_deref(), Some(printer.id.as_str()));
+
+        let clear: PrintAttemptInputWithPrinter = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-14T12:00:00Z",
+            "quantity": 2,
+            "notes": "Clear printer",
+            "filamentIds": [],
+            "outcome": "printed",
+            "printerId": null
+        }))
+        .unwrap();
+        let cleared = runtime
+            .update_print_attempt_with_printer(&context, &created.id, clear)
+            .unwrap();
+        assert_eq!(cleared.printer_id, None);
+        assert_eq!(cleared.printer_name, None);
+    }
+
+    #[test]
+    fn part_stock_protocol_gates_writes_and_preserves_transactional_event_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let runtime = LibraryRuntime::open(config(root)).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.create_model("Parts protocol model", None))
+            .unwrap();
+        let writer = RequestContext {
+            principal_id: "parts-writer".into(),
+            capabilities: [Capability::CatalogRead, Capability::CatalogWrite]
+                .into_iter()
+                .collect(),
+            request_id: "parts-writer".into(),
+        };
+        let reader = RequestContext {
+            principal_id: "parts-reader".into(),
+            capabilities: [Capability::CatalogRead].into_iter().collect(),
+            request_id: "parts-reader".into(),
+        };
+        let stock = runtime
+            .create_part_stock(
+                &writer,
+                PartStockInput {
+                    name: "M3 heat-set insert".into(),
+                    category: Some("hardware".into()),
+                    quantity: 10,
+                    unit: "pcs".into(),
+                    notes: "brass".into(),
+                    low_stock: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(stock.metadata_version, 1);
+        assert_eq!(
+            runtime.list_part_stock(&reader).unwrap(),
+            vec![stock.clone()]
+        );
+        assert_eq!(
+            runtime
+                .create_part_stock(
+                    &reader,
+                    PartStockInput {
+                        name: "forbidden".into(),
+                        category: None,
+                        quantity: 0,
+                        unit: "pcs".into(),
+                        notes: String::new(),
+                        low_stock: 0,
+                    },
+                )
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+
+        let cancelled: PrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-15T12:00:00Z",
+            "quantity": 2,
+            "notes": "cancelled during setup",
+            "filamentIds": [],
+            "outcome": "cancelled",
+            "parts": [{"id": stock.id, "quantity": 3}]
+        }))
+        .unwrap();
+        let created = runtime
+            .create_print_attempt(&writer, &model.id, cancelled)
+            .unwrap();
+        assert_eq!(created.outcome, PrintOutcome::Cancelled);
+        assert_eq!(created.parts[0].quantity_per_copy, 3);
+        assert_eq!(created.parts[0].quantity, 6);
+        assert_eq!(runtime.list_part_stock(&reader).unwrap()[0].quantity, 4);
+
+        let edit_without_parts: PrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-15T12:00:00Z",
+            "quantity": 1,
+            "notes": "copy count corrected",
+            "filamentIds": [],
+            "outcome": "cancelled"
+        }))
+        .unwrap();
+        let updated = runtime
+            .update_print_attempt(&writer, &created.id, edit_without_parts)
+            .unwrap();
+        assert_eq!(updated.parts[0].quantity, 3);
+        assert_eq!(runtime.list_part_stock(&reader).unwrap()[0].quantity, 7);
+
+        let batch_input: PrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-15T13:00:00Z",
+            "quantity": 2,
+            "notes": "batch print",
+            "filamentIds": [],
+            "outcome": "printed",
+            "parts": [{"id": stock.id, "quantity": 1}]
+        }))
+        .unwrap();
+        let batch_item = PrintAttemptBatchItem {
+            model_id: model.id.clone(),
+            input: batch_input,
+        };
+        let first = runtime
+            .create_print_attempts(&writer, "parts-replay-key", vec![batch_item.clone()])
+            .unwrap();
+        let replay = runtime
+            .create_print_attempts(&writer, "parts-replay-key", vec![batch_item])
+            .unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(runtime.list_part_stock(&reader).unwrap()[0].quantity, 5);
+
+        runtime.delete_print_attempt(&writer, &created.id).unwrap();
+        runtime.delete_print_attempt(&writer, &first[0].id).unwrap();
+        assert_eq!(runtime.list_part_stock(&reader).unwrap()[0].quantity, 10);
+    }
+
+    #[test]
+    fn ordinary_print_history_input_ignores_import_creation_time() {
+        let input: CorePrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printed_at": "2026-10-10T12:00:00Z",
+            "created_at": "2000-01-01T00:00:00Z",
+            "quantity": 1,
+            "notes": "ordinary local create",
+            "filament_ids": [],
+            "outcome": "printed"
+        }))
+        .unwrap();
+        assert!(serde_json::to_value(&input)
+            .unwrap()
+            .get("created_at")
+            .is_none());
+
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Ordinary print history", None).unwrap();
+        let attempt = db.create_print_attempt(&model.id, &input).unwrap();
+        assert_ne!(attempt.created_at, "2000-01-01T00:00:00Z");
+        assert_eq!(attempt.created_at, attempt.updated_at);
+    }
+
     fn config(root: PathBuf) -> RuntimeConfig {
         let settings = root
             .parent()
             .unwrap()
             .join("runtime-fixture-integrations.json");
         RuntimeConfig::desktop(root, settings)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn runtime_rejects_catalog_path_replacement_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let runtime = LibraryRuntime::open(config(root.clone())).unwrap();
+        runtime
+            .mutate_db(|db| db.create_model("Original catalog", None))
+            .unwrap();
+
+        let catalog = root.join("library.sqlite3");
+        let displaced = root.join("library.sqlite3.displaced");
+        std::fs::rename(&catalog, &displaced).unwrap();
+        drop(LibraryDb::open(&root).unwrap());
+
+        let result = runtime.with_db::<(), RuntimeError>(|_| Ok(()));
+        assert!(matches!(
+            result,
+            Err(RuntimeError {
+                code: RuntimeErrorCode::Stale,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn backup_is_atomically_published_and_never_overwrites_existing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        drop(LibraryDb::open(&root).unwrap());
+        let backup_directory = temp.path().join("backups");
+        std::fs::create_dir(&backup_directory).unwrap();
+        let destination = backup_directory.join("library.zip");
+
+        let result = create_backup_file(&root, &destination).unwrap();
+        assert_eq!(
+            hash_management_file(&destination, library_backup::MAX_BACKUP_ARCHIVE_BYTES)
+                .unwrap()
+                .1,
+            result.sha256
+        );
+        assert_eq!(std::fs::read_dir(&backup_directory).unwrap().count(), 1);
+
+        let original = std::fs::read(&destination).unwrap();
+        assert!(create_backup_file(&root, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&backup_directory).unwrap().count(), 1);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn backup_asset_source_stays_in_its_open_root_after_path_swap() {
+        use library_backup::BackupAssetSource as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let library_path = temp.path().join("library");
+        drop(LibraryDb::open(&library_path).unwrap());
+        let library = library_path.canonicalize().unwrap();
+        let original_asset = library.join("originals/owned.stl");
+        std::fs::write(&original_asset, b"original managed bytes").unwrap();
+
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(outside.join("originals")).unwrap();
+        std::fs::write(outside.join("originals/decoy.stl"), b"outside sentinel").unwrap();
+
+        let source = GuardedBackupAssetSource {
+            directory: secure_fs::Directory::open(&library).unwrap(),
+        };
+        let displaced = temp.path().join("library.displaced");
+        std::fs::rename(&library, &displaced).unwrap();
+        std::os::unix::fs::symlink(&outside, &library).unwrap();
+
+        let paths = source.asset_paths().unwrap();
+        assert!(paths.contains(&PathBuf::from("originals/owned.stl")));
+        assert!(!paths.contains(&PathBuf::from("originals/decoy.stl")));
+        let mut opened = source.open_asset(Path::new("originals/owned.stl")).unwrap();
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original managed bytes");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn backup_asset_walk_bounds_directory_entries_and_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        drop(LibraryDb::open(&library).unwrap());
+        std::fs::write(library.join("originals/a.stl"), b"a").unwrap();
+        std::fs::write(library.join("originals/b.stl"), b"b").unwrap();
+        std::fs::create_dir_all(library.join("manuals/one/two/three")).unwrap();
+        let source = GuardedBackupAssetSource {
+            directory: secure_fs::Directory::open(&library.canonicalize().unwrap()).unwrap(),
+        };
+
+        assert!(source.asset_paths_with_limits(1, 64, 1024).is_err());
+        assert!(source.asset_paths_with_limits(100, 1, 1024).is_err());
+        assert!(source.asset_paths_with_limits(100, 64, 1).is_err());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn oversized_backup_retains_the_handle_created_temporary_file_in_a_recovery_hold() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        drop(LibraryDb::open(&root).unwrap());
+        let backup_directory = temp.path().join("backups");
+        std::fs::create_dir(&backup_directory).unwrap();
+        let destination = backup_directory.join("library.zip");
+
+        assert!(create_backup_file_with_limit(&root, &destination, 32).is_err());
+        assert!(!destination.exists());
+        let names = std::fs::read_dir(&backup_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        let hold = names
+            .iter()
+            .find(|name| name.to_string_lossy().ends_with(".data"))
+            .expect("temporary archive bytes should remain recoverable");
+        assert!(!std::fs::read(backup_directory.join(hold))
+            .unwrap()
+            .is_empty());
+        let journal = names
+            .iter()
+            .find(|name| name.to_string_lossy().ends_with(".journal"))
+            .expect("temporary archive hold should have a durable journal");
+        assert!(backup_directory
+            .join(format!("{}.verified", journal.to_string_lossy()))
+            .exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn backup_rename_preserves_a_destination_created_after_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        drop(LibraryDb::open(&root).unwrap());
+        let backup_directory = temp.path().join("backups");
+        std::fs::create_dir(&backup_directory).unwrap();
+        let destination = backup_directory.join("library.zip");
+        let sentinel = b"created after backup preflight";
+
+        let result = create_backup_file_with_limit_and_hook(
+            &root,
+            &destination,
+            library_backup::MAX_BACKUP_ARCHIVE_BYTES,
+            || std::fs::write(&destination, sentinel).unwrap(),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), sentinel);
+        let names = std::fs::read_dir(&backup_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.to_string_lossy() == "library.zip")
+                .count(),
+            1
+        );
+        let hold = names
+            .iter()
+            .find(|name| name.to_string_lossy().ends_with(".data"))
+            .expect("failed backup bytes should remain recoverable");
+        assert!(!std::fs::read(backup_directory.join(hold))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn backup_fallback_keeps_the_path_based_no_clobber_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        drop(LibraryDb::open(&root).unwrap());
+        let backup_directory = temp.path().join("backups");
+        std::fs::create_dir(&backup_directory).unwrap();
+        let destination = backup_directory.join("library.zip");
+
+        let result = create_backup_file(&root, &destination).unwrap();
+        assert!(destination.is_file());
+        assert_eq!(
+            hash_management_file(&destination, library_backup::MAX_BACKUP_ARCHIVE_BYTES)
+                .unwrap()
+                .1,
+            result.sha256
+        );
+        assert!(create_backup_file(&root, &destination).is_err());
+    }
+
+    #[test]
+    fn library_json_export_includes_safe_printer_maintenance_and_reminder_records() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let printer = db
+            .create_printer(
+                &library_core::models::PrinterInput {
+                    nickname: "Workshop P1".into(),
+                    make: Some("Prusa Research".into()),
+                    model: Some("MK4S".into()),
+                    printer_type: Some("FDM".into()),
+                    firmware: Some("Prusa firmware".into()),
+                    host: Some("192.0.2.10".into()),
+                    web_url: Some("http://192.0.2.10/".into()),
+                    bed_mm: Some([250.0, 210.0, 220.0]),
+                    notes: "Nozzle serviced".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let maintenance_log = db
+            .create_printer_maintenance_log(
+                &printer.id,
+                &library_core::models::PrinterMaintenanceInput {
+                    title: "Replace nozzle".into(),
+                    performed_at: "2026-10-12T12:00:00Z".into(),
+                    notes: "Installed 0.4 mm nozzle".into(),
+                },
+            )
+            .unwrap();
+        let reminder = db
+            .create_printer_reminder(
+                &printer.id,
+                &library_core::models::PrinterReminderInput {
+                    title: "Clean build plate".into(),
+                    notes: "Use mild soap".into(),
+                    due_at: "2026-10-20T12:00:00Z".into(),
+                    interval_days: Some(30),
+                },
+            )
+            .unwrap();
+
+        let (export, model_count) =
+            build_library_export_value(&db, "2026-10-14T00:00:00Z").unwrap();
+
+        let assert_rfc3339 = |value: &serde_json::Value, field: &str| {
+            let timestamp = value.as_str().unwrap_or_default();
+            assert!(
+                time::OffsetDateTime::parse(
+                    timestamp,
+                    &time::format_description::well_known::Rfc3339
+                )
+                .is_ok(),
+                "{field} must be RFC3339, got {timestamp}"
+            );
+        };
+        assert_eq!(model_count, 0);
+        let exported_printer = &export["printers"][0];
+        assert_eq!(exported_printer["gogglelab_printer_id"], printer.id);
+        assert_eq!(exported_printer["nickname"], "Workshop P1");
+        assert_eq!(exported_printer["manufacturer"], "Prusa Research");
+        assert_eq!(exported_printer["model"], "MK4S");
+        assert_eq!(exported_printer["printer_type"], "FDM");
+        assert_eq!(exported_printer["firmware_type"], "Prusa firmware");
+        assert_eq!(exported_printer["host"], "192.0.2.10");
+        assert_eq!(exported_printer["web_url"], "http://192.0.2.10");
+        assert_eq!(exported_printer["source_kind"], "manual");
+        assert_rfc3339(&exported_printer["created_at"], "printer created_at");
+        assert_rfc3339(&exported_printer["updated_at"], "printer updated_at");
+        assert_eq!(
+            exported_printer["bed_mm"],
+            serde_json::json!([250.0, 210.0, 220.0])
+        );
+        assert_eq!(exported_printer["notes"], "Nozzle serviced");
+        for excluded in [
+            "credentials",
+            "password",
+            "api_key",
+            "token",
+            "endpoint_approved",
+            "connection_status",
+            "job_status",
+            "last_checked_at",
+            "connection_error_code",
+        ] {
+            assert!(
+                exported_printer.get(excluded).is_none(),
+                "unexpected {excluded}"
+            );
+        }
+
+        let exported_log = &export["printer_maintenance_logs"][0];
+        assert_eq!(
+            exported_log["gogglelab_maintenance_log_id"],
+            maintenance_log.id
+        );
+        assert_eq!(exported_log["gogglelab_printer_id"], printer.id);
+        assert_eq!(
+            exported_log["printer_nickname"],
+            maintenance_log.printer_nickname
+        );
+        assert_eq!(exported_log["title"], "Replace nozzle");
+        assert_eq!(exported_log["performed_at"], "2026-10-12T12:00:00.000Z");
+        assert_eq!(exported_log["notes"], "Installed 0.4 mm nozzle");
+        assert_rfc3339(&exported_log["created_at"], "maintenance log created_at");
+        assert!(exported_log.get("printer_id").is_none());
+
+        let exported_reminder = &export["printer_maintenance_reminders"][0];
+        assert_eq!(
+            exported_reminder["gogglelab_printer_reminder_id"],
+            reminder.id
+        );
+        assert_eq!(exported_reminder["gogglelab_printer_id"], printer.id);
+        assert_eq!(
+            exported_reminder["printer_nickname"],
+            reminder.printer_nickname
+        );
+        assert_eq!(exported_reminder["title"], "Clean build plate");
+        assert_eq!(exported_reminder["notes"], "Use mild soap");
+        assert_eq!(exported_reminder["due_at"], "2026-10-20T12:00:00.000Z");
+        assert_eq!(exported_reminder["interval_days"], 30);
+        assert_eq!(exported_reminder["status"], "active");
+        assert_eq!(
+            exported_reminder["last_completed_at"],
+            serde_json::Value::Null
+        );
+        assert_rfc3339(&exported_reminder["created_at"], "reminder created_at");
+        assert_rfc3339(&exported_reminder["updated_at"], "reminder updated_at");
+        assert!(exported_reminder.get("printer_id").is_none());
+
+        let mut writer = CappedJsonWriter::new(Vec::new(), MAX_PRINTVENTORY_JSON_BYTES);
+        stream_library_json_export(&db, "2026-10-15T00:00:00Z", &mut writer).unwrap();
+        let streamed: serde_json::Value = serde_json::from_slice(&writer.into_inner()).unwrap();
+        assert_rfc3339(
+            &streamed["printers"][0]["created_at"],
+            "streamed printer created_at",
+        );
+        assert_rfc3339(
+            &streamed["printers"][0]["updated_at"],
+            "streamed printer updated_at",
+        );
+        assert_rfc3339(
+            &streamed["printer_maintenance_logs"][0]["created_at"],
+            "streamed maintenance log created_at",
+        );
+        assert_rfc3339(
+            &streamed["printer_maintenance_reminders"][0]["created_at"],
+            "streamed reminder created_at",
+        );
+        assert_rfc3339(
+            &streamed["printer_maintenance_reminders"][0]["updated_at"],
+            "streamed reminder updated_at",
+        );
+    }
+
+    #[test]
+    fn imported_printer_history_round_trips_through_the_printventory_json_export() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let part = db
+            .create_part_stock(&CorePartStockInput {
+                name: "M3 heat-set insert".into(),
+                category: Some("hardware".into()),
+                quantity: 10,
+                unit: "pcs".into(),
+                notes: "brass".into(),
+                low_stock: 2,
+            })
+            .unwrap();
+        let mut printer_data = library_core::models::PrinterDataImport::default();
+        printer_data
+            .printers
+            .push(library_core::models::PrinterDataImportPrinter {
+                external_ref: "external-printer-1".into(),
+                map_to_local_printer_id: None,
+                input: library_core::models::PrinterInput {
+                    nickname: "Round-trip printer".into(),
+                    make: Some("Fixture maker".into()),
+                    model: Some("Fixture model".into()),
+                    printer_type: Some("FDM".into()),
+                    firmware: None,
+                    host: None,
+                    web_url: None,
+                    bed_mm: Some([220.0, 220.0, 250.0]),
+                    notes: "Imported for round-trip verification".into(),
+                },
+                created_at: Some("2026-10-13T11:00:00Z".into()),
+                updated_at: Some("2026-10-14T10:00:00Z".into()),
+            });
+        printer_data
+            .maintenance_logs
+            .push(library_core::models::PrinterDataImportMaintenanceLog {
+                external_ref: "external-maintenance-1".into(),
+                printer_external_ref: Some("external-printer-1".into()),
+                printer_nickname: Some("Round-trip printer before rename".into()),
+                input: library_core::models::PrinterMaintenanceInput {
+                    title: "Clean nozzle".into(),
+                    performed_at: "2026-10-14T12:00:00Z".into(),
+                    notes: "Imported maintenance".into(),
+                },
+                created_at: Some("2026-10-14T12:00:00Z".into()),
+            });
+        printer_data
+            .reminders
+            .push(library_core::models::PrinterDataImportReminder {
+                external_ref: "external-reminder-1".into(),
+                printer_external_ref: Some("external-printer-1".into()),
+                printer_nickname: Some("Round-trip printer before rename".into()),
+                input: library_core::models::PrinterReminderInput {
+                    title: "Inspect belts".into(),
+                    notes: "Imported reminder".into(),
+                    due_at: "2026-11-14T12:00:00Z".into(),
+                    interval_days: Some(30),
+                },
+                status: library_core::models::PrinterReminderStatus::Active,
+                last_completed_at: None,
+                created_at: "2026-10-14T12:00:00Z".into(),
+                updated_at: "2026-10-14T12:00:00Z".into(),
+            });
+
+        let imported = db.import_printer_data(&printer_data).unwrap();
+        let printer_id = imported.printer_ref_map[0].local_printer_id.clone();
+        let imported_log = db
+            .list_printer_maintenance_logs(Some(&printer_id))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let imported_reminder = db
+            .list_printer_reminders(Some(&printer_id), true)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let model = db.create_model("Round-trip model", None).unwrap();
+        db.import_print_attempt_with_printer(
+            &model.id,
+            &library_core::models::PrintAttemptInput {
+                printed_at: "2026-10-14T13:00:00Z".into(),
+                quantity: 1,
+                notes: "Linked history".into(),
+                filament_ids: vec![],
+                outcome: library_core::models::PrintOutcome::Printed,
+                parts: Some(vec![CorePartUsageInput {
+                    id: part.id,
+                    quantity: 2,
+                    snapshot: None,
+                }]),
+            },
+            Some("2026-10-14T13:00:00.000Z"),
+            Some(&printer_id),
+            None,
+        )
+        .unwrap();
+
+        let (export, model_count) = export_library_json_value_with_slicers(
+            &db,
+            &[SlicerJsonExportEntry {
+                name: "Round-trip slicer".into(),
+                path: "C:\\Apps\\FixtureSlicer.exe".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(model_count, 1);
+        let exported_bytes = serialize_library_json_export(&export).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&exported_bytes).unwrap();
+        let mut streamed = CappedJsonWriter::new(Vec::new(), MAX_PRINTVENTORY_JSON_BYTES);
+        stream_library_json_export_with_slicers(
+            &db,
+            export["exportDate"].as_str().unwrap(),
+            &mut streamed,
+            &[SlicerJsonExportEntry {
+                name: "Round-trip slicer".into(),
+                path: "C:\\Apps\\FixtureSlicer.exe".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(streamed.into_inner(), exported_bytes);
+
+        assert_eq!(parsed["printers"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["printers"][0]["gogglelab_printer_id"], printer_id);
+        assert!(parsed["printers"][0].get("endpoint_approved").is_none());
+        assert_eq!(
+            parsed["printer_maintenance_logs"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            parsed["printer_maintenance_logs"][0]["gogglelab_maintenance_log_id"],
+            imported_log.id
+        );
+        assert_eq!(
+            parsed["printer_maintenance_logs"][0]["gogglelab_printer_id"],
+            printer_id
+        );
+        assert_eq!(
+            parsed["printer_maintenance_reminders"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            parsed["printer_maintenance_reminders"][0]["gogglelab_printer_reminder_id"],
+            imported_reminder.id
+        );
+        assert_eq!(
+            parsed["models"][0]["printEvents"][0]["gogglelab_printer_id"],
+            printer_id
+        );
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/printventory-printer-history.json"
+        ))
+        .unwrap();
+        let exported_events = parsed["models"][0]["printEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "printed_at": event["printed_at"],
+                    "outcome": event["outcome"],
+                    "quantity": event["quantity"],
+                    "notes": event["notes"],
+                    "created_at": event["created_at"],
+                    "printer_nickname": event["printer_nickname"],
+                    "printer_manufacturer": event["printer_manufacturer"],
+                    "printer_model": event["printer_model"],
+                    "printer_type": event["printer_type"],
+                    "gogglelab_printer_id": "printer-external-1",
+                    "filaments": event["filaments"],
+                    "parts": event["parts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|part| serde_json::json!({
+                            "id": "part-external-1",
+                            "name": part["name"],
+                            "category": part["category"],
+                            "unit": part["unit"],
+                            "quantity": part["quantity"],
+                            "quantityPerCopy": part["quantityPerCopy"],
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let export_contract = serde_json::json!({
+            "version": parsed["version"],
+            "models": [{ "printEvents": exported_events }],
+            "parts": [{
+                "gogglelab_part_id": "part-external-1",
+                "name": parsed["parts"][0]["name"],
+                "category": parsed["parts"][0]["category"],
+                "quantity": parsed["parts"][0]["quantity"],
+                "unit": parsed["parts"][0]["unit"],
+                "notes": parsed["parts"][0]["notes"],
+                "low_stock": parsed["parts"][0]["low_stock"],
+            }],
+            "printers": [{
+                "gogglelab_printer_id": "printer-external-1",
+                "nickname": parsed["printers"][0]["nickname"],
+                "manufacturer": parsed["printers"][0]["manufacturer"],
+                "model": parsed["printers"][0]["model"],
+                "printer_type": parsed["printers"][0]["printer_type"],
+                "created_at": parsed["printers"][0]["created_at"],
+                "updated_at": parsed["printers"][0]["updated_at"],
+            }],
+            "printer_maintenance_logs": [{
+                "gogglelab_maintenance_log_id": "maintenance-external-1",
+                "gogglelab_printer_id": "printer-external-1",
+                "printer_nickname": parsed["printer_maintenance_logs"][0]["printer_nickname"],
+                "title": parsed["printer_maintenance_logs"][0]["title"],
+                "notes": parsed["printer_maintenance_logs"][0]["notes"],
+                "performed_at": parsed["printer_maintenance_logs"][0]["performed_at"],
+                "created_at": parsed["printer_maintenance_logs"][0]["created_at"],
+            }],
+            "printer_maintenance_reminders": [{
+                "gogglelab_printer_reminder_id": "reminder-external-1",
+                "gogglelab_printer_id": "printer-external-1",
+                "printer_nickname": parsed["printer_maintenance_reminders"][0]["printer_nickname"],
+                "title": parsed["printer_maintenance_reminders"][0]["title"],
+                "notes": parsed["printer_maintenance_reminders"][0]["notes"],
+                "due_at": parsed["printer_maintenance_reminders"][0]["due_at"],
+                "interval_days": parsed["printer_maintenance_reminders"][0]["interval_days"],
+                "status": parsed["printer_maintenance_reminders"][0]["status"],
+                "last_completed_at": parsed["printer_maintenance_reminders"][0]["last_completed_at"],
+                "created_at": parsed["printer_maintenance_reminders"][0]["created_at"],
+                "updated_at": parsed["printer_maintenance_reminders"][0]["updated_at"],
+            }],
+            "slicers": parsed["slicers"],
+        });
+        assert_eq!(export_contract, fixture);
+    }
+
+    #[test]
+    fn printventory_export_keeps_unlinked_printer_history_and_empty_snapshots() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut batch = library_core::models::PrinterDataImport::default();
+        batch
+            .maintenance_logs
+            .push(library_core::models::PrinterDataImportMaintenanceLog {
+                external_ref: "unlinked-log-null".into(),
+                printer_external_ref: None,
+                printer_nickname: None,
+                input: library_core::models::PrinterMaintenanceInput {
+                    title: "Imported service without a name".into(),
+                    performed_at: "2026-10-15T12:00:00Z".into(),
+                    notes: "Keep this history".into(),
+                },
+                created_at: Some("2026-10-15T12:30:00Z".into()),
+            });
+        batch
+            .maintenance_logs
+            .push(library_core::models::PrinterDataImportMaintenanceLog {
+                external_ref: "unlinked-log-dangling".into(),
+                printer_external_ref: Some("skipped-printer".into()),
+                printer_nickname: Some("Retired P1".into()),
+                input: library_core::models::PrinterMaintenanceInput {
+                    title: "Imported service with a snapshot".into(),
+                    performed_at: "2026-10-15T13:00:00Z".into(),
+                    notes: "Keep the printer label".into(),
+                },
+                created_at: Some("2026-10-15T13:30:00Z".into()),
+            });
+        batch.reminders.extend([
+            library_core::models::PrinterDataImportReminder {
+                external_ref: "unlinked-reminder-null".into(),
+                printer_external_ref: None,
+                printer_nickname: None,
+                input: library_core::models::PrinterReminderInput {
+                    title: "Imported reminder without a name".into(),
+                    notes: "Keep this reminder".into(),
+                    due_at: "2026-11-15T12:00:00Z".into(),
+                    interval_days: None,
+                },
+                status: library_core::models::PrinterReminderStatus::Paused,
+                last_completed_at: None,
+                created_at: "2026-10-15T12:00:00Z".into(),
+                updated_at: "2026-10-15T12:00:00Z".into(),
+            },
+            library_core::models::PrinterDataImportReminder {
+                external_ref: "unlinked-reminder-dangling".into(),
+                printer_external_ref: Some("skipped-printer".into()),
+                printer_nickname: Some("Retired P1".into()),
+                input: library_core::models::PrinterReminderInput {
+                    title: "Imported reminder with a snapshot".into(),
+                    notes: "Keep the printer label".into(),
+                    due_at: "2026-11-16T12:00:00Z".into(),
+                    interval_days: Some(90),
+                },
+                status: library_core::models::PrinterReminderStatus::Completed,
+                last_completed_at: Some("2026-10-14T12:00:00Z".into()),
+                created_at: "2026-10-15T13:00:00Z".into(),
+                updated_at: "2026-10-15T13:00:00Z".into(),
+            },
+        ]);
+
+        let result = db.import_printer_data(&batch).unwrap();
+        assert_eq!(result.imported_maintenance_log_count, 2);
+        assert_eq!(result.imported_reminder_count, 2);
+        assert_eq!(db.list_printers().unwrap().len(), 0);
+
+        let (export, _) = build_library_export_value(&db, "2026-10-16T00:00:00Z").unwrap();
+        assert_eq!(export["printers"].as_array().unwrap().len(), 0);
+        let logs = export["printer_maintenance_logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        let empty_log = logs
+            .iter()
+            .find(|record| record["title"] == "Imported service without a name")
+            .unwrap();
+        assert_eq!(empty_log["gogglelab_printer_id"], serde_json::Value::Null);
+        assert_eq!(empty_log["printer_nickname"], "");
+        let snapshot_log = logs
+            .iter()
+            .find(|record| record["title"] == "Imported service with a snapshot")
+            .unwrap();
+        assert_eq!(
+            snapshot_log["gogglelab_printer_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(snapshot_log["printer_nickname"], "Retired P1");
+        let reminders = export["printer_maintenance_reminders"].as_array().unwrap();
+        assert_eq!(reminders.len(), 2);
+        let empty_reminder = reminders
+            .iter()
+            .find(|record| record["title"] == "Imported reminder without a name")
+            .unwrap();
+        assert_eq!(
+            empty_reminder["gogglelab_printer_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(empty_reminder["printer_nickname"], "");
+        assert_eq!(empty_reminder["status"], "paused");
+        let snapshot_reminder = reminders
+            .iter()
+            .find(|record| record["title"] == "Imported reminder with a snapshot")
+            .unwrap();
+        assert_eq!(
+            snapshot_reminder["gogglelab_printer_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(snapshot_reminder["printer_nickname"], "Retired P1");
+        assert_eq!(snapshot_reminder["status"], "completed");
+        assert_eq!(
+            snapshot_reminder["last_completed_at"],
+            "2026-10-14T12:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn library_json_export_keeps_maintenance_logs_above_ui_limit() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut batch = library_core::models::PrinterDataImport::default();
+        batch
+            .printers
+            .push(library_core::models::PrinterDataImportPrinter {
+                external_ref: "export-printer".into(),
+                map_to_local_printer_id: None,
+                input: library_core::models::PrinterInput {
+                    nickname: "Export P-1".into(),
+                    make: None,
+                    model: None,
+                    printer_type: None,
+                    firmware: None,
+                    host: None,
+                    web_url: None,
+                    bed_mm: None,
+                    notes: String::new(),
+                },
+                created_at: None,
+                updated_at: None,
+            });
+        for index in 0..10_001 {
+            batch
+                .maintenance_logs
+                .push(library_core::models::PrinterDataImportMaintenanceLog {
+                    external_ref: format!("maintenance-{index}"),
+                    printer_external_ref: Some("export-printer".into()),
+                    printer_nickname: Some("Export P-1".into()),
+                    input: library_core::models::PrinterMaintenanceInput {
+                        title: "Service printer".into(),
+                        performed_at: "2026-10-14T12:00:00Z".into(),
+                        notes: String::new(),
+                    },
+                    created_at: None,
+                });
+            if index < 10_000 {
+                batch
+                    .reminders
+                    .push(library_core::models::PrinterDataImportReminder {
+                        external_ref: format!("reminder-{index}"),
+                        printer_external_ref: Some("export-printer".into()),
+                        printer_nickname: Some("Export P-1".into()),
+                        input: library_core::models::PrinterReminderInput {
+                            title: "Clean nozzle".into(),
+                            notes: String::new(),
+                            due_at: "2026-11-01T00:00:00Z".into(),
+                            interval_days: None,
+                        },
+                        status: library_core::models::PrinterReminderStatus::Active,
+                        last_completed_at: None,
+                        created_at: "1700000000".into(),
+                        updated_at: "1700000000".into(),
+                    });
+            }
+        }
+        db.import_printer_data(&batch).unwrap();
+
+        let (export, _) = export_library_json_value(&db).unwrap();
+
+        let logs = export["printer_maintenance_logs"].as_array().unwrap();
+        let reminders = export["printer_maintenance_reminders"].as_array().unwrap();
+        assert_eq!(logs.len(), 10_001);
+        assert_eq!(reminders.len(), 10_000);
+        assert!(logs.windows(2).all(|pair| {
+            pair[0]["gogglelab_maintenance_log_id"].as_str().unwrap()
+                < pair[1]["gogglelab_maintenance_log_id"].as_str().unwrap()
+        }));
+        assert!(reminders.windows(2).all(|pair| {
+            pair[0]["gogglelab_printer_reminder_id"].as_str().unwrap()
+                < pair[1]["gogglelab_printer_reminder_id"].as_str().unwrap()
+        }));
+    }
+
+    #[test]
+    fn library_json_export_drops_legacy_web_url_path_query_and_fragment() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut printer = db
+            .create_printer(
+                &library_core::models::PrinterInput {
+                    nickname: "Legacy URL P-1".into(),
+                    make: None,
+                    model: None,
+                    printer_type: None,
+                    firmware: None,
+                    host: None,
+                    web_url: None,
+                    bed_mm: None,
+                    notes: String::new(),
+                },
+                false,
+            )
+            .unwrap();
+        printer.web_url = Some(
+            "https://printer.local:8443/ui/secret-token-value?token=query-secret#fragment-secret"
+                .into(),
+        );
+
+        let exported = export_printer_value(&printer).unwrap();
+        let serialized = exported.to_string();
+
+        assert_eq!(exported["web_url"], "https://printer.local:8443");
+        for secret in ["secret-token-value", "query-secret", "fragment-secret"] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn oversized_library_json_export_is_rejected_before_creating_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("oversized-export.json");
+        let export = serde_json::json!({
+            "payload": "x".repeat(MAX_PRINTVENTORY_JSON_BYTES + 1)
+        });
+
+        let error = write_library_json_export(&destination, &export).unwrap_err();
+
+        assert_eq!(error.code, RuntimeErrorCode::InvalidInput);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn slicer_json_export_stream_and_value_preserve_only_name_and_path() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let slicers = vec![SlicerJsonExportEntry {
+            name: "Local Slicer".into(),
+            path: "C:\\Slicers\\Local Slicer.exe".into(),
+        }];
+        let expected = serde_json::json!([{ "name": "Local Slicer", "path": "C:\\Slicers\\Local Slicer.exe" }]);
+        let (value, count) =
+            build_library_export_value_with_slicers(&db, "2026-10-17T00:00:00Z", &slicers).unwrap();
+        assert_eq!(value["slicers"], expected);
+        assert_eq!(count, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("slicer-export.json");
+        let stage = stage_library_json_export_with_limit_and_slicers(
+            &db,
+            "2026-10-17T00:00:00Z",
+            &destination,
+            MAX_PRINTVENTORY_JSON_BYTES,
+            &slicers,
+        )
+        .unwrap();
+        stage.publish(&destination).unwrap();
+        let bytes = std::fs::read(destination).unwrap();
+        assert_eq!(bytes, serde_json::to_vec_pretty(&value).unwrap());
+        assert_eq!(
+            export_library_json_value(&db).unwrap().0["slicers"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn slicer_json_export_rejects_invalid_or_unbounded_profiles_before_publish() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let valid = SlicerJsonExportEntry {
+            name: "Slicer".into(),
+            path: "/Applications/Slicer.app".into(),
+        };
+        let mut invalid = vec![
+            SlicerJsonExportEntry {
+                name: " ".into(),
+                ..valid.clone()
+            },
+            SlicerJsonExportEntry {
+                name: "x".repeat(129),
+                ..valid.clone()
+            },
+            SlicerJsonExportEntry {
+                name: "Bad\nName".into(),
+                ..valid.clone()
+            },
+            SlicerJsonExportEntry {
+                path: " ".into(),
+                ..valid.clone()
+            },
+            SlicerJsonExportEntry {
+                path: "x".repeat(4097),
+                ..valid.clone()
+            },
+            SlicerJsonExportEntry {
+                path: "/tmp/bad\0path".into(),
+                ..valid.clone()
+            },
+        ]
+        .into_iter()
+        .map(|entry| vec![entry])
+        .collect::<Vec<_>>();
+        invalid.push(vec![valid.clone(); 65]);
+        invalid.push(vec![valid.clone(), valid]);
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("invalid-export.json");
+        for profiles in invalid {
+            assert!(export_library_json_value_with_slicers(&db, &profiles).is_err());
+            assert!(stage_library_json_export_with_slicers(&db, &destination, &profiles).is_err());
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn staged_library_json_export_enforces_exact_limit_before_publish() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Staged export", None).unwrap();
+        db.create_print_attempt(
+            &model.id,
+            &CorePrintAttemptInput {
+                printed_at: "2026-10-14T12:00:00Z".into(),
+                quantity: 1,
+                notes: "A print event streamed independently".into(),
+                filament_ids: Vec::new(),
+                outcome: CorePrintOutcome::Printed,
+                parts: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+        let (expected_value, expected_models) =
+            build_library_export_value(&db, "2026-10-14T00:00:00Z").unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("exact-limit.json");
+        let expected_bytes = serde_json::to_vec_pretty(&expected_value).unwrap();
+        let stage = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &destination,
+            expected_bytes.len(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gogglelab-printventory-"))
+                .count(),
+            0,
+            "export preparation must not create a sibling staging pathname"
+        );
+        let result = stage.publish(&destination).unwrap();
+
+        assert_eq!(result.models, expected_models);
+        assert_eq!(result.bytes as usize, expected_bytes.len());
+        let actual_bytes = std::fs::read(&destination).unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(&actual_bytes).unwrap();
+        assert_eq!(actual, expected_value);
+        assert_eq!(actual_bytes, expected_bytes);
+
+        let overflow_destination = temp.path().join("overflow.json");
+        let error = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &overflow_destination,
+            expected_bytes.len() - 1,
+        )
+        .unwrap_err();
+        assert!(matches!(error, LibraryError::InvalidInput(message) if message.contains("limit")));
+        assert!(!overflow_destination.exists());
+
+        let existing_destination = temp.path().join("existing.json");
+        let stage = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &existing_destination,
+            expected_bytes.len(),
+        )
+        .unwrap();
+        std::fs::write(&existing_destination, b"preserve this file").unwrap();
+        assert!(stage.publish(&existing_destination).is_err());
+        assert_eq!(
+            std::fs::read(&existing_destination).unwrap(),
+            b"preserve this file"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+
+        let replaced_destination = temp.path().join("replaced-stage.json");
+        let stage = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &replaced_destination,
+            MAX_PRINTVENTORY_JSON_BYTES,
+        )
+        .unwrap();
+        std::fs::write(&replaced_destination, b"created concurrently").unwrap();
+        assert!(stage.publish(&replaced_destination).is_err());
+        assert_eq!(
+            std::fs::read(&replaced_destination).unwrap(),
+            b"created concurrently"
+        );
+    }
+
+    #[test]
+    fn partial_export_write_failure_leaves_exact_bytes_for_user_choice() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("retry-export.json");
+
+        let stage = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &destination,
+            MAX_PRINTVENTORY_JSON_BYTES,
+        )
+        .unwrap();
+        assert!(stage.bytes.len() > 8);
+        let expected_partial = stage.bytes[..8].to_vec();
+        let error = stage
+            .publish_with_failure_after(&destination, 8)
+            .unwrap_err();
+        assert!(
+            matches!(error, LibraryError::InvalidInput(message) if message.contains("partial file may remain"))
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), expected_partial);
+        std::fs::remove_file(&destination).unwrap();
+
+        let retry = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &destination,
+            MAX_PRINTVENTORY_JSON_BYTES,
+        )
+        .unwrap();
+        let result = retry.publish(&destination).unwrap();
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), result.bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_export_sync_failure_leaves_file_for_user_choice() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("sync-failed-export.json");
+        let stage = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &destination,
+            MAX_PRINTVENTORY_JSON_BYTES,
+        )
+        .unwrap();
+        let expected = stage.bytes.clone();
+
+        let error = stage.publish_with_sync_failure(&destination).unwrap_err();
+
+        assert!(
+            matches!(error, LibraryError::InvalidInput(message) if message.contains("partial file may remain"))
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_during_export_write_is_preserved_with_displaced_bytes() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("replacement-export.json");
+        let displaced_output = temp.path().join("displaced-output.json");
+        let replacement = b"replacement owned by another process";
+        let stage = stage_library_json_export_with_limit(
+            &db,
+            "2026-10-14T00:00:00Z",
+            &destination,
+            MAX_PRINTVENTORY_JSON_BYTES,
+        )
+        .unwrap();
+        let expected_output = stage.bytes.clone();
+
+        let error = stage
+            .publish_with_replacement_during_write(&destination, 8, replacement, &displaced_output)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, LibraryError::InvalidInput(message) if message.contains("could not be verified"))
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), replacement);
+        assert_eq!(std::fs::read(&displaced_output).unwrap(), expected_output);
+    }
+
+    #[test]
+    fn json_export_snapshot_blocks_concurrent_catalog_writes_across_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LibraryDb::open(temp.path()).unwrap();
+        db.create_model("Snapshot model", None).unwrap();
+        let other_connection = LibraryDb::open(temp.path()).unwrap();
+
+        let count = db
+            .with_json_export_snapshot(|snapshot| {
+                let count = snapshot.count_models_for_json_export()?;
+                assert_eq!(count, 1);
+                assert!(other_connection
+                    .create_model("Concurrent model", None)
+                    .is_err());
+                let page = snapshot.list_models_for_json_export_page(0, 1)?;
+                assert_eq!(page.len(), count);
+                Ok(count)
+            })
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(other_connection.count_models_for_json_export().unwrap(), 1);
+    }
+
+    #[test]
+    fn library_json_export_maps_linked_and_unlinked_print_events_without_printer_id() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Printer-attributed model", None).unwrap();
+        let printer = db
+            .create_printer(
+                &library_core::models::PrinterInput {
+                    nickname: "Workshop P2".into(),
+                    make: Some("Prusa Research".into()),
+                    model: Some("MK4S".into()),
+                    printer_type: Some("FDM".into()),
+                    firmware: Some("Prusa firmware".into()),
+                    host: None,
+                    web_url: None,
+                    bed_mm: None,
+                    notes: String::new(),
+                },
+                false,
+            )
+            .unwrap();
+        db.create_print_attempt_with_printer(
+            &model.id,
+            &CorePrintAttemptInputWithPrinter {
+                input: CorePrintAttemptInput {
+                    printed_at: "2026-10-13T12:00:00Z".into(),
+                    quantity: 1,
+                    notes: "Linked print".into(),
+                    filament_ids: Vec::new(),
+                    outcome: CorePrintOutcome::Printed,
+                    parts: Some(Vec::new()),
+                },
+                printer_id: Some(Some(printer.id.clone())),
+            },
+        )
+        .unwrap();
+        db.create_print_attempt(
+            &model.id,
+            &CorePrintAttemptInput {
+                printed_at: "2026-10-14T12:00:00Z".into(),
+                quantity: 1,
+                notes: "Unlinked print".into(),
+                filament_ids: Vec::new(),
+                outcome: CorePrintOutcome::Printed,
+                parts: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+
+        let (export, _) = build_library_export_value(&db, "2026-10-14T00:00:00Z").unwrap();
+        let events = export["models"][0]["printEvents"].as_array().unwrap();
+        let linked = events
+            .iter()
+            .find(|event| event["notes"] == "Linked print")
+            .unwrap();
+        assert_eq!(linked["gogglelab_printer_id"], printer.id);
+        assert_eq!(linked["printer_nickname"], "Workshop P2");
+        assert_eq!(linked["printer_manufacturer"], "Prusa Research");
+        assert_eq!(linked["printer_model"], "MK4S");
+        assert_eq!(linked["printer_type"], "FDM");
+        let linked_created_at = linked["created_at"].as_str().unwrap();
+        assert!(
+            time::OffsetDateTime::parse(
+                linked_created_at,
+                &time::format_description::well_known::Rfc3339
+            )
+            .is_ok(),
+            "print event created_at must be RFC3339, got {linked_created_at}"
+        );
+        assert!(linked.get("printer_id").is_none());
+
+        let unlinked = events
+            .iter()
+            .find(|event| event["notes"] == "Unlinked print")
+            .unwrap();
+        for field in [
+            "gogglelab_printer_id",
+            "printer_nickname",
+            "printer_manufacturer",
+            "printer_model",
+            "printer_type",
+        ] {
+            assert_eq!(
+                unlinked[field],
+                serde_json::Value::Null,
+                "unexpected {field}"
+            );
+        }
+        assert!(unlinked.get("printer_id").is_none());
+
+        let mut writer = CappedJsonWriter::new(Vec::new(), MAX_PRINTVENTORY_JSON_BYTES);
+        stream_library_json_export(&db, "2026-10-15T00:00:00Z", &mut writer).unwrap();
+        let streamed: serde_json::Value = serde_json::from_slice(&writer.into_inner()).unwrap();
+        for event in streamed["models"][0]["printEvents"].as_array().unwrap() {
+            let created_at = event["created_at"].as_str().unwrap();
+            assert!(
+                time::OffsetDateTime::parse(
+                    created_at,
+                    &time::format_description::well_known::Rfc3339
+                )
+                .is_ok(),
+                "streamed print event created_at must be RFC3339, got {created_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn printventory_json_export_includes_parts_and_scaled_event_usage_in_both_paths() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let part = db
+            .create_part_stock(&CorePartStockInput {
+                name: "M3 heat-set insert".into(),
+                category: Some("hardware".into()),
+                quantity: 10,
+                unit: "pcs".into(),
+                notes: "brass".into(),
+                low_stock: 2,
+            })
+            .unwrap();
+        let model = db.create_model("Parts export model", None).unwrap();
+        db.create_print_attempt(
+            &model.id,
+            &CorePrintAttemptInput {
+                printed_at: "2026-10-15T12:00:00Z".into(),
+                quantity: 2,
+                notes: "Cancelled assembly".into(),
+                filament_ids: Vec::new(),
+                outcome: CorePrintOutcome::Cancelled,
+                parts: Some(vec![CorePartUsageInput {
+                    id: part.id.clone(),
+                    quantity: 3,
+                    snapshot: None,
+                }]),
+            },
+        )
+        .unwrap();
+
+        let (value, _) = build_library_export_value(&db, "2026-10-16T00:00:00Z").unwrap();
+        assert_eq!(value["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(value["parts"][0]["gogglelab_part_id"], part.id);
+        assert_eq!(value["parts"][0]["name"], "M3 heat-set insert");
+        assert_eq!(value["parts"][0]["category"], "hardware");
+        assert_eq!(value["parts"][0]["quantity"], 4);
+        assert_eq!(value["parts"][0]["unit"], "pcs");
+        assert_eq!(value["parts"][0]["notes"], "brass");
+        assert_eq!(value["parts"][0]["low_stock"], 2);
+        let event = &value["models"][0]["printEvents"][0];
+        assert_eq!(event["outcome"], "cancelled");
+        assert_eq!(event["parts"][0]["id"], part.id);
+        assert_eq!(event["parts"][0]["name"], "M3 heat-set insert");
+        assert_eq!(event["parts"][0]["quantity"], 6);
+        assert_eq!(event["parts"][0]["quantityPerCopy"], 3);
+
+        let mut writer = CappedJsonWriter::new(Vec::new(), MAX_PRINTVENTORY_JSON_BYTES);
+        stream_library_json_export(&db, "2026-10-16T00:00:00Z", &mut writer).unwrap();
+        let streamed: serde_json::Value = serde_json::from_slice(&writer.into_inner()).unwrap();
+        assert_eq!(streamed["parts"], value["parts"]);
+        assert_eq!(
+            streamed["models"][0]["printEvents"][0]["parts"],
+            event["parts"]
+        );
+        assert_eq!(
+            streamed["models"][0]["printEvents"][0]["outcome"],
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn library_json_export_public_wrapper_uses_runtime_utc_timestamp() {
+        let db = LibraryDb::open_in_memory().unwrap();
+
+        let (export, model_count) = export_library_json_value(&db).unwrap();
+
+        assert_eq!(model_count, 0);
+        let export_date = export["exportDate"].as_str().unwrap();
+        let parsed = time::OffsetDateTime::parse(
+            export_date,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_eq!(parsed.offset(), time::UtcOffset::UTC);
+    }
+
+    #[test]
+    fn library_json_export_accepts_5000_models_and_rejects_the_next_model() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        for index in 0..library_core::MAX_LIBRARY_JSON_EXPORT_MODELS {
+            db.create_model(&format!("Export cap model {index}"), None)
+                .unwrap();
+        }
+
+        let (export, model_count) = export_library_json_value(&db).unwrap();
+        assert_eq!(model_count, 5_000);
+        assert_eq!(export["models"].as_array().unwrap().len(), 5_000);
+
+        db.create_model("Export cap model 5000", None).unwrap();
+        let error = export_library_json_value(&db).unwrap_err();
+        assert!(matches!(
+            error,
+            LibraryError::InvalidInput(message)
+                if message.contains("models")
+                    && message.contains("supported maximum of 5000")
+        ));
     }
 
     #[test]
@@ -6312,6 +13791,7 @@ mod tests {
                 notes: String::new(),
                 filament_ids: vec!["legacy-unknown".into()],
                 outcome: library_core::PrintOutcome::Printed,
+                parts: Some(Vec::new()),
             },
         )
         .unwrap();
@@ -6481,7 +13961,7 @@ mod tests {
             RuntimeErrorCode::Busy
         );
         drop(io);
-        let mut maintenance = runtime.begin_maintenance().unwrap();
+        let maintenance = runtime.begin_maintenance().unwrap();
         let before = runtime.library_epoch();
         assert_eq!(maintenance.invalidate(), before + 1);
         assert_eq!(
@@ -7306,7 +14786,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_download_source_tamper_removes_partial_owned_archive() {
+    fn bundle_download_source_tamper_retains_partial_owned_archive_in_a_recovery_hold() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("part.stl");
         fs::write(&source, triangle_stl(0.0)).unwrap();
@@ -7347,7 +14827,27 @@ mod tests {
             RuntimeErrorCode::Stale
         );
         let namespace = runtime.root.join("staging/bundle-downloads");
-        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+        let names = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| {
+            name.to_string_lossy().starts_with("bundle-")
+                && name.to_string_lossy().ends_with(".zip")
+        }));
+        let held_name = names
+            .iter()
+            .find(|name| name.to_string_lossy().ends_with(".data"))
+            .expect("partial archive bytes should remain recoverable");
+        assert!(fs::metadata(namespace.join(held_name)).unwrap().is_file());
+        let journal_name = std::ffi::OsString::from(format!(
+            "{}.journal",
+            held_name.to_string_lossy().trim_end_matches(".data")
+        ));
+        assert!(namespace.join(&journal_name).exists());
+        assert!(namespace
+            .join(format!("{}.verified", journal_name.to_string_lossy()))
+            .exists());
     }
 
     #[test]
@@ -7825,6 +15325,77 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn quarantine_rejects_catalog_replacement_after_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, context, model, source, _) = writable_source_fixture(temp.path());
+        let original_source = fs::read(&source).unwrap();
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::QuarantineLooseSource {
+                    target: VersionedTarget {
+                        model_id: model.id.clone(),
+                        expected_version: model.metadata_version,
+                    },
+                },
+            )
+            .unwrap();
+
+        let catalog = runtime.root.join("library.sqlite3");
+        let displaced = runtime.root.join("library.sqlite3.displaced");
+        runtime.install_before_action_dispatch_hook(move || {
+            fs::rename(&catalog, &displaced).unwrap();
+            fs::copy(&displaced, &catalog).unwrap();
+        });
+        let error = runtime.execute_action(&context, &plan.token).unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::Stale, "{error:?}");
+        assert_eq!(fs::read(&source).unwrap(), original_source);
+        assert!(LibraryDb::open(&runtime.root)
+            .unwrap()
+            .get_model(&model.id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_rejects_catalog_replacement_after_opening_guarded_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, context, model, source, _) = writable_source_fixture(temp.path());
+        let original_source = fs::read(&source).unwrap();
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::QuarantineLooseSource {
+                    target: VersionedTarget {
+                        model_id: model.id.clone(),
+                        expected_version: model.metadata_version,
+                    },
+                },
+            )
+            .unwrap();
+
+        let catalog = runtime.root.join("library.sqlite3");
+        let replacement = runtime.root.join("library.sqlite3.replacement");
+        let displaced = runtime.root.join("library.sqlite3.displaced");
+        fs::copy(&catalog, &replacement).unwrap();
+        runtime.install_after_guarded_catalog_open_hook(move || {
+            fs::rename(&catalog, &displaced).unwrap();
+            fs::rename(&replacement, &catalog).unwrap();
+        });
+
+        let error = runtime.execute_action(&context, &plan.token).unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::Stale, "{error:?}");
+        assert_eq!(fs::read(&source).unwrap(), original_source);
+        assert!(LibraryDb::open(&runtime.root)
+            .unwrap()
+            .get_model(&model.id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn source_quarantine_and_undo_use_one_use_versioned_plans() {
         let temp = tempfile::tempdir().unwrap();
         let (runtime, context, model, source, _) = writable_source_fixture(temp.path());
@@ -7869,8 +15440,23 @@ mod tests {
             ManagementResult::Quarantined {
                 snapshot_id,
                 model_id,
+                source_holds,
             } => {
                 assert_eq!(model_id, model.id);
+                assert_eq!(source_holds.len(), 1);
+                assert_eq!(source_holds[0].model_id, model.id);
+                assert_eq!(source_holds[0].relative_path, "part.stl");
+                assert_eq!(source_holds[0].bytes, original.len() as u64);
+                assert_eq!(
+                    source_holds[0].sha256,
+                    format!("{:x}", Sha256::digest(&original))
+                );
+                assert!(!source_holds[0].root_handle_id.is_empty());
+                assert!(source_holds[0].hold_name.ends_with(".data"));
+                assert!(source_holds[0].journal_name.ends_with(".journal"));
+                assert!(!serde_json::to_string(&source_holds)
+                    .unwrap()
+                    .contains(temp.path().to_string_lossy().as_ref()));
                 snapshot_id
             }
             other => panic!("unexpected quarantine result: {other:?}"),
@@ -8065,15 +15651,32 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            runtime.execute_action(&context, &plan.token).unwrap(),
+        match runtime.execute_action(&context, &plan.token).unwrap() {
             ManagementResult::Moved {
-                model: MutationVersion {
-                    model_id: model.id.clone(),
-                    metadata_version: model.metadata_version + 1,
-                }
+                model: moved,
+                source_holds,
+            } => {
+                assert_eq!(
+                    moved,
+                    MutationVersion {
+                        model_id: model.id.clone(),
+                        metadata_version: model.metadata_version + 1,
+                    }
+                );
+                assert_eq!(source_holds.len(), 1);
+                assert_eq!(source_holds[0].model_id, model.id);
+                assert_eq!(source_holds[0].relative_path, "part.stl");
+                assert_eq!(source_holds[0].bytes, original.len() as u64);
+                assert_eq!(
+                    source_holds[0].sha256,
+                    format!("{:x}", Sha256::digest(&original))
+                );
+                assert!(!serde_json::to_string(&source_holds)
+                    .unwrap()
+                    .contains(temp.path().to_string_lossy().as_ref()));
             }
-        );
+            other => panic!("unexpected move result: {other:?}"),
+        }
         assert!(!source.exists());
         assert_eq!(fs::read(&destination).unwrap(), original);
         assert_eq!(
@@ -8203,6 +15806,922 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_recovery_uses_pinned_parent_after_parent_path_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        fs::create_dir(&parent_path).unwrap();
+        let library = parent_path.join("library");
+        LibraryDb::open(&library)
+            .unwrap()
+            .create_model("Original sentinel", None)
+            .unwrap();
+        let canonical_root = library.canonicalize().unwrap();
+        let nonce = "8".repeat(32);
+        let staged_name = format!(".gogglelab-empty-{nonce}");
+        let previous_name = format!("library.previous-purge-{nonce}");
+        let staged = parent_path.join(&staged_name);
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("stage-sentinel"), b"owned stage").unwrap();
+        let journal = PurgeJournal {
+            version: 1,
+            root_path: canonical_root.to_str().unwrap().to_owned(),
+            nonce: nonce.clone(),
+            staged_name,
+            previous_name: previous_name.clone(),
+            committed: false,
+        };
+        let journal_path = write_purge_journal(&canonical_root, &journal).unwrap();
+        let previous = parent_path.join(&previous_name);
+        fs::rename(&canonical_root, &previous).unwrap();
+
+        let moved_parent = temp.path().join("pinned-parent");
+        let decoy_parent = parent_path.clone();
+        let decoy_previous = decoy_parent.join(&previous_name);
+        let decoy_staged = decoy_parent.join(&journal.staged_name);
+        let journal_name = journal_path.file_name().unwrap().to_os_string();
+        let decoy_journal = decoy_parent.join(&journal_name);
+        let encoded_journal = serde_json::to_vec(&journal).unwrap();
+
+        recover_interrupted_catalog_purge_with_hook(&canonical_root, || {
+            fs::rename(&parent_path, &moved_parent).unwrap();
+            fs::create_dir(&decoy_parent).unwrap();
+            let decoy_root = decoy_parent.join("library");
+            LibraryDb::open(&decoy_root)
+                .unwrap()
+                .create_model("Decoy sentinel", None)
+                .unwrap();
+            fs::create_dir(&decoy_previous).unwrap();
+            fs::write(decoy_previous.join("sentinel"), b"decoy previous").unwrap();
+            fs::create_dir(&decoy_staged).unwrap();
+            fs::write(decoy_staged.join("sentinel"), b"decoy stage").unwrap();
+            fs::write(&decoy_journal, &encoded_journal).unwrap();
+        })
+        .unwrap();
+
+        let restored = moved_parent.join("library");
+        assert!(
+            restored.is_dir(),
+            "recovery must restore the pinned Library"
+        );
+        let restored_db = LibraryDb::open(&restored).unwrap();
+        let restored_models = restored_db.list_models(None, None).unwrap();
+        assert_eq!(restored_models.len(), 1);
+        assert_eq!(restored_models[0].display_name, "Original sentinel");
+        assert!(!moved_parent.join(&previous_name).exists());
+        assert!(!moved_parent.join(&journal.staged_name).exists());
+        assert!(!moved_parent.join(&journal_name).exists());
+
+        let decoy_db = LibraryDb::open(decoy_parent.join("library")).unwrap();
+        assert_eq!(
+            decoy_db.list_models(None, None).unwrap()[0].display_name,
+            "Decoy sentinel"
+        );
+        assert_eq!(
+            fs::read(decoy_previous.join("sentinel")).unwrap(),
+            b"decoy previous"
+        );
+        assert_eq!(
+            fs::read(decoy_staged.join("sentinel")).unwrap(),
+            b"decoy stage"
+        );
+        assert_eq!(fs::read(&decoy_journal).unwrap(), encoded_journal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovers_catalog_purge_interrupted_after_moving_the_original_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        {
+            let db = LibraryDb::open(&library).unwrap();
+            db.create_model("Recovery sentinel", None).unwrap();
+        }
+        let canonical_root = library.canonicalize().unwrap();
+        let parent = canonical_root.parent().unwrap();
+        let nonce = "1".repeat(32);
+        let staged_name = format!(".gogglelab-empty-{nonce}");
+        let previous_name = format!("library.previous-purge-{nonce}");
+        let staged = parent.join(&staged_name);
+        let previous = parent.join(&previous_name);
+        fs::create_dir(&staged).unwrap();
+        drop(LibraryDb::open(&staged).unwrap());
+        write_purge_stage_marker(&staged, &nonce).unwrap();
+        let journal = PurgeJournal {
+            version: 1,
+            root_path: canonical_root.to_str().unwrap().to_owned(),
+            nonce: nonce.clone(),
+            staged_name,
+            previous_name,
+            committed: false,
+        };
+        let journal_path = write_purge_journal(&canonical_root, &journal).unwrap();
+        fs::rename(&canonical_root, &previous).unwrap();
+
+        let mut runtime_config = config(library.clone());
+        runtime_config.local_catalog_root_access = false;
+        runtime_config.capabilities.insert(Capability::CatalogRead);
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+
+        let models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "Recovery sentinel");
+        assert!(library.is_dir());
+        assert!(!previous.exists());
+        assert!(!staged.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_preserves_interrupted_empty_catalog_and_restores_previous_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        {
+            let db = LibraryDb::open(&library).unwrap();
+            db.create_model("Recovery sentinel", None).unwrap();
+        }
+        let canonical_root = library.canonicalize().unwrap();
+        let parent = canonical_root.parent().unwrap();
+        let nonce = "2".repeat(32);
+        let staged_name = format!(".gogglelab-empty-{nonce}");
+        let previous_name = format!("library.previous-purge-{nonce}");
+        let staged = parent.join(&staged_name);
+        let previous = parent.join(&previous_name);
+        fs::create_dir(&staged).unwrap();
+        drop(LibraryDb::open(&staged).unwrap());
+        write_purge_stage_marker(&staged, &nonce).unwrap();
+        let journal = PurgeJournal {
+            version: 1,
+            root_path: canonical_root.to_str().unwrap().to_owned(),
+            nonce: nonce.clone(),
+            staged_name,
+            previous_name,
+            committed: false,
+        };
+        let journal_path = write_purge_journal(&canonical_root, &journal).unwrap();
+        fs::rename(&canonical_root, &previous).unwrap();
+        fs::rename(&staged, &canonical_root).unwrap();
+        let interrupted_empty = parent.join(format!(".gogglelab-interrupted-purge-{nonce}"));
+
+        let mut runtime_config = config(library.clone());
+        runtime_config.local_catalog_root_access = false;
+        runtime_config.capabilities.insert(Capability::CatalogRead);
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+
+        let models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "Recovery sentinel");
+        assert!(library.is_dir());
+        assert!(!previous.exists());
+        assert!(interrupted_empty.is_dir());
+        assert!(purge_stage_marker_matches(&interrupted_empty, &nonce).unwrap());
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_removes_an_unmarked_stage_owned_by_a_published_purge_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        {
+            let db = LibraryDb::open(&library).unwrap();
+            db.create_model("Recovery sentinel", None).unwrap();
+        }
+        let canonical_root = library.canonicalize().unwrap();
+        let nonce = "7".repeat(32);
+        let staged_name = format!(".gogglelab-empty-{nonce}");
+        let staged = canonical_root.parent().unwrap().join(&staged_name);
+        let journal = PurgeJournal {
+            version: 1,
+            root_path: canonical_root.to_str().unwrap().to_owned(),
+            nonce: nonce.clone(),
+            staged_name,
+            previous_name: format!("library.previous-purge-{nonce}"),
+            committed: false,
+        };
+        let journal_path = write_purge_journal(&canonical_root, &journal).unwrap();
+        fs::create_dir(&staged).unwrap();
+        drop(LibraryDb::open(&staged).unwrap());
+
+        recover_interrupted_catalog_purge(&canonical_root).unwrap();
+
+        assert!(canonical_root.is_dir());
+        assert!(!staged.exists());
+        assert!(!journal_path.exists());
+        let db = LibraryDb::open(&canonical_root).unwrap();
+        assert_eq!(db.list_models(None, None).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_removes_an_unpublished_purge_journal_temp_without_touching_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        {
+            let db = LibraryDb::open(&library).unwrap();
+            db.create_model("Recovery sentinel", None).unwrap();
+        }
+        let canonical_root = library.canonicalize().unwrap();
+        let journal_path = purge_journal_path(&canonical_root).unwrap();
+        let temporary = purge_journal_temp_path(&journal_path);
+        fs::write(&temporary, b"partial unpublished journal").unwrap();
+
+        recover_interrupted_catalog_purge(&canonical_root).unwrap();
+
+        assert!(!temporary.exists());
+        assert!(!journal_path.exists());
+        let db = LibraryDb::open(&canonical_root).unwrap();
+        assert_eq!(db.list_models(None, None).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_recovery_refuses_a_symlinked_configured_library_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let actual_library = temp.path().join("actual-library");
+        {
+            let db = LibraryDb::open(&actual_library).unwrap();
+            db.create_model("Protected sentinel", None).unwrap();
+        }
+        let configured_library = temp.path().join("library-link");
+        std::os::unix::fs::symlink(&actual_library, &configured_library).unwrap();
+        let configured_path_with_trailing_separator =
+            PathBuf::from(format!("{}/", configured_library.display()));
+
+        let error = recover_interrupted_catalog_purge(&configured_path_with_trailing_separator)
+            .unwrap_err();
+
+        assert_eq!(error.code, RuntimeErrorCode::Corrupt);
+        let db = LibraryDb::open(&actual_library).unwrap();
+        assert_eq!(db.list_models(None, None).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_recovery_rejects_a_previous_directory_name_not_bound_to_its_nonce() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        {
+            let db = LibraryDb::open(&library).unwrap();
+            db.create_model("Protected sentinel", None).unwrap();
+        }
+        let canonical_root = library.canonicalize().unwrap();
+        let nonce = "3".repeat(32);
+        let journal = PurgeJournal {
+            version: 1,
+            root_path: canonical_root.to_str().unwrap().to_owned(),
+            nonce: nonce.clone(),
+            staged_name: format!(".gogglelab-empty-{nonce}"),
+            previous_name: format!("library.previous-purge-{nonce}"),
+            committed: false,
+        };
+        let journal_path = write_purge_journal(&canonical_root, &journal).unwrap();
+        let mut journal_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal_value["previousName"] =
+            serde_json::json!(format!("library.previous-purge-{nonce}-unexpected"));
+        fs::write(&journal_path, serde_json::to_vec(&journal_value).unwrap()).unwrap();
+        let previous = canonical_root
+            .parent()
+            .unwrap()
+            .join(format!("library.previous-purge-{nonce}"));
+        fs::rename(&canonical_root, &previous).unwrap();
+
+        let error = recover_interrupted_catalog_purge(&canonical_root).unwrap_err();
+
+        assert_eq!(error.code, RuntimeErrorCode::Corrupt);
+        assert!(!canonical_root.exists());
+        assert!(previous.is_dir());
+        assert!(journal_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_commit_marker_failure_keeps_runtime_maintenance_armed() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let mut runtime_config = config(library.clone());
+        runtime_config.local_catalog_root_access = false;
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        let nonce = "4".repeat(32);
+        write_purge_stage_marker(&runtime.root, &nonce).unwrap();
+        let parent_path = runtime.root.parent().unwrap();
+        let previous_name = std::ffi::OsString::from(format!(
+            "{}.previous-purge-{nonce}",
+            runtime.root.file_name().unwrap().to_string_lossy()
+        ));
+        let previous_path = parent_path.join(&previous_name);
+        fs::create_dir(&previous_path).unwrap();
+        fs::write(previous_path.join("sentinel"), b"preserve previous").unwrap();
+        let journal = PurgeJournal {
+            version: 1,
+            root_path: runtime.root.to_string_lossy().into_owned(),
+            nonce: nonce.clone(),
+            staged_name: format!(".gogglelab-empty-{nonce}"),
+            previous_name: previous_name.to_string_lossy().into_owned(),
+            committed: false,
+        };
+        let journal_path = write_purge_journal(&runtime.root, &journal).unwrap();
+        let journal_name = journal_path.file_name().unwrap().to_os_string();
+        let parent_directory = secure_fs::Directory::open(parent_path).unwrap();
+        let staged_directory = secure_fs::Directory::open(&runtime.root).unwrap();
+        let mut guard = runtime.begin_maintenance().unwrap();
+
+        let error = finish_catalog_purge_commit(
+            &mut guard,
+            &staged_directory,
+            &parent_directory,
+            &runtime.root,
+            &journal_name,
+            &nonce,
+            |_, _| {
+                Err(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Injected purge stage-marker cleanup failure".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                })
+            },
+            |_, _| panic!("journal cleanup must not run after marker failure"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, RuntimeErrorCode::Corrupt);
+        drop(guard);
+        assert!(runtime.maintenance.load(Ordering::Acquire));
+        assert!(purge_stage_marker_matches(&runtime.root, &nonce).unwrap());
+        let journal_after_failure: PurgeJournal =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        assert!(journal_after_failure.committed);
+        assert!(runtime.read_db(|db| db.list_models(None, None)).is_err());
+        drop(runtime);
+
+        let mut restarted_config = config(library.clone());
+        restarted_config.local_catalog_root_access = false;
+        let restarted = LibraryRuntime::open(restarted_config).unwrap();
+        assert_eq!(
+            restarted
+                .read_db(|db| db.list_models(None, None))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(previous_path.is_dir());
+        assert_eq!(
+            fs::read(previous_path.join("sentinel")).unwrap(),
+            b"preserve previous"
+        );
+        assert!(!purge_stage_marker_path(&library).exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_commit_journal_failure_keeps_runtime_maintenance_armed() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let mut runtime_config = config(library.clone());
+        runtime_config.local_catalog_root_access = false;
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        let nonce = "6".repeat(32);
+        write_purge_stage_marker(&runtime.root, &nonce).unwrap();
+        let parent_path = runtime.root.parent().unwrap();
+        let previous_name = std::ffi::OsString::from(format!(
+            "{}.previous-purge-{nonce}",
+            runtime.root.file_name().unwrap().to_string_lossy()
+        ));
+        let previous_path = parent_path.join(&previous_name);
+        fs::create_dir(&previous_path).unwrap();
+        fs::write(previous_path.join("sentinel"), b"preserve previous").unwrap();
+        let journal = PurgeJournal {
+            version: 1,
+            root_path: runtime.root.to_string_lossy().into_owned(),
+            nonce: nonce.clone(),
+            staged_name: format!(".gogglelab-empty-{nonce}"),
+            previous_name: previous_name.to_string_lossy().into_owned(),
+            committed: false,
+        };
+        let journal_path = write_purge_journal(&runtime.root, &journal).unwrap();
+        let journal_name = journal_path.file_name().unwrap().to_os_string();
+        let parent_directory = secure_fs::Directory::open(parent_path).unwrap();
+        let staged_directory = secure_fs::Directory::open(&runtime.root).unwrap();
+        let mut guard = runtime.begin_maintenance().unwrap();
+
+        let error = finish_catalog_purge_commit(
+            &mut guard,
+            &staged_directory,
+            &parent_directory,
+            &runtime.root,
+            &journal_name,
+            &nonce,
+            remove_purge_stage_marker_at,
+            |_, _| Err(io_error()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, RuntimeErrorCode::Io);
+        drop(guard);
+        assert!(runtime.maintenance.load(Ordering::Acquire));
+        assert!(!purge_stage_marker_path(&runtime.root).exists());
+        let journal_after_failure: PurgeJournal =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        assert!(journal_after_failure.committed);
+        assert!(runtime.read_db(|db| db.list_models(None, None)).is_err());
+        drop(runtime);
+
+        let mut restarted_config = config(library.clone());
+        restarted_config.local_catalog_root_access = false;
+        let restarted = LibraryRuntime::open(restarted_config).unwrap();
+        assert_eq!(
+            restarted
+                .read_db(|db| db.list_models(None, None))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(previous_path.is_dir());
+        assert_eq!(
+            fs::read(previous_path.join("sentinel")).unwrap(),
+            b"preserve previous"
+        );
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_recovery_uses_pinned_parent_for_child_state_after_path_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_entry = temp.path().join("restore-parent");
+        fs::create_dir(&parent_entry).unwrap();
+        let parent_path = parent_entry.canonicalize().unwrap();
+        let library = parent_path.join("library");
+        LibraryDb::open(&library)
+            .unwrap()
+            .create_model("Original sentinel", None)
+            .unwrap();
+        let canonical_root = library.canonicalize().unwrap();
+        let nonce = "a".repeat(32);
+        let staged_name = std::ffi::OsString::from(format!(".gogglelab-restore-{nonce}"));
+        let previous_name = std::ffi::OsString::from(format!("library.previous-{nonce}"));
+        let failed_name = std::ffi::OsString::from(format!(".gogglelab-failed-restore-{nonce}"));
+        let staged = parent_path.join(&staged_name);
+        fs::create_dir(&staged).unwrap();
+        LibraryDb::open(&staged)
+            .unwrap()
+            .create_model("Staged sentinel", None)
+            .unwrap();
+
+        let parent_handle = secure_fs::Directory::open(&parent_path).unwrap();
+        let journal = RestoreJournal {
+            version: 1,
+            root_path: canonical_root.to_str().unwrap().to_owned(),
+            nonce: nonce.clone(),
+            staged_name: staged_name.to_string_lossy().into_owned(),
+            previous_name: previous_name.to_string_lossy().into_owned(),
+            failed_name: failed_name.to_string_lossy().into_owned(),
+            committed: false,
+        };
+        let journal_name =
+            write_restore_journal_at(&parent_handle, &canonical_root, &journal).unwrap();
+        let previous = parent_path.join(&previous_name);
+        fs::rename(&canonical_root, &previous).unwrap();
+        drop(parent_handle);
+
+        let moved_parent = parent_path.with_file_name("restore-parent-pinned");
+        let decoy_parent = parent_path.clone();
+        let decoy_root = decoy_parent.join("library");
+        let decoy_staged = decoy_parent.join(&staged_name);
+        recover_interrupted_library_restore_with_hook(&canonical_root, || {
+            fs::rename(&parent_path, &moved_parent).unwrap();
+            fs::create_dir(&decoy_parent).unwrap();
+            LibraryDb::open(&decoy_root)
+                .unwrap()
+                .create_model("Decoy sentinel", None)
+                .unwrap();
+            fs::create_dir(&decoy_staged).unwrap();
+            fs::write(decoy_staged.join("sentinel"), b"decoy stage").unwrap();
+        })
+        .unwrap();
+
+        let restored = moved_parent.join("library");
+        assert!(
+            restored.is_dir(),
+            "recovery must restore the pinned Library"
+        );
+        let restored_db = LibraryDb::open(&restored).unwrap();
+        let restored_models = restored_db.list_models(None, None).unwrap();
+        assert_eq!(restored_models.len(), 1);
+        assert_eq!(restored_models[0].display_name, "Original sentinel");
+        assert!(!moved_parent.join(&previous_name).exists());
+        assert!(!moved_parent.join(&staged_name).exists());
+        assert!(!moved_parent.join(&journal_name).exists());
+
+        let decoy_db = LibraryDb::open(&decoy_root).unwrap();
+        assert_eq!(
+            decoy_db.list_models(None, None).unwrap()[0].display_name,
+            "Decoy sentinel"
+        );
+        assert_eq!(
+            fs::read(decoy_staged.join("sentinel")).unwrap(),
+            b"decoy stage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_recovery_rolls_back_precommit_and_preserves_committed_root() {
+        fn setup_library(path: &Path, model_name: &str) {
+            let db = LibraryDb::open(path).unwrap();
+            db.create_model(model_name, None).unwrap();
+        }
+
+        fn journal_for(root: &Path, nonce: &str) -> RestoreJournal {
+            RestoreJournal {
+                version: 1,
+                root_path: root.to_string_lossy().into_owned(),
+                nonce: nonce.into(),
+                staged_name: format!(".gogglelab-restore-{nonce}"),
+                previous_name: format!(
+                    "{}.previous-{nonce}",
+                    root.file_name().unwrap().to_string_lossy()
+                ),
+                failed_name: format!(".gogglelab-failed-restore-{nonce}"),
+                committed: false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+
+        // Crash after root -> previous but before staged -> root.
+        let first_root = temp.path().join("first-library");
+        setup_library(&first_root, "Original before install");
+        let first_root = first_root.canonicalize().unwrap();
+        let first_parent_path = first_root.parent().unwrap();
+        let first_journal = journal_for(&first_root, &"a".repeat(32));
+        let first_parent = secure_fs::Directory::open(first_parent_path).unwrap();
+        let first_journal_name =
+            write_restore_journal_at(&first_parent, &first_root, &first_journal).unwrap();
+        let first_previous = first_parent_path.join(&first_journal.previous_name);
+        let first_staged = first_parent_path.join(&first_journal.staged_name);
+        fs::rename(&first_root, &first_previous).unwrap();
+        setup_library(&first_staged, "Uncommitted staged library");
+
+        recover_interrupted_library_restore(&first_root).unwrap();
+
+        let first_db = LibraryDb::open(&first_root).unwrap();
+        assert_eq!(
+            first_db.list_models(None, None).unwrap()[0].display_name,
+            "Original before install"
+        );
+        assert!(!first_previous.exists());
+        assert!(!first_staged.exists());
+        assert!(!first_parent_path
+            .join(
+                restore_journal_path(&first_root)
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+            )
+            .exists());
+        drop(first_journal_name);
+
+        // Crash after staged -> root but before the committed state is durable.
+        let second_root = temp.path().join("second-library");
+        setup_library(&second_root, "Original before activation");
+        let second_root = second_root.canonicalize().unwrap();
+        let second_parent_path = second_root.parent().unwrap();
+        let second_journal = journal_for(&second_root, &"b".repeat(32));
+        let second_parent = secure_fs::Directory::open(second_parent_path).unwrap();
+        let second_journal_name =
+            write_restore_journal_at(&second_parent, &second_root, &second_journal).unwrap();
+        let second_previous = second_parent_path.join(&second_journal.previous_name);
+        let second_staged = second_parent_path.join(&second_journal.staged_name);
+        fs::rename(&second_root, &second_previous).unwrap();
+        setup_library(&second_staged, "Uncommitted activated library");
+        fs::rename(&second_staged, &second_root).unwrap();
+
+        recover_interrupted_library_restore(&second_root).unwrap();
+
+        let second_db = LibraryDb::open(&second_root).unwrap();
+        assert_eq!(
+            second_db.list_models(None, None).unwrap()[0].display_name,
+            "Original before activation"
+        );
+        let failed = second_parent_path.join(&second_journal.failed_name);
+        assert!(LibraryDb::open(&failed).is_ok());
+        assert!(!second_previous.exists());
+        assert!(!second_parent_path.join(&second_journal_name).exists());
+
+        // After the durable commit bit, startup must retain the new root.
+        let third_root = temp.path().join("third-library");
+        setup_library(&third_root, "Original retained as previous");
+        let third_root = third_root.canonicalize().unwrap();
+        let third_parent_path = third_root.parent().unwrap();
+        let third_journal = journal_for(&third_root, &"c".repeat(32));
+        let third_parent = secure_fs::Directory::open(third_parent_path).unwrap();
+        let third_journal_name =
+            write_restore_journal_at(&third_parent, &third_root, &third_journal).unwrap();
+        let third_previous = third_parent_path.join(&third_journal.previous_name);
+        let third_staged = third_parent_path.join(&third_journal.staged_name);
+        fs::rename(&third_root, &third_previous).unwrap();
+        setup_library(&third_staged, "Committed restored library");
+        fs::rename(&third_staged, &third_root).unwrap();
+        mark_restore_journal_committed_at(
+            &third_parent,
+            &third_root,
+            &third_journal_name,
+            &third_journal.nonce,
+        )
+        .unwrap();
+
+        recover_interrupted_library_restore(&third_root).unwrap();
+
+        let third_db = LibraryDb::open(&third_root).unwrap();
+        assert_eq!(
+            third_db.list_models(None, None).unwrap()[0].display_name,
+            "Committed restored library"
+        );
+        let previous_db = LibraryDb::open(&third_previous).unwrap();
+        assert_eq!(
+            previous_db.list_models(None, None).unwrap()[0].display_name,
+            "Original retained as previous"
+        );
+        assert!(!third_parent_path.join(&third_journal_name).exists());
+    }
+
+    #[test]
+    fn purge_catalog_backs_up_before_swapping_and_preserves_external_sources_and_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let external_models = temp.path().join("external-models");
+        let backups = temp.path().join("backups");
+        fs::create_dir(&external_models).unwrap();
+        fs::create_dir(&backups).unwrap();
+        let external_source = external_models.join("indexed.stl");
+        fs::write(&external_source, triangle_stl(2.0)).unwrap();
+        let external_bytes = fs::read(&external_source).unwrap();
+        let managed_input = temp.path().join("managed.stl");
+        fs::write(&managed_input, triangle_stl(0.0)).unwrap();
+        let managed = {
+            let db = LibraryDb::open(&library).unwrap();
+            let root = db
+                .add_index_root(&external_models, 60, 50 * 1024 * 1024)
+                .unwrap();
+            let model = db
+                .import_file(&managed_input, None, Some("Managed source"))
+                .unwrap()
+                .model;
+            (root, model)
+        };
+        let mut runtime_config = config(library.clone());
+        runtime_config.local_catalog_root_access = false;
+        runtime_config.roots = vec![
+            RuntimeRootPolicy {
+                id: "models".into(),
+                catalog_root_id: Some(managed.0.id.clone()),
+                label: "Models".into(),
+                path: external_models.clone(),
+                access: RootAccess::ReadOnly,
+            },
+            RuntimeRootPolicy {
+                id: "backups".into(),
+                catalog_root_id: None,
+                label: "Backups".into(),
+                path: backups.clone(),
+                access: RootAccess::BackupOnly,
+            },
+        ];
+        runtime_config.capabilities = BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::CatalogWrite,
+            Capability::Maintenance,
+            Capability::BackupWrite,
+            Capability::Scan,
+        ]);
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        scanner::scan_root(&runtime, &managed.0).unwrap();
+        assert_eq!(
+            runtime
+                .read_db(|db| db.list_models(None, None))
+                .unwrap()
+                .len(),
+            2
+        );
+        let context = RequestContext {
+            principal_id: "purge-operator".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::CatalogWrite,
+                Capability::Maintenance,
+                Capability::BackupWrite,
+                Capability::Scan,
+            ]),
+            request_id: "purge-catalog".into(),
+        };
+        let managed_asset = runtime
+            .read_db(|db| db.resolve_model_source_ref(&managed.1.id))
+            .unwrap()
+            .outer_path;
+        let managed_bytes = fs::read(&managed_asset).unwrap();
+        let changed_plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::PurgeCatalog {
+                    backup_destination_handle_id: "backups".into(),
+                    backup_file_name: "changed-after-plan.zip".into(),
+                },
+            )
+            .unwrap();
+        fs::write(&managed_asset, b"modified after purge confirmation").unwrap();
+        assert_eq!(
+            runtime
+                .execute_action(&context, &changed_plan.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        assert!(!backups.join("changed-after-plan.zip").exists());
+        assert_eq!(
+            runtime
+                .read_db(|db| db.list_models(None, None))
+                .unwrap()
+                .len(),
+            2
+        );
+        fs::write(&managed_asset, &managed_bytes).unwrap();
+
+        fs::write(backups.join("occupied.zip"), b"preserve this file").unwrap();
+        assert!(runtime
+            .plan_action(
+                &context,
+                ManagementAction::PurgeCatalog {
+                    backup_destination_handle_id: "backups".into(),
+                    backup_file_name: "occupied.zip".into(),
+                },
+            )
+            .is_err());
+        assert_eq!(
+            fs::read(backups.join("occupied.zip")).unwrap(),
+            b"preserve this file"
+        );
+
+        let plan = runtime
+            .plan_action(
+                &context,
+                ManagementAction::PurgeCatalog {
+                    backup_destination_handle_id: "backups".into(),
+                    backup_file_name: "before-purge.zip".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.action_kind, "purgeCatalog");
+        assert!(plan.impact.iter().any(|item| item.contains("backup")));
+        let backup_destination = backups.join("before-purge.zip");
+        assert!(matches!(
+            runtime.execute_action(&context, &plan.token).unwrap(),
+            ManagementResult::Purged {
+                backup_destination_handle_id,
+                backup_file_name,
+                ..
+            } if backup_destination_handle_id == "backups" && backup_file_name == "before-purge.zip"
+        ));
+        assert!(backup_destination.is_file());
+        let current_models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+        assert!(current_models.is_empty());
+        let roots_after = runtime.read_db(|db| db.list_index_roots()).unwrap();
+        assert_eq!(roots_after.len(), 1);
+        assert_eq!(roots_after[0].id, managed.0.id);
+        assert_eq!(fs::read(&external_source).unwrap(), external_bytes);
+
+        let restored = temp.path().join("verified-backup");
+        library_backup::restore_backup_to_staging(&backup_destination, &restored).unwrap();
+        let restored_db = LibraryDb::open(&restored).unwrap();
+        assert_eq!(restored_db.list_models(None, None).unwrap().len(), 2);
+        assert!(restored_db
+            .list_index_roots()
+            .unwrap()
+            .iter()
+            .any(|root| root.id == managed.0.id));
+        let previous = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("library.previous-purge-"))
+            })
+            .unwrap();
+        assert!(previous.join("originals").is_dir());
+        assert!(managed.1.content_hash.is_some());
+    }
+
+    #[test]
+    fn cleanup_orphans_deletes_generated_assets_without_recoverable_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let mut runtime_config = config(library.clone());
+        runtime_config.local_catalog_root_access = false;
+        runtime_config
+            .capabilities
+            .extend([Capability::MediaWrite, Capability::Maintenance]);
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        let thumbnail_dir = library.join("thumbnails");
+        fs::create_dir_all(&thumbnail_dir).unwrap();
+        let thumbnail =
+            thumbnail_dir.join(format!("{}-isometric-v1-256-ffffff.png", "a".repeat(64)));
+        let note = thumbnail_dir.join("operator-note.png");
+        let cache_bytes = b"orphan extracted archive member";
+        let cache_hash = format!("{:x}", Sha256::digest(cache_bytes));
+        let cache_dir = library.join("indexed-cache").join(&cache_hash);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache = cache_dir.join("part.stl");
+        fs::write(&thumbnail, b"generated thumbnail orphan").unwrap();
+        fs::write(&cache, cache_bytes).unwrap();
+        fs::write(&note, b"operator file").unwrap();
+        let expected_bytes =
+            fs::metadata(&thumbnail).unwrap().len() + fs::metadata(&cache).unwrap().len();
+        let context = RequestContext {
+            principal_id: "cleanup-operator".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::Maintenance,
+                Capability::MediaWrite,
+            ]),
+            request_id: "cleanup-orphans".into(),
+        };
+        let plan = runtime
+            .plan_action(&context, ManagementAction::CleanupOrphans)
+            .unwrap();
+        assert_eq!(plan.action_kind, "cleanupOrphans");
+        assert!(plan.impact.iter().any(|item| item.contains("2")));
+        let result = runtime.execute_action(&context, &plan.token).unwrap();
+        assert!(matches!(
+            result,
+            ManagementResult::CleanupCompleted { files: 2, bytes }
+                if bytes == expected_bytes
+        ));
+        assert!(!thumbnail.exists());
+        assert!(!cache.exists());
+        assert!(!cache_dir.exists());
+        let remaining_thumbnail_files = fs::read_dir(&thumbnail_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining_thumbnail_files,
+            vec![std::ffi::OsString::from("operator-note.png")]
+        );
+        assert_eq!(fs::read(&note).unwrap(), b"operator file");
+        assert_eq!(
+            runtime
+                .execute_action(&context, &plan.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+    }
+
+    #[test]
+    fn cleanup_orphans_rejects_changed_file_hashes_without_deleting_the_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let mut runtime_config = config(library.clone());
+        runtime_config.local_catalog_root_access = false;
+        runtime_config
+            .capabilities
+            .extend([Capability::MediaWrite, Capability::Maintenance]);
+        let runtime = LibraryRuntime::open(runtime_config).unwrap();
+        let thumbnails = library.join("thumbnails");
+        fs::create_dir_all(&thumbnails).unwrap();
+        let orphan = thumbnails.join(format!("{}-isometric-v1-256-ffffff.png", "b".repeat(64)));
+        fs::write(&orphan, b"original generated bytes").unwrap();
+        let context = RequestContext {
+            principal_id: "cleanup-hash-operator".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::Maintenance,
+                Capability::MediaWrite,
+            ]),
+            request_id: "cleanup-hash".into(),
+        };
+        let plan = runtime
+            .plan_action(&context, ManagementAction::CleanupOrphans)
+            .unwrap();
+        fs::write(&orphan, b"changed generated bytes").unwrap();
+        assert_eq!(
+            runtime
+                .execute_action(&context, &plan.token)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        assert_eq!(fs::read(&orphan).unwrap(), b"changed generated bytes");
     }
 
     #[test]
@@ -8815,6 +17334,22 @@ mod tests {
                 .unwrap()
                 .staged_upload_bytes,
             0
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn desktop_configuration_removes_physical_source_writes_without_handle_relative_support() {
+        let config = RuntimeConfig::desktop(
+            PathBuf::from("C:/synthetic/library"),
+            PathBuf::from("C:/synthetic/settings.json"),
+        );
+        assert!(!config
+            .capabilities
+            .contains(&Capability::PhysicalSourceWrite));
+        assert_eq!(
+            require_durable_source_mutations().unwrap_err().code,
+            RuntimeErrorCode::Unsupported
         );
     }
 }

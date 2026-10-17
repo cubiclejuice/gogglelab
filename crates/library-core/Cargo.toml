@@ -6,10 +6,18 @@ edition.workspace = true
 
 [dependencies]
 serde_json = "1"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "hooks"] }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 stl-core = { path = "../stl-core" }
 thiserror = "2"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
+url = "=2.5.8"
 uuid = { version = "1.26", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+] }

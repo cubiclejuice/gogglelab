@@ -1,0 +1,97 @@
+name: Windows Community test build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-community-test-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-community:
+    name: Verify and package unsigned Windows test installers
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          components: clippy
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check Community frontend
+        run: bun run check:frontend
+
+      - name: Test local Fusion bridge
+        run: python integrations/fusion/test_bridge.py
+
+      - name: Prepare frontend and bundled CAD/license resources
+        run: bun run build:web
+
+      - name: Test public Rust workspace
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      - name: Lint public Rust workspace
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Build unsigned Community Windows installers
+        run: bun run build -- --release --bundles nsis,msi --no-sign
+
+      - name: Prepare bounded test artifact and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactDirectory = Join-Path $env:RUNNER_TEMP 'gogglelab-community-windows'
+          New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
+
+          $nsisInstallers = @(Get-ChildItem 'target/release/bundle/nsis' -Filter '*.exe' -File)
+          $msiInstallers = @(Get-ChildItem 'target/release/bundle/msi' -Filter '*.msi' -File)
+          if ($nsisInstallers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($nsisInstallers.Count)."
+          }
+          if ($msiInstallers.Count -ne 1) {
+            throw "Expected exactly one MSI installer, found $($msiInstallers.Count)."
+          }
+
+          Copy-Item $nsisInstallers[0].FullName $artifactDirectory
+          Copy-Item $msiInstallers[0].FullName $artifactDirectory
+          $installers = @(Get-ChildItem $artifactDirectory -File)
+          $checksumLines = foreach ($installer in $installers) {
+            $checksum = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$checksum  $($installer.Name)"
+          }
+          $checksumLines | Set-Content (Join-Path $artifactDirectory 'SHA256SUMS.txt') -Encoding ascii
+
+          @(
+            'Edition: Community (Free)'
+            'Build: unsigned test installers; not a release'
+            "Commit: $env:GITHUB_SHA"
+            'Target: x86_64-pc-windows-msvc'
+          ) | Set-Content (Join-Path $artifactDirectory 'BUILD-INFO.txt') -Encoding ascii
+          Copy-Item 'docs/WINDOWS-FRIEND-ACCEPTANCE.md' $artifactDirectory
+
+      - name: Upload friend-testable installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gogglelab-community-windows-${{ github.sha }}
+          path: ${{ runner.temp }}/gogglelab-community-windows/
+          if-no-files-found: error
+          retention-days: 14

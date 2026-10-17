@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 
 use crate::extension_api::{AppError, SlicerApp, SourceFormat};
 use crate::library_commands::LibraryState;
+use crate::settings::SettingsState;
 
 type SlicerDetector = dyn Fn() -> Vec<SlicerApp> + Send + Sync;
 type SlicerLauncher = dyn Fn(&SlicerApp, &Path) -> Result<(), AppError> + Send + Sync;
@@ -32,15 +33,6 @@ struct DesktopHostSlicerAdapter {
 }
 
 impl DesktopHostSlicerAdapter {
-    fn new(runtime: Arc<library_runtime::LibraryRuntime>) -> Self {
-        Self::with_host_batch_ops(
-            runtime,
-            crate::slicers::detect_slicers,
-            |slicer, path| crate::handoff::launch_paths(slicer, &[path.to_path_buf()]),
-            crate::handoff::launch_paths,
-        )
-    }
-
     #[cfg(test)]
     fn with_host_ops(
         runtime: Arc<library_runtime::LibraryRuntime>,
@@ -126,6 +118,7 @@ impl HostSlicerAdapter for DesktopHostSlicerAdapter {
                 message: "Model metadata changed; refresh the model before opening it".into(),
                 retryable: true,
                 current_version: Some(model.metadata_version),
+                source_holds: Vec::new(),
             });
         }
         let lease = self
@@ -226,6 +219,7 @@ impl HostSlicerAdapter for DesktopHostSlicerAdapter {
                     message: "Model metadata changed; refresh the model before opening it".into(),
                     retryable: true,
                     current_version: Some(model.metadata_version),
+                    source_holds: Vec::new(),
                 });
             }
             let lease = self
@@ -302,6 +296,7 @@ fn host_slicer_error(code: &'static str, message: &str) -> EngineError {
         message: message.into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -310,6 +305,7 @@ const DEFAULT_DESKTOP_SERVER_PORT: u16 = 3745;
 pub struct DesktopServerState {
     token_path: PathBuf,
     web_root: PathBuf,
+    slicer_settings: SettingsState,
     running: Mutex<Option<RunningServer>>,
 }
 
@@ -321,10 +317,11 @@ struct RunningServer {
 }
 
 impl DesktopServerState {
-    pub fn new(token_path: PathBuf, web_root: PathBuf) -> Self {
+    pub fn new(token_path: PathBuf, web_root: PathBuf, slicer_settings: SettingsState) -> Self {
         Self {
             token_path,
             web_root,
+            slicer_settings,
             running: Mutex::new(None),
         }
     }
@@ -389,9 +386,32 @@ async fn start_impl(
         library_server::load_or_create_bearer_secret(&server.token_path).map_err(server_error)?;
     let engine = Arc::new(
         ProtocolEngineAdapter::new(Arc::clone(library.runtime()), HostMode::Desktop)
-            .with_host_slicer(Arc::new(DesktopHostSlicerAdapter::new(Arc::clone(
-                library.runtime(),
-            )))),
+            .with_host_slicer(Arc::new(DesktopHostSlicerAdapter::with_host_batch_ops(
+                Arc::clone(library.runtime()),
+                {
+                    let settings = server.slicer_settings.clone();
+                    move || {
+                        let settings = settings.0.lock().unwrap();
+                        crate::slicers::available_slicers(&settings)
+                    }
+                },
+                {
+                    let settings = server.slicer_settings.clone();
+                    move |slicer, path| {
+                        crate::slicers::launch_with_current_profile(&settings, slicer, || {
+                            crate::handoff::launch_paths(slicer, &[path.to_path_buf()])
+                        })
+                    }
+                },
+                {
+                    let settings = server.slicer_settings.clone();
+                    move |slicer, paths| {
+                        crate::slicers::launch_with_current_profile(&settings, slicer, || {
+                            crate::handoff::launch_paths(slicer, paths)
+                        })
+                    }
+                },
+            ))),
     );
     let app = library_server::router_with_static(
         engine,
@@ -573,6 +593,8 @@ mod tests {
                     bundle_id: "com.bambulab.bambu-studio".into(),
                     display_name: "Bambu Studio".into(),
                     app_path: "/fixture/Bambu Studio.app".into(),
+                    custom: false,
+                    profile_identity: None,
                 }]
             },
             move |slicer, path| {
@@ -665,6 +687,8 @@ mod tests {
                     bundle_id: "com.bambulab.bambu-studio".into(),
                     display_name: "Bambu Studio".into(),
                     app_path: "/fixture/Bambu Studio.app".into(),
+                    custom: false,
+                    profile_identity: None,
                 }]
             },
             |_, _| panic!("batch handoff should launch one path set"),

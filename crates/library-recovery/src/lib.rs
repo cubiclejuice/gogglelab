@@ -2,22 +2,30 @@
 //! creates a Library directory or opens the mutable LibraryDb.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 
+use library_core::catalog_vfs::{open_pinned_file, same_file_identity, CatalogVfs};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 
 pub const MANIFEST_VERSION: u32 = 1;
-pub const LIBRARY_SCHEMA_VERSION: u32 = 6;
+pub const LIBRARY_SCHEMA_VERSION: u32 = 11;
 pub const MAX_COLORWAY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
 const MAX_ROWS: usize = 50_000;
+const MAX_PRINTERS: usize = 5_000;
+const MAX_PRINTER_HISTORY_ROWS: usize = 10_000;
+const MAX_PART_STOCK_RECORDS: usize = 10_000;
+const MAX_PART_USAGE_PER_ATTEMPT: usize = 256;
+const MAX_PRINTER_LABEL_CHARS: usize = 128;
+const MAX_PRINTER_NOTES_BYTES: usize = 20_000;
 const MAX_METADATA_BYTES: i64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
@@ -82,6 +90,10 @@ fn valid_rfc3339(value: &str) -> bool {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).is_ok()
 }
 
+fn valid_database_timestamp(value: &str) -> bool {
+    valid_rfc3339(value) || value.parse::<u64>().is_ok()
+}
+
 fn invalid_external_id(value: &str) -> bool {
     value.is_empty()
         || value.len() > 256
@@ -95,6 +107,117 @@ fn invalid_capture_id(value: &str) -> bool {
         || value.chars().any(|character| {
             !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
         })
+}
+
+fn invalid_catalog_record_id(value: &str) -> bool {
+    value.is_empty()
+        || value.len() > 128
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value.contains('/')
+        || value.contains('\\')
+}
+
+fn invalid_printer_label(value: &str) -> bool {
+    value.is_empty()
+        || value.trim() != value
+        || value.chars().count() > MAX_PRINTER_LABEL_CHARS
+        || value.chars().any(char::is_control)
+}
+
+fn invalid_printer_snapshot_label(value: &str) -> bool {
+    !value.is_empty() && invalid_printer_label(value)
+}
+
+fn invalid_optional_printer_label(value: Option<&str>) -> bool {
+    value.is_some_and(invalid_printer_label)
+}
+
+fn invalid_printer_notes(value: &str) -> bool {
+    value.len() > MAX_PRINTER_NOTES_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+}
+
+fn valid_printer_port(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u16>().is_ok()
+}
+
+fn valid_host_authority(authority: &str) -> bool {
+    if authority.is_empty()
+        || authority.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '@' | '/' | '\\' | '?' | '#')
+        })
+    {
+        return false;
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some(close) = rest.find(']') else {
+            return false;
+        };
+        if rest[..close].parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+        let suffix = &rest[close + 1..];
+        return suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_printer_port);
+    }
+
+    if authority.matches(':').count() > 1 {
+        return false;
+    }
+    let host = if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || !valid_printer_port(port) {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.chars().count() <= 63
+                && label.chars().next().is_some_and(char::is_alphanumeric)
+                && label.chars().last().is_some_and(char::is_alphanumeric)
+                && label
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '-')
+        })
+}
+
+fn invalid_printer_host(value: &str) -> bool {
+    value.len() > 255 || value.trim() != value || !valid_host_authority(value)
+}
+
+fn invalid_printer_web_url(value: &str) -> bool {
+    if value.len() > 2048
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || value.contains(['?', '#', '\\'])
+    {
+        return true;
+    }
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return true;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    let authority = remainder.split('/').next().unwrap_or_default();
+    !valid_host_authority(authority)
 }
 
 fn invalid_sha256(value: &str) -> bool {
@@ -126,6 +249,14 @@ pub struct RecoveryManifest {
     pub captures: Vec<RecoveryCaptureItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub print_batch_receipts: Vec<RecoveryPrintBatchReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts_stock: Vec<RecoveryPartStock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub printers: Vec<RecoveryPrinter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub printer_maintenance_logs: Vec<RecoveryPrinterMaintenanceLog>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub printer_reminders: Vec<RecoveryPrinterReminder>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,7 +332,97 @@ pub struct RecoveryPrintAttempt {
     pub quantity: u32,
     pub notes: String,
     pub outcome: String,
+    #[serde(default)]
+    pub stock_adjusted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_name: Option<String>,
     pub filament_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<RecoveryPrintAttemptPart>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPrintAttemptPart {
+    /// Stable historical identity. The stock row may have been deleted.
+    pub part_id: String,
+    pub part_name: String,
+    pub category: Option<String>,
+    pub unit: String,
+    pub quantity_per_copy: u32,
+    /// Total stock consumed by this event across all copies.
+    pub quantity: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPartStock {
+    pub id: String,
+    pub metadata_version: u64,
+    pub name: String,
+    pub category: Option<String>,
+    pub quantity: u64,
+    pub unit: String,
+    pub notes: String,
+    pub low_stock: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Portable printer metadata with endpoint approval deliberately revoked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPrinter {
+    pub id: String,
+    pub metadata_version: u64,
+    pub nickname: String,
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub printer_type: Option<String>,
+    pub firmware: Option<String>,
+    pub host: Option<String>,
+    pub web_url: Option<String>,
+    /// Portable recovery data never retains authority to contact an endpoint.
+    pub endpoint_approved: bool,
+    pub bed_mm: Option<[f32; 3]>,
+    pub notes: String,
+    pub source_kind: String,
+    pub connection_status: String,
+    pub job_status: String,
+    pub last_checked_at: Option<String>,
+    pub connection_error_code: Option<String>,
+    pub print_count: u64,
+    pub last_printed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPrinterMaintenanceLog {
+    pub id: String,
+    #[serde(default = "default_recovery_metadata_version")]
+    pub metadata_version: u64,
+    pub printer_id: Option<String>,
+    pub printer_nickname: String,
+    pub title: String,
+    pub performed_at: String,
+    pub notes: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPrinterReminder {
+    pub id: String,
+    pub metadata_version: u64,
+    pub printer_id: Option<String>,
+    pub printer_nickname: String,
+    pub title: String,
+    pub notes: String,
+    pub due_at: String,
+    pub interval_days: Option<u32>,
+    pub status: String,
+    pub last_completed_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -317,6 +538,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn default_recovery_metadata_version() -> u64 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryRevision {
     pub id: String,
@@ -368,34 +593,61 @@ pub fn inspect_library(root: &Path) -> Result<RecoveryManifest, RecoveryError> {
     read_library(root, None)
 }
 
+/// Inspects a disposable restore staging Library without leaving a persistent
+/// catalog alias. Normal Library reads use the identity-pinned VFS path.
+pub fn inspect_staged_library(root: &Path) -> Result<RecoveryManifest, RecoveryError> {
+    read_library_with_mode(root, None, false)
+}
+
 fn read_library(
     root: &Path,
     selected_ids: Option<&[String]>,
 ) -> Result<RecoveryManifest, RecoveryError> {
+    read_library_with_mode(root, selected_ids, true)
+}
+
+fn read_library_with_mode(
+    root: &Path,
+    selected_ids: Option<&[String]>,
+    use_catalog_vfs: bool,
+) -> Result<RecoveryManifest, RecoveryError> {
+    let (manifest, ()) = with_library_read(root, selected_ids, use_catalog_vfs, |_, _, _| Ok(()))?;
+    Ok(manifest)
+}
+
+fn with_library_read<T>(
+    root: &Path,
+    selected_ids: Option<&[String]>,
+    use_catalog_vfs: bool,
+    operation: impl FnOnce(
+        &Path,
+        &mut RecoveryManifest,
+        &RecoveryCatalogReader,
+    ) -> Result<T, RecoveryError>,
+) -> Result<(RecoveryManifest, T), RecoveryError> {
     let root = existing_library_root(root)?;
     let database = root.join("library.sqlite3");
-    let database_metadata = database
-        .symlink_metadata()
-        .map_err(|_| invalid("No existing Library database was found"))?;
-    if !database_metadata.is_file() || database_metadata.file_type().is_symlink() {
-        return Err(invalid("Library database must be an ordinary file"));
-    }
-    let conn = Connection::open_with_flags(
-        database,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
-    let mut manifest = read_catalog(&conn)?;
+    let catalog = RecoveryCatalogReader::open(&database, use_catalog_vfs)?;
+    catalog.check_identity()?;
+    catalog
+        .connection()
+        .execute_batch("BEGIN DEFERRED TRANSACTION")?;
+    let mut manifest = read_catalog(catalog.connection())?;
     if let Some(ids) = selected_ids {
         select_models(&mut manifest, ids)?;
     }
+    catalog.check_identity()?;
     populate_asset_bytes(&root, &mut manifest)?;
     validate_catalog_assets(&root, &manifest)?;
     if serde_json::to_vec(&manifest)?.len() > MAX_MANIFEST_BYTES {
         return Err(invalid("Recovery manifest exceeds its size limit"));
     }
-    conn.execute_batch("COMMIT")?;
-    Ok(manifest)
+    catalog.check_identity()?;
+    catalog.connection().execute_batch("COMMIT")?;
+    catalog.check_identity()?;
+    let result = operation(&root, &mut manifest, &catalog)?;
+    catalog.check_identity()?;
+    Ok((manifest, result))
 }
 
 /// Exports selected model IDs, or every model when the selection is empty.
@@ -406,7 +658,6 @@ pub fn export_library_zip(
     destination: &Path,
 ) -> Result<RecoveryManifest, RecoveryError> {
     let root = existing_library_root(root)?;
-    let mut manifest = read_library(&root, Some(model_ids))?;
     if !destination.is_absolute() {
         return Err(invalid("Recovery destination must be absolute"));
     }
@@ -419,12 +670,175 @@ pub fn export_library_zip(
         ));
     }
     let temporary = tempfile::NamedTempFile::new_in(parent)?;
-    write_archive(temporary.reopen()?, &root, &mut manifest)?;
+    let (manifest, ()) =
+        with_library_read(&root, Some(model_ids), true, |root, manifest, catalog| {
+            write_archive(temporary.reopen()?, root, manifest)?;
+            catalog.check_identity()?;
+            Ok(())
+        })?;
     temporary
         .persist_noclobber(destination)
         .map_err(|error| RecoveryError::Io(error.error))?;
     Ok(manifest)
 }
+
+struct RecoveryCatalogReader {
+    // Drop the connection before unregistering its VFS.
+    connection: Connection,
+    pinned_file: File,
+    vfs: Option<CatalogVfs>,
+    path: PathBuf,
+}
+
+impl RecoveryCatalogReader {
+    fn open(path: &Path, use_catalog_vfs: bool) -> Result<Self, RecoveryError> {
+        let pinned_file = open_catalog_file(path)?;
+        let (connection, vfs) = if use_catalog_vfs {
+            let vfs = CatalogVfs::new(path, &pinned_file)?;
+            let connection = Connection::open_with_flags_and_vfs(
+                vfs.sqlite_path(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                vfs.vfs_name(),
+            )?;
+            (connection, Some(vfs))
+        } else {
+            // SQLite's NOFOLLOW may reject macOS's noncanonical /var spelling
+            // because /var itself is a symlink. Canonicalize only the already
+            // admitted parent, keep the leaf uns followed, and prove it still
+            // names the pinned staging database before SQLite opens it.
+            let sqlite_path = canonical_parent_path(path)?;
+            check_visible_file_identity(&sqlite_path, &pinned_file, "Staged database")?;
+            let connection = Connection::open_with_flags(
+                &sqlite_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            (connection, None)
+        };
+        let catalog = Self {
+            connection,
+            pinned_file,
+            vfs,
+            path: path.to_path_buf(),
+        };
+        catalog.check_identity()?;
+        Ok(catalog)
+    }
+
+    fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    fn check_identity(&self) -> Result<(), RecoveryError> {
+        if let Some(vfs) = &self.vfs {
+            vfs.check_connection(&self.connection)?;
+            Ok(())
+        } else {
+            check_open_catalog_identity(&self.path, &self.pinned_file, &self.connection)
+        }
+    }
+}
+
+fn open_catalog_file(path: &Path) -> Result<File, RecoveryError> {
+    open_pinned_regular_file(path, "Library database")
+}
+
+fn open_pinned_regular_file(path: &Path, label: &str) -> Result<File, RecoveryError> {
+    let before =
+        fs::symlink_metadata(path).map_err(|_| invalid(format!("{label} was not found")))?;
+    if !before.is_file() || before.file_type().is_symlink() || is_reparse_point(&before) {
+        return Err(invalid(format!("{label} must be an ordinary file")));
+    }
+    let file = open_pinned_file(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || is_reparse_point(&opened) {
+        return Err(invalid(format!(
+            "{label} changed while it was being opened"
+        )));
+    }
+    let visible = open_pinned_file(path)?;
+    if !same_file_identity(&file, &visible)? {
+        return Err(invalid(format!(
+            "{label} changed while it was being opened"
+        )));
+    }
+    Ok(file)
+}
+
+fn check_open_catalog_identity(
+    path: &Path,
+    pinned_file: &File,
+    connection: &Connection,
+) -> Result<(), RecoveryError> {
+    check_visible_file_identity(path, pinned_file, "Library database")?;
+    let mut moved = 1;
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut i32).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK || moved != 0 {
+        return Err(invalid(
+            "SQLite recovery connection changed database identity",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_parent_path(path: &Path) -> Result<PathBuf, RecoveryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("SQLite path has no parent"))?
+        .canonicalize()?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| invalid("SQLite path has no filename"))?;
+    Ok(parent.join(filename))
+}
+
+fn check_visible_file_identity(
+    path: &Path,
+    pinned_file: &File,
+    label: &str,
+) -> Result<(), RecoveryError> {
+    let visible_metadata = fs::symlink_metadata(path)?;
+    if !visible_metadata.is_file()
+        || visible_metadata.file_type().is_symlink()
+        || is_reparse_point(&visible_metadata)
+    {
+        return Err(invalid(format!("{label} identity changed during recovery")));
+    }
+    let visible_file = open_pinned_file(path)?;
+    if !same_file_identity(pinned_file, &visible_file)? {
+        return Err(invalid(format!("{label} identity changed during recovery")));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Writes the exact UTF-8 bytes supplied by the original webview's
 /// localStorage value. Malformed JSON is intentionally preserved.
@@ -525,6 +939,16 @@ fn select_models(manifest: &mut RecoveryManifest, ids: &[String]) -> Result<(), 
         }
     }
     manifest.models.retain(|model| selected.contains(&model.id));
+    let linked_part_ids: BTreeSet<_> = manifest
+        .models
+        .iter()
+        .flat_map(|model| model.print_attempts.iter())
+        .flat_map(|attempt| attempt.parts.iter())
+        .map(|part| part.part_id.as_str())
+        .collect();
+    manifest
+        .parts_stock
+        .retain(|part| linked_part_ids.contains(part.id.as_str()));
     manifest.captures.retain(|capture| {
         capture
             .page_model_id
@@ -702,7 +1126,7 @@ fn write_asset(
         return Err(invalid("Recovery export has too many entries"));
     }
     let path = managed_file(root, &asset.original_relative_path, kind)?;
-    let mut source = File::open(path)?;
+    let mut source = open_pinned_file(&path)?;
     let source_bytes = source.metadata()?.len();
     if source_bytes > MAX_ENTRY_BYTES || source_bytes != asset.bytes {
         return Err(invalid(
@@ -934,6 +1358,84 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
     if bundle_ids.len() != bundles.len() {
         return Err(invalid("Duplicate bundle identity"));
     }
+    let (printers, printer_maintenance_logs, printer_reminders) = if schema_version >= 7 {
+        read_printer_catalog(conn, schema_version)?
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    let printer_ids = printers
+        .iter()
+        .map(|printer| printer.id.clone())
+        .collect::<BTreeSet<_>>();
+    let parts_stock = if schema_version >= 9 {
+        let rows = collect_rows(
+            conn,
+            "SELECT id,metadata_version,name,category,quantity,unit,notes,low_stock,created_at,updated_at
+             FROM parts_stock ORDER BY id",
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )?;
+        if rows.len() > MAX_PART_STOCK_RECORDS {
+            return Err(invalid(
+                "Library has too many part-stock records for recovery",
+            ));
+        }
+        let mut stock = Vec::with_capacity(rows.len());
+        for (
+            id,
+            metadata_version,
+            name,
+            category,
+            quantity,
+            unit,
+            notes,
+            low_stock,
+            created_at,
+            updated_at,
+        ) in rows
+        {
+            if invalid_catalog_record_id(&id)
+                || metadata_version <= 0
+                || invalid_printer_label(&name)
+                || invalid_optional_printer_label(category.as_deref())
+                || quantity < 0
+                || invalid_printer_label(&unit)
+                || invalid_printer_notes(&notes)
+                || !(0..=1_000_000).contains(&low_stock)
+                || !valid_database_timestamp(&created_at)
+                || !valid_database_timestamp(&updated_at)
+            {
+                return Err(invalid("Part-stock metadata is invalid"));
+            }
+            stock.push(RecoveryPartStock {
+                id,
+                metadata_version: metadata_version as u64,
+                name,
+                category,
+                quantity: quantity as u64,
+                unit,
+                notes,
+                low_stock: low_stock as u32,
+                created_at,
+                updated_at,
+            });
+        }
+        stock
+    } else {
+        Vec::new()
+    };
 
     let mut print_batch_receipts = Vec::new();
     if schema_version >= 3 {
@@ -1009,7 +1511,57 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             });
         }
 
-        let attempts=collect_rows(conn,"SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at FROM print_attempts ORDER BY model_id,printed_at,id",|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?)))?;
+        let attempt_query = if schema_version >= 10 {
+            "SELECT id,model_id,printed_at,quantity,notes,outcome,printer_id,printer_name,
+                    created_at,updated_at,stock_adjusted
+             FROM print_attempts ORDER BY model_id,printed_at,id"
+        } else if schema_version >= 9 {
+            "SELECT id,model_id,printed_at,quantity,notes,outcome,printer_id,printer_name,
+                    created_at,updated_at,NULL
+             FROM print_attempts ORDER BY model_id,printed_at,id"
+        } else if schema_version >= 7 {
+            "SELECT id,model_id,printed_at,quantity,notes,outcome,printer_id,printer_name,
+                    created_at,updated_at,NULL FROM print_attempts ORDER BY model_id,printed_at,id"
+        } else {
+            "SELECT id,model_id,printed_at,quantity,notes,outcome,NULL,NULL,created_at,updated_at,NULL
+             FROM print_attempts ORDER BY model_id,printed_at,id"
+        };
+        let attempts = collect_rows(conn, attempt_query, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+            ))
+        })?;
+        let part_usage_rows = if schema_version >= 9 {
+            collect_rows(
+                conn,
+                "SELECT attempt_id,part_id,part_name,category,unit,quantity_per_copy,quantity,ordinal
+                 FROM print_attempt_parts ORDER BY attempt_id,ordinal",
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )?
+        } else {
+            Vec::new()
+        };
         let filament_rows=collect_rows(conn,"SELECT attempt_id,filament_id,ordinal FROM print_attempt_filaments ORDER BY attempt_id,ordinal",|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?;
         let mut filaments: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
         for (attempt, filament, ordinal) in filament_rows {
@@ -1027,14 +1579,99 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         {
             return Err(invalid("A filament references an unknown print attempt"));
         }
-        for (id, model_id, printed_at, quantity, notes, outcome, created_at, updated_at) in attempts
+        let attempt_quantities: BTreeMap<_, _> =
+            attempts.iter().map(|row| (row.0.as_str(), row.3)).collect();
+        let mut attempt_parts: BTreeMap<String, Vec<(i64, RecoveryPrintAttemptPart)>> =
+            BTreeMap::new();
+        let mut unique_part_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (
+            attempt_id,
+            part_id,
+            part_name,
+            category,
+            unit,
+            quantity_per_copy,
+            quantity,
+            ordinal,
+        ) in part_usage_rows
+        {
+            let Some(attempt_quantity) = attempt_quantities.get(attempt_id.as_str()).copied()
+            else {
+                return Err(invalid("Part usage references an unknown print attempt"));
+            };
+            let expected_quantity = quantity_per_copy
+                .checked_mul(attempt_quantity)
+                .ok_or_else(|| invalid("Part usage quantity is out of range"))?;
+            if invalid_catalog_record_id(&part_id)
+                || invalid_printer_label(&part_name)
+                || invalid_optional_printer_label(category.as_deref())
+                || invalid_printer_label(&unit)
+                || !(1..=9_999).contains(&quantity_per_copy)
+                || !(1..=100_000_000).contains(&quantity)
+                || quantity != expected_quantity
+                || ordinal < 0
+                || ordinal as usize >= MAX_PART_USAGE_PER_ATTEMPT
+                || !unique_part_ids
+                    .entry(attempt_id.clone())
+                    .or_default()
+                    .insert(part_id.clone())
+            {
+                return Err(invalid("Print attempt part usage is invalid"));
+            }
+            attempt_parts.entry(attempt_id).or_default().push((
+                ordinal,
+                RecoveryPrintAttemptPart {
+                    part_id,
+                    part_name,
+                    category,
+                    unit,
+                    quantity_per_copy: quantity_per_copy as u32,
+                    quantity: quantity as u32,
+                },
+            ));
+        }
+        for rows in attempt_parts.values_mut() {
+            rows.sort_by_key(|(ordinal, _)| *ordinal);
+            if rows.len() > MAX_PART_USAGE_PER_ATTEMPT
+                || rows
+                    .iter()
+                    .enumerate()
+                    .any(|(expected, (ordinal, _))| *ordinal != expected as i64)
+            {
+                return Err(invalid("Print attempt part order is invalid"));
+            }
+        }
+        for (
+            id,
+            model_id,
+            printed_at,
+            quantity,
+            notes,
+            outcome,
+            printer_id,
+            printer_name,
+            created_at,
+            updated_at,
+            stock_adjusted,
+        ) in attempts
         {
             if !(1..=10_000).contains(&quantity)
                 || notes.len() > 20_000
-                || !matches!(outcome.as_str(), "printed" | "failed")
+                || !matches!(outcome.as_str(), "printed" | "failed" | "cancelled")
+                || stock_adjusted.is_some_and(|marker| !matches!(marker, 0 | 1))
                 || !valid_rfc3339(&printed_at)
+                || (schema_version >= 7
+                    && (!valid_database_timestamp(&created_at)
+                        || !valid_database_timestamp(&updated_at)))
+                || printer_id
+                    .as_deref()
+                    .is_some_and(|id| invalid_catalog_record_id(id) || !printer_ids.contains(id))
+                || printer_name.as_deref().is_some_and(invalid_printer_label)
+                || (printer_id.is_some() && printer_name.is_none())
             {
-                return Err(invalid("Print attempt metadata is invalid"));
+                return Err(invalid(
+                    "Print attempt metadata or printer reference is invalid",
+                ));
             }
             let position = *index
                 .get(&model_id)
@@ -1057,6 +1694,12 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
             {
                 return Err(invalid("Print attempt filaments are invalid"));
             }
+            let parts = attempt_parts
+                .remove(&id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, part)| part)
+                .collect();
             models[position].print_attempts.push(RecoveryPrintAttempt {
                 id,
                 model_id,
@@ -1064,7 +1707,11 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
                 quantity: quantity as u32,
                 notes,
                 outcome,
+                stock_adjusted: stock_adjusted.map(|marker| marker == 1),
+                printer_id,
+                printer_name,
                 filament_ids: values.into_iter().map(|(_, f)| f).collect(),
+                parts,
                 created_at,
                 updated_at,
             });
@@ -1884,7 +2531,337 @@ fn read_catalog(conn: &Connection) -> Result<RecoveryManifest, RecoveryError> {
         filaments,
         captures,
         print_batch_receipts,
+        parts_stock,
+        printers,
+        printer_maintenance_logs,
+        printer_reminders,
     })
+}
+
+fn read_printer_catalog(
+    conn: &Connection,
+    schema_version: u32,
+) -> Result<
+    (
+        Vec<RecoveryPrinter>,
+        Vec<RecoveryPrinterMaintenanceLog>,
+        Vec<RecoveryPrinterReminder>,
+    ),
+    RecoveryError,
+> {
+    let rows = collect_rows(
+        conn,
+        "SELECT p.id,p.metadata_version,p.nickname,p.make,p.model,p.printer_type,p.firmware,
+                p.host,p.web_url,p.endpoint_approved,p.bed_x_mm,p.bed_y_mm,p.bed_z_mm,p.notes,
+                p.source_kind,p.connection_status,p.job_status,p.last_checked_at,p.connection_error_code,
+                p.created_at,p.updated_at,
+                COALESCE((SELECT SUM(a.quantity) FROM print_attempts a
+                          WHERE a.printer_id=p.id AND a.outcome='printed'),0),
+                (SELECT MAX(a.printed_at) FROM print_attempts a
+                 WHERE a.printer_id=p.id AND a.outcome='printed')
+         FROM printers p ORDER BY lower(p.nickname),p.id",
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<f64>>(11)?,
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, String>(15)?,
+                row.get::<_, String>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, String>(19)?,
+                row.get::<_, String>(20)?,
+                row.get::<_, i64>(21)?,
+                row.get::<_, Option<String>>(22)?,
+            ))
+        },
+    )?;
+    if rows.len() > MAX_PRINTERS {
+        return Err(invalid("Library has too many printer records for recovery"));
+    }
+
+    let mut printers = Vec::with_capacity(rows.len());
+    let mut printer_ids = BTreeSet::new();
+    for (
+        id,
+        metadata_version,
+        nickname,
+        make,
+        model,
+        printer_type,
+        firmware,
+        host,
+        web_url,
+        endpoint_approved,
+        bed_x,
+        bed_y,
+        bed_z,
+        notes,
+        source_kind,
+        connection_status,
+        job_status,
+        last_checked_at,
+        connection_error_code,
+        created_at,
+        updated_at,
+        print_count,
+        last_printed_at,
+    ) in rows
+    {
+        let bed_mm = match (bed_x, bed_y, bed_z) {
+            (None, None, None) => None,
+            (Some(x), Some(y), Some(z))
+                if [x, y, z]
+                    .iter()
+                    .all(|value| value.is_finite() && (0.1..=10_000.0).contains(value)) =>
+            {
+                Some([x as f32, y as f32, z as f32])
+            }
+            _ => return Err(invalid("Printer bed dimensions are invalid")),
+        };
+        if invalid_catalog_record_id(&id)
+            || !printer_ids.insert(id.clone())
+            || metadata_version <= 0
+            || invalid_printer_label(&nickname)
+            || invalid_optional_printer_label(make.as_deref())
+            || invalid_optional_printer_label(model.as_deref())
+            || invalid_optional_printer_label(printer_type.as_deref())
+            || invalid_optional_printer_label(firmware.as_deref())
+            || host.as_deref().is_some_and(invalid_printer_host)
+            || web_url.as_deref().is_some_and(invalid_printer_web_url)
+            || !matches!(endpoint_approved, 0 | 1)
+            || (endpoint_approved == 1 && host.is_none() && web_url.is_none())
+            || invalid_printer_notes(&notes)
+            || !matches!(source_kind.as_str(), "manual" | "discovered" | "imported")
+            || !matches!(
+                connection_status.as_str(),
+                "unknown" | "online" | "offline" | "auth_required" | "error"
+            )
+            || !matches!(
+                job_status.as_str(),
+                "unknown" | "idle" | "printing" | "paused" | "complete"
+            )
+            || (connection_status != "online" && job_status != "unknown")
+            || connection_error_code.as_deref().is_some_and(|code| {
+                code.is_empty()
+                    || code.len() > 64
+                    || !code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-')
+                    })
+                    || matches!(connection_status.as_str(), "online" | "unknown")
+            })
+            || last_checked_at
+                .as_deref()
+                .is_some_and(|value| !valid_database_timestamp(value))
+            || print_count < 0
+            || last_printed_at
+                .as_deref()
+                .is_some_and(|value| !valid_rfc3339(value))
+            || !valid_database_timestamp(&created_at)
+            || !valid_database_timestamp(&updated_at)
+        {
+            return Err(invalid("Printer metadata is invalid"));
+        }
+        printers.push(RecoveryPrinter {
+            id,
+            metadata_version: u64::try_from(metadata_version)
+                .map_err(|_| invalid("Printer metadata version is invalid"))?,
+            nickname,
+            make,
+            model,
+            printer_type,
+            firmware,
+            host,
+            web_url,
+            // Approval belongs to this host and is never portable.
+            endpoint_approved: false,
+            bed_mm,
+            notes,
+            source_kind,
+            connection_status,
+            job_status,
+            last_checked_at,
+            connection_error_code,
+            print_count: u64::try_from(print_count)
+                .map_err(|_| invalid("Printer print count is invalid"))?,
+            last_printed_at,
+            created_at,
+            updated_at,
+        });
+    }
+
+    let printer_ids = printers
+        .iter()
+        .map(|printer| printer.id.clone())
+        .collect::<BTreeSet<_>>();
+    let maintenance_query = if schema_version >= 8 {
+        "SELECT id,metadata_version,printer_id,printer_nickname,title,performed_at,notes,created_at
+         FROM printer_maintenance_logs ORDER BY performed_at,id"
+    } else {
+        "SELECT id,1,printer_id,printer_nickname,title,performed_at,notes,created_at
+         FROM printer_maintenance_logs ORDER BY performed_at,id"
+    };
+    let maintenance_rows = collect_rows(conn, maintenance_query, |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+        ))
+    })?;
+    if maintenance_rows.len() > MAX_PRINTER_HISTORY_ROWS {
+        return Err(invalid(
+            "Library has too many printer maintenance logs for recovery",
+        ));
+    }
+    let mut maintenance_logs = Vec::with_capacity(maintenance_rows.len());
+    for (
+        id,
+        metadata_version,
+        printer_id,
+        printer_nickname,
+        title,
+        performed_at,
+        notes,
+        created_at,
+    ) in maintenance_rows
+    {
+        let metadata_version = u64::try_from(metadata_version)
+            .map_err(|_| invalid("Printer maintenance log version is invalid"))?;
+        maintenance_logs.push(RecoveryPrinterMaintenanceLog {
+            id,
+            metadata_version,
+            printer_id,
+            printer_nickname,
+            title,
+            performed_at,
+            notes,
+            created_at,
+        });
+    }
+    let mut log_ids = BTreeSet::new();
+    if maintenance_logs.iter().any(|log| {
+        invalid_catalog_record_id(&log.id)
+            || log.metadata_version == 0
+            || !log_ids.insert(log.id.as_str())
+            || log
+                .printer_id
+                .as_deref()
+                .is_some_and(|id| invalid_catalog_record_id(id) || !printer_ids.contains(id))
+            || invalid_printer_snapshot_label(&log.printer_nickname)
+            || invalid_printer_label(&log.title)
+            || invalid_printer_notes(&log.notes)
+            || !valid_rfc3339(&log.performed_at)
+            || !valid_database_timestamp(&log.created_at)
+    }) {
+        return Err(invalid(
+            "Printer maintenance log metadata or reference is invalid",
+        ));
+    }
+
+    let reminders = collect_rows(
+        conn,
+        "SELECT id,metadata_version,printer_id,printer_nickname,title,notes,due_at,
+                interval_days,status,last_completed_at,created_at,updated_at
+         FROM printer_reminders ORDER BY due_at,id",
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+            ))
+        },
+    )?;
+    if reminders.len() > MAX_PRINTER_HISTORY_ROWS {
+        return Err(invalid(
+            "Library has too many printer reminders for recovery",
+        ));
+    }
+    let mut reminder_ids = BTreeSet::new();
+    let mut printer_reminders = Vec::with_capacity(reminders.len());
+    for (
+        id,
+        metadata_version,
+        printer_id,
+        printer_nickname,
+        title,
+        notes,
+        due_at,
+        interval_days,
+        status,
+        last_completed_at,
+        created_at,
+        updated_at,
+    ) in reminders
+    {
+        if invalid_catalog_record_id(&id)
+            || !reminder_ids.insert(id.clone())
+            || metadata_version <= 0
+            || printer_id
+                .as_deref()
+                .is_some_and(|id| invalid_catalog_record_id(id) || !printer_ids.contains(id))
+            || invalid_printer_snapshot_label(&printer_nickname)
+            || invalid_printer_label(&title)
+            || invalid_printer_notes(&notes)
+            || !valid_rfc3339(&due_at)
+            || interval_days.is_some_and(|days| !(1..=36_500).contains(&days))
+            || !matches!(status.as_str(), "active" | "paused" | "completed")
+            || last_completed_at
+                .as_deref()
+                .is_some_and(|value| !valid_rfc3339(value))
+            || !valid_database_timestamp(&created_at)
+            || !valid_database_timestamp(&updated_at)
+        {
+            return Err(invalid("Printer reminder metadata or reference is invalid"));
+        }
+        printer_reminders.push(RecoveryPrinterReminder {
+            id,
+            metadata_version: u64::try_from(metadata_version)
+                .map_err(|_| invalid("Printer reminder metadata version is invalid"))?,
+            printer_id,
+            printer_nickname,
+            title,
+            notes,
+            due_at,
+            interval_days: interval_days
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| invalid("Printer reminder interval is invalid"))?,
+            status,
+            last_completed_at,
+            created_at,
+            updated_at,
+        });
+    }
+
+    Ok((printers, maintenance_logs, printer_reminders))
 }
 
 fn populate_asset_bytes(root: &Path, manifest: &mut RecoveryManifest) -> Result<(), RecoveryError> {
@@ -1925,7 +2902,7 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if !(1..=LIBRARY_SCHEMA_VERSION as i64).contains(&version) {
         return Err(invalid(format!(
-            "Unsupported Library schema version {version}; recovery supports versions 1 through 5"
+            "Unsupported Library schema version {version}; recovery supports versions 1 through {LIBRARY_SCHEMA_VERSION}"
         )));
     }
     const TABLES: &[(&str, &[&str])] = &[
@@ -2193,6 +3170,104 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
             return Err(invalid("Schema-5 capture metadata exceeds recovery limit"));
         }
     }
+    if version >= 7 {
+        tables.extend_from_slice(&[
+            (
+                "printers",
+                &[
+                    "id",
+                    "metadata_version",
+                    "nickname",
+                    "make",
+                    "model",
+                    "printer_type",
+                    "firmware",
+                    "host",
+                    "web_url",
+                    "endpoint_approved",
+                    "bed_x_mm",
+                    "bed_y_mm",
+                    "bed_z_mm",
+                    "notes",
+                    "source_kind",
+                    "connection_status",
+                    "job_status",
+                    "last_checked_at",
+                    "connection_error_code",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "printer_maintenance_logs",
+                &[
+                    "id",
+                    "printer_id",
+                    "printer_nickname",
+                    "title",
+                    "performed_at",
+                    "notes",
+                    "created_at",
+                ],
+            ),
+            (
+                "printer_reminders",
+                &[
+                    "id",
+                    "metadata_version",
+                    "printer_id",
+                    "printer_nickname",
+                    "title",
+                    "notes",
+                    "due_at",
+                    "interval_days",
+                    "status",
+                    "last_completed_at",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+        ]);
+        tables.push(("print_attempts", &["printer_id", "printer_name"]));
+    }
+    if version >= 8 {
+        tables.push(("printer_maintenance_logs", &["metadata_version"]));
+    }
+    if version >= 9 {
+        tables.extend_from_slice(&[
+            (
+                "parts_stock",
+                &[
+                    "id",
+                    "metadata_version",
+                    "name",
+                    "category",
+                    "quantity",
+                    "unit",
+                    "notes",
+                    "low_stock",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "print_attempt_parts",
+                &[
+                    "attempt_id",
+                    "part_id",
+                    "part_name",
+                    "category",
+                    "unit",
+                    "quantity_per_copy",
+                    "quantity",
+                    "ordinal",
+                ],
+            ),
+        ]);
+    }
+    if version >= 10 {
+        tables.push(("print_attempts", &["stock_adjusted"]));
+    }
     for (table, required) in &tables {
         let found_type: Option<String> = conn
             .query_row(
@@ -2220,6 +3295,19 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
     if model_count < 0 || model_count as usize > MAX_MODELS {
         return Err(invalid("Library has too many models for recovery"));
     }
+    if version >= 9 {
+        let parts_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM parts_stock", [], |row| row.get(0))?;
+        let part_usage_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM print_attempt_parts", [], |row| {
+                row.get(0)
+            })?;
+        if !(0..=MAX_PART_STOCK_RECORDS as i64).contains(&parts_count)
+            || !(0..=MAX_ROWS as i64).contains(&part_usage_count)
+        {
+            return Err(invalid("Part-stock catalog exceeds recovery limits"));
+        }
+    }
     let mut metadata_bytes = 0i64;
     for (table, columns) in tables.iter().filter(|(table, _)| *table != "jobs") {
         let terms = columns
@@ -2237,4 +3325,375 @@ fn validate_schema(conn: &Connection) -> Result<(), RecoveryError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod catalog_vfs_tests {
+    use super::*;
+    use library_core::LibraryDb;
+
+    #[test]
+    fn recovery_reads_committed_wal_state_from_the_catalog_vfs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        drop(LibraryDb::open(&root).unwrap());
+
+        let database = root.join("library.sqlite3");
+        let pinned = File::open(&database).unwrap();
+        let vfs = library_core::catalog_vfs::CatalogVfs::new(&database, &pinned).unwrap();
+        let writer = Connection::open_with_flags_and_vfs(
+            vfs.sqlite_path(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            vfs.vfs_name(),
+        )
+        .unwrap();
+        let mode: String = writer
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        drop(writer);
+        drop(vfs);
+
+        let db = LibraryDb::open(&root).unwrap();
+        db.create_folder("Committed WAL folder", None).unwrap();
+
+        let manifest = inspect_library(&root).unwrap();
+        assert!(manifest
+            .folders
+            .iter()
+            .any(|folder| folder.name == "Committed WAL folder"));
+    }
+}
+
+#[cfg(test)]
+mod phase8_recovery_tests {
+    use super::{export_library_zip, inspect_library, MAX_PRINTER_NOTES_BYTES};
+    use library_core::{
+        LibraryDb, PrintAttemptInput, PrintAttemptInputWithPrinter, PrintOutcome, PrinterInput,
+        PrinterMaintenanceInput, PrinterReminderInput,
+    };
+    use rusqlite::Connection;
+    use std::fs::{self, File};
+    use std::io::Read;
+    use std::path::PathBuf;
+    use zip::ZipArchive;
+
+    const SYNTHETIC_STL: &[u8] = b"solid fixture\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid fixture\n";
+
+    struct Phase8Fixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        model_id: String,
+        printer_id: String,
+        attempt_id: String,
+        maintenance_id: String,
+        reminder_id: String,
+    }
+
+    fn phase8_fixture() -> Phase8Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let source = temp.path().join("synthetic.stl");
+        fs::write(&source, SYNTHETIC_STL).unwrap();
+
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db
+            .import_file(&source, None, Some("Synthetic model"))
+            .unwrap()
+            .model;
+        let printer = db
+            .create_printer(
+                &PrinterInput {
+                    nickname: "Synthetic printer".into(),
+                    make: Some("Fixture Maker".into()),
+                    model: Some("Fixture One".into()),
+                    printer_type: Some("FDM".into()),
+                    firmware: Some("1.0".into()),
+                    host: Some("printer.local".into()),
+                    web_url: Some("https://printer.local/".into()),
+                    bed_mm: Some([256.0, 256.0, 300.0]),
+                    notes: "Local fixture only".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let attempt = db
+            .create_print_attempt_with_printer(
+                &model.id,
+                &PrintAttemptInputWithPrinter {
+                    input: PrintAttemptInput {
+                        printed_at: "2026-01-02T03:04:05Z".into(),
+                        quantity: 2,
+                        notes: "Synthetic print history".into(),
+                        filament_ids: vec![],
+                        outcome: PrintOutcome::Printed,
+                        parts: None,
+                    },
+                    printer_id: Some(Some(printer.id.clone())),
+                },
+            )
+            .unwrap();
+        let maintenance = db
+            .create_printer_maintenance_log(
+                &printer.id,
+                &PrinterMaintenanceInput {
+                    title: "Clean nozzle".into(),
+                    performed_at: "2026-01-03T04:05:06Z".into(),
+                    notes: "Synthetic maintenance log".into(),
+                },
+            )
+            .unwrap();
+        let maintenance = db
+            .update_printer_maintenance_log(
+                &maintenance.id,
+                maintenance.metadata_version,
+                &PrinterMaintenanceInput {
+                    title: "Clean nozzle".into(),
+                    performed_at: "2026-01-03T04:05:06Z".into(),
+                    notes: "Synthetic maintenance log version 2".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(maintenance.metadata_version, 2);
+        let reminder = db
+            .create_printer_reminder(
+                &printer.id,
+                &PrinterReminderInput {
+                    title: "Check belts".into(),
+                    notes: "Synthetic reminder".into(),
+                    due_at: "2026-02-03T04:05:06Z".into(),
+                    interval_days: Some(90),
+                },
+            )
+            .unwrap();
+        drop(db);
+
+        Phase8Fixture {
+            _temp: temp,
+            root,
+            model_id: model.id,
+            printer_id: printer.id,
+            attempt_id: attempt.id,
+            maintenance_id: maintenance.id,
+            reminder_id: reminder.id,
+        }
+    }
+
+    fn archive_manifest(path: &std::path::Path) -> serde_json::Value {
+        let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        archive
+            .by_name("manifest.json")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn schema_v8_recovery_exports_printers_history_reminders_and_attempt_snapshots() {
+        let fixture = phase8_fixture();
+        let manifest = inspect_library(&fixture.root).unwrap();
+
+        assert_eq!(
+            manifest.library_schema_version,
+            crate::LIBRARY_SCHEMA_VERSION
+        );
+        assert_eq!(manifest.printers.len(), 1);
+        let printer = &manifest.printers[0];
+        assert_eq!(printer.id, fixture.printer_id);
+        assert_eq!(printer.nickname, "Synthetic printer");
+        assert_eq!(printer.host.as_deref(), Some("printer.local"));
+        assert_eq!(printer.web_url.as_deref(), Some("https://printer.local"));
+        assert!(!printer.endpoint_approved);
+        assert_eq!(printer.bed_mm, Some([256.0, 256.0, 300.0]));
+        assert_eq!(manifest.printer_maintenance_logs.len(), 1);
+        assert_eq!(
+            manifest.printer_maintenance_logs[0].id,
+            fixture.maintenance_id
+        );
+        assert_eq!(manifest.printer_maintenance_logs[0].metadata_version, 2);
+        assert_eq!(manifest.printer_reminders.len(), 1);
+        assert_eq!(manifest.printer_reminders[0].id, fixture.reminder_id);
+        let attempt = manifest.models[0]
+            .print_attempts
+            .iter()
+            .find(|attempt| attempt.id == fixture.attempt_id)
+            .unwrap();
+        assert_eq!(
+            attempt.printer_id.as_deref(),
+            Some(fixture.printer_id.as_str())
+        );
+        assert_eq!(attempt.printer_name.as_deref(), Some("Synthetic printer"));
+
+        let archive_path = fixture.root.parent().unwrap().join("phase8-recovery.zip");
+        export_library_zip(
+            &fixture.root,
+            std::slice::from_ref(&fixture.model_id),
+            &archive_path,
+        )
+        .unwrap();
+        let portable = archive_manifest(&archive_path);
+        assert_eq!(portable["printers"][0]["endpoint_approved"], false);
+        assert_eq!(
+            portable["printer_maintenance_logs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            portable["printer_maintenance_logs"][0]["metadata_version"],
+            2
+        );
+        assert_eq!(portable["printer_reminders"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            portable["models"][0]["print_attempts"][0]["printer_name"],
+            "Synthetic printer"
+        );
+        let printer_json = portable["printers"][0].as_object().unwrap();
+        for secret_field in ["credential", "password", "access_code", "api_key", "token"] {
+            assert!(!printer_json.contains_key(secret_field));
+        }
+    }
+
+    #[test]
+    fn schema_v7_recovery_defaults_maintenance_log_version_to_one() {
+        let fixture = phase8_fixture();
+        let conn = Connection::open(fixture.root.join("library.sqlite3")).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE printer_maintenance_logs DROP COLUMN metadata_version;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let manifest = inspect_library(&fixture.root).unwrap();
+        assert_eq!(manifest.library_schema_version, 7);
+        assert_eq!(manifest.printer_maintenance_logs.len(), 1);
+        assert_eq!(manifest.printer_maintenance_logs[0].metadata_version, 1);
+    }
+
+    #[test]
+    fn schema_v6_exports_empty_printer_defaults_and_no_attempt_snapshots() {
+        let fixture = phase8_fixture();
+        let database = fixture.root.join("library.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP INDEX IF EXISTS printer_reminders_due_idx;
+             DROP INDEX IF EXISTS printer_reminders_printer_idx;
+             DROP INDEX IF EXISTS printer_maintenance_printer_idx;
+             DROP INDEX IF EXISTS printer_name_idx;
+             DROP INDEX IF EXISTS print_attempt_printer_idx;
+             DROP TABLE printer_reminders;
+             DROP TABLE printer_maintenance_logs;
+             ALTER TABLE print_attempts DROP COLUMN printer_name;
+             ALTER TABLE print_attempts DROP COLUMN printer_id;
+             DROP TABLE printers;
+             PRAGMA user_version=6;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let manifest = inspect_library(&fixture.root).unwrap();
+        assert_eq!(manifest.library_schema_version, 6);
+        assert!(manifest.printers.is_empty());
+        assert!(manifest.printer_maintenance_logs.is_empty());
+        assert!(manifest.printer_reminders.is_empty());
+        let attempt = manifest.models[0]
+            .print_attempts
+            .iter()
+            .find(|attempt| attempt.id == fixture.attempt_id)
+            .unwrap();
+        assert_eq!(attempt.printer_id, None);
+        assert_eq!(attempt.printer_name, None);
+
+        let archive_path = fixture.root.parent().unwrap().join("phase6-recovery.zip");
+        export_library_zip(
+            &fixture.root,
+            std::slice::from_ref(&fixture.model_id),
+            &archive_path,
+        )
+        .unwrap();
+        let portable = archive_manifest(&archive_path);
+        assert!(portable.get("printers").is_none());
+        assert!(portable.get("printer_maintenance_logs").is_none());
+        assert!(portable.get("printer_reminders").is_none());
+        assert!(portable["models"][0]["print_attempts"][0]
+            .get("printer_id")
+            .is_none());
+    }
+
+    #[test]
+    fn schema_v8_recovery_rejects_dangling_printer_references() {
+        let fixture = phase8_fixture();
+        let conn = Connection::open(fixture.root.join("library.sqlite3")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "UPDATE printer_reminders SET printer_id='missing-printer' WHERE id=?1",
+            rusqlite::params![&fixture.reminder_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(inspect_library(&fixture.root).is_err());
+
+        let fixture = phase8_fixture();
+        let conn = Connection::open(fixture.root.join("library.sqlite3")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "UPDATE print_attempts SET printer_id='missing-printer' WHERE id=?1",
+            rusqlite::params![&fixture.attempt_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(inspect_library(&fixture.root).is_err());
+
+        let fixture = phase8_fixture();
+        let conn = Connection::open(fixture.root.join("library.sqlite3")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "UPDATE printer_maintenance_logs SET printer_id='missing-printer' WHERE id=?1",
+            rusqlite::params![&fixture.maintenance_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(inspect_library(&fixture.root).is_err());
+    }
+
+    #[test]
+    fn schema_v8_recovery_rejects_credentials_embedded_in_printer_endpoints() {
+        for (update, value) in [
+            ("UPDATE printers SET host=?1", "user:secret@printer.local"),
+            (
+                "UPDATE printers SET web_url=?1",
+                "https://user:secret@printer.local/",
+            ),
+        ] {
+            let fixture = phase8_fixture();
+            let conn = Connection::open(fixture.root.join("library.sqlite3")).unwrap();
+            conn.execute(update, rusqlite::params![value]).unwrap();
+            drop(conn);
+            assert!(inspect_library(&fixture.root).is_err());
+        }
+    }
+
+    #[test]
+    fn schema_v8_recovery_rejects_oversized_printer_notes() {
+        let fixture = phase8_fixture();
+        let conn = Connection::open(fixture.root.join("library.sqlite3")).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        conn.execute(
+            "UPDATE printers SET notes=?1 WHERE id=?2",
+            rusqlite::params!["x".repeat(MAX_PRINTER_NOTES_BYTES + 1), &fixture.printer_id,],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(inspect_library(&fixture.root).is_err());
+    }
 }

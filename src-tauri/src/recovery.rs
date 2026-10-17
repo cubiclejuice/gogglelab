@@ -6,6 +6,7 @@ use library_recovery::{
 use tauri::{AppHandle, Manager};
 
 use crate::error::AppError;
+use crate::library_commands::LibraryState;
 
 fn library_root(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
     app.path()
@@ -41,6 +42,44 @@ pub fn recovery_export_library(
         Path::new(&destination_path),
     )
     .map_err(recovery_error)
+}
+
+/// Export the supported library JSON contract to a new file.
+/// The user chooses the destination; existing files are never overwritten.
+#[tauri::command]
+pub fn recovery_export_printventory_json(
+    state: tauri::State<'_, LibraryState>,
+    settings: tauri::State<'_, crate::settings::SettingsState>,
+    destination_path: String,
+) -> Result<usize, AppError> {
+    let slicers = settings
+        .0
+        .lock()
+        .map_err(|_| AppError::Library {
+            message: "Slicer settings are unavailable".into(),
+        })?
+        .slicer_profiles
+        .iter()
+        .map(|profile| library_runtime::SlicerJsonExportEntry {
+            name: profile.name.clone(),
+            path: profile.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let destination = Path::new(&destination_path);
+    let stage = state.with_db(|db| {
+        library_runtime::stage_library_json_export_with_slicers(db, destination, &slicers).map_err(
+            |error| AppError::Library {
+                message: error.to_string(),
+            },
+        )
+    })?;
+    let _maintenance = state.begin_maintenance()?;
+    let result = stage
+        .publish(destination)
+        .map_err(|error| AppError::Library {
+            message: error.to_string(),
+        })?;
+    Ok(result.models)
 }
 
 /// The frontend must pass localStorage.getItem's raw value from this webview.

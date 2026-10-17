@@ -2,11 +2,16 @@ import {
   HttpLibraryClient,
   LibraryHttpError,
   formatWireInteger,
+  managementActionAvailability,
   type BrowserModel,
   type BrowserModelQuery,
   type CaptureEnvelope,
+  type BrowserPartStock,
+  type BrowserPartStockInput,
+  type BrowserPrintAttemptInput,
   type HostCapabilities,
 } from "./lib/library-client";
+import { partStockValidationError, printAttemptStockWarning } from "./lib/library-history";
 import { isBrowserDialogCurrent } from "./lib/browser-dialog";
 import {
   BoundedTaskQueue,
@@ -104,6 +109,7 @@ let downloadRoutesAvailable = false;
 let metadataRoutesAvailable = false;
 let historyRoutesAvailable = false;
 let historyBatchRoutesAvailable = false;
+let partStockRoutesAvailable = false;
 let filamentRoutesAvailable = false;
 let scanRoutesAvailable = false;
 let captureSummaryRoutesAvailable = false;
@@ -196,6 +202,9 @@ refresh.textContent = "Refresh";
 refresh.disabled = true;
 const manageCatalog = actionButton("Manage catalog", () => void showCatalogManager());
 manageCatalog.disabled = true;
+const partStockButton = actionButton("Parts stock", () => void showPartStockManager());
+partStockButton.disabled = true;
+partStockButton.hidden = true;
 const reviewDuplicates = actionButton("Duplicates in loaded", () => void showDuplicates());
 reviewDuplicates.disabled = true;
 const browserSettings = actionButton("Catalog settings", () => void showBrowserSettings());
@@ -374,6 +383,7 @@ toolbar.append(
   viewMode,
   refresh,
   manageCatalog,
+  partStockButton,
   reviewDuplicates,
   browserSettings,
   browserManagement,
@@ -410,6 +420,7 @@ const catalogControls = [
   viewMode,
   refresh,
   manageCatalog,
+  partStockButton,
   reviewDuplicates,
   browserSettings,
   browserManagement,
@@ -731,13 +742,21 @@ async function showManagement(): Promise<void> {
   document.body.append(dialog);
   dialog.showModal();
   const roots = await client.listRoots();
-  const handles = roots.filter((root) => root.access === "backupOnly" || root.access === "writable");
+  const availableActions = managementActionAvailability(capabilities?.features, roots);
+  const handles = roots.filter(
+    (root) => root.access === "backupOnly" || root.access === "writable",
+  );
   const handle = document.createElement("select");
   handle.setAttribute("aria-label", "Operator storage handle");
   for (const root of handles) handle.add(new Option(root.label, root.id));
   const fileName = document.createElement("input");
   fileName.value = "gogglelab-backup.zip";
-  fileName.setAttribute("aria-label", "Backup or export filename");
+  fileName.setAttribute("aria-label", "Backup, export, or purge filename");
+  const purgeHandle = document.createElement("select");
+  purgeHandle.setAttribute("aria-label", "Backup-only catalog purge destination");
+  for (const root of roots.filter((item) => item.access === "backupOnly")) {
+    purgeHandle.add(new Option(root.label, root.id));
+  }
   const snapshot = document.createElement("input");
   snapshot.placeholder = "Removal snapshot ID";
   const backupRoot = document.createElement("input");
@@ -766,7 +785,10 @@ async function showManagement(): Promise<void> {
         void client
           .executeManagementAction(result.token)
           .then(async (outcome) => {
-            message.textContent = JSON.stringify(outcome);
+            message.textContent =
+              outcome.kind === "cleanupCompleted"
+                ? `Deleted ${outcome.files} generated orphan files (${outcome.bytes} bytes). Original model files were untouched.`
+                : JSON.stringify(outcome);
             selectedModels.clear();
             await reloadLoadedPages();
           })
@@ -840,7 +862,7 @@ async function showManagement(): Promise<void> {
         }),
     ),
   );
-  if (capabilities?.features.trashSource) {
+  if (availableActions.physicalSource) {
     const selected = [...selectedModels.values()];
     const physical =
       selected.length === 1 && selected[0].sourceKind === "indexed" && !selected[0].archiveMember
@@ -876,21 +898,34 @@ async function showManagement(): Promise<void> {
         "Plan undo quarantine",
         () => void plan({ kind: "undoQuarantine", snapshotId: snapshot.value }),
       ),
-      actionButton(
-        "Plan catalog purge with backup",
-        () =>
-          void plan({
-            kind: "purgeCatalog",
-            backupDestinationHandleId: handle.value,
-            backupFileName: fileName.value,
-          }),
-      ),
-      actionButton("Plan orphan cleanup", () => void plan({ kind: "cleanupOrphans" })),
     );
   } else {
     const notice = document.createElement("p");
     notice.textContent = "Physical source actions are disabled on this host.";
     controls.append(notice);
+  }
+  if (availableActions.purgeCatalog) {
+    controls.append(
+      purgeHandle,
+      actionButton(
+        "Plan catalog purge with backup",
+        () =>
+          void plan({
+            kind: "purgeCatalog",
+            backupDestinationHandleId: purgeHandle.value,
+            backupFileName: fileName.value,
+            confirm: true,
+          }),
+      ),
+    );
+  }
+  if (availableActions.cleanupOrphans) {
+    controls.append(
+      actionButton(
+        "Plan orphan cleanup",
+        () => void plan({ kind: "cleanupOrphans", confirm: true }),
+      ),
+    );
   }
   dialog.addEventListener("close", () => dialog.remove(), { once: true });
 }
@@ -1784,6 +1819,197 @@ async function showFilaments(model: BrowserModel): Promise<void> {
   dialog.addEventListener("close", () => dialog.remove(), { once: true });
 }
 
+async function showPartStockManager(): Promise<void> {
+  if (!partStockRoutesAvailable) return;
+  const invoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const dialog = document.createElement("dialog");
+  dialog.className = "browser-metadata-dialog";
+  const title = document.createElement("h2");
+  title.textContent = "Parts stock";
+  const message = document.createElement("p");
+  message.setAttribute("role", "status");
+  message.setAttribute("aria-live", "polite");
+  const list = document.createElement("div");
+  const form = document.createElement("form");
+  const name = document.createElement("input");
+  name.type = "text";
+  name.maxLength = 128;
+  name.placeholder = "Part name";
+  name.setAttribute("aria-label", "Part name");
+  const category = document.createElement("input");
+  category.type = "text";
+  category.maxLength = 128;
+  category.placeholder = "Category";
+  category.setAttribute("aria-label", "Part category");
+  const quantity = document.createElement("input");
+  quantity.type = "number";
+  quantity.min = "0";
+  quantity.max = "1000000";
+  quantity.step = "1";
+  quantity.value = "0";
+  quantity.setAttribute("aria-label", "Stock quantity");
+  const unit = document.createElement("input");
+  unit.type = "text";
+  unit.maxLength = 128;
+  unit.placeholder = "Unit, such as pcs or ml";
+  unit.setAttribute("aria-label", "Stock unit");
+  const lowStock = document.createElement("input");
+  lowStock.type = "number";
+  lowStock.min = "0";
+  lowStock.max = "1000000";
+  lowStock.step = "1";
+  lowStock.value = "0";
+  lowStock.setAttribute("aria-label", "Low-stock threshold");
+  const notes = document.createElement("textarea");
+  notes.maxLength = 20_000;
+  notes.placeholder = "Part notes";
+  notes.setAttribute("aria-label", "Part notes");
+  const save = actionButton("Add part", () => {});
+  save.type = "submit";
+  const close = actionButton("Close", () => dialog.close());
+  form.append(name, category, quantity, unit, lowStock, notes, save);
+  dialog.append(title, list, form, message, close);
+  document.body.append(dialog);
+  dialog.showModal();
+  name.focus();
+  let inventory: BrowserPartStock[] = [];
+  let editing: BrowserPartStock | null = null;
+  let operationPending = false;
+  const errorMessage = (reason: unknown): string => {
+    const value = String((reason as { message?: unknown })?.message ?? reason);
+    const normalized = value.toLocaleLowerCase();
+    if (normalized.includes("insufficient stock") || normalized.includes("not enough stock"))
+      return `Not enough stock for this event. Review Parts stock or lower the per-copy amount. ${value}`;
+    if (normalized.includes("version conflict") || normalized.includes("stock conflict"))
+      return `Parts stock changed elsewhere. Refresh the list and try again. ${value}`;
+    return value;
+  };
+  const resetForm = () => {
+    editing = null;
+    name.value = "";
+    category.value = "";
+    quantity.value = "0";
+    unit.value = "pcs";
+    lowStock.value = "0";
+    notes.value = "";
+    save.textContent = "Add part";
+  };
+  const renderList = () => {
+    list.replaceChildren();
+    for (const part of inventory) {
+      const row = document.createElement("article");
+      const heading = document.createElement("h3");
+      heading.textContent = part.name;
+      const quantityValue = BigInt(part.quantity);
+      const lowStockValue = BigInt(part.lowStock);
+      const details = document.createElement("p");
+      details.textContent = `${part.category ? `${part.category} · ` : ""}${quantityValue.toLocaleString()} ${part.unit} available · low-stock threshold ${lowStockValue.toLocaleString()}${quantityValue <= lowStockValue ? " · Low stock" : ""}`;
+      const edit = actionButton("Edit", () => {
+        editing = part;
+        name.value = part.name;
+        category.value = part.category ?? "";
+        quantity.value = part.quantity;
+        unit.value = part.unit;
+        lowStock.value = part.lowStock;
+        notes.value = part.notes;
+        save.textContent = "Save part";
+        name.focus();
+      });
+      const remove = actionButton("Delete", () => {
+        if (
+          !window.confirm(
+            `Delete ${part.name} from stock? Existing print history keeps its saved part ID, name, and use; deleting the part does not restore stock.`,
+          )
+        ) {
+          return;
+        }
+        operationPending = true;
+        remove.disabled = true;
+        void client
+          .deletePartStock(part.id, part.metadataVersion)
+          .then(async () => {
+            if (editing?.id === part.id) resetForm();
+            message.textContent = `${part.name} removed from current stock. Historical use remains saved.`;
+            inventory = await client.listPartStock();
+            renderList();
+            await reloadLoadedPages();
+          })
+          .catch((reason) => {
+            message.textContent = `Could not delete stock: ${errorMessage(reason)}`;
+          })
+          .finally(() => {
+            operationPending = false;
+            remove.disabled = false;
+          });
+      });
+      row.append(heading, details);
+      if (part.notes) {
+        const note = document.createElement("p");
+        note.textContent = part.notes;
+        row.append(note);
+      }
+      row.append(edit, remove);
+      list.append(row);
+    }
+  };
+  const refresh = async () => {
+    message.textContent = "Loading stock…";
+    try {
+      inventory = await client.listPartStock();
+      renderList();
+      message.textContent = `${inventory.length.toLocaleString()} stock part(s).`;
+    } catch (reason) {
+      message.textContent = `Could not load stock: ${errorMessage(reason)}`;
+    }
+  };
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (operationPending) return;
+    const input: BrowserPartStockInput = {
+      name: name.value,
+      category: category.value.trim() || null,
+      quantity: Number(quantity.value),
+      unit: unit.value,
+      notes: notes.value,
+      lowStock: Number(lowStock.value),
+    };
+    const problem = partStockValidationError(input);
+    if (problem) {
+      message.textContent = problem;
+      return;
+    }
+    operationPending = true;
+    save.disabled = true;
+    const operation = editing
+      ? client.updatePartStock(editing.id, editing.metadataVersion, input)
+      : client.createPartStock(input);
+    void operation
+      .then(async () => {
+        message.textContent = `${input.name} stock saved.`;
+        resetForm();
+        inventory = await client.listPartStock();
+        renderList();
+        await reloadLoadedPages();
+      })
+      .catch((reason) => {
+        message.textContent = `Could not save stock: ${errorMessage(reason)}`;
+      })
+      .finally(() => {
+        operationPending = false;
+        save.disabled = false;
+      });
+  });
+  dialog.addEventListener(
+    "close",
+    () => {
+      dialog.remove();
+      if (invoker?.isConnected) invoker.focus();
+    },
+    { once: true },
+  );
+  await refresh();
+}
+
 async function showHistory(model: BrowserModel): Promise<void> {
   const invoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const dialog = document.createElement("dialog");
@@ -1796,6 +2022,7 @@ async function showHistory(model: BrowserModel): Promise<void> {
   message.setAttribute("role", "status");
   const date = document.createElement("input");
   date.type = "date";
+  date.required = true;
   date.setAttribute("aria-label", "Print date");
   const now = new Date();
   date.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
@@ -1803,12 +2030,14 @@ async function showHistory(model: BrowserModel): Promise<void> {
   quantity.type = "number";
   quantity.setAttribute("aria-label", "Print quantity");
   quantity.min = "1";
+  quantity.max = "10000";
+  quantity.step = "1";
   quantity.value = "1";
   const notes = document.createElement("textarea");
   notes.setAttribute("aria-label", "Print notes");
   const outcome = document.createElement("select");
   outcome.setAttribute("aria-label", "Print outcome");
-  for (const value of ["printed", "failed"]) {
+  for (const value of ["printed", "failed", "cancelled"]) {
     const option = document.createElement("option");
     option.value = value;
     option.textContent = value;
@@ -1816,30 +2045,162 @@ async function showHistory(model: BrowserModel): Promise<void> {
   }
   const save = actionButton("Log print", () => {});
   save.type = "submit";
+  const partFieldset = document.createElement("fieldset");
+  partFieldset.hidden = !partStockRoutesAvailable;
+  const partLegend = document.createElement("legend");
+  partLegend.textContent = "Parts per copy";
+  const partHelp = document.createElement("p");
+  partHelp.textContent =
+    "Printed, failed, and cancelled events consume stock. Totals multiply per-copy use by print quantity. Unchanged historical snapshots stay attached; changing this parts list replaces the event's recorded use.";
+  const partSummary = document.createElement("div");
+  partSummary.setAttribute("role", "status");
+  partSummary.setAttribute("aria-live", "polite");
+  partFieldset.append(partLegend, partHelp, partSummary);
+  const partUseInputs = new Map<string, HTMLInputElement>();
+  const partQuantityInputs = new Map<string, HTMLInputElement>();
+  let partStock: BrowserPartStock[] = [];
+  let partSelectionChanged = false;
   const close = actionButton("Close", () => dialog.close());
-  form.append(date, quantity, outcome, notes, save);
+  form.append(date, quantity, outcome, notes, partFieldset, save);
   dialog.append(title, list, form, message, close);
   document.body.append(dialog);
   dialog.showModal();
   date.focus();
   let revision = 0;
   let editingAttempt: import("./lib/library-client").BrowserPrintAttempt | null = null;
+  const describeStockError = (reason: unknown): string => {
+    const value = String((reason as { message?: unknown })?.message ?? reason);
+    const normalized = value.toLocaleLowerCase();
+    if (normalized.includes("insufficient stock") || normalized.includes("not enough stock"))
+      return `Not enough stock for this event. Review Parts stock or lower the per-copy amount. ${value}`;
+    if (normalized.includes("version conflict") || normalized.includes("stock conflict"))
+      return `Parts stock changed elsewhere. Refresh the list and try again. ${value}`;
+    return value;
+  };
+  const refreshPartSummary = () => {
+    partSummary.replaceChildren();
+    const selected = partStock.filter((part) => partUseInputs.get(part.id)?.checked);
+    let hasInsufficient = false;
+    for (const part of selected) {
+      const perCopy = Number(partQuantityInputs.get(part.id)?.value);
+      const copies = Number(quantity.value);
+      if (
+        !Number.isInteger(perCopy) ||
+        perCopy < 1 ||
+        perCopy > 9_999 ||
+        !Number.isInteger(copies) ||
+        copies < 1 ||
+        copies > 10_000
+      ) {
+        continue;
+      }
+      const total = BigInt(perCopy) * BigInt(copies);
+      const released = BigInt(
+        editingAttempt?.parts
+          ?.filter((item) => item.id === part.id)
+          .reduce((sum, item) => sum + item.quantity, 0) ?? 0,
+      );
+      const available = BigInt(part.quantity) + released;
+      const sufficient = total <= available;
+      hasInsufficient ||= !sufficient;
+      const line = document.createElement("p");
+      line.textContent = sufficient
+        ? `${part.name}: ${perCopy} per copy, ${total.toLocaleString()} ${part.unit} total; ${available.toLocaleString()} available.`
+        : `${part.name}: ${total.toLocaleString()} ${part.unit} needed, ${available.toLocaleString()} available. Add stock or reduce the per-copy amount.`;
+      partSummary.append(line);
+    }
+    if (selected.length === 0) {
+      const empty = document.createElement("p");
+      empty.textContent = editingAttempt?.parts?.length
+        ? "Saved historical part use remains attached unless you change the part selection."
+        : "No parts selected.";
+      partSummary.append(empty);
+    }
+    save.disabled = hasInsufficient;
+  };
+  const renderPartControls = (
+    attempt: import("./lib/library-client").BrowserPrintAttempt | null,
+  ) => {
+    partFieldset.replaceChildren(partLegend, partHelp, partSummary);
+    partUseInputs.clear();
+    partQuantityInputs.clear();
+    partSelectionChanged = false;
+    for (const part of partStock) {
+      const row = document.createElement("div");
+      const label = document.createElement("label");
+      const use = document.createElement("input");
+      use.type = "checkbox";
+      use.checked = Boolean(attempt?.parts?.some((item) => item.id === part.id));
+      use.setAttribute("aria-label", `Use ${part.name} for this print`);
+      label.append(
+        use,
+        document.createTextNode(
+          `${part.name} · ${BigInt(part.quantity).toLocaleString()} ${part.unit} available`,
+        ),
+      );
+      const perCopy = document.createElement("input");
+      perCopy.type = "number";
+      perCopy.min = "1";
+      perCopy.max = "9999";
+      perCopy.step = "1";
+      perCopy.value = String(
+        attempt?.parts?.find((item) => item.id === part.id)?.quantityPerCopy ?? 1,
+      );
+      perCopy.disabled = !use.checked;
+      perCopy.setAttribute("aria-label", `${part.name} quantity per copy`);
+      partUseInputs.set(part.id, use);
+      partQuantityInputs.set(part.id, perCopy);
+      use.addEventListener("change", () => {
+        partSelectionChanged = true;
+        perCopy.disabled = !use.checked;
+        refreshPartSummary();
+      });
+      perCopy.addEventListener("input", () => {
+        partSelectionChanged = true;
+        refreshPartSummary();
+      });
+      row.append(label, perCopy);
+      partFieldset.append(row);
+    }
+    const available = new Set(partStock.map((part) => part.id));
+    for (const part of attempt?.parts ?? []) {
+      if (part.id && available.has(part.id)) continue;
+      const snapshot = document.createElement("p");
+      snapshot.textContent = `Historical use: ${part.name} · ${part.quantity} ${part.unit} total. The stock item was removed; the saved event snapshot is preserved.`;
+      partFieldset.append(snapshot);
+    }
+    refreshPartSummary();
+  };
   const render = async () => {
     const request = ++revision;
     try {
-      const attempts = await client.listHistory(model.id);
+      const [attempts, availableParts] = await Promise.all([
+        client.listHistory(model.id),
+        partStockRoutesAvailable ? client.listPartStock() : Promise.resolve([]),
+      ]);
       if (!isBrowserDialogCurrent(request, revision, dialog.open, dialog.isConnected)) return;
+      partStock = availableParts;
+      renderPartControls(editingAttempt);
       list.replaceChildren();
       for (const attempt of attempts) {
         const row = document.createElement("p");
-        row.textContent = `${attempt.printedAt.slice(0, 10)} · ${attempt.quantity} · ${attempt.outcome}${attempt.notes ? ` · ${attempt.notes}` : ""}`;
+        const partSummaryText = attempt.parts?.length
+          ? ` · Parts: ${attempt.parts.map((part) => `${part.name}${part.category ? ` (${part.category})` : ""} ${part.quantity} ${part.unit}`).join(", ")}`
+          : "";
+        const stockWarning = printAttemptStockWarning(
+          attempt.stockAdjusted,
+          (attempt.parts?.length ?? 0) > 0,
+        );
+        row.textContent = `${attempt.printedAt.slice(0, 10)} · ${attempt.quantity} · ${attempt.outcome}${attempt.notes ? ` · ${attempt.notes}` : ""}${partSummaryText}${stockWarning ? ` · ${stockWarning}` : ""}`;
         row.append(
           actionButton("Edit", () => {
             editingAttempt = attempt;
+            partSelectionChanged = false;
             date.value = attempt.printedAt.slice(0, 10);
             quantity.value = String(attempt.quantity);
             notes.value = attempt.notes;
             outcome.value = attempt.outcome;
+            renderPartControls(attempt);
             save.textContent = "Save print";
             date.focus();
           }),
@@ -1848,12 +2209,13 @@ async function showHistory(model: BrowserModel): Promise<void> {
             () =>
               void client
                 .deleteHistory(attempt.id)
-                .then(() => {
+                .then(async () => {
+                  await reloadLoadedPages();
                   if (dialog.open && dialog.isConnected) return render();
                 })
                 .catch((error) => {
                   if (dialog.open && dialog.isConnected)
-                    message.textContent = String(error?.message ?? error);
+                    message.textContent = describeStockError(error);
                 }),
           ),
         );
@@ -1868,13 +2230,44 @@ async function showHistory(model: BrowserModel): Promise<void> {
     event.preventDefault();
     save.disabled = true;
     const request = revision;
-    const input = {
+    const input: BrowserPrintAttemptInput = {
       printedAt: `${date.value}T12:00:00.000Z`,
       quantity: Number(quantity.value),
       notes: notes.value,
       filamentIds: model.filamentIds.slice(0, 5),
-      outcome: outcome.value as "printed" | "failed",
+      outcome: outcome.value as "printed" | "failed" | "cancelled",
     };
+    if (!editingAttempt || partSelectionChanged) {
+      input.parts = partStock.flatMap((part) => {
+        const use = partUseInputs.get(part.id);
+        const perCopy = partQuantityInputs.get(part.id);
+        return use?.checked && perCopy ? [{ id: part.id, quantity: Number(perCopy.value) }] : [];
+      });
+    }
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/.test(date.value) ||
+      !Number.isInteger(input.quantity) ||
+      input.quantity < 1 ||
+      input.quantity > 10_000
+    ) {
+      message.textContent = "Choose a valid print date and a whole quantity from 1 to 10,000.";
+      save.disabled = false;
+      return;
+    }
+    if (
+      input.parts?.some(
+        (part) =>
+          !part.id.trim() ||
+          !Number.isInteger(part.quantity) ||
+          part.quantity < 1 ||
+          part.quantity > 9_999,
+      )
+    ) {
+      message.textContent =
+        "Each part needs a selected stock item and a whole quantity from 1 to 9,999 per copy.";
+      save.disabled = false;
+      return;
+    }
     const operation = editingAttempt
       ? client.updateHistory(editingAttempt.id, input)
       : client.createHistory(model.id, input);
@@ -1889,7 +2282,7 @@ async function showHistory(model: BrowserModel): Promise<void> {
       })
       .catch((error) => {
         if (isBrowserDialogCurrent(request, revision, dialog.open, dialog.isConnected))
-          message.textContent = String(error?.message ?? error);
+          message.textContent = describeStockError(error);
       })
       .finally(() => {
         if (dialog.open && dialog.isConnected) save.disabled = false;
@@ -2310,6 +2703,8 @@ login.addEventListener("submit", (event) => {
         "/api/v1/models/{modelId}/metadata" in openApi.paths && "/api/v1/tags" in openApi.paths;
       historyRoutesAvailable = "/api/v1/models/{modelId}/history" in openApi.paths;
       historyBatchRoutesAvailable = "/api/v1/history/bulk" in openApi.paths;
+      partStockRoutesAvailable = "/api/v1/parts" in openApi.paths;
+      partStockButton.hidden = !partStockRoutesAvailable;
       filamentRoutesAvailable =
         "/api/v1/models/filaments/bulk" in openApi.paths && "/api/v1/filaments" in openApi.paths;
       scanRoutesAvailable = "/api/v1/scan" in openApi.paths && "/api/v1/roots" in openApi.paths;
@@ -2388,6 +2783,8 @@ disconnect.addEventListener("click", () => {
   metadataRoutesAvailable = false;
   historyRoutesAvailable = false;
   historyBatchRoutesAvailable = false;
+  partStockRoutesAvailable = false;
+  partStockButton.hidden = true;
   filamentRoutesAvailable = false;
   scanRoutesAvailable = false;
   captureSummaryRoutesAvailable = false;

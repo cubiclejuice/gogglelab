@@ -15,6 +15,7 @@ use tauri::State;
 
 use crate::extension_api::AppError;
 use crate::library_commands::{library_error, LibraryState};
+use crate::settings::SettingsState;
 
 #[cfg(test)]
 const MAX_PREVIEW_MEMBERS: usize = 32;
@@ -167,6 +168,7 @@ pub fn library_close_bundle_preview(
 pub async fn library_send_bundle_to_slicer(
     library: State<'_, LibraryState>,
     preview: State<'_, BundlePreviewState>,
+    settings: State<'_, SettingsState>,
     bundle_id: String,
     slicer_id: String,
     token: String,
@@ -192,6 +194,7 @@ pub async fn library_send_bundle_to_slicer(
         )
     };
     let preview = preview.inner().clone();
+    let settings = settings.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _io = library.begin_io()?;
         library
@@ -207,6 +210,7 @@ pub async fn library_send_bundle_to_slicer(
             &snapshot,
             token_epoch,
             library_generation,
+            &settings,
         )
     })
     .await
@@ -574,6 +578,7 @@ fn send_bundle_to_slicer(
     expected: &[BundleSnapshotMember],
     token_epoch: u64,
     library_generation: u64,
+    settings: &SettingsState,
 ) -> Result<(), AppError> {
     send_bundle_with(
         library,
@@ -582,8 +587,15 @@ fn send_bundle_to_slicer(
         token,
         expected,
         || token_is_current(library, preview, token_epoch, library_generation),
-        crate::extension_api::installed_slicers,
-        crate::handoff::launch_paths,
+        || {
+            let current = settings.0.lock().unwrap();
+            crate::slicers::available_slicers(&current)
+        },
+        |slicer, paths| {
+            crate::slicers::launch_with_current_profile(settings, slicer, || {
+                crate::handoff::launch_paths(slicer, paths)
+            })
+        },
     )
     .map(|_| ())
 }
@@ -998,6 +1010,8 @@ mod tests {
             bundle_id: "com.bambulab.bambu-studio".into(),
             display_name: "Bambu Studio".into(),
             app_path: "/Applications/Bambu Studio.app".into(),
+            custom: false,
+            profile_identity: None,
         };
         let mut launched = false;
         let io_guard = library.begin_io().unwrap();

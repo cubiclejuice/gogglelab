@@ -319,6 +319,7 @@ impl IntegrationEngine for LibraryRuntime {
                 message: "AI provider was not found".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         state
@@ -368,6 +369,7 @@ impl IntegrationEngine for LibraryRuntime {
                 message: "AI review belongs to another principal".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         inner.reviews.remove(index);
@@ -596,6 +598,7 @@ fn apply_ai_review(
             message: "AI review belongs to another principal".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         });
     }
     if review.epoch != inner.epoch || review.library_generation != runtime.library_epoch() {
@@ -703,6 +706,7 @@ fn integration_transport(
             message: "Integration network transport is not enabled".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
 }
 
@@ -905,6 +909,7 @@ fn integration_busy(message: impl Into<String>) -> RuntimeError {
         message: message.into(),
         retryable: true,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -914,6 +919,7 @@ fn stale_integration(message: impl Into<String>) -> RuntimeError {
         message: message.into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 

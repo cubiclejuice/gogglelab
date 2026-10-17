@@ -1,6 +1,9 @@
 mod archive;
+mod bambu_discovery;
 mod cad_engine;
 mod commands;
+mod elegoo_discovery;
+mod elegoo_sdcp;
 mod error;
 pub mod extension_api;
 mod filetree;
@@ -19,15 +22,20 @@ mod library_management;
 mod library_scan;
 mod library_thumbnail;
 mod opened_urls;
+mod printer_commands;
+mod printer_network;
+mod printer_network_commands;
 mod printers;
 mod recovery;
 mod server_commands;
 mod settings;
+mod slicer_profiles;
 mod slicers;
 mod state;
 mod step_preview;
 mod trash;
 mod types;
+mod visual_qa;
 
 pub use folder_watch::{FolderWatchState, SelectedRootHandle};
 
@@ -43,6 +51,25 @@ fn cli_arg_path() -> Option<String> {
     std::env::args().nth(1)
 }
 
+fn server_web_root<E>(
+    resource_dir: Result<std::path::PathBuf, E>,
+    debug_build: bool,
+) -> Result<std::path::PathBuf, E> {
+    // An unbundled macOS development executable may have no resource path.
+    // Only debug builds can use the workspace's generated browser assets.
+    if debug_build {
+        if let Ok(root) = resource_dir {
+            let packaged = root.join("server-web");
+            if packaged.is_dir() {
+                return Ok(packaged);
+            }
+        }
+        Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist-browser"))
+    } else {
+        resource_dir.map(|root| root.join("server-web"))
+    }
+}
+
 pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -52,6 +79,7 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
         .manage(folder_watch::FolderWatchState::default())
         .manage(OpenedUrls::default())
         .manage(settings::SettingsState::default())
+        .manage(printer_network_commands::PrinterNetworkState::default())
         .invoke_handler(tauri::generate_handler![
             cad_engine::read_cad_engine,
             commands::open_model,
@@ -63,6 +91,7 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             cli_arg_path,
             opened_urls::opened_urls,
             slicers::detect_slicers,
+            slicers::detect_slicer_profile_candidates,
             server_commands::library_server_start,
             server_commands::library_server_stop,
             server_commands::library_server_status,
@@ -128,14 +157,39 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             library_commands::library_update_model_metadata,
             library_commands::library_update_models_metadata,
             library_commands::library_create_print_attempt,
+            library_commands::library_create_print_attempt_with_printer,
+            library_commands::library_import_print_attempt,
+            library_commands::library_import_print_attempts,
             library_commands::library_list_print_attempts,
             library_commands::library_get_print_attempt,
             library_commands::library_update_print_attempt,
+            library_commands::library_update_print_attempt_with_printer,
             library_commands::library_delete_print_attempt,
+            printer_commands::library_list_printers,
+            printer_commands::library_create_printer,
+            printer_commands::library_create_printers_batch,
+            printer_commands::library_import_printer_data,
+            printer_commands::library_update_printer,
+            printer_commands::library_delete_printer,
+            printer_commands::library_list_printer_maintenance_logs,
+            printer_commands::library_create_printer_maintenance_log,
+            printer_commands::library_update_printer_maintenance_log,
+            printer_commands::library_delete_printer_maintenance_log,
+            printer_commands::library_list_printer_reminders,
+            printer_commands::library_create_printer_reminder,
+            printer_commands::library_update_printer_reminder,
+            printer_commands::library_delete_printer_reminder,
+            printer_commands::library_complete_printer_reminder,
+            printer_network_commands::library_discover_printers,
+            printer_network_commands::library_cancel_printer_discovery,
+            printer_network_commands::library_test_printer_connection,
             library_commands::library_create_bundle,
             library_commands::library_set_model_bundle,
             settings::get_default_slicer,
             settings::set_default_slicer,
+            settings::save_slicer_profiles,
+            settings::import_slicer_profiles,
+            slicers::list_slicer_profiles,
             settings::get_settings,
             settings::set_active_printer,
             settings::set_display_units,
@@ -146,6 +200,7 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             printers::detect_printers,
             recovery::recovery_list_library,
             recovery::recovery_export_library,
+            recovery::recovery_export_printventory_json,
             recovery::recovery_export_colorways,
             filetree::move_tree_entry,
             filetree::list_dir,
@@ -157,6 +212,8 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             trash::move_tree_file_to_trash,
         ])
         .setup(|app| {
+            // This must precede every data/config lookup and settings load.
+            visual_qa::validate_startup(&app.config().identifier)?;
             let library_root = app.path().app_data_dir()?.join("library");
             let library = library_commands::LibraryState::try_new_with_config(
                 library_root,
@@ -179,21 +236,21 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             app.manage(library);
             app.manage(server_commands::DesktopServerState::new(
                 app.path().app_config_dir()?.join("server-token"),
-                {
-                    let packaged = app.path().resource_dir()?.join("server-web");
-                    #[cfg(debug_assertions)]
-                    let packaged = if packaged.is_dir() {
-                        packaged
-                    } else {
-                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist-browser")
-                    };
-                    packaged
-                },
+                server_web_root(app.path().resource_dir(), cfg!(debug_assertions))?,
+                app.state::<settings::SettingsState>().inner().clone(),
             ));
-            library_scan::start_background_scanner(app.handle().clone());
             let loaded = settings::load(app.handle());
             app.set_theme(loaded.appearance_mode.native_theme());
             *app.state::<settings::SettingsState>().0.lock().unwrap() = loaded;
+            let library_state = app.state::<library_commands::LibraryState>();
+            let settings_state = app.state::<settings::SettingsState>();
+            printer_commands::migrate_legacy_settings_printers(
+                app.handle(),
+                library_state.inner(),
+                settings_state.inner(),
+            )
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            library_scan::start_background_scanner(app.handle().clone());
             Ok(())
         })
 }
@@ -223,6 +280,27 @@ pub fn run() {
 
 #[cfg(test)]
 mod extension_api_tests {
+    #[test]
+    fn debug_server_web_root_falls_back_when_resource_dir_is_unavailable() {
+        assert_eq!(
+            super::server_web_root(Err("unknown path"), true),
+            Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist-browser"))
+        );
+    }
+
+    #[test]
+    fn release_server_web_root_requires_packaged_resource_directory() {
+        assert_eq!(
+            super::server_web_root(Err("unknown path"), false),
+            Err("unknown path")
+        );
+        let resource_dir = std::path::PathBuf::from("synthetic-packaged-resources");
+        assert_eq!(
+            super::server_web_root(Ok::<_, &str>(resource_dir.clone()), false),
+            Ok(resource_dir.join("server-web"))
+        );
+    }
+
     #[test]
     fn exposes_a_composable_core_builder() {
         let _builder = crate::configure_builder();

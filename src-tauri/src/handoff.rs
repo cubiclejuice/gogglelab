@@ -12,6 +12,7 @@ use tauri::State;
 
 use crate::extension_api::{self, AppError, AppState, OriginalSource, SlicerApp, SourceFormat};
 use crate::library_commands::LibraryState;
+use crate::settings::SettingsState;
 
 static HANDOFF_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static HANDOFF_STORAGE_LOCK: Mutex<()> = Mutex::new(());
@@ -19,6 +20,8 @@ static HANDOFF_STORAGE_LOCK: Mutex<()> = Mutex::new(());
 const MAX_BATCH_MODELS: usize = 100;
 const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_HANDOFF_STORAGE_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(any(windows, test))]
+const MAX_HANDOFF_TREE_ENTRIES: usize = 16_384;
 const HANDOFF_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const HANDOFF_ROOT_MARKER: &str = ".gogglelab-handoff-root";
 const HANDOFF_DIRECTORY_MARKER: &str = ".gogglelab-handoff-directory";
@@ -32,18 +35,27 @@ const HANDOFF_ROOT_ID: &str = "gogglelab-handoff-root-v1";
 pub fn open_in_slicer(
     viewer: State<'_, AppState>,
     library: State<'_, LibraryState>,
+    settings: State<'_, SettingsState>,
     generation: u64,
     slicer_id: String,
 ) -> Result<(), AppError> {
     let _io = library.begin_io()?;
+    let settings = settings.inner().clone();
     extension_api::with_original_source_digest(&viewer, generation, |source, digest| {
         checked_owned_source_launch(
             source,
             digest,
             library.root(),
             &slicer_id,
-            extension_api::installed_slicers,
-            launch,
+            || {
+                let current = settings.0.lock().unwrap();
+                crate::slicers::available_slicers(&current)
+            },
+            |slicer, path| {
+                crate::slicers::launch_with_current_profile(&settings, slicer, || {
+                    launch(slicer, path)
+                })
+            },
         )
         .map(|_| ())
     })
@@ -485,6 +497,52 @@ fn handoff_filename(source: &OriginalSource) -> String {
     format!("{basename}.{extension}")
 }
 
+#[cfg(any(windows, test))]
+fn canonical_windows_local_app_data(
+    local_app_data: &Path,
+    user_profile: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, AppError> {
+    let local_app_data =
+        canonicalize(local_app_data).map_err(|error| crate::error::map_io_error(&error))?;
+    let user_profile =
+        canonicalize(user_profile).map_err(|error| crate::error::map_io_error(&error))?;
+    if !local_app_data.starts_with(&user_profile) {
+        return Err(AppError::Library {
+            message: "Windows local application data resolves outside the current user profile"
+                .into(),
+        });
+    }
+    Ok(local_app_data)
+}
+
+#[cfg(any(windows, test))]
+fn windows_private_handoff_sddl(user_sid: &str, is_directory: bool) -> Result<String, AppError> {
+    let sid_body = user_sid
+        .strip_prefix("S-1-")
+        .ok_or_else(|| AppError::Library {
+            message: "Current user SID is invalid for private handoff storage".into(),
+        })?;
+    if sid_body.is_empty()
+        || sid_body.split('-').any(|component| {
+            component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err(AppError::Library {
+            message: "Current user SID is invalid for private handoff storage".into(),
+        });
+    }
+    let inheritance = if is_directory { "OICI" } else { "" };
+    Ok(format!(
+        "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;{user_sid})"
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn security_descriptor_owner_matches_user(security_sddl: &str, user_sid: &str) -> bool {
+    security_sddl == user_sid
+}
+
 pub(crate) fn stable_handoff_root(library_root: &Path) -> Result<PathBuf, AppError> {
     #[cfg(windows)]
     {
@@ -500,20 +558,18 @@ pub(crate) fn stable_handoff_root(library_root: &Path) -> Result<PathBuf, AppErr
             .ok_or_else(|| AppError::Library {
                 message: "Windows user profile is unavailable for private handoff storage".into(),
             })?;
-        if !profile.starts_with(&user_profile) {
-            return Err(AppError::Library {
-                message: "Windows local application data is outside the current user profile"
-                    .into(),
-            });
-        }
+        // Resolve junctions and other reparse points before checking
+        // containment so a lexical path cannot redirect staged bytes outside
+        // the current user's profile.
+        let profile = canonical_windows_local_app_data(&profile, &user_profile, |path| {
+            fs::canonicalize(path)
+        })?;
         let library_name = library_root
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("library");
-        // This assumes LOCALAPPDATA is the OS-managed current-user profile
-        // location; shared or redirected-outside-profile values fail closed.
-        // Staged bytes therefore avoid inheriting ACLs from a selected model
-        // volume with broader access.
+        // `create_owned_handoff_root` replaces inherited ACLs with the
+        // current-user-and-SYSTEM-only DACL before staging any model bytes.
         return Ok(profile.join(format!("GoggleLab-{library_name}-handoff-v1")));
     }
     #[cfg(not(windows))]
@@ -540,10 +596,12 @@ fn create_owned_handoff_root(root: &Path) -> Result<(), AppError> {
                 message: "Handoff namespace is not a real directory".into(),
             });
         }
-        Ok(_) => verify_owner_marker(root.join(HANDOFF_ROOT_MARKER), HANDOFF_ROOT_ID)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            create_private_directory(root).map_err(|error| crate::error::map_io_error(&error))?;
+        Ok(_) => {
+            verify_owner_marker(root.join(HANDOFF_ROOT_MARKER), HANDOFF_ROOT_ID)?;
             set_private_directory_permissions(root)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_and_secure_handoff_root(root, set_private_directory_permissions)?;
             let marker = root.join(HANDOFF_ROOT_MARKER);
             if let Err(error) = write_owner_marker(marker.clone(), HANDOFF_ROOT_ID) {
                 let _ = fs::remove_file(marker);
@@ -596,12 +654,15 @@ fn write_owner_marker(path: PathBuf, value: &str) -> Result<(), AppError> {
     marker
         .sync_all()
         .map_err(|error| crate::error::map_io_error(&error))?;
+    drop(marker);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .map_err(|error| crate::error::map_io_error(&error))?;
     }
+    #[cfg(windows)]
+    set_private_file_permissions(&path)?;
     Ok(())
 }
 
@@ -636,8 +697,24 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), AppError> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|error| crate::error::map_io_error(&error))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    set_private_windows_dacl_tree(path)?;
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
+    Ok(())
+}
+
+fn create_and_secure_handoff_root(
+    root: &Path,
+    secure_permissions: impl FnOnce(&Path) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    create_private_directory(root).map_err(|error| crate::error::map_io_error(&error))?;
+    if let Err(error) = secure_permissions(root) {
+        // This path was just created by this call. `remove_dir` is deliberately
+        // non-recursive, so a concurrent or unexpected child prevents cleanup.
+        let _ = fs::remove_dir(root);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -648,9 +725,474 @@ fn set_private_file_permissions(path: &Path) -> Result<(), AppError> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|error| crate::error::map_io_error(&error))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    set_private_windows_dacl(path, false)?;
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(windows)]
+fn set_private_windows_dacl_tree(root: &Path) -> Result<(), AppError> {
+    let user_sid = windows_current_user_sid()?;
+    let mut paths = Vec::new();
+    collect_handoff_tree_paths(root, &mut paths)?;
+
+    // Do not partially repair a tree if any object is owned by another
+    // principal; that owner could still rewrite its DACL after repair.
+    for (path, _) in &paths {
+        let (owner_sid, _) = windows_path_security(path)?;
+        if !security_descriptor_owner_matches_user(&owner_sid, &user_sid) {
+            return Err(windows_owner_mismatch());
+        }
+    }
+    for (path, is_directory) in paths {
+        set_private_windows_dacl_for_user(&path, &user_sid, is_directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn collect_handoff_tree_paths(
+    root: &Path,
+    paths: &mut Vec<(PathBuf, bool)>,
+) -> Result<(), AppError> {
+    let mut pending = Vec::new();
+    let mut discovered_entries = 0;
+    enqueue_handoff_tree_path(&mut pending, root.to_path_buf(), &mut discovered_entries)?;
+    while let Some(path) = pending.pop() {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| crate::error::map_io_error(&error))?;
+        if windows_is_reparse_point(&metadata) {
+            return Err(AppError::Library {
+                message: "Handoff storage contains an unsupported reparse point".into(),
+            });
+        }
+        let is_directory = metadata.is_dir();
+        paths.push((path.clone(), is_directory));
+        if is_directory {
+            for entry in fs::read_dir(&path).map_err(|error| crate::error::map_io_error(&error))? {
+                enqueue_handoff_tree_path(
+                    &mut pending,
+                    entry
+                        .map_err(|error| crate::error::map_io_error(&error))?
+                        .path(),
+                    &mut discovered_entries,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn enqueue_handoff_tree_path(
+    pending: &mut Vec<PathBuf>,
+    path: PathBuf,
+    discovered_entries: &mut usize,
+) -> Result<(), AppError> {
+    if *discovered_entries >= MAX_HANDOFF_TREE_ENTRIES {
+        return Err(AppError::Library {
+            message: "Handoff storage contains too many entries to secure".into(),
+        });
+    }
+    pending.push(path);
+    *discovered_entries += 1;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn windows_current_user_sid() -> Result<String, AppError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: `OpenProcessToken` returned this owned handle.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the process pseudo-handle is valid and the output pointer is writable.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    let token = Token(token);
+    let mut needed = 0_u32;
+    // SAFETY: this first call asks Windows for the required buffer length.
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    let word_count = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut token_data = vec![0_u64; word_count];
+    // SAFETY: `token_data` is suitably aligned and has the size reported by Windows.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            token_data.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    // SAFETY: the successful TokenUser query initialized a TOKEN_USER at the buffer start.
+    let token_user = unsafe { &*(token_data.as_ptr().cast::<TOKEN_USER>()) };
+    let mut sid_string = std::ptr::null_mut();
+    // SAFETY: the SID belongs to the live token buffer and `sid_string` is writable.
+    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string) } == 0 {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    // SAFETY: Windows returned a NUL-terminated UTF-16 SID string.
+    let sid_result = unsafe {
+        let mut length = 0_usize;
+        while *sid_string.add(length) != 0 {
+            length += 1;
+        }
+        let wide = std::slice::from_raw_parts(sid_string, length);
+        OsString::from_wide(wide)
+            .into_string()
+            .map_err(|_| AppError::Library {
+                message: "Current user SID is not valid text".into(),
+            })
+    };
+    // SAFETY: `ConvertSidToStringSidW` allocated this buffer with LocalAlloc.
+    unsafe {
+        LocalFree(sid_string.cast());
+    }
+    let sid = sid_result?;
+    windows_private_handoff_sddl(&sid, false)?;
+    Ok(sid)
+}
+
+#[cfg(windows)]
+fn secure_windows_path_dacl(
+    path: &Path,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<(), AppError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| crate::error::map_io_error(&error))?;
+    if windows_is_reparse_point(&metadata) || metadata.is_dir() != is_directory {
+        return Err(AppError::Library {
+            message: "Handoff storage changed while securing its permissions".into(),
+        });
+    }
+    if windows_path_has_private_dacl(path, user_sid, is_directory)? {
+        return Ok(());
+    }
+    let sddl = windows_private_handoff_sddl(user_sid, is_directory)?;
+    set_windows_named_dacl(path, &sddl)
+}
+
+#[cfg(windows)]
+fn set_private_windows_dacl(path: &Path, is_directory: bool) -> Result<(), AppError> {
+    let user_sid = windows_current_user_sid()?;
+    set_private_windows_dacl_for_user(path, &user_sid, is_directory)
+}
+
+#[cfg(windows)]
+fn set_private_windows_dacl_for_user(
+    path: &Path,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<(), AppError> {
+    secure_windows_path_dacl(path, user_sid, is_directory)?;
+    let (owner_sid, dacl_sddl) = windows_path_security(path)?;
+    if !security_descriptor_owner_matches_user(&owner_sid, user_sid)
+        || !security_descriptor_has_private_dacl(&dacl_sddl, user_sid, is_directory)?
+    {
+        return Err(AppError::Library {
+            message: "Could not verify private handoff ownership and permissions".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_path_has_private_dacl(
+    path: &Path,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<bool, AppError> {
+    let (owner_sid, dacl_sddl) = windows_path_security(path)?;
+    if !security_descriptor_owner_matches_user(&owner_sid, user_sid) {
+        return Err(windows_owner_mismatch());
+    }
+    security_descriptor_has_private_dacl(&dacl_sddl, user_sid, is_directory)
+}
+
+#[cfg(windows)]
+fn security_descriptor_has_private_dacl(
+    security_sddl: &str,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<bool, AppError> {
+    let dacl_start = security_sddl.find("D:").ok_or_else(|| AppError::Library {
+        message: "Handoff storage DACL could not be read".into(),
+    })?;
+    let actual = &security_sddl[dacl_start..];
+    let expected = windows_private_handoff_sddl(user_sid, is_directory)?;
+    let Some((actual_flags, mut actual_aces)) = parse_dacl_sddl(&actual) else {
+        return Ok(false);
+    };
+    let Some((expected_flags, mut expected_aces)) = parse_dacl_sddl(&expected) else {
+        return Ok(false);
+    };
+    if !actual_flags.contains('P') || !expected_flags.contains('P') {
+        return Ok(false);
+    }
+    actual_aces.sort_unstable();
+    expected_aces.sort_unstable();
+    Ok(actual_aces == expected_aces)
+}
+
+#[cfg(windows)]
+fn windows_owner_mismatch() -> AppError {
+    AppError::Library {
+        message: "Handoff storage is not owned by the current user".into(),
+    }
+}
+
+#[cfg(windows)]
+fn parse_dacl_sddl(value: &str) -> Option<(&str, Vec<&str>)> {
+    let body = value.strip_prefix("D:")?;
+    let first_ace = body.find('(')?;
+    let flags = &body[..first_ace];
+    let mut rest = &body[first_ace..];
+    let mut aces = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix('(')?;
+        let end = rest.find(')')?;
+        let ace = &rest[..end];
+        if ace.contains('(') {
+            return None;
+        }
+        aces.push(ace);
+        rest = &rest[end + 1..];
+    }
+    Some((flags, aces))
+}
+
+#[cfg(windows)]
+fn windows_path_security(path: &Path) -> Result<(String, String), AppError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+        GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut owner_sid: PSID = std::ptr::null_mut();
+    // SAFETY: Windows reads the NUL-terminated path and writes the descriptor pointer.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() || owner_sid.is_null() {
+        // SAFETY: GetNamedSecurityInfoW allocates this only on a successful partial result.
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(AppError::Library {
+            message: "Could not verify handoff storage permissions".into(),
+        });
+    }
+    let mut owner_string = std::ptr::null_mut();
+    // SAFETY: `owner_sid` belongs to the returned descriptor and the output is writable.
+    let owner_converted = unsafe { ConvertSidToStringSidW(owner_sid, &mut owner_string) };
+    let mut dacl_sddl = std::ptr::null_mut();
+    // SAFETY: the descriptor was returned by GetNamedSecurityInfoW and `dacl_sddl` is writable.
+    let dacl_converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            DACL_SECURITY_INFORMATION,
+            &mut dacl_sddl,
+            std::ptr::null_mut(),
+        )
+    };
+    let owner_result = if owner_converted == 0 || owner_string.is_null() {
+        Err(AppError::Library {
+            message: "Could not verify handoff storage owner".into(),
+        })
+    } else {
+        // SAFETY: Windows returned a NUL-terminated UTF-16 SID string.
+        unsafe {
+            let mut length = 0_usize;
+            while *owner_string.add(length) != 0 {
+                length += 1;
+            }
+            let wide = std::slice::from_raw_parts(owner_string, length);
+            OsString::from_wide(wide)
+                .into_string()
+                .map_err(|_| AppError::Library {
+                    message: "Handoff owner SID is not valid text".into(),
+                })
+        }
+    };
+    let dacl_result = if dacl_converted == 0 || dacl_sddl.is_null() {
+        Err(AppError::Library {
+            message: "Could not verify handoff storage permissions".into(),
+        })
+    } else {
+        // SAFETY: Windows returned a NUL-terminated UTF-16 DACL string.
+        unsafe {
+            let mut length = 0_usize;
+            while *dacl_sddl.add(length) != 0 {
+                length += 1;
+            }
+            let wide = std::slice::from_raw_parts(dacl_sddl, length);
+            OsString::from_wide(wide)
+                .into_string()
+                .map_err(|_| AppError::Library {
+                    message: "Handoff DACL is not valid text".into(),
+                })
+        }
+    };
+    // SAFETY: all returned buffers were allocated by Windows with LocalAlloc.
+    unsafe {
+        if !owner_string.is_null() {
+            LocalFree(owner_string.cast());
+        }
+        if !dacl_sddl.is_null() {
+            LocalFree(dacl_sddl.cast());
+        }
+        LocalFree(descriptor.cast());
+    }
+    match (owner_result, dacl_result) {
+        (Ok(owner_sid), Ok(dacl_sddl)) => Ok((owner_sid, dacl_sddl)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn set_windows_named_dacl(path: &Path, sddl: &str) -> Result<(), AppError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let sddl_wide = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the SDDL is NUL-terminated and the output pointer is writable.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(AppError::Library {
+            message: "Could not construct private handoff permissions".into(),
+        });
+    }
+    let result = (|| {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut dacl_present = 0;
+        // SAFETY: the descriptor came from Windows' SDDL converter; output pointers are valid.
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                std::ptr::null_mut(),
+            )
+        } == 0
+            || dacl_present == 0
+            || dacl.is_null()
+        {
+            return Err(AppError::Library {
+                message: "Could not construct private handoff permissions".into(),
+            });
+        }
+        // SAFETY: path and DACL remain valid for the duration of this call.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(AppError::Library {
+                message: "Could not apply private handoff permissions".into(),
+            });
+        }
+        Ok(())
+    })();
+    // SAFETY: descriptor was allocated by the Windows SDDL converter.
+    unsafe {
+        LocalFree(descriptor.cast());
+    }
+    result
 }
 
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
@@ -683,8 +1225,7 @@ fn is_private(metadata: &fs::Metadata) -> bool {
     #[cfg(not(unix))]
     {
         let _ = metadata;
-        // On Windows the namespace is under the user's protected LOCALAPPDATA
-        // DACL; other supported targets are Unix-like.
+        // Windows DACL verification and repair are performed before staging.
         true
     }
 }
@@ -777,9 +1318,26 @@ fn checked_source_launch(
 }
 
 fn supported_slicer<'a>(slicer_id: &str, installed: &'a [SlicerApp]) -> Option<&'a SlicerApp> {
-    installed
-        .iter()
-        .find(|slicer| slicer.id == slicer_id && slicer.bundle_id == slicer_id)
+    installed.iter().find(|slicer| {
+        if slicer.id != slicer_id {
+            return false;
+        }
+        if slicer.custom {
+            slicer.profile_identity.as_ref().is_some_and(|identity| {
+                identity.canonical_path == slicer.app_path
+                    && identity.bundle_id.as_deref().unwrap_or_default() == slicer.bundle_id
+                    && crate::slicer_profiles::profile_identity_is_current(identity)
+            })
+        } else {
+            slicer.bundle_id == slicer.id
+                && crate::slicers::slicer_definition(&slicer.bundle_id).is_some()
+                && slicer.profile_identity.as_ref().is_none_or(|identity| {
+                    identity.canonical_path == slicer.app_path
+                        && identity.bundle_id.as_deref() == Some(slicer.id.as_str())
+                        && crate::slicer_profiles::profile_identity_is_current(identity)
+                })
+        }
+    })
 }
 
 pub(crate) fn is_supported_slicer(slicer_id: &str, installed: &[SlicerApp]) -> bool {
@@ -802,11 +1360,11 @@ pub(crate) fn checked_paths_launch(
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn launch_arguments(slicer_id: &str, source_paths: &[PathBuf]) -> Vec<OsString> {
+fn launch_arguments(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Vec<OsString> {
     let mut arguments = vec![
         OsString::from("-n"),
-        OsString::from("-b"),
-        OsString::from(slicer_id),
+        OsString::from("-a"),
+        OsString::from(&slicer.app_path),
     ];
     arguments.extend(source_paths.iter().map(|path| path.as_os_str().to_owned()));
     arguments
@@ -819,16 +1377,25 @@ fn launch(slicer: &SlicerApp, source_path: &Path) -> Result<(), AppError> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn launch_paths(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Result<(), AppError> {
-    let status = Command::new("open")
-        .args(launch_arguments(&slicer.bundle_id, source_paths))
-        .status()
-        .map_err(|_| AppError::LaunchFailed { status: None })?;
-    if status.success() {
-        Ok(())
+    verify_slicer_identity(slicer)?;
+    if slicer
+        .profile_identity
+        .as_ref()
+        .is_some_and(|identity| identity.bundle_id.is_some())
+    {
+        let status = Command::new("open")
+            .args(launch_arguments(slicer, source_paths))
+            .status()
+            .map_err(|_| AppError::LaunchFailed { status: None })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(AppError::LaunchFailed {
+                status: status.code(),
+            })
+        }
     } else {
-        Err(AppError::LaunchFailed {
-            status: status.code(),
-        })
+        launch_executable(slicer, source_paths)
     }
 }
 
@@ -842,10 +1409,10 @@ pub(crate) fn launch_paths(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Resu
     launch_executable(slicer, source_paths)
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
 fn launch_executable(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Result<(), AppError> {
-    // app_path comes only from the current allowlisted detector. Command and
-    // args bypass a shell, preserving the model path as one literal argument.
+    verify_slicer_identity(slicer)?;
+    // The executable path is resolved from a fresh built-in detection or a
+    // saved profile created from the local application picker. No shell is used.
     Command::new(&slicer.app_path)
         .args(executable_arguments(source_paths))
         .spawn()
@@ -858,7 +1425,30 @@ fn launch_executable(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Result<(),
         .map_err(|_| AppError::LaunchFailed { status: None })
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+fn verify_slicer_identity(slicer: &SlicerApp) -> Result<(), AppError> {
+    let Some(identity) = slicer.profile_identity.as_ref() else {
+        return Err(AppError::UnknownSlicer);
+    };
+    if identity.canonical_path != slicer.app_path
+        || !crate::slicer_profiles::profile_identity_is_current(identity)
+    {
+        return Err(AppError::UnknownSlicer);
+    }
+
+    let actual_bundle_id = identity.bundle_id.as_deref().unwrap_or_default();
+    if slicer.custom {
+        if actual_bundle_id != slicer.bundle_id {
+            return Err(AppError::UnknownSlicer);
+        }
+    } else if slicer.bundle_id != slicer.id
+        || actual_bundle_id != slicer.id
+        || crate::slicers::slicer_definition(&slicer.bundle_id).is_none()
+    {
+        return Err(AppError::UnknownSlicer);
+    }
+    Ok(())
+}
+
 fn executable_arguments(source_paths: &[PathBuf]) -> Vec<OsString> {
     source_paths
         .iter()
@@ -869,11 +1459,18 @@ fn executable_arguments(source_paths: &[PathBuf]) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_bytes_batch_launch, checked_bytes_launch, checked_owned_source_launch,
-        checked_paths_launch, checked_source_launch, checked_stream_batch_launch,
-        create_owned_handoff_root, launch_arguments, mark_owned_handoff_directory,
-        stable_handoff_root, supported_slicer, StreamHandoffRequest, VerifiedHandoffRequest,
-        HANDOFF_SEQUENCE, MAX_BATCH_BYTES, MAX_HANDOFF_STORAGE_BYTES,
+        canonical_windows_local_app_data, checked_bytes_batch_launch, checked_bytes_launch,
+        checked_owned_source_launch, checked_paths_launch, checked_source_launch,
+        checked_stream_batch_launch, create_and_secure_handoff_root, create_owned_handoff_root,
+        enqueue_handoff_tree_path, launch_arguments, mark_owned_handoff_directory,
+        security_descriptor_owner_matches_user, stable_handoff_root, supported_slicer,
+        windows_private_handoff_sddl, StreamHandoffRequest, VerifiedHandoffRequest,
+        HANDOFF_SEQUENCE, MAX_BATCH_BYTES, MAX_HANDOFF_STORAGE_BYTES, MAX_HANDOFF_TREE_ENTRIES,
+    };
+    #[cfg(windows)]
+    use super::{
+        set_private_directory_permissions, set_windows_named_dacl, windows_current_user_sid,
+        windows_path_has_private_dacl, windows_path_security,
     };
     use crate::extension_api::{AppError, OriginalSource, SlicerApp, SourceFormat};
     use sha2::{Digest, Sha256};
@@ -888,7 +1485,198 @@ mod tests {
             bundle_id: "com.bambulab.bambu-studio".into(),
             display_name: "Bambu Studio".into(),
             app_path: "/Applications/Bambu Studio.app".into(),
+            custom: false,
+            profile_identity: None,
         }
+    }
+
+    #[test]
+    fn windows_handoff_profile_checks_the_resolved_local_app_data_path() {
+        let local_app_data = Path::new("C:/Users/Ada/AppData/Local");
+        let user_profile = Path::new("C:/Users/Ada");
+        let resolved_profile = PathBuf::from("/private/users/ada");
+        let resolved_local = resolved_profile.join("AppData/Local");
+        let resolve = |path: &Path| {
+            if path == local_app_data {
+                Ok(resolved_local.clone())
+            } else {
+                Ok(resolved_profile.clone())
+            }
+        };
+        assert_eq!(
+            canonical_windows_local_app_data(local_app_data, user_profile, resolve).unwrap(),
+            resolved_local
+        );
+
+        let redirected = PathBuf::from("/shared/local-app-data");
+        let resolve_redirected = |path: &Path| {
+            if path == local_app_data {
+                Ok(redirected.clone())
+            } else {
+                Ok(resolved_profile.clone())
+            }
+        };
+        assert!(
+            canonical_windows_local_app_data(local_app_data, user_profile, resolve_redirected)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_handoff_dacl_grants_only_the_current_user_and_system() {
+        let user_sid = "S-1-5-21-123456789-234567890-345678901-1001";
+        assert_eq!(
+            windows_private_handoff_sddl(user_sid, true).unwrap(),
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-123456789-234567890-345678901-1001)"
+        );
+        assert_eq!(
+            windows_private_handoff_sddl(user_sid, false).unwrap(),
+            "D:P(A;;FA;;;SY)(A;;FA;;;S-1-5-21-123456789-234567890-345678901-1001)"
+        );
+        assert!(windows_private_handoff_sddl("S-1-5-21-1);(A;;FA;;;WD", true).is_err());
+    }
+
+    #[test]
+    fn windows_handoff_owner_policy_requires_the_current_user_sid() {
+        let user_sid = "S-1-5-21-123456789-234567890-345678901-1001";
+        assert!(security_descriptor_owner_matches_user(user_sid, user_sid));
+        assert!(!security_descriptor_owner_matches_user(
+            "S-1-5-21-987654321-123456789-345678901-1002",
+            user_sid,
+        ));
+        assert!(!security_descriptor_owner_matches_user("", user_sid));
+    }
+
+    #[test]
+    fn failed_security_setup_removes_only_the_new_empty_handoff_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("new-handoff-root");
+
+        let result = create_and_secure_handoff_root(&root, |_| {
+            Err(AppError::Library {
+                message: "injected permission failure".into(),
+            })
+        });
+
+        assert!(result.is_err());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn failed_security_setup_never_removes_a_preexisting_handoff_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("existing-handoff-root");
+        fs::create_dir(&root).unwrap();
+        let keep = root.join("keep.txt");
+        fs::write(&keep, b"existing user data").unwrap();
+
+        let result = create_and_secure_handoff_root(&root, |_| {
+            panic!("permission setup must not run for a preexisting root")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(keep).unwrap(), b"existing user data");
+    }
+
+    #[test]
+    fn failed_security_setup_does_not_recursively_remove_unexpected_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("new-handoff-root");
+        let keep = root.join("unexpected-child.txt");
+
+        let result = create_and_secure_handoff_root(&root, |created_root| {
+            fs::write(created_root.join("unexpected-child.txt"), b"keep this data")
+                .map_err(|error| crate::error::map_io_error(&error))?;
+            Err(AppError::Library {
+                message: "injected permission failure".into(),
+            })
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(keep).unwrap(), b"keep this data");
+    }
+
+    #[test]
+    fn handoff_tree_discovery_rejects_an_entry_before_queue_exceeds_limit() {
+        let mut pending = Vec::new();
+        let mut discovered = 0;
+
+        for index in 0..MAX_HANDOFF_TREE_ENTRIES {
+            enqueue_handoff_tree_path(
+                &mut pending,
+                PathBuf::from(format!("entry-{index}")),
+                &mut discovered,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(pending.len(), MAX_HANDOFF_TREE_ENTRIES);
+        assert!(enqueue_handoff_tree_path(
+            &mut pending,
+            PathBuf::from("over-limit"),
+            &mut discovered,
+        )
+        .is_err());
+        assert_eq!(pending.len(), MAX_HANDOFF_TREE_ENTRIES);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handoff_dacl_repairs_broad_permissions_on_existing_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("handoff");
+        let nested = root.join("batch-existing");
+        let file = nested.join("model.stl");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(&file, b"verified model bytes").unwrap();
+
+        let user_sid = windows_current_user_sid().unwrap();
+        for (path, _) in [(&root, true), (&nested, true), (&file, false)] {
+            let (owner_sid, _) = windows_path_security(path).unwrap();
+            if !security_descriptor_owner_matches_user(&owner_sid, &user_sid) {
+                eprintln!("Skipping DACL repair exercise: the Windows token's default owner is not the current user SID");
+                assert!(set_private_directory_permissions(&root).is_err());
+                return;
+            }
+        }
+
+        set_windows_named_dacl(&root, "D:(A;OICI;FA;;;WD)").unwrap();
+        set_windows_named_dacl(&nested, "D:(A;OICI;FA;;;WD)").unwrap();
+        set_windows_named_dacl(&file, "D:(A;;FA;;;WD)").unwrap();
+        assert!(!windows_path_has_private_dacl(&root, &user_sid, true).unwrap());
+        assert!(!windows_path_has_private_dacl(&nested, &user_sid, true).unwrap());
+        assert!(!windows_path_has_private_dacl(&file, &user_sid, false).unwrap());
+
+        set_private_directory_permissions(&root).unwrap();
+
+        assert!(windows_path_has_private_dacl(&root, &user_sid, true).unwrap());
+        assert!(windows_path_has_private_dacl(&nested, &user_sid, true).unwrap());
+        assert!(windows_path_has_private_dacl(&file, &user_sid, false).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handoff_rejects_real_reparse_escape_when_supported() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let app_data_parent = profile.join("AppData");
+        let local_app_data = app_data_parent.join("Local");
+        let shared = temp.path().join("shared");
+        fs::create_dir_all(&app_data_parent).unwrap();
+        fs::create_dir(&shared).unwrap();
+        if let Err(error) = symlink_dir(&shared, &local_app_data) {
+            eprintln!("Skipping real reparse-point check; Windows runner disallowed directory symlinks: {error}");
+            return;
+        }
+
+        assert!(
+            canonical_windows_local_app_data(&local_app_data, &profile, |path| {
+                fs::canonicalize(path)
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1205,8 +1993,8 @@ mod tests {
         };
 
         let root = stable_handoff_root(&library_root).unwrap();
-        assert!(root.starts_with(PathBuf::from(local_app_data)));
-        assert!(root.starts_with(PathBuf::from(user_profile)));
+        assert!(root.starts_with(fs::canonicalize(PathBuf::from(local_app_data)).unwrap()));
+        assert!(root.starts_with(fs::canonicalize(PathBuf::from(user_profile)).unwrap()));
     }
 
     #[test]
@@ -1322,8 +2110,48 @@ mod tests {
             bundle_id: "attacker.controlled.bundle".into(),
             display_name: "Bambu Studio".into(),
             app_path: "/Applications/Bambu Studio.app".into(),
+            custom: false,
+            profile_identity: None,
         }];
         assert!(supported_slicer("com.bambulab.bambu-studio", &mismatched).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_profile_replacement_is_rejected_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CustomSlicer");
+        std::fs::write(&path, b"selected executable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let identity = crate::slicer_profiles::capture_profile_identity(&path).unwrap();
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"different executable").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let custom = SlicerApp {
+            id: "a4c1003e-64ed-4d8b-b687-734f4148e648".into(),
+            bundle_id: String::new(),
+            display_name: "Custom Slicer".into(),
+            app_path: identity.canonical_path.clone(),
+            custom: true,
+            profile_identity: Some(identity),
+        };
+        let source = OriginalSource {
+            path: PathBuf::from("/tmp/model.stl"),
+            format: SourceFormat::Stl,
+        };
+        let custom_id = custom.id.clone();
+        let mut launched = false;
+
+        let result = checked_source_launch(&source, &custom_id, &[custom], |_, _| {
+            launched = true;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(AppError::UnknownSlicer)));
+        assert!(!launched);
     }
 
     #[test]
@@ -1352,7 +2180,10 @@ mod tests {
             app_path: missing.to_string_lossy().into_owned(),
             ..installed_bambu()
         };
-        assert!(super::launch_executable(&slicer, &[PathBuf::from("source.stl")]).is_err());
+        assert!(matches!(
+            super::launch_executable(&slicer, &[PathBuf::from("source.stl")]),
+            Err(AppError::UnknownSlicer)
+        ));
     }
 
     #[test]
@@ -1364,13 +2195,14 @@ mod tests {
     }
 
     #[test]
-    fn macos_launch_preserves_bundle_id_and_source_as_literal_arguments() {
+    fn macos_launch_preserves_exact_application_path_and_source_arguments() {
         let path = Path::new("/tmp/模型 with spaces; $(echo unsafe).3mf");
-        let args = launch_arguments("com.bambulab.bambu-studio", &[path.to_path_buf()]);
+        let slicer = installed_bambu();
+        let args = launch_arguments(&slicer, &[path.to_path_buf()]);
 
         assert_eq!(args[0], "-n");
-        assert_eq!(args[1], "-b");
-        assert_eq!(args[2], "com.bambulab.bambu-studio");
+        assert_eq!(args[1], "-a");
+        assert_eq!(args[2], Path::new(&slicer.app_path).as_os_str());
         assert_eq!(args[3], path.as_os_str());
     }
 
@@ -1396,8 +2228,10 @@ mod tests {
         .unwrap();
         assert!(launched);
         assert_eq!(super::executable_arguments(&paths), paths);
-        let mac = launch_arguments("com.bambulab.bambu-studio", &paths);
-        assert_eq!(&mac[..3], ["-n", "-b", "com.bambulab.bambu-studio"]);
+        let mac = launch_arguments(&installed[0], &paths);
+        assert_eq!(mac[0], "-n");
+        assert_eq!(mac[1], "-a");
+        assert_eq!(mac[2], Path::new(&installed[0].app_path).as_os_str());
         assert_eq!(mac[3], paths[0].as_os_str());
         assert_eq!(mac[4], paths[1].as_os_str());
     }

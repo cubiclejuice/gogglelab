@@ -13,7 +13,9 @@ import {
   modelGeometry,
   isAppError,
   describeError,
-  detectSlicers,
+  listSlicerProfiles,
+  detectSlicerProfileCandidates,
+  saveSlicerProfiles,
   getDefaultSlicer,
   setDefaultSlicer,
   openInSlicer,
@@ -39,9 +41,9 @@ import {
   libraryDeleteTag,
   libraryUpdateModelMetadata,
   libraryUpdateModelsMetadata,
-  libraryCreatePrintAttempt,
   libraryListPrintAttempts,
-  libraryUpdatePrintAttempt,
+  libraryCreatePrintAttemptWithPrinter,
+  libraryUpdatePrintAttemptWithPrinter,
   libraryDeletePrintAttempt,
   libraryCreateBundle,
   libraryCreateFolder,
@@ -68,6 +70,10 @@ import {
   libraryCreateFilament,
   libraryUpdateFilament,
   libraryDeleteFilament,
+  libraryListPartStock,
+  libraryCreatePartStock,
+  libraryUpdatePartStock,
+  libraryDeletePartStock,
   librarySetModelFilaments,
   libraryBulkSetModelFilaments,
   libraryBulkAssignModelFilaments,
@@ -83,6 +89,23 @@ import {
   libraryServerStop,
   libraryServerStatus,
   libraryServerRevealAccessKey,
+  libraryListPrinters,
+  libraryCreatePrinter,
+  libraryUpdatePrinter,
+  libraryDeletePrinter,
+  libraryCreatePrintersBatch,
+  libraryDiscoverPrinters,
+  libraryCancelPrinterDiscovery,
+  libraryTestPrinterConnection,
+  libraryListPrinterMaintenanceLogs,
+  libraryCreatePrinterMaintenanceLog,
+  libraryUpdatePrinterMaintenanceLog,
+  libraryDeletePrinterMaintenanceLog,
+  libraryListPrinterReminders,
+  libraryCreatePrinterReminder,
+  libraryUpdatePrinterReminder,
+  libraryDeletePrinterReminder,
+  libraryCompletePrinterReminder,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -93,10 +116,11 @@ import {
   listDir,
   detectPrinters,
   moveTreeFileToTrash,
-  getDefaultSlicer as getDefaultSlicerId,
   type Printer,
   type AppearanceMode,
   type SlicerApp,
+  type SlicerProfileDraft,
+  type SlicerProfileView,
   type IntegrityReport,
   type ModelSummary,
 } from "./lib/ipc";
@@ -126,6 +150,21 @@ import { LibraryAiDialog } from "./lib/library-ai-dialog";
 import { filamentAssignmentBatch } from "./lib/library-filaments";
 import { pathContainsOpenDialog } from "./lib/dialog-escape";
 import { LibraryServerSettingsSection } from "./lib/library-server-settings";
+import {
+  GENERIC_PRINTER_ID,
+  PrinterFleetManager,
+  mapDiscoverySuggestion,
+  mapLibraryPrinter,
+  mapMaintenanceLog,
+  mapMaintenanceLogDraftToInput,
+  mapMaintenanceReminder,
+  mapMaintenanceReminderDraftToInput,
+  mapPrinterDraftToInput,
+  mapReminderCompletion,
+  type ManagedPrinter,
+  type PrinterFleetModel,
+  type PrinterFleetCallbacks,
+} from "./lib/printer-fleet";
 import "./styles.css";
 
 export function startApp(extensions: AppExtensions): void {
@@ -183,9 +222,9 @@ export function startApp(extensions: AppExtensions): void {
     deleteTag: libraryDeleteTag,
     updateModelMetadata: libraryUpdateModelMetadata,
     updateModelsMetadata: libraryUpdateModelsMetadata,
-    createPrintAttempt: libraryCreatePrintAttempt,
+    createPrintAttempt: libraryCreatePrintAttemptWithPrinter,
     listPrintAttempts: libraryListPrintAttempts,
-    updatePrintAttempt: libraryUpdatePrintAttempt,
+    updatePrintAttempt: libraryUpdatePrintAttemptWithPrinter,
     deletePrintAttempt: libraryDeletePrintAttempt,
     createBundle: libraryCreateBundle,
     createFolder: libraryCreateFolder,
@@ -212,6 +251,10 @@ export function startApp(extensions: AppExtensions): void {
     createFilament: libraryCreateFilament,
     updateFilament: libraryUpdateFilament,
     deleteFilament: libraryDeleteFilament,
+    listPartStock: libraryListPartStock,
+    createPartStock: libraryCreatePartStock,
+    updatePartStock: libraryUpdatePartStock,
+    deletePartStock: libraryDeletePartStock,
     setModelFilaments: librarySetModelFilaments,
     bulkSetModelFilaments: libraryBulkSetModelFilaments,
     bulkAssignModelFilaments: libraryBulkAssignModelFilaments,
@@ -450,7 +493,15 @@ export function startApp(extensions: AppExtensions): void {
     '<path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>';
   gearButton.addEventListener("click", () => openSettings(gearButton));
   tree.addFooterControl(gearButton);
-  mountRecoveryControl(app, (control) => tree.addFooterControl(control));
+  mountRecoveryControl(
+    app,
+    (control) => tree.addFooterControl(control),
+    async () => {
+      await refreshSlicers();
+      await refreshPrinterFleet();
+      await refreshLibrary();
+    },
+  );
   extensions.mountLicenseControl?.(app, (control) => tree.addFooterControl(control));
 
   const libraryButton = document.createElement("button");
@@ -470,6 +521,7 @@ export function startApp(extensions: AppExtensions): void {
       printers,
       activePrinterId,
       slicers,
+      slicerProfiles,
       defaultSlicerId: activeSlicerId,
       units: displayUnits,
       appearanceMode,
@@ -487,6 +539,7 @@ export function startApp(extensions: AppExtensions): void {
         printers,
         activePrinterId,
         slicers,
+        slicerProfiles,
         defaultSlicerId: activeSlicerId,
         units: displayUnits,
         appearanceMode,
@@ -504,11 +557,22 @@ export function startApp(extensions: AppExtensions): void {
     refreshSettingsPanel();
   };
   settingsPanel.onPrinter = (id) => applyPrinter(id);
-  settingsPanel.onSlicer = (id) => {
+  settingsPanel.onSlicer = async (id) => {
+    await setDefaultSlicer(id);
     activeSlicerId = id;
-    void setDefaultSlicer(id);
     void refreshColorwayPalette();
     updateHandoffButton();
+    refreshSettingsPanel();
+  };
+  settingsPanel.onChooseSlicerPath = async () => {
+    const selected = await openDialog({ multiple: false });
+    if (Array.isArray(selected)) return selected[0] ?? null;
+    return typeof selected === "string" ? selected : null;
+  };
+  settingsPanel.onDetectSlicerProfiles = () => detectSlicerProfileCandidates();
+  settingsPanel.onSaveSlicerProfiles = async (profiles: SlicerProfileDraft[]) => {
+    await saveSlicerProfiles(profiles);
+    await refreshSlicers();
   };
   settingsPanel.onUnits = (u) => {
     displayUnits = u;
@@ -569,15 +633,46 @@ export function startApp(extensions: AppExtensions): void {
       });
   };
 
-  function applyPrinter(id: string) {
+  let printers: Printer[] = [];
+  let managedPrinters: ManagedPrinter[] = [];
+  let printerFleetManager: PrinterFleetManager | null = null;
+  let printerFleetModel: PrinterFleetModel = {
+    managedPrinters: [],
+    slicerDetections: [],
+    activePrinterId: GENERIC_PRINTER_ID,
+    maintenanceLogs: [],
+    maintenanceReminders: [],
+  };
+
+  function setActivePrinterView(id: string) {
     activePrinterId = id;
-    void setActivePrinter(id);
     const active = printers.find((p) => p.id === id);
     if (active) viewport.setBed(active.bed_mm);
     hud.setPrinters(printers, id);
+    printerFleetModel = { ...printerFleetModel, activePrinterId: id };
+    printerFleetManager?.updateModel(printerFleetModel);
+    const activeManagedPrinterId = managedPrinters.some((printer) => printer.id === id) ? id : null;
+    libraryPanel.setPrinterOptions(
+      managedPrinters.map((printer) => ({ id: printer.id, name: printer.name })),
+      activeManagedPrinterId,
+    );
+    refreshSettingsPanel();
+  }
+
+  function applyPrinter(id: string) {
+    if (!printers.some((printer) => printer.id === id)) return;
+    setActivePrinterView(id);
+    void setActivePrinter(id).catch(() => {
+      if (printerFleetManager) {
+        printerFleetManager.state.error =
+          "Could not save the active printer. Choose it again to retry.";
+        printerFleetManager.updateModel(printerFleetModel);
+      }
+    });
   }
 
   let slicers: SlicerApp[] = [];
+  let slicerProfiles: SlicerProfileView[] = [];
   let activeSlicerId: string | null = null;
   let loadedGeneration: number | null = null; // the generation currently on the viewport, if any
   let loadedSourcePath: string | null = null;
@@ -624,48 +719,218 @@ export function startApp(extensions: AppExtensions): void {
       .catch(() => {});
   }
 
-  async function initSlicers() {
-    slicers = await detectSlicers();
-    const saved = await getDefaultSlicer();
-    activeSlicerId =
-      (saved && slicers.some((s) => s.id === saved) ? saved : slicers[0]?.id) ?? null;
-    if (activeSlicerId && activeSlicerId !== saved) {
-      void setDefaultSlicer(activeSlicerId);
-    }
+  async function refreshSlicers(): Promise<SlicerApp[]> {
+    const [profiles, saved] = await Promise.all([listSlicerProfiles(), getDefaultSlicer()]);
+    slicerProfiles = profiles;
+    slicers = profiles
+      .filter((profile) => profile.available)
+      .map((profile) => ({
+        id: profile.id,
+        bundle_id: profile.bundle_id,
+        display_name: profile.display_name,
+        app_path: profile.app_path,
+      }));
+    activeSlicerId = saved && slicers.some((slicer) => slicer.id === saved) ? saved : null;
     updateHandoffButton();
+    refreshSettingsPanel();
     void refreshColorwayPalette();
+    return slicers;
+  }
+
+  async function initSlicers() {
+    await refreshSlicers().catch(() => {
+      slicerProfiles = [];
+      slicers = [];
+      activeSlicerId = null;
+      updateHandoffButton();
+      refreshSettingsPanel();
+      void refreshColorwayPalette();
+    });
   }
   initSlicers();
 
-  // Printer list = detected from installed slicers (refreshed every launch,
-  // read-only) + manual entries from settings.json. Active printer: whatever
-  // was chosen last if it still exists, else the detected printer from the
-  // default slicer, else the first one, else a generic 256mm bed so bed-fit
-  // always has *something* to evaluate against.
-  let printers: Printer[] = [];
-  async function buildPrinterList(): Promise<{ list: Printer[]; activeId: string }> {
-    const [settings, detected, defaultSlicer] = await Promise.all([
-      getSettings(),
-      detectPrinters().catch(() => []),
-      getDefaultSlicerId(),
-    ]);
-    const list: Printer[] = [
-      ...detected.map((d) => ({
-        id: d.id,
-        name: `${d.name} · ${d.source_display}`,
-        bed_mm: d.bed_mm,
-      })),
-      ...settings.printers,
-    ];
-    if (list.length === 0) {
-      list.push({ id: "generic-256", name: "Generic 256 mm bed", bed_mm: [256, 256, 256] });
+  async function refreshPrinterFleet(deletedPrinterId?: string): Promise<void> {
+    const [settingsResult, catalogResult, detectedResult, logsResult, remindersResult] =
+      await Promise.allSettled([
+        getSettings(),
+        libraryListPrinters(),
+        detectPrinters(),
+        libraryListPrinterMaintenanceLogs(),
+        libraryListPrinterReminders(null, true),
+      ]);
+    if (catalogResult.status === "rejected") throw catalogResult.reason;
+    const settings = settingsResult.status === "fulfilled" ? settingsResult.value : null;
+    const catalog = catalogResult.value;
+    const detected = detectedResult.status === "fulfilled" ? detectedResult.value : [];
+    const maintenanceLogs =
+      logsResult.status === "fulfilled"
+        ? logsResult.value.map(mapMaintenanceLog)
+        : printerFleetModel.maintenanceLogs;
+    const maintenanceReminders =
+      remindersResult.status === "fulfilled"
+        ? remindersResult.value.map(mapMaintenanceReminder)
+        : printerFleetModel.maintenanceReminders;
+    managedPrinters = catalog.map(mapLibraryPrinter);
+    const slicerDetections = detected.map((item) => ({
+      id: item.id,
+      name: `${item.name} · ${item.source_display}`,
+      model: item.name,
+      bedMm: [...item.bed_mm] as [number, number, number],
+      source: item.source_display,
+    }));
+    const seen = new Set<string>();
+    const list: Printer[] = [];
+    const pushPrinter = (printer: Printer) => {
+      if (seen.has(printer.id)) return;
+      seen.add(printer.id);
+      list.push(printer);
+    };
+    for (const printer of managedPrinters) {
+      pushPrinter({ id: printer.id, name: printer.name, bed_mm: [...printer.bedMm] });
     }
-    const fromDefaultSlicer = detected.find((d) => d.source_slicer === defaultSlicer)?.id;
-    const activeId = list.some((p) => p.id === settings.active_printer)
-      ? settings.active_printer
-      : (fromDefaultSlicer ?? list[0].id);
-    return { list, activeId };
+    for (const detection of detected) {
+      pushPrinter({
+        id: detection.id,
+        name: `${detection.name} · ${detection.source_display}`,
+        bed_mm: [...detection.bed_mm],
+      });
+    }
+    pushPrinter({ id: GENERIC_PRINTER_ID, name: "Generic 256 mm bed", bed_mm: [256, 256, 256] });
+
+    let activeId = settings?.active_printer || activePrinterId || GENERIC_PRINTER_ID;
+    if (
+      deletedPrinterId &&
+      activeId === deletedPrinterId &&
+      !managedPrinters.some((printer) => printer.id === deletedPrinterId)
+    ) {
+      activeId = GENERIC_PRINTER_ID;
+      await setActivePrinter(GENERIC_PRINTER_ID).catch(() => {});
+    }
+    if (!seen.has(activeId)) {
+      pushPrinter({
+        id: activeId,
+        name: `Unavailable printer (${activeId})`,
+        bed_mm: [256, 256, 256],
+      });
+    }
+    printers = list;
+    activePrinterId = activeId;
+    printerFleetModel = {
+      managedPrinters,
+      slicerDetections,
+      activePrinterId,
+      maintenanceLogs,
+      maintenanceReminders,
+    };
+    printerFleetManager?.updateModel(printerFleetModel);
+    const activeManagedPrinterId = managedPrinters.some((printer) => printer.id === activePrinterId)
+      ? activePrinterId
+      : null;
+    libraryPanel.setPrinterOptions(
+      managedPrinters.map((printer) => ({ id: printer.id, name: printer.name })),
+      activeManagedPrinterId,
+    );
+    hud.setPrinters(printers, activePrinterId);
+    const active = printers.find((printer) => printer.id === activePrinterId);
+    if (active) viewport.setBed(active.bed_mm);
+    refreshSettingsPanel();
+    if (settings && !settings.active_printer) void setActivePrinter(GENERIC_PRINTER_ID);
   }
+
+  const printerFleetCallbacks: PrinterFleetCallbacks = {
+    removePrinter: async (id) => {
+      const target = managedPrinters.find((printer) => printer.id === id);
+      if (!target) throw new Error("Printer is no longer available.");
+      try {
+        await libraryDeletePrinter(id, target.metadataVersion);
+      } catch (error) {
+        // Deletion may have succeeded before the settings fallback failed.
+        // Re-read both stores before letting the UI report the error.
+        await refreshPrinterFleet(id);
+        throw error;
+      }
+      await refreshPrinterFleet();
+    },
+    savePrinter: async (draft) => {
+      const input = mapPrinterDraftToInput(draft);
+      const saved = draft.id
+        ? await libraryUpdatePrinter(
+            draft.id,
+            draft.metadataVersion ?? 0,
+            input,
+            draft.endpointApproved,
+          )
+        : await libraryCreatePrinter(input, draft.endpointApproved);
+      await refreshPrinterFleet();
+      return mapLibraryPrinter(saved);
+    },
+    setDefaultPrinter: async (id) => {
+      await setActivePrinter(id);
+      setActivePrinterView(id);
+    },
+    discoverPrinters: async (range) =>
+      (await libraryDiscoverPrinters(range)).map(mapDiscoverySuggestion),
+    cancelDiscovery: libraryCancelPrinterDiscovery,
+    addDiscoveredPrinters: async (items) => {
+      const saved = await libraryCreatePrintersBatch(
+        items.map(({ draft, endpointApproved }) => ({
+          input: mapPrinterDraftToInput(draft),
+          endpointApproved,
+        })),
+      );
+      await refreshPrinterFleet();
+      return saved.map(mapLibraryPrinter);
+    },
+    testConnection: async (id, mainboardId, discoverMainboardId) => {
+      const response = await libraryTestPrinterConnection(id, mainboardId, discoverMainboardId);
+      await refreshPrinterFleet();
+      return {
+        result: response.result,
+        printer: mapLibraryPrinter(response.printer),
+        statusEventObserved: response.statusEventObserved,
+      };
+    },
+    saveMaintenanceLog: async (draft) => {
+      const input = mapMaintenanceLogDraftToInput(draft);
+      if (draft.id) {
+        if (draft.metadataVersion === null) {
+          throw new Error("Reload this maintenance log before editing it.");
+        }
+        const saved = await libraryUpdatePrinterMaintenanceLog(
+          draft.id,
+          draft.metadataVersion,
+          input,
+        );
+        return mapMaintenanceLog(saved);
+      }
+      const saved = await libraryCreatePrinterMaintenanceLog(draft.printerId, input);
+      return mapMaintenanceLog(saved);
+    },
+    deleteMaintenanceLog: (id, expectedVersion) =>
+      libraryDeletePrinterMaintenanceLog(id, expectedVersion),
+    saveMaintenanceReminder: async (draft) => {
+      const input = mapMaintenanceReminderDraftToInput(draft);
+      const saved = draft.id
+        ? await libraryUpdatePrinterReminder(draft.id, draft.metadataVersion ?? 0, input)
+        : await libraryCreatePrinterReminder(draft.printerId, input);
+      return mapMaintenanceReminder(saved);
+    },
+    completeMaintenanceReminder: async (id, expectedVersion) =>
+      mapReminderCompletion(
+        await libraryCompletePrinterReminder(id, expectedVersion, {
+          completedAt: new Date().toISOString(),
+          notes: "",
+        }),
+      ),
+    deleteMaintenanceReminder: (id) => {
+      const reminder = printerFleetModel.maintenanceReminders.find((item) => item.id === id);
+      if (!reminder) throw new Error("Reminder is no longer available.");
+      return libraryDeletePrinterReminder(id, reminder.metadataVersion);
+    },
+  };
+
+  printerFleetManager = new PrinterFleetManager(main, printerFleetModel, printerFleetCallbacks);
+  settingsPanel.addExtensionSection(printerFleetManager.element);
 
   async function initSettings() {
     const settings = await getSettings();
@@ -687,13 +952,7 @@ export function startApp(extensions: AppExtensions): void {
       applyAccent(accentColor);
     }
     hud.setUnits(displayUnits);
-    const { list, activeId } = await buildPrinterList();
-    printers = list;
-    activePrinterId = activeId;
-    hud.setPrinters(printers, activeId);
-    const active = printers.find((p) => p.id === activeId);
-    if (active) viewport.setBed(active.bed_mm);
-    if (activeId !== settings.active_printer) void setActivePrinter(activeId);
+    await refreshPrinterFleet();
   }
   initSettings();
 
@@ -735,22 +994,26 @@ export function startApp(extensions: AppExtensions): void {
   // is what lets list_dir refuse anything outside them.
   tree.onOpenFile = (path) => loadModel(path);
   tree.onTrashFile = async (path) => {
-    await moveTreeFileToTrash(path);
-    if (path !== loadedSourcePath && path !== loadingSourcePath) return;
-    const gen = ++generation;
-    stepController?.abort();
-    stepController = null;
-    loadingSourcePath = null;
-    loadedSourcePath = null;
-    loadedGeneration = null;
-    loadedFormat = null;
-    plateSession.reset(gen);
-    colorFeature.reset(gen);
-    clearProgressTimer();
-    hud.hide();
-    setWindowTitle(null);
-    updateHandoffButton();
-    setOverlay({ kind: "hint", text: "Model moved to Trash." });
+    const receipt = await moveTreeFileToTrash(path);
+    if (path === loadedSourcePath || path === loadingSourcePath) {
+      const gen = ++generation;
+      stepController?.abort();
+      stepController = null;
+      loadingSourcePath = null;
+      loadedSourcePath = null;
+      loadedGeneration = null;
+      loadedFormat = null;
+      plateSession.reset(gen);
+      colorFeature.reset(gen);
+      clearProgressTimer();
+      hud.hide();
+      setWindowTitle(null);
+      updateHandoffButton();
+    }
+    setOverlay({
+      kind: "hint",
+      text: `Item moved to a recoverable hold at ${receipt.recoveryPath}. Journal: ${receipt.journalPath}.`,
+    });
   };
   tree.onRootChanged = () => hideFolderModal();
   tree.onPickFolder = () => {
@@ -1015,14 +1278,16 @@ export function startApp(extensions: AppExtensions): void {
     };
     activeLibraryRefresh = request;
     try {
-      const [folders, models, roots, catalogSettings, tags, filaments] = await Promise.all([
-        libraryService.listFolders(),
-        libraryService.listModels(),
-        libraryService.listRoots(),
-        libraryService.getCatalogSettings(),
-        libraryService.listTags(),
-        libraryService.listFilaments(true),
-      ]);
+      const [folders, models, roots, catalogSettings, tags, filaments, partStock] =
+        await Promise.all([
+          libraryService.listFolders(),
+          libraryService.listModels(),
+          libraryService.listRoots(),
+          libraryService.getCatalogSettings(),
+          libraryService.listTags(),
+          libraryService.listFilaments(true),
+          libraryService.listPartStock(),
+        ]);
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
           generation: libraryRefreshSequence,
@@ -1030,7 +1295,7 @@ export function startApp(extensions: AppExtensions): void {
       ) {
         return;
       }
-      libraryPanel.render(folders, models, roots, catalogSettings, tags, filaments);
+      libraryPanel.render(folders, models, roots, catalogSettings, tags, filaments, partStock);
       if (libraryOperations.isCurrent(owner)) {
         libraryPanel.setStatus(
           "Managed copies are stored locally and survive source-file changes.",
@@ -1158,16 +1423,29 @@ export function startApp(extensions: AppExtensions): void {
     await refreshLibrary();
   };
   libraryPanel.onListPrintAttempts = libraryService.listPrintAttempts;
-  libraryPanel.onCreatePrintAttempt = async (modelId, input) => {
-    await libraryService.createPrintAttempt(modelId, input);
+  libraryPanel.onCreatePrintAttempt = async (modelId, input, printerId) => {
+    await libraryService.createPrintAttempt(modelId, input, printerId ?? null);
     await refreshLibrary();
   };
-  libraryPanel.onUpdatePrintAttempt = async (attemptId, input) => {
-    await libraryService.updatePrintAttempt(attemptId, input);
+  libraryPanel.onUpdatePrintAttempt = async (attemptId, input, printerId) => {
+    await libraryService.updatePrintAttempt(attemptId, input, printerId);
     await refreshLibrary();
   };
   libraryPanel.onDeletePrintAttempt = async (attemptId) => {
     await libraryService.deletePrintAttempt(attemptId);
+    await refreshLibrary();
+  };
+  libraryPanel.onListPartStock = libraryService.listPartStock;
+  libraryPanel.onCreatePartStock = async (input) => {
+    await libraryService.createPartStock(input);
+    await refreshLibrary();
+  };
+  libraryPanel.onUpdatePartStock = async (id, expectedVersion, input) => {
+    await libraryService.updatePartStock(id, expectedVersion, input);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeletePartStock = async (id, expectedVersion) => {
+    await libraryService.deletePartStock(id, expectedVersion);
     await refreshLibrary();
   };
   libraryPanel.onCreateBundle = async (modelIds) => {
@@ -1243,7 +1521,7 @@ export function startApp(extensions: AppExtensions): void {
   let bundlePreviewGeneration = 0;
   libraryPanel.onPreviewBundle = async (bundleId) => {
     const preview = await libraryService.prepareBundlePreview(bundleId, ++bundlePreviewGeneration);
-    await libraryBundle.show(preview, await detectSlicers());
+    await libraryBundle.show(preview, await refreshSlicers());
   };
   libraryBundle.onClosePreview = libraryService.closeBundlePreview;
   libraryBundle.onHandoff = libraryService.sendBundleToSlicer;
@@ -1300,7 +1578,16 @@ export function startApp(extensions: AppExtensions): void {
   };
   libraryManagement.onCleanup = async () => {
     const result = await libraryService.cleanupOrphanCache();
-    libraryPanel.setStatus(`Cleaned ${result.files} orphan cache files · ${result.bytes} bytes.`);
+    const status =
+      result.files > 0
+        ? `Removed ${result.files} generated orphan files · ${result.bytes} bytes. Original model files were untouched.`
+        : "No generated orphan files needed cleanup.";
+    const handoff = result.handoffCleanupSkipped ? " Slicer handoff cleanup was skipped." : "";
+    const issues =
+      result.issues.length > 0
+        ? ` ${result.issues.length} item(s) could not be fully confirmed: ${result.issues.slice(0, 2).join("; ")}`
+        : "";
+    libraryPanel.setStatus(`${status}${handoff}${issues}`);
   };
   let filamentDialogModelIds: string[] = [];
   const refreshFilamentDialog = async () => {

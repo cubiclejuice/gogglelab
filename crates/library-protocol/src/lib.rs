@@ -54,6 +54,10 @@ pub struct RuntimeError {
     pub message: String,
     pub retryable: bool,
     pub current_version: Option<u64>,
+    /// Path-free recovery receipts for any original source bytes retained
+    /// before the operation stopped. Empty on ordinary failures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_holds: Vec<SourceHoldReceipt>,
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -522,7 +526,11 @@ pub struct ActionPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ManagementResult {
     Removed {
         snapshot_id: String,
@@ -557,10 +565,12 @@ pub enum ManagementResult {
     Quarantined {
         snapshot_id: String,
         model_id: String,
+        source_holds: Vec<SourceHoldReceipt>,
     },
     QuarantinedBatch {
         snapshot_id: String,
         models: Vec<String>,
+        source_holds: Vec<SourceHoldReceipt>,
     },
     QuarantineUndone {
         model: MutationVersion,
@@ -570,9 +580,11 @@ pub enum ManagementResult {
     },
     Moved {
         model: MutationVersion,
+        source_holds: Vec<SourceHoldReceipt>,
     },
     MovedBatch {
         models: Vec<MutationVersion>,
+        source_holds: Vec<SourceHoldReceipt>,
     },
     Purged {
         backup_destination_handle_id: String,
@@ -583,6 +595,24 @@ pub enum ManagementResult {
         files: u64,
         bytes: u64,
     },
+}
+
+/// Receipt for an original source file retained after a guarded source action.
+///
+/// The opaque `root_handle_id` and `relative_path` identify the original
+/// location without exposing a host filesystem path. Hold and journal names
+/// are sibling names in that admitted root. The payload remains recoverable;
+/// no permanent deletion is implied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceHoldReceipt {
+    pub model_id: String,
+    pub root_handle_id: String,
+    pub relative_path: String,
+    pub hold_name: String,
+    pub journal_name: String,
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -717,6 +747,10 @@ pub struct VersionedMetadataUpdate {
     pub model_id: String,
     pub expected_version: u64,
     pub patch: MetadataPatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filament_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -772,6 +806,63 @@ pub struct Filament {
     pub source_missing: bool,
 }
 
+/// Consumable hardware inventory; separate from geometric 3D parts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PartStock {
+    pub id: String,
+    pub metadata_version: u64,
+    pub name: String,
+    pub category: Option<String>,
+    pub quantity: u64,
+    pub unit: String,
+    pub notes: String,
+    pub low_stock: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PartStockInput {
+    pub name: String,
+    pub category: Option<String>,
+    pub quantity: u32,
+    pub unit: String,
+    pub notes: String,
+    pub low_stock: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartUsageInput {
+    pub id: String,
+    /// Quantity consumed per copy of the model.
+    pub quantity: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<PartUsageSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PartUsageSnapshot {
+    pub name: String,
+    pub category: Option<String>,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintAttemptPart {
+    /// `None` means the stock row was deleted; the event snapshot remains.
+    pub id: Option<String>,
+    pub name: String,
+    pub category: Option<String>,
+    pub unit: String,
+    pub quantity_per_copy: u32,
+    /// Total inventory consumed across all copies in this event.
+    pub quantity: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFilamentAssignment {
@@ -784,6 +875,7 @@ pub struct ModelFilamentAssignment {
 pub enum PrintOutcome {
     Printed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -794,6 +886,33 @@ pub struct PrintAttemptInput {
     pub notes: String,
     pub filament_ids: Vec<String>,
     pub outcome: PrintOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<PartUsageInput>>,
+}
+
+/// Single-event input with optional local printer attribution. Keeping this
+/// separate from `PrintAttemptInput` preserves the older batch wire contract.
+/// On update, omitted `printerId` preserves attribution while explicit `null`
+/// clears it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintAttemptInputWithPrinter {
+    #[serde(flatten)]
+    pub input: PrintAttemptInput,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub printer_id: Option<Option<String>>,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -805,7 +924,15 @@ pub struct PrintAttempt {
     pub quantity: u32,
     pub notes: String,
     pub filament_ids: Vec<String>,
+    #[serde(default)]
+    pub parts: Vec<PrintAttemptPart>,
     pub outcome: PrintOutcome,
+    #[serde(default)]
+    pub stock_adjusted: Option<bool>,
+    #[serde(default)]
+    pub printer_id: Option<String>,
+    #[serde(default)]
+    pub printer_name: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1007,6 +1134,7 @@ pub trait TagEngine: Send + Sync {
             message: "Model tag assignment is not supported by this host".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
     }
     fn remove_model_tags_by_name(
@@ -1021,6 +1149,7 @@ pub trait TagEngine: Send + Sync {
             message: "Model tag assignment is not supported by this host".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
     }
     fn create_tag(
@@ -1093,6 +1222,28 @@ pub trait FilamentEngine: Send + Sync {
     ) -> Result<Vec<MutationVersion>, RuntimeError>;
 }
 
+pub trait PartStockEngine: Send + Sync {
+    fn list_part_stock(&self, context: &RequestContext) -> Result<Vec<PartStock>, RuntimeError>;
+    fn create_part_stock(
+        &self,
+        context: &RequestContext,
+        input: PartStockInput,
+    ) -> Result<PartStock, RuntimeError>;
+    fn update_part_stock(
+        &self,
+        context: &RequestContext,
+        part_id: &str,
+        expected_version: u64,
+        input: PartStockInput,
+    ) -> Result<PartStock, RuntimeError>;
+    fn delete_part_stock(
+        &self,
+        context: &RequestContext,
+        part_id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError>;
+}
+
 pub trait PrintHistoryEngine: Send + Sync {
     fn create_print_attempts(
         &self,
@@ -1112,12 +1263,46 @@ pub trait PrintHistoryEngine: Send + Sync {
         model_id: &str,
         input: PrintAttemptInput,
     ) -> Result<PrintAttempt, RuntimeError>;
+    fn create_print_attempt_with_printer(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        input: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, RuntimeError> {
+        if matches!(input.printer_id, Some(Some(_))) {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Unsupported,
+                message: "Printer attribution is unavailable in this runtime".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        self.create_print_attempt(context, model_id, input.input)
+    }
     fn update_print_attempt(
         &self,
         context: &RequestContext,
         attempt_id: &str,
         input: PrintAttemptInput,
     ) -> Result<PrintAttempt, RuntimeError>;
+    fn update_print_attempt_with_printer(
+        &self,
+        context: &RequestContext,
+        attempt_id: &str,
+        input: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, RuntimeError> {
+        if input.printer_id.is_some() {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Unsupported,
+                message: "Printer attribution is unavailable in this runtime".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        self.update_print_attempt(context, attempt_id, input.input)
+    }
     fn delete_print_attempt(
         &self,
         context: &RequestContext,
@@ -1204,6 +1389,7 @@ pub trait ScanEngine: Send + Sync {
                 message: "Root-relative subdirectory scans are unsupported by this host".into(),
                 retryable: false,
                 current_version: None,
+                source_holds: Vec::new(),
             })
         }
     }
@@ -1300,6 +1486,7 @@ pub trait ManagementEngine: Send + Sync {
             message: "Library JSON export is unavailable".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
     }
 }
@@ -1593,6 +1780,256 @@ impl<T> LibraryEngine for T where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    struct LegacyPrintHistoryEngine;
+
+    fn legacy_print_attempt() -> PrintAttempt {
+        PrintAttempt {
+            id: "print-1".into(),
+            model_id: "model-1".into(),
+            printed_at: "2026-10-14T12:00:00.000Z".into(),
+            quantity: 1,
+            notes: String::new(),
+            filament_ids: Vec::new(),
+            parts: Vec::new(),
+            outcome: PrintOutcome::Printed,
+            stock_adjusted: None,
+            printer_id: None,
+            printer_name: None,
+            created_at: "2026-10-14T12:00:00.000Z".into(),
+            updated_at: "2026-10-14T12:00:00.000Z".into(),
+        }
+    }
+
+    impl PrintHistoryEngine for LegacyPrintHistoryEngine {
+        fn create_print_attempts(
+            &self,
+            _: &RequestContext,
+            _: &str,
+            _: Vec<PrintAttemptBatchItem>,
+        ) -> Result<Vec<PrintAttempt>, RuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn list_print_attempts(
+            &self,
+            _: &RequestContext,
+            _: &str,
+        ) -> Result<Vec<PrintAttempt>, RuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn create_print_attempt(
+            &self,
+            _: &RequestContext,
+            _: &str,
+            _: PrintAttemptInput,
+        ) -> Result<PrintAttempt, RuntimeError> {
+            Ok(legacy_print_attempt())
+        }
+
+        fn update_print_attempt(
+            &self,
+            _: &RequestContext,
+            _: &str,
+            _: PrintAttemptInput,
+        ) -> Result<PrintAttempt, RuntimeError> {
+            Ok(legacy_print_attempt())
+        }
+
+        fn delete_print_attempt(&self, _: &RequestContext, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn legacy_print_history_engines_keep_old_calls_and_reject_unhandled_patches() {
+        let engine = LegacyPrintHistoryEngine;
+        let context = RequestContext {
+            principal_id: "test".into(),
+            capabilities: BTreeSet::new(),
+            request_id: "request".into(),
+        };
+        let legacy_input: PrintAttemptInputWithPrinter =
+            serde_json::from_value(serde_json::json!({
+                "printedAt": "2026-10-14T12:00:00Z",
+                "quantity": 1,
+                "notes": "",
+                "filamentIds": [],
+                "outcome": "printed"
+            }))
+            .unwrap();
+        assert!(engine
+            .create_print_attempt_with_printer(&context, "model-1", legacy_input)
+            .is_ok());
+
+        let linked: PrintAttemptInputWithPrinter = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-14T12:00:00Z",
+            "quantity": 1,
+            "notes": "",
+            "filamentIds": [],
+            "outcome": "printed",
+            "printerId": "printer-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            engine
+                .create_print_attempt_with_printer(&context, "model-1", linked)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Unsupported
+        );
+
+        let clear_update: PrintAttemptInputWithPrinter =
+            serde_json::from_value(serde_json::json!({
+                "printedAt": "2026-10-14T12:00:00Z",
+                "quantity": 1,
+                "notes": "",
+                "filamentIds": [],
+                "outcome": "printed",
+                "printerId": null
+            }))
+            .unwrap();
+        assert_eq!(
+            engine
+                .update_print_attempt_with_printer(&context, "print-1", clear_update)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Unsupported
+        );
+
+        let batch: Vec<PrintAttemptBatchItem> = serde_json::from_value(serde_json::json!([{
+            "modelId": "model-1",
+            "input": {
+                "printedAt": "2026-10-14T12:00:00Z",
+                "quantity": 1,
+                "notes": "",
+                "filamentIds": [],
+                "outcome": "printed"
+            }
+        }]))
+        .unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn single_print_attempt_preserves_printer_patch_presence_and_batch_contract() {
+        let base = serde_json::json!({
+            "printedAt": "2026-10-14T12:00:00Z",
+            "quantity": 1,
+            "notes": "",
+            "filamentIds": [],
+            "outcome": "printed"
+        });
+
+        let omitted: PrintAttemptInputWithPrinter = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.printer_id, None);
+        assert!(serde_json::to_value(&omitted)
+            .unwrap()
+            .get("printerId")
+            .is_none());
+
+        let mut clear_value = base.clone();
+        clear_value["printerId"] = Value::Null;
+        let clear: PrintAttemptInputWithPrinter = serde_json::from_value(clear_value).unwrap();
+        assert_eq!(clear.printer_id, Some(None));
+        assert_eq!(
+            serde_json::to_value(&clear).unwrap()["printerId"],
+            Value::Null
+        );
+
+        let mut linked_value = base.clone();
+        linked_value["printerId"] = Value::String("printer-1".into());
+        let linked: PrintAttemptInputWithPrinter = serde_json::from_value(linked_value).unwrap();
+        assert_eq!(linked.printer_id, Some(Some("printer-1".into())));
+
+        let batch: PrintAttemptBatchItem = serde_json::from_value(serde_json::json!({
+            "modelId": "model-1",
+            "input": base
+        }))
+        .unwrap();
+        assert_eq!(batch.input.quantity, 1);
+        assert!(serde_json::to_value(batch).unwrap()["input"]
+            .get("printerId")
+            .is_none());
+
+        let result = PrintAttempt {
+            id: "print-1".into(),
+            model_id: "model-1".into(),
+            printed_at: "2026-10-14T12:00:00.000Z".into(),
+            quantity: 1,
+            notes: String::new(),
+            filament_ids: Vec::new(),
+            parts: Vec::new(),
+            outcome: PrintOutcome::Printed,
+            stock_adjusted: Some(true),
+            printer_id: Some("printer-1".into()),
+            printer_name: Some("Workshop".into()),
+            created_at: "2026-10-14T12:00:00.000Z".into(),
+            updated_at: "2026-10-14T12:00:00.000Z".into(),
+        };
+        let encoded = serde_json::to_value(result).unwrap();
+        assert_eq!(encoded["printerId"], "printer-1");
+        assert_eq!(encoded["printerName"], "Workshop");
+
+        let mut unassigned = legacy_print_attempt();
+        unassigned.printer_id = None;
+        unassigned.printer_name = None;
+        let encoded = serde_json::to_value(unassigned).unwrap();
+        assert_eq!(encoded["printerId"], Value::Null);
+        assert_eq!(encoded["printerName"], Value::Null);
+    }
+
+    #[test]
+    fn cancelled_attempts_and_optional_stock_usage_keep_the_wire_contract() {
+        let input: PrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-15T12:00:00Z",
+            "quantity": 2,
+            "notes": "cancelled after setup",
+            "filamentIds": [],
+            "outcome": "cancelled",
+            "parts": [{"id": "part-1", "quantity": 3}]
+        }))
+        .unwrap();
+        assert_eq!(input.outcome, PrintOutcome::Cancelled);
+        assert_eq!(input.parts.as_ref().unwrap()[0].id, "part-1");
+        assert_eq!(input.parts.as_ref().unwrap()[0].quantity, 3);
+
+        let legacy: PrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printedAt": "2026-10-15T12:00:00Z",
+            "quantity": 1,
+            "notes": "legacy",
+            "filamentIds": [],
+            "outcome": "failed"
+        }))
+        .unwrap();
+        assert_eq!(legacy.parts, None);
+        assert_eq!(serde_json::to_value(legacy).unwrap().get("parts"), None);
+    }
+
+    #[test]
+    fn unknown_stock_adjustment_state_is_explicit_on_the_wire() {
+        let attempt = PrintAttempt {
+            id: "attempt-1".into(),
+            model_id: "model-1".into(),
+            printed_at: "2026-10-15T12:00:00Z".into(),
+            quantity: 1,
+            notes: String::new(),
+            filament_ids: Vec::new(),
+            parts: Vec::new(),
+            outcome: PrintOutcome::Failed,
+            stock_adjusted: None,
+            printer_id: None,
+            printer_name: None,
+            created_at: "2026-10-15T12:00:00Z".into(),
+            updated_at: "2026-10-15T12:00:00Z".into(),
+        };
+        let value = serde_json::to_value(attempt).unwrap();
+        assert!(value.get("stockAdjusted").is_some());
+        assert_eq!(value["stockAdjusted"], Value::Null);
+        assert!(value.get("stock_adjusted").is_none());
+    }
 
     #[test]
     fn protocol_dtos_use_camel_case_and_keep_secrets_out_of_context() {
@@ -1621,6 +2058,105 @@ mod tests {
         .unwrap();
         assert!(context_fields.get("token").is_none());
         assert!(context_fields.get("secret").is_none());
+    }
+
+    #[test]
+    fn generated_cleanup_reports_only_deleted_counts() {
+        let result = ManagementResult::CleanupCompleted {
+            files: 1,
+            bytes: 19,
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["kind"], "cleanupCompleted");
+        assert_eq!(encoded["files"], 1);
+        assert_eq!(encoded["bytes"], 19);
+        assert_eq!(
+            serde_json::from_value::<ManagementResult>(encoded).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn source_action_results_expose_path_free_recovery_holds() {
+        let hold = SourceHoldReceipt {
+            model_id: "model-1".into(),
+            root_handle_id: "root-1".into(),
+            relative_path: "models/part.stl".into(),
+            hold_name: ".part.stl.hold.data".into(),
+            journal_name: ".part.stl.hold.json".into(),
+            bytes: 19,
+            sha256: "b".repeat(64),
+        };
+        let results = [
+            ManagementResult::Quarantined {
+                snapshot_id: "removal-1".into(),
+                model_id: "model-1".into(),
+                source_holds: vec![hold.clone()],
+            },
+            ManagementResult::QuarantinedBatch {
+                snapshot_id: "removal-1".into(),
+                models: vec!["model-1".into()],
+                source_holds: vec![hold.clone()],
+            },
+            ManagementResult::Moved {
+                model: MutationVersion {
+                    model_id: "model-1".into(),
+                    metadata_version: 2,
+                },
+                source_holds: vec![hold.clone()],
+            },
+            ManagementResult::MovedBatch {
+                models: vec![MutationVersion {
+                    model_id: "model-1".into(),
+                    metadata_version: 2,
+                }],
+                source_holds: vec![hold],
+            },
+        ];
+
+        for result in results {
+            let encoded = serde_json::to_value(&result).unwrap();
+            assert_eq!(encoded["sourceHolds"].as_array().unwrap().len(), 1);
+            assert_eq!(encoded["sourceHolds"][0]["rootHandleId"], "root-1");
+            assert_eq!(encoded["sourceHolds"][0]["relativePath"], "models/part.stl");
+            assert!(encoded["sourceHolds"][0].get("root_handle_id").is_none());
+            assert_eq!(
+                serde_json::from_value::<ManagementResult>(encoded).unwrap(),
+                result
+            );
+        }
+
+        let partial = RuntimeError {
+            code: RuntimeErrorCode::Io,
+            message: "operation stopped after retaining source bytes".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: vec![SourceHoldReceipt {
+                model_id: "model-1".into(),
+                root_handle_id: "root-1".into(),
+                relative_path: "models/part.stl".into(),
+                hold_name: ".part.stl.hold.data".into(),
+                journal_name: ".part.stl.hold.json".into(),
+                bytes: 19,
+                sha256: "b".repeat(64),
+            }],
+        };
+        let encoded_error = serde_json::to_value(&partial).unwrap();
+        assert_eq!(encoded_error["code"], "io");
+        assert_eq!(
+            encoded_error["message"],
+            "operation stopped after retaining source bytes"
+        );
+        assert_eq!(encoded_error["sourceHolds"][0]["bytes"], 19);
+        assert!(encoded_error.get("source_holds").is_none());
+        let empty_error = RuntimeError {
+            source_holds: Vec::new(),
+            ..partial
+        };
+        assert!(serde_json::to_value(empty_error)
+            .unwrap()
+            .get("sourceHolds")
+            .is_none());
     }
 }
 

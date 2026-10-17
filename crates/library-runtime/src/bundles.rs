@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ use library_protocol::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::secure_fs::Directory;
 use crate::{format_system_time, LibraryRuntime};
 
 const MAX_PREVIEW_MEMBERS: usize = 32;
@@ -331,12 +332,14 @@ pub(crate) fn create_bundle_archive(
     let revision = runtime.catalog_revision();
     let namespace = owned_bundle_namespace(runtime.host_library_root())?;
     let path = namespace.join(format!("bundle-{}.zip", uuid::Uuid::new_v4().simple()));
+    let directory = Directory::open(&namespace).map_err(|_| io_error())?;
+    let name = path.file_name().ok_or_else(|| io_error())?;
+    let mut created = false;
     let result = (|| {
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let file = directory
+            .create_new_file_read_write(name)
             .map_err(|_| io_error())?;
+        created = true;
         let mut archive = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
@@ -348,22 +351,28 @@ pub(crate) fn create_bundle_archive(
         }
         let file = archive.finish().map_err(|_| io_error())?;
         file.sync_all().map_err(|_| io_error())?;
-        validate_snapshot(runtime, bundle_id, &snapshot, revision)?;
-        let metadata = fs::symlink_metadata(&path).map_err(|_| io_error())?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() > MAX_BUNDLE_DOWNLOAD_BYTES
-        {
+        let metadata = file.metadata().map_err(|_| io_error())?;
+        if !metadata.is_file() || metadata.len() > MAX_BUNDLE_DOWNLOAD_BYTES {
             return Err(invalid("Generated bundle archive exceeds its owned limit"));
+        }
+        let expected_hash = hash_file(file.try_clone().map_err(|_| io_error())?, metadata.len())?;
+        validate_snapshot(runtime, bundle_id, &snapshot, revision)?;
+        let published = directory.open_file(name).map_err(|_| io_error())?;
+        let published_metadata = published.metadata().map_err(|_| io_error())?;
+        if published_metadata.len() != metadata.len()
+            || hash_file(published, metadata.len())? != expected_hash
+        {
+            let _ = directory.hold_entry(name);
+            return Err(stale("Generated bundle archive changed before publication"));
         }
         Ok(BundleArchive {
             path: path.clone(),
             bytes: metadata.len(),
-            sha256: hash_file(&path, metadata.len())?,
+            sha256: expected_hash,
         })
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&path);
+    if result.is_err() && created {
+        let _ = directory.hold_entry(name);
     }
     result
 }
@@ -445,8 +454,8 @@ fn sanitized_name(model: &Model) -> String {
     }
 }
 
-fn hash_file(path: &Path, expected_bytes: u64) -> Result<String, RuntimeError> {
-    let mut file = fs::File::open(path).map_err(|_| io_error())?;
+fn hash_file(mut file: fs::File, expected_bytes: u64) -> Result<String, RuntimeError> {
+    file.seek(SeekFrom::Start(0)).map_err(|_| io_error())?;
     let mut digest = Sha256::new();
     let mut read = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -595,6 +604,7 @@ fn invalid(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -604,6 +614,7 @@ fn not_found(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -613,6 +624,7 @@ fn stale(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: true,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -622,6 +634,7 @@ fn forbidden() -> RuntimeError {
         message: "Bundle preview belongs to another principal".into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -631,6 +644,7 @@ fn busy(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: true,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -640,6 +654,7 @@ fn io_error() -> RuntimeError {
         message: "Bundle preview filesystem operation failed".into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 

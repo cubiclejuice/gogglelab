@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,10 @@ use library_integrations::{
     ProviderConfig, ProviderKind, SpoolmanConfig, StructuredOutputMode,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+use crate::secure_fs::Directory;
 
 const SETTINGS_VERSION: u32 = 1;
 const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
@@ -451,34 +455,72 @@ fn persist_settings(path: &Path, settings: &SettingsFile) -> Result<(), String> 
     {
         return Err("Integration settings file is unsafe".into());
     }
+    if parent
+        .canonicalize()
+        .map_err(|_| "Integration settings directory could not be inspected")?
+        != parent
+    {
+        return Err("Integration settings directory identity changed".into());
+    }
+    let directory = Directory::open(parent)
+        .map_err(|_| "Integration settings directory could not be opened")?;
+    let destination = path
+        .file_name()
+        .ok_or_else(|| "Integration settings filename is invalid".to_string())?;
+    let previous = match directory.open_file(destination) {
+        Ok(file) => Some(settings_fingerprint(file)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("Integration settings file is unsafe".into()),
+    };
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temporary = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
+    let temporary = OsString::from(format!(".integrations-{}-{nonce}.tmp", std::process::id()));
+    let mut file = directory
+        .create_new_file_read_write(&temporary)
         .map_err(|_| "Integration settings temporary file could not be created")?;
-    let result = (|| {
-        file.write_all(&bytes)
-            .map_err(|_| "Integration settings could not be written".to_string())?;
-        file.sync_all()
-            .map_err(|_| "Integration settings could not be synchronized".to_string())?;
+    let write_result = file
+        .write_all(&bytes)
+        .map_err(|_| "Integration settings could not be written".to_string())
+        .and_then(|()| {
+            file.sync_all()
+                .map_err(|_| "Integration settings could not be synchronized".to_string())
+        });
+    drop(file);
+    let result = write_result.and_then(|()| {
         validate_config_ancestors(path)?;
-        fs::rename(&temporary, path)
-            .map_err(|_| "Integration settings could not be published".to_string())
-    })();
+        match &previous {
+            Some(expected) => directory
+                .replace_child_if_same(&temporary, destination, expected, MAX_SETTINGS_BYTES)
+                .map_err(|_| "Integration settings changed before publication".to_string()),
+            None => directory
+                .rename_child_exclusive(&temporary, destination)
+                .map_err(|_| "Integration settings could not be published".to_string()),
+        }
+    });
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = directory.hold_entry(&temporary);
     }
     result
+}
+
+fn settings_fingerprint(file: File) -> Result<(u64, String), String> {
+    let length = file
+        .metadata()
+        .map_err(|_| "Integration settings file could not be inspected")?
+        .len();
+    if length > MAX_SETTINGS_BYTES {
+        return Err("Integration settings file is oversized".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Integration settings file could not be read")?;
+    if bytes.len() as u64 != length {
+        return Err("Integration settings file changed while it was read".into());
+    }
+    Ok((length, format!("{:x}", Sha256::digest(bytes))))
 }
 
 fn validate_config_ancestors(path: &Path) -> Result<(), String> {
@@ -503,6 +545,41 @@ fn validate_config_ancestors(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_replacement_preserves_displaced_bytes_in_recoverable_hold() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().canonicalize().unwrap();
+        let path = directory.join("integrations.json");
+        let previous = b"previous settings bytes";
+        fs::write(&path, previous).unwrap();
+
+        persist_settings(
+            &path,
+            &SettingsFile {
+                version: SETTINGS_VERSION,
+                spoolman: None,
+                providers: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let held = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gogglelab-held-")
+                    && entry.file_name().to_string_lossy().ends_with(".data")
+            })
+            .find(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == previous));
+        assert!(
+            held.is_some(),
+            "settings replacement must preserve the displaced config in a recoverable hold"
+        );
+    }
 
     #[test]
     fn legacy_settings_default_to_local_category_sharing_and_never_persist_credentials() {

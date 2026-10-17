@@ -62,10 +62,6 @@ pub struct SelectedRootHandle {
 }
 
 impl SelectedRootHandle {
-    pub(crate) fn directory(&self) -> &File {
-        &self.directory
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -73,13 +69,16 @@ impl SelectedRootHandle {
     /// Confirms the selected path still resolves to the object held open by
     /// this handle. This detects replacement and symlink substitution.
     pub fn verify_current(&self) -> Result<(), String> {
+        if root_identity(&self.directory)? != self.identity {
+            return Err("The selected folder handle changed identity.".into());
+        }
         verify_root_path(&self.path, self.identity)
     }
 
     /// Atomically creates a child directory relative to the opened root.
     /// The operation never follows a replaced root path or overwrites an
     /// existing child. Callers own product-specific name policy.
-    /// Move only a regular ZIP under this selected root to the operating-system Trash.
+    /// Move a regular ZIP under this selected root to an app-managed recovery hold.
     pub fn move_zip_to_trash(&self, path: &Path) -> Result<(), String> {
         crate::trash::move_zip_to_trash(self, path)
     }

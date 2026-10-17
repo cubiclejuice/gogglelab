@@ -569,7 +569,7 @@ fn schema_v3_recovery_preserves_metadata_history_archive_refs_and_categories() {
 }
 
 #[test]
-fn schema_v6_recovery_preserves_filaments_gallery_capture_ratings_and_history_ids() {
+fn schema_v8_recovery_preserves_filaments_gallery_capture_ratings_and_history_ids() {
     use library_core::{
         CapturePageInput, CaptureReceiptInput, FilamentInput, LibraryDb, PrintAttemptInput,
         PrintOutcome, SpoolmanFilamentRecord, SpoolmanSpoolRecord,
@@ -634,6 +634,7 @@ fn schema_v6_recovery_preserves_filaments_gallery_capture_ratings_and_history_id
             notes: String::new(),
             filament_ids: vec![manual.id.clone(), "legacy-unknown".into()],
             outcome: PrintOutcome::Printed,
+            parts: None,
         },
     )
     .unwrap();
@@ -685,7 +686,10 @@ fn schema_v6_recovery_preserves_filaments_gallery_capture_ratings_and_history_id
     drop(conn);
 
     let manifest = inspect_library(&root).unwrap();
-    assert_eq!(manifest.library_schema_version, 6);
+    assert_eq!(
+        manifest.library_schema_version,
+        library_recovery::LIBRARY_SCHEMA_VERSION
+    );
     assert_eq!(manifest.filament_sources.len(), 1);
     assert_eq!(manifest.filaments.len(), 3);
     assert_eq!(manifest.captures.len(), 1);
@@ -842,6 +846,453 @@ fn schema_v6_recovery_preserves_filaments_gallery_capture_ratings_and_history_id
         .unwrap();
     }
     assert!(inspect_library(&root).is_err());
+}
+
+#[test]
+fn schema_v11_recovery_preserves_part_stock_and_event_snapshots_for_full_and_selected_exports() {
+    use library_core::{
+        LibraryDb, PartStockInput, PartUsageInput, PrintAttemptInput, PrintOutcome,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("library-v11");
+    let db = LibraryDb::open(&root).unwrap();
+    let selected_model = db.create_model("Selected model", None).unwrap();
+    let other_model = db.create_model("Other model", None).unwrap();
+    let screw = db
+        .create_part_stock(&PartStockInput {
+            name: "M3 screw".into(),
+            category: Some("Fasteners".into()),
+            quantity: 24,
+            unit: "pcs".into(),
+            notes: "Shelf A".into(),
+            low_stock: 5,
+        })
+        .unwrap();
+    let spacer = db
+        .create_part_stock(&PartStockInput {
+            name: "Printed spacer".into(),
+            category: Some("Hardware".into()),
+            quantity: 10,
+            unit: "pcs".into(),
+            notes: String::new(),
+            low_stock: 2,
+        })
+        .unwrap();
+    let selected_attempt = db
+        .create_print_attempt(
+            &selected_model.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-15T12:00:00Z".into(),
+                quantity: 2,
+                notes: "Failed jobs still consume parts".into(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Failed,
+                parts: Some(vec![PartUsageInput {
+                    id: screw.id.clone(),
+                    quantity: 3,
+                    snapshot: None,
+                }]),
+            },
+        )
+        .unwrap();
+    let imported_attempt = db
+        .import_print_attempt(
+            &selected_model.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-15T12:10:00Z".into(),
+                quantity: 1,
+                notes: "Historical imported event".into(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Printed,
+                parts: None,
+            },
+            "2026-10-15T12:10:00Z",
+        )
+        .unwrap();
+    let cancelled_attempt = db
+        .create_print_attempt(
+            &selected_model.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-15T12:15:00Z".into(),
+                quantity: 1,
+                notes: "Cancelled event".into(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Cancelled,
+                parts: None,
+            },
+        )
+        .unwrap();
+    let other_attempt = db
+        .create_print_attempt(
+            &other_model.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-15T12:05:00Z".into(),
+                quantity: 1,
+                notes: String::new(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Printed,
+                parts: Some(vec![PartUsageInput {
+                    id: spacer.id.clone(),
+                    quantity: 1,
+                    snapshot: None,
+                }]),
+            },
+        )
+        .unwrap();
+    let consumed_spacer = db.get_part_stock(&spacer.id).unwrap().unwrap();
+    db.delete_part_stock(&spacer.id, consumed_spacer.metadata_version)
+        .unwrap();
+    drop(db);
+
+    let manifest = inspect_library(&root).unwrap();
+    assert_eq!(manifest.library_schema_version, 11);
+    assert_eq!(manifest.parts_stock.len(), 1);
+    assert_eq!(manifest.parts_stock[0].id, screw.id);
+    assert_eq!(manifest.parts_stock[0].metadata_version, 2);
+    assert_eq!(manifest.parts_stock[0].quantity, 18);
+    let selected = manifest
+        .models
+        .iter()
+        .find(|model| model.id == selected_model.id)
+        .unwrap();
+    let selected_part = &selected.print_attempts[0].parts[0];
+    assert_eq!(selected.print_attempts[0].id, selected_attempt.id);
+    assert_eq!(selected.print_attempts[0].stock_adjusted, Some(true));
+    let historical = selected
+        .print_attempts
+        .iter()
+        .find(|attempt| attempt.id == imported_attempt.id)
+        .unwrap();
+    assert_eq!(historical.stock_adjusted, Some(false));
+    let cancelled = selected
+        .print_attempts
+        .iter()
+        .find(|candidate| candidate.id == cancelled_attempt.id)
+        .unwrap();
+    assert_eq!(cancelled.outcome, "cancelled");
+    assert_eq!(cancelled.stock_adjusted, Some(true));
+    assert_eq!(selected_part.part_id, screw.id);
+    assert_eq!(selected_part.part_name, "M3 screw");
+    assert_eq!(selected_part.category.as_deref(), Some("Fasteners"));
+    assert_eq!(selected_part.unit, "pcs");
+    assert_eq!(selected_part.quantity_per_copy, 3);
+    assert_eq!(selected_part.quantity, 6);
+    let other = manifest
+        .models
+        .iter()
+        .find(|model| model.id == other_model.id)
+        .unwrap();
+    let deleted_snapshot = &other.print_attempts[0].parts[0];
+    assert_eq!(other.print_attempts[0].id, other_attempt.id);
+    assert_eq!(deleted_snapshot.part_id, spacer.id);
+    assert_eq!(deleted_snapshot.part_name, "Printed spacer");
+    assert!(manifest.parts_stock.iter().all(|part| part.id != spacer.id));
+
+    let selected_destination = tmp.path().join("selected-v11.zip");
+    let selected_export = export_library_zip(
+        &root,
+        std::slice::from_ref(&selected_model.id),
+        &selected_destination,
+    )
+    .unwrap();
+    assert_eq!(selected_export.models.len(), 1);
+    assert_eq!(selected_export.parts_stock.len(), 1);
+    assert_eq!(selected_export.parts_stock[0].id, screw.id);
+    assert_eq!(selected_export.models[0].print_attempts[0].parts.len(), 1);
+    assert_eq!(
+        selected_export.models[0].print_attempts[0].parts[0].part_id,
+        screw.id
+    );
+    let mut archive = ZipArchive::new(File::open(selected_destination).unwrap()).unwrap();
+    let archived_manifest: serde_json::Value =
+        serde_json::from_slice(&zip_bytes(&mut archive, "manifest.json")).unwrap();
+    assert_eq!(archived_manifest["parts_stock"][0]["id"], screw.id);
+    assert_eq!(
+        archived_manifest["models"][0]["print_attempts"][0]["parts"][0]["quantity"],
+        6
+    );
+    assert_eq!(
+        archived_manifest["models"][0]["print_attempts"][0]["stock_adjusted"],
+        true
+    );
+    assert_eq!(
+        archived_manifest["models"][0]["print_attempts"][1]["stock_adjusted"],
+        false
+    );
+    assert_eq!(
+        archived_manifest["models"][0]["print_attempts"][2]["outcome"],
+        "cancelled"
+    );
+
+    let other_export = export_library_zip(
+        &root,
+        std::slice::from_ref(&other_model.id),
+        &tmp.path().join("other-v9.zip"),
+    )
+    .unwrap();
+    assert_eq!(other_export.parts_stock.len(), 0);
+    assert_eq!(
+        other_export.models[0].print_attempts[0].parts[0].part_id,
+        spacer.id
+    );
+    assert_eq!(
+        other_export.models[0].print_attempts[0].parts[0].part_name,
+        "Printed spacer"
+    );
+
+    let connection = Connection::open(root.join("library.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE print_attempt_parts SET quantity=5 WHERE attempt_id=?1",
+            [&selected_attempt.id],
+        )
+        .unwrap();
+    assert!(inspect_library(&root).is_err());
+    connection
+        .execute(
+            "UPDATE print_attempt_parts SET quantity=6 WHERE attempt_id=?1",
+            [&selected_attempt.id],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF;")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO print_attempt_parts
+             (attempt_id,part_id,part_name,category,unit,quantity_per_copy,quantity,ordinal)
+             VALUES('unknown-attempt','orphan-part','Orphan',NULL,'pcs',1,1,0)",
+            [],
+        )
+        .unwrap();
+    assert!(inspect_library(&root).is_err());
+}
+
+#[test]
+fn schema_v8_recovery_remains_supported_without_part_stock_tables() {
+    use library_core::{LibraryDb, PrintAttemptInput, PrintOutcome};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("library-v8");
+    let db = LibraryDb::open(&root).unwrap();
+    let model = db.create_model("Schema v8 recovery", None).unwrap();
+    let attempt = db
+        .create_print_attempt(
+            &model.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-16T12:00:00Z".into(),
+                quantity: 1,
+                notes: "legacy print history".into(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Printed,
+                parts: None,
+            },
+        )
+        .unwrap();
+    drop(db);
+    let connection = Connection::open(root.join("library.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE print_attempt_parts;
+             DROP TABLE parts_stock;
+             PRAGMA user_version=8;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let recovered = inspect_library(&root).unwrap();
+    assert_eq!(recovered.library_schema_version, 8);
+    assert!(recovered.parts_stock.is_empty());
+    assert!(recovered.models.iter().all(|model| model
+        .print_attempts
+        .iter()
+        .all(|attempt| attempt.parts.is_empty())));
+    let recovered_attempt = recovered
+        .models
+        .iter()
+        .flat_map(|model| &model.print_attempts)
+        .find(|candidate| candidate.id == attempt.id)
+        .unwrap();
+    assert_eq!(recovered_attempt.stock_adjusted, None);
+}
+
+#[test]
+fn schema_v9_catalog_without_stock_marker_marks_all_events_unknown() {
+    use library_core::{
+        LibraryDb, PartStockInput, PartUsageInput, PrintAttemptInput, PrintOutcome,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("library-v9-no-stock-marker");
+    let db = LibraryDb::open(&root).unwrap();
+    let model = db.create_model("Legacy schema-nine model", None).unwrap();
+    let stock = db
+        .create_part_stock(&PartStockInput {
+            name: "Legacy linked part".into(),
+            category: None,
+            quantity: 3,
+            unit: "pcs".into(),
+            notes: String::new(),
+            low_stock: 0,
+        })
+        .unwrap();
+    let linked_attempt = db
+        .create_print_attempt(
+            &model.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-15T12:55:00Z".into(),
+                quantity: 1,
+                notes: "Pre-v10 event with usage".into(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Printed,
+                parts: Some(vec![PartUsageInput {
+                    id: stock.id,
+                    quantity: 1,
+                    snapshot: None,
+                }]),
+            },
+        )
+        .unwrap();
+    let unlinked_attempt = db
+        .import_print_attempt(
+            &model.id,
+            &PrintAttemptInput {
+                printed_at: "2026-10-15T13:00:00Z".into(),
+                quantity: 1,
+                notes: "Historical event".into(),
+                filament_ids: vec![],
+                outcome: PrintOutcome::Printed,
+                parts: None,
+            },
+            "2026-10-15T13:00:00Z",
+        )
+        .unwrap();
+    drop(db);
+
+    let connection = Connection::open(root.join("library.sqlite3")).unwrap();
+    let linked_marker: i64 = connection
+        .query_row(
+            "SELECT stock_adjusted FROM print_attempts WHERE id=?1",
+            [&linked_attempt.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let unlinked_marker: i64 = connection
+        .query_row(
+            "SELECT stock_adjusted FROM print_attempts WHERE id=?1",
+            [&unlinked_attempt.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked_marker, 1);
+    assert_eq!(unlinked_marker, 0);
+    connection
+        .execute_batch(
+            "ALTER TABLE print_attempts DROP COLUMN stock_adjusted;
+             PRAGMA user_version=9;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let recovered = inspect_library(&root).unwrap();
+    assert_eq!(recovered.library_schema_version, 9);
+    let recovered_linked = recovered.models[0]
+        .print_attempts
+        .iter()
+        .find(|candidate| candidate.id == linked_attempt.id)
+        .unwrap();
+    assert_eq!(recovered_linked.stock_adjusted, None);
+    let recovered_unlinked = recovered.models[0]
+        .print_attempts
+        .iter()
+        .find(|candidate| candidate.id == unlinked_attempt.id)
+        .unwrap();
+    assert_eq!(recovered_unlinked.stock_adjusted, None);
+}
+
+#[test]
+fn legacy_recovery_event_manifest_defaults_stock_adjusted_to_unknown() {
+    let event: library_recovery::RecoveryPrintAttempt = serde_json::from_value(serde_json::json!({
+        "id": "event-1",
+        "model_id": "model-1",
+        "printed_at": "2026-10-15T13:00:00Z",
+        "quantity": 1,
+        "notes": "",
+        "outcome": "printed",
+        "filament_ids": [],
+        "created_at": "2026-10-15T13:00:00Z",
+        "updated_at": "2026-10-15T13:00:00Z"
+    }))
+    .unwrap();
+    assert_eq!(event.stock_adjusted, None);
+}
+
+#[test]
+fn schema_v11_recovery_rejects_missing_part_stock_tables() {
+    use library_core::LibraryDb;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("library-v11-incomplete");
+    drop(LibraryDb::open(&root).unwrap());
+    let connection = Connection::open(root.join("library.sqlite3")).unwrap();
+    connection.execute("DROP TABLE parts_stock", []).unwrap();
+    drop(connection);
+
+    assert!(inspect_library(&root).is_err());
+}
+
+#[test]
+fn schema_v11_recovery_preserves_empty_unlinked_printer_history_names() {
+    use library_core::models::{
+        PrinterDataImport, PrinterDataImportMaintenanceLog, PrinterDataImportReminder,
+        PrinterMaintenanceInput, PrinterReminderInput, PrinterReminderStatus,
+    };
+    use library_core::LibraryDb;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("library-v11-empty-printer-history");
+    let db = LibraryDb::open(&root).unwrap();
+    let batch = PrinterDataImport {
+        printers: vec![],
+        maintenance_logs: vec![PrinterDataImportMaintenanceLog {
+            external_ref: "orphan-log".into(),
+            printer_external_ref: None,
+            printer_nickname: None,
+            input: PrinterMaintenanceInput {
+                title: "Preserve empty log name".into(),
+                performed_at: "2026-10-02T12:00:00Z".into(),
+                notes: String::new(),
+            },
+            created_at: None,
+        }],
+        reminders: vec![PrinterDataImportReminder {
+            external_ref: "orphan-reminder".into(),
+            printer_external_ref: None,
+            printer_nickname: Some(String::new()),
+            input: PrinterReminderInput {
+                title: "Preserve empty reminder name".into(),
+                notes: String::new(),
+                due_at: "2026-11-02T12:00:00Z".into(),
+                interval_days: None,
+            },
+            status: PrinterReminderStatus::Active,
+            last_completed_at: None,
+            created_at: "2026-10-02T12:00:00Z".into(),
+            updated_at: "2026-10-02T12:00:00Z".into(),
+        }],
+    };
+    db.import_printer_data(&batch).unwrap();
+    drop(db);
+
+    let manifest = inspect_library(&root).unwrap();
+    assert_eq!(manifest.library_schema_version, 11);
+    assert_eq!(manifest.printer_maintenance_logs.len(), 1);
+    assert_eq!(manifest.printer_maintenance_logs[0].printer_id, None);
+    assert_eq!(manifest.printer_maintenance_logs[0].printer_nickname, "");
+    assert_eq!(manifest.printer_reminders.len(), 1);
+    assert_eq!(manifest.printer_reminders[0].printer_id, None);
+    assert_eq!(manifest.printer_reminders[0].printer_nickname, "");
 }
 
 #[test]

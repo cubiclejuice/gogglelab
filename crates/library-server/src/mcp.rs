@@ -10,7 +10,10 @@ use axum::{Extension, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Value};
 
-use crate::{tool_definitions, LibraryEngine, RequestContext, ServerState, MCP_PROTOCOL_VERSION};
+use crate::{
+    tool_definitions, wire_source_hold, LibraryEngine, RequestContext, ServerState,
+    MCP_PROTOCOL_VERSION,
+};
 
 const SESSION_HEADER: &str = "mcp-session-id";
 const VERSION_HEADER: &str = "mcp-protocol-version";
@@ -327,10 +330,27 @@ pub async fn post<E: LibraryEngine>(
                             id,
                             json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
                         ),
-                        Ok(Err(error)) => rpc_result(
-                            id,
-                            json!({"isError":true,"content":[{"type":"text","text":error.message}],"structuredContent":{"error":{"code":error.code,"retryable":error.retryable}}}),
-                        ),
+                        Ok(Err(error)) => {
+                            let mut error_details =
+                                json!({"code":error.code,"retryable":error.retryable});
+                            if !error.source_holds.is_empty() {
+                                error_details["sourceHolds"] = Value::Array(
+                                    error
+                                        .source_holds
+                                        .into_iter()
+                                        .map(wire_source_hold)
+                                        .collect(),
+                                );
+                            }
+                            rpc_result(
+                                id,
+                                json!({
+                                    "isError":true,
+                                    "content":[{"type":"text","text":error.message}],
+                                    "structuredContent":{"error":error_details}
+                                }),
+                            )
+                        }
                         Err(_) => rpc_result(
                             id,
                             json!({"isError":true,"content":[{"type":"text","text":"Tool execution stopped unexpectedly"}],"structuredContent":{"error":{"code":"internal","retryable":true}}}),

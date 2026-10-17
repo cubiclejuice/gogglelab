@@ -7,6 +7,8 @@ import type {
   LibraryScanStatus,
   LibraryTag,
   MetadataPatch,
+  PartStock,
+  PartStockInput,
   PrintAttempt,
   PrintAttemptInput,
   PrintStatus,
@@ -20,7 +22,12 @@ import {
   type PrintedFilter,
   type SelectionScope,
 } from "./library-editor";
-import { LibraryPrintHistory } from "./library-history";
+import {
+  describePartStockError,
+  LibraryPrintHistory,
+  partStockValidationError,
+  type PrintHistoryPrinter,
+} from "./library-history";
 import { filamentLabel, matchesFilamentFilter } from "./library-filaments";
 import {
   chooseRouletteModel,
@@ -44,6 +51,224 @@ const DEFAULT_CATALOG_SETTINGS: CatalogSettings = {
   thumbnail_concurrency: 2,
   scan_batch_size: 128,
 };
+
+export class LibraryPartStockManager {
+  private readonly dialog: HTMLDialogElement;
+  private readonly status: HTMLElement;
+  private readonly list: HTMLElement;
+  private readonly form: HTMLFormElement;
+  private readonly nameInput: HTMLInputElement;
+  private readonly categoryInput: HTMLInputElement;
+  private readonly quantityInput: HTMLInputElement;
+  private readonly unitInput: HTMLInputElement;
+  private readonly lowStockInput: HTMLInputElement;
+  private readonly notesInput: HTMLTextAreaElement;
+  private readonly saveButton: HTMLButtonElement;
+  private editing: PartStock | null = null;
+  private parts: PartStock[] = [];
+
+  onList: () => Promise<PartStock[]> = async () => [];
+  onCreate: (input: PartStockInput) => Promise<void> = async () => {};
+  onUpdate: (id: string, expectedVersion: number, input: PartStockInput) => Promise<void> =
+    async () => {};
+  onDelete: (id: string, expectedVersion: number) => Promise<void> = async () => {};
+
+  constructor(container: HTMLElement) {
+    this.dialog = document.createElement("dialog");
+    this.dialog.className = "library-history-dialog library-parts-dialog";
+    const header = document.createElement("header");
+    const title = document.createElement("h2");
+    title.textContent = "Parts stock";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn";
+    close.textContent = "Close";
+    close.addEventListener("click", () => this.dialog.close());
+    header.append(title, close);
+    this.status = document.createElement("p");
+    this.status.setAttribute("role", "status");
+    this.status.setAttribute("aria-live", "polite");
+    this.form = document.createElement("form");
+    this.form.className = "library-history-form library-parts-form";
+    this.nameInput = this.textInput("Part name", 128);
+    this.categoryInput = this.textInput("Category", 128);
+    this.quantityInput = this.numberInput("Stock quantity", 0, 1_000_000);
+    this.unitInput = this.textInput("Unit", 128);
+    this.lowStockInput = this.numberInput("Low-stock threshold", 0, 1_000_000);
+    this.notesInput = document.createElement("textarea");
+    this.notesInput.maxLength = 20_000;
+    this.notesInput.placeholder = "Part notes";
+    this.notesInput.setAttribute("aria-label", "Part notes");
+    this.saveButton = document.createElement("button");
+    this.saveButton.type = "submit";
+    this.saveButton.className = "btn primary";
+    this.form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.save();
+    });
+    this.form.append(
+      this.nameInput,
+      this.categoryInput,
+      this.quantityInput,
+      this.unitInput,
+      this.lowStockInput,
+      this.notesInput,
+      this.saveButton,
+    );
+    this.list = document.createElement("div");
+    this.list.className = "library-history-list library-parts-list";
+    this.dialog.append(header, this.status, this.form, this.list);
+    container.append(this.dialog);
+    this.resetForm();
+  }
+
+  async show(): Promise<void> {
+    if (!this.dialog.open) this.dialog.showModal();
+    await this.refresh();
+    this.nameInput.focus();
+  }
+
+  private async refresh(): Promise<void> {
+    this.status.textContent = "Loading stock…";
+    try {
+      this.parts = await this.onList();
+      this.renderList();
+      this.status.textContent = this.parts.length
+        ? `${this.parts.length.toLocaleString()} stock part(s). Low stock is flagged at or below each threshold.`
+        : "No parts yet. Add a part to track stock used by print events.";
+    } catch (reason) {
+      this.status.textContent = `Could not load parts stock: ${describePartStockError(reason)}`;
+    }
+  }
+
+  private renderList(): void {
+    this.list.replaceChildren();
+    for (const part of this.parts) {
+      const row = document.createElement("article");
+      row.className = "library-part-stock-row";
+      const heading = document.createElement("h3");
+      heading.textContent = part.name;
+      const details = document.createElement("p");
+      const category = part.category ? `${part.category} · ` : "";
+      const stockState = part.quantity <= part.lowStock ? " · Low stock" : "";
+      details.textContent = `${category}${part.quantity.toLocaleString()} ${part.unit} available · low-stock threshold ${part.lowStock.toLocaleString()}${stockState}`;
+      const notes = document.createElement("p");
+      notes.textContent = part.notes;
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "btn";
+      edit.textContent = "Edit";
+      edit.addEventListener("click", () => this.edit(part));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn";
+      remove.textContent = "Delete";
+      remove.addEventListener("click", () => void this.remove(part));
+      row.append(heading, details);
+      if (part.notes) row.append(notes);
+      row.append(edit, remove);
+      this.list.append(row);
+    }
+  }
+
+  private edit(part: PartStock): void {
+    this.editing = part;
+    this.nameInput.value = part.name;
+    this.categoryInput.value = part.category ?? "";
+    this.quantityInput.value = String(part.quantity);
+    this.unitInput.value = part.unit;
+    this.lowStockInput.value = String(part.lowStock);
+    this.notesInput.value = part.notes;
+    this.saveButton.textContent = "Save part";
+    this.status.textContent = `Editing ${part.name}.`;
+    this.nameInput.focus();
+  }
+
+  private async save(): Promise<void> {
+    const input = this.readInput();
+    const problem = partStockValidationError(input);
+    if (problem) {
+      this.status.textContent = problem;
+      return;
+    }
+    this.saveButton.disabled = true;
+    try {
+      if (this.editing) {
+        await this.onUpdate(this.editing.id, this.editing.metadataVersion, input);
+        this.status.textContent = `${input.name} stock saved.`;
+      } else {
+        await this.onCreate(input);
+        this.status.textContent = `${input.name} added to stock.`;
+      }
+      this.resetForm();
+      await this.refresh();
+    } catch (reason) {
+      this.status.textContent = `Could not save stock: ${describePartStockError(reason)}`;
+    } finally {
+      this.saveButton.disabled = false;
+    }
+  }
+
+  private async remove(part: PartStock): Promise<void> {
+    if (
+      !window.confirm(
+        `Delete ${part.name} from stock? Existing print history keeps its saved part ID, name, and use; deleting the part does not restore stock.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await this.onDelete(part.id, part.metadataVersion);
+      this.status.textContent = `${part.name} removed from current stock. Historical use remains saved.`;
+      if (this.editing?.id === part.id) this.resetForm();
+      await this.refresh();
+    } catch (reason) {
+      this.status.textContent = `Could not delete stock: ${describePartStockError(reason)}`;
+    }
+  }
+
+  private readInput(): PartStockInput {
+    return {
+      name: this.nameInput.value,
+      category: this.categoryInput.value.trim() || null,
+      quantity: Number(this.quantityInput.value),
+      unit: this.unitInput.value,
+      notes: this.notesInput.value,
+      lowStock: Number(this.lowStockInput.value),
+    };
+  }
+
+  private resetForm(): void {
+    this.editing = null;
+    this.nameInput.value = "";
+    this.categoryInput.value = "";
+    this.quantityInput.value = "0";
+    this.unitInput.value = "pcs";
+    this.lowStockInput.value = "0";
+    this.notesInput.value = "";
+    this.saveButton.textContent = "Add part";
+  }
+
+  private textInput(label: string, maxLength: number): HTMLInputElement {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = maxLength;
+    input.placeholder = label;
+    input.setAttribute("aria-label", label);
+    return input;
+  }
+
+  private numberInput(label: string, min: number, max: number): HTMLInputElement {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = "1";
+    input.value = String(min);
+    input.setAttribute("aria-label", label);
+    return input;
+  }
+}
 
 export interface LibraryViewOptions {
   query: string;
@@ -366,6 +591,7 @@ export class LibraryPanel {
   private readonly scanButton: HTMLButtonElement;
   private readonly cancelScanButton: HTMLButtonElement;
   private readonly importButton: HTMLButtonElement;
+  private readonly partStockButton: HTMLButtonElement;
   private readonly addRootButton: HTMLButtonElement;
   private readonly purgeButton: HTMLButtonElement;
   private readonly generateMissingButton: HTMLButtonElement;
@@ -389,12 +615,14 @@ export class LibraryPanel {
   private readonly metadataEditor: LibraryMetadataEditor;
   private readonly tagManager: LibraryTagManager;
   private readonly printHistory: LibraryPrintHistory;
+  private readonly partStockManager: LibraryPartStockManager;
   private invoker: HTMLElement | null = null;
   private allFolders: LibraryFolder[] = [];
   private allModels: LibraryModel[] = [];
   private allRoots: IndexRoot[] = [];
   private allTags: LibraryTag[] = [];
   private allFilaments: Filament[] = [];
+  private allPartStock: PartStock[] = [];
   private filteredModels: LibraryModel[] = [];
   private visibleModelIds: string[] = [];
   private readonly selectedModelIds = new Set<string>();
@@ -454,11 +682,22 @@ export class LibraryPanel {
     async () => {};
   onDeleteTag: (id: string) => Promise<void> = async () => {};
   onListPrintAttempts: (modelId: string) => Promise<PrintAttempt[]> = async () => [];
-  onCreatePrintAttempt: (modelId: string, input: PrintAttemptInput) => Promise<void> =
-    async () => {};
-  onUpdatePrintAttempt: (attemptId: string, input: PrintAttemptInput) => Promise<void> =
-    async () => {};
+  onCreatePrintAttempt: (
+    modelId: string,
+    input: PrintAttemptInput,
+    printerId: string | null,
+  ) => Promise<void> = async () => {};
+  onUpdatePrintAttempt: (
+    attemptId: string,
+    input: PrintAttemptInput,
+    printerId: string | null | undefined,
+  ) => Promise<void> = async () => {};
   onDeletePrintAttempt: (attemptId: string) => Promise<void> = async () => {};
+  onListPartStock: () => Promise<PartStock[]> = async () => [];
+  onCreatePartStock: (input: PartStockInput) => Promise<void> = async () => {};
+  onUpdatePartStock: (id: string, expectedVersion: number, input: PartStockInput) => Promise<void> =
+    async () => {};
+  onDeletePartStock: (id: string, expectedVersion: number) => Promise<void> = async () => {};
   onCreateBundle: (modelIds: string[]) => Promise<void> = async () => {};
   onCreateCollection: (name: string) => Promise<void> = async () => {};
   onRenameCollection: (id: string, name: string) => Promise<void> = async () => {};
@@ -478,6 +717,7 @@ export class LibraryPanel {
     this.metadataEditor = new LibraryMetadataEditor(container);
     this.tagManager = new LibraryTagManager(container);
     this.printHistory = new LibraryPrintHistory(container);
+    this.partStockManager = new LibraryPartStockManager(container);
     this.metadataEditor.onSave = async (targets, patch) => {
       await this.onSaveMetadata(targets, patch);
     };
@@ -486,12 +726,23 @@ export class LibraryPanel {
     this.tagManager.onCreate = (name, category) => this.onCreateTag(name, category);
     this.tagManager.onUpdate = (id, name, category) => this.onUpdateTag(id, name, category);
     this.tagManager.onDelete = (id) => this.onDeleteTag(id);
-    this.printHistory.onCreate = async (modelId, input) => {
-      await this.onCreatePrintAttempt(modelId, input);
+    this.partStockManager.onList = async () => {
+      const parts = await this.onListPartStock();
+      this.allPartStock = parts;
+      this.printHistory.setPartStock(parts);
+      return parts;
+    };
+    this.partStockManager.onCreate = (input) => this.onCreatePartStock(input);
+    this.partStockManager.onUpdate = (id, expectedVersion, input) =>
+      this.onUpdatePartStock(id, expectedVersion, input);
+    this.partStockManager.onDelete = (id, expectedVersion) =>
+      this.onDeletePartStock(id, expectedVersion);
+    this.printHistory.onCreate = async (modelId, input, printerId) => {
+      await this.onCreatePrintAttempt(modelId, input, printerId);
       await this.refreshPrintHistory(modelId);
     };
-    this.printHistory.onUpdate = async (attemptId, input) => {
-      await this.onUpdatePrintAttempt(attemptId, input);
+    this.printHistory.onUpdate = async (attemptId, input, printerId) => {
+      await this.onUpdatePrintAttempt(attemptId, input, printerId);
       if (this.activeHistoryModelId) await this.refreshPrintHistory(this.activeHistoryModelId);
     };
     this.printHistory.onDelete = async (attemptId) => {
@@ -530,6 +781,7 @@ export class LibraryPanel {
     const actions = document.createElement("div");
     actions.className = "library-actions";
     this.importButton = this.actionButton("Import copies…", "primary", () => this.onImport());
+    this.partStockButton = this.actionButton("Parts stock…", "", () => void this.openPartStock());
     this.addRootButton = this.actionButton(
       "Index folder…",
       "",
@@ -537,7 +789,13 @@ export class LibraryPanel {
     );
     const closeButton = this.actionButton("Close", "", () => this.hide());
     const managementButton = this.actionButton("Manage…", "", () => this.onOpenManagement());
-    actions.append(this.importButton, this.addRootButton, managementButton, closeButton);
+    actions.append(
+      this.importButton,
+      this.addRootButton,
+      this.partStockButton,
+      managementButton,
+      closeButton,
+    );
     header.append(heading, actions);
 
     this.status = document.createElement("div");
@@ -774,6 +1032,13 @@ export class LibraryPanel {
     return this.root.open;
   }
 
+  setPrinterOptions(
+    printers: readonly PrintHistoryPrinter[],
+    activePrinterId: string | null,
+  ): void {
+    this.printHistory.setPrinterOptions(printers, activePrinterId);
+  }
+
   show(invoker?: HTMLElement): void {
     const active = invoker ?? document.activeElement;
     this.invoker = active instanceof HTMLElement ? active : null;
@@ -812,6 +1077,7 @@ export class LibraryPanel {
     settings: CatalogSettings = this.catalogSettings,
     tags: LibraryTag[] = this.allTags,
     filaments: Filament[] = this.allFilaments,
+    partStock: PartStock[] = this.allPartStock,
   ): void {
     for (const modelId of thumbnailCacheInvalidations(this.allModels, models)) {
       this.thumbnailCache.delete(modelId);
@@ -822,6 +1088,8 @@ export class LibraryPanel {
     this.allRoots = roots;
     this.allTags = tags;
     this.allFilaments = filaments;
+    this.allPartStock = partStock;
+    this.printHistory.setPartStock(partStock);
     this.tagManager.update(tags);
     this.refreshMetadataFilterOptions(models, tags);
     this.refreshFilamentFilterOptions(filaments);
@@ -1124,6 +1392,7 @@ export class LibraryPanel {
         await this.onListPrintAttempts(model.id),
         this.allFilaments,
         active instanceof HTMLElement ? active : undefined,
+        this.allPartStock,
       );
     } catch (error) {
       this.setStatus(`Could not load print history: ${libraryErrorMessage(error)}`);
@@ -1132,6 +1401,10 @@ export class LibraryPanel {
 
   private async refreshPrintHistory(modelId: string): Promise<void> {
     this.printHistory.update(await this.onListPrintAttempts(modelId));
+  }
+
+  private async openPartStock(): Promise<void> {
+    await this.partStockManager.show();
   }
 
   private renderContent(): void {

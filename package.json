@@ -25,7 +25,7 @@
     "check": "bun run check:frontend && bun run build:web && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked",
     "check:core": "bun run check",
     "check:frontend": "bun run fmt:check && bun run lint && bun run typecheck && bun run test:core",
-    "test:core": "bun test src",
+    "test:core": "bun test src scripts/build-app-args.test.mjs",
     "fmt": "oxfmt package.json .oxlintrc.json src/main.ts src/lib src-tauri/tauri.conf.json",
     "fmt:check": "oxfmt --check package.json .oxlintrc.json src/main.ts src/lib src-tauri/tauri.conf.json",
     "lint": "oxlint src",

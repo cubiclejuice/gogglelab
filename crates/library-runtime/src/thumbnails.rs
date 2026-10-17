@@ -1,12 +1,15 @@
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{ffi::OsStr, ffi::OsString};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use library_core::CatalogSettings;
 use sha2::{Digest, Sha256};
 use stl_core::ParsedStl;
+
+use crate::secure_fs::Directory;
 
 const RENDER_VERSION: u32 = 1;
 const MAX_RENDER_TRIANGLES: usize = 200_000;
@@ -42,30 +45,9 @@ pub fn ensure_thumbnail(
     regenerate: bool,
 ) -> Result<ThumbnailArtifact, String> {
     let relative = thumbnail_relative_path(content_hash, settings);
-    let output = library_root.join(&relative);
-    if !regenerate {
-        match fs::symlink_metadata(&output) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err("Thumbnail cache entry is a symlink".into());
-            }
-            Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CACHED_PNG_BYTES => {
-                let bytes = read_bounded(&output, MAX_CACHED_PNG_BYTES)?;
-                if validate_png_bytes(&bytes).is_ok() {
-                    return Ok(ThumbnailArtifact {
-                        relative_path: relative,
-                        png_hash: hex_digest(&bytes),
-                    });
-                }
-            }
-            Ok(metadata) if metadata.is_file() => {
-                return Err("Thumbnail cache entry exceeds the size limit".into());
-            }
-            Ok(_) => return Err("Thumbnail cache entry is not a regular file".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.to_string()),
-        }
+    if let Some(cached) = cached_thumbnail(library_root, &relative, regenerate)? {
+        return Ok(cached);
     }
-
     let source_metadata = fs::symlink_metadata(source_path).map_err(|error| error.to_string())?;
     if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
         return Err("Model source is not a regular file".into());
@@ -79,28 +61,125 @@ pub fn ensure_thumbnail(
     if bytes.len() as u64 != expected_source_bytes || hex_digest(&bytes) != content_hash {
         return Err("Model source changed since it was indexed".into());
     }
-    let parsed = stl_core::parse_model(&bytes).map_err(|error| error.to_string())?;
-    let png = match crate::images::embedded_3mf_thumbnail(&bytes) {
-        Ok(Some(png)) => png,
-        _ => render_png(&parsed, settings)?,
-    };
+    ensure_thumbnail_from_bytes(
+        library_root,
+        &bytes,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+    )
+}
+
+fn cached_thumbnail(
+    library_root: &Path,
+    relative: &Path,
+    regenerate: bool,
+) -> Result<Option<ThumbnailArtifact>, String> {
+    if regenerate {
+        return Ok(None);
+    }
+    let output = library_root.join(relative);
     let parent = output
         .parent()
         .ok_or_else(|| "Thumbnail output has no parent directory".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let staging = output.with_extension(format!(
-        "{}.{}.part",
+    let directory = thumbnail_directory(library_root, parent)?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| "Thumbnail output filename is invalid".to_string())?;
+    let file = match open_thumbnail_file(&directory, name)? {
+        Some(file) => file,
+        None => return Ok(None),
+    };
+    if file.metadata().map_err(|error| error.to_string())?.len() > MAX_CACHED_PNG_BYTES {
+        return Err("Thumbnail cache entry exceeds the size limit".into());
+    }
+    let bytes = read_bounded_file(file, MAX_CACHED_PNG_BYTES)?;
+    if validate_png_bytes(&bytes).is_ok() {
+        Ok(Some(ThumbnailArtifact {
+            relative_path: relative.to_path_buf(),
+            png_hash: hex_digest(&bytes),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn ensure_thumbnail_from_bytes(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+) -> Result<ThumbnailArtifact, String> {
+    if source_bytes.len() as u64 != expected_source_bytes
+        || source_bytes.len() as u64 > stl_core::limits::MAX_FILE_BYTES
+        || hex_digest(source_bytes) != content_hash
+    {
+        return Err("Model source changed since it was indexed".into());
+    }
+    let relative = thumbnail_relative_path(content_hash, settings);
+    let output = library_root.join(&relative);
+    let parent = output
+        .parent()
+        .ok_or_else(|| "Thumbnail output has no parent directory".to_string())?;
+    let directory = thumbnail_directory(library_root, parent)?;
+    let output_name = output
+        .file_name()
+        .ok_or_else(|| "Thumbnail output filename is invalid".to_string())?;
+    if !regenerate {
+        match open_thumbnail_file(&directory, output_name)? {
+            Some(file) => {
+                let bytes = read_bounded_file(file, MAX_CACHED_PNG_BYTES)?;
+                if validate_png_bytes(&bytes).is_ok() {
+                    return Ok(ThumbnailArtifact {
+                        relative_path: relative,
+                        png_hash: hex_digest(&bytes),
+                    });
+                }
+            }
+            None => {}
+        }
+    }
+    let parsed = stl_core::parse_model(source_bytes).map_err(|error| error.to_string())?;
+    let png = match crate::images::embedded_3mf_thumbnail(source_bytes) {
+        Ok(Some(png)) => png,
+        _ => render_png(&parsed, settings)?,
+    };
+    if png.len() as u64 > MAX_CACHED_PNG_BYTES {
+        return Err("Generated thumbnail exceeds its cache size limit".into());
+    }
+    let staging_name = OsString::from(format!(
+        ".thumbnail-{}-{}.part",
         std::process::id(),
         STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let png_hash = hex_digest(&png);
-    fs::write(&staging, png).map_err(|error| error.to_string())?;
-    if output.exists() {
-        fs::remove_file(&output).map_err(|error| error.to_string())?;
-    }
-    if let Err(error) = fs::rename(&staging, &output) {
-        let _ = fs::remove_file(&staging);
+    let mut file = directory
+        .create_new_file(&staging_name)
+        .map_err(|error| error.to_string())?;
+    let write_result = file.write_all(&png).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = directory.hold_entry(&staging_name);
         return Err(error.to_string());
+    }
+    if let Err(error) = directory.replace_child(&staging_name, output_name) {
+        let _ = directory.hold_entry(&staging_name);
+        return Err(error.to_string());
+    }
+    let published = directory
+        .open_file(output_name)
+        .map_err(|error| error.to_string())?;
+    let published_bytes = read_bounded_file(published, MAX_CACHED_PNG_BYTES)?;
+    if validate_png_bytes(&published_bytes).is_err() || hex_digest(&published_bytes) != png_hash {
+        let _ = directory.hold_verified_file(
+            output_name,
+            &(published_bytes.len() as u64, hex_digest(&published_bytes)),
+            MAX_CACHED_PNG_BYTES,
+        );
+        return Err("Published thumbnail failed its content hash check".into());
     }
     Ok(ThumbnailArtifact {
         relative_path: relative,
@@ -162,8 +241,60 @@ fn validate_png_bytes(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+fn thumbnail_directory(library_root: &Path, parent: &Path) -> Result<Directory, String> {
+    let metadata = fs::symlink_metadata(library_root).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Library root is not a real directory".into());
+    }
+    if parent != library_root.join("thumbnails") {
+        return Err("Thumbnail cache path is outside its owned directory".into());
+    }
+    // Resolve aliases in ancestor components such as macOS's /var and /tmp,
+    // then use only the canonical path for the pinned directory operations.
+    let canonical_root = library_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let root = Directory::open(&canonical_root).map_err(|error| error.to_string())?;
+    if !root
+        .matches_path(&canonical_root)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("Library root identity changed".into());
+    }
+    let thumbnails_name = OsStr::new("thumbnails");
+    match root.open_child(thumbnails_name) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            root.create_child_directory(thumbnails_name)
+                .map_err(|error| error.to_string())?;
+            root.sync().map_err(|error| error.to_string())?;
+            root.open_child(thumbnails_name)
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn open_thumbnail_file(directory: &Directory, name: &OsStr) -> Result<Option<File>, String> {
+    match directory.open_file(name) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if is_symlink_error(&error) => Err("Thumbnail cache entry is a symlink".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn is_symlink_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_symlink_error(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn read_bounded_file(file: File, limit: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -172,6 +303,11 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
         return Err("File grew beyond the allowed size while being read".into());
     }
     Ok(bytes)
+}
+
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    read_bounded_file(file, limit)
 }
 
 fn render_png(model: &ParsedStl, settings: &CatalogSettings) -> Result<Vec<u8>, String> {
@@ -481,7 +617,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("thumbnails")).unwrap();
-        root
+        root.canonicalize().unwrap()
     }
 
     #[test]
@@ -540,6 +676,45 @@ mod tests {
         )
         .unwrap();
         assert!(png_data_uri(&root.join(regenerated.relative_path)).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regeneration_retains_displaced_thumbnail_in_recoverable_hold() {
+        let root = temp_root("displaced-thumbnail");
+        let source = root.join("source.stl");
+        let source_bytes = binary_triangle();
+        fs::write(&source, &source_bytes).unwrap();
+        let source_hash = hex_digest(&source_bytes);
+        let output = root.join(thumbnail_relative_path(&source_hash, &settings()));
+        let displaced = b"preexisting thumbnail bytes";
+        fs::write(&output, displaced).unwrap();
+
+        ensure_thumbnail(
+            &root,
+            &source,
+            &source_hash,
+            source_bytes.len() as u64,
+            &settings(),
+            true,
+        )
+        .unwrap();
+
+        let held = fs::read_dir(root.join("thumbnails"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gogglelab-held-")
+                    && entry.file_name().to_string_lossy().ends_with(".data")
+            })
+            .find(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == displaced));
+        assert!(
+            held.is_some(),
+            "regeneration must preserve displaced bytes in a recoverable hold"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -4,7 +4,29 @@ import {
   formatWireInteger,
   HttpLibraryClient,
   LibraryHttpError,
+  managementActionAvailability,
 } from "./library-client";
+
+test("catalog maintenance visibility is independent of physical source-write access", () => {
+  const features = {
+    trashSource: false,
+    purgeCatalog: true,
+    cleanupOrphans: true,
+  };
+  const backupOnly = [
+    { id: "backups", catalogRootId: null, label: "Backups", access: "backupOnly" },
+  ];
+  expect(managementActionAvailability(features, backupOnly)).toEqual({
+    physicalSource: false,
+    purgeCatalog: true,
+    cleanupOrphans: true,
+  });
+  expect(managementActionAvailability(features, [])).toEqual({
+    physicalSource: false,
+    purgeCatalog: false,
+    cleanupOrphans: true,
+  });
+});
 
 test("browser server URL admits HTTPS and exact loopback HTTP origins", () => {
   expect(admitBrowserServerUrl("https://library.example").origin).toBe("https://library.example");
@@ -167,6 +189,60 @@ test("metadata mutations use camelCase patches and one atomic bulk request", asy
   }
 });
 
+test("part stock REST operations use reviewed versioned writes", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  client.setToken("token");
+  const original = globalThis.fetch;
+  const requests = [];
+  const part = {
+    id: "part/bolt",
+    name: "M3 bolt",
+    category: "Hardware",
+    quantity: "40",
+    unit: "pcs",
+    notes: "",
+    lowStock: "8",
+    metadataVersion: "3",
+  };
+  try {
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url: String(url), init });
+      if (requests.length === 1) return Response.json([part]);
+      if (requests.length === 2 || requests.length === 3) return Response.json(part);
+      return new Response(null, { status: 204 });
+    };
+    expect(await client.listPartStock()).toEqual([part]);
+    const input = {
+      name: "M3 bolt",
+      category: "Hardware",
+      quantity: 40,
+      unit: "pcs",
+      notes: "",
+      lowStock: 8,
+    };
+    await client.createPartStock(input);
+    await client.updatePartStock("part/bolt", "3", input);
+    await client.deletePartStock("part/bolt", "4");
+
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+      "/api/v1/parts",
+      "/api/v1/parts",
+      "/api/v1/parts/part%2Fbolt",
+      "/api/v1/parts/part%2Fbolt",
+    ]);
+    expect(requests.map((request) => request.init.method ?? "GET")).toEqual([
+      "GET",
+      "POST",
+      "PUT",
+      "DELETE",
+    ]);
+    expect(JSON.parse(requests[2].init.body)).toEqual({ expectedVersion: "3", input });
+    expect(JSON.parse(requests[3].init.body)).toEqual({ expectedVersion: "4" });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test("capture import sends complete bound upload tokens", async () => {
   const client = new HttpLibraryClient("https://library.test");
   client.setToken("token");
@@ -215,6 +291,43 @@ test("filament assignment preserves per-model IDs in one atomic request", async 
     await client.assignFilaments(assignments);
     expect(new URL(request.url).pathname).toBe("/api/v1/models/filaments/bulk");
     expect(request.body).toEqual({ assignments });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("partial source-hold receipts survive authenticated HTTP errors", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  client.setToken("token");
+  const original = globalThis.fetch;
+  const sourceHolds = [
+    {
+      modelId: "model-1",
+      rootHandleId: "models",
+      relativePath: "part.stl",
+      holdName: ".gogglelab-held-a1.data",
+      journalName: ".gogglelab-held-a1.journal",
+      bytes: "21",
+      sha256: "a".repeat(64),
+    },
+  ];
+  try {
+    globalThis.fetch = async () =>
+      Response.json(
+        {
+          error: {
+            code: "conflict",
+            message: "A later batch target failed.",
+            requestId: "request-1",
+            retryable: false,
+            sourceHolds,
+          },
+        },
+        { status: 409 },
+      );
+    const error = await client.listModels().catch((value) => value);
+    expect(error).toBeInstanceOf(LibraryHttpError);
+    expect(error.sourceHolds).toEqual(sourceHolds);
   } finally {
     globalThis.fetch = original;
   }
@@ -506,6 +619,37 @@ test("management requires a separate server plan and explicit token execution", 
     await client.executeManagementAction(plan.token);
     expect(JSON.parse(requests[0].init.body)).toEqual(action);
     expect(JSON.parse(requests[1].init.body)).toEqual({ token: "one-use" });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("catalog purge and orphan cleanup carry explicit confirmation to the server", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  client.setToken("token");
+  const original = globalThis.fetch;
+  const requests = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url: String(url), init });
+      return Response.json({ token: "one-use", actionKind: "planned", impact: [] });
+    };
+    await client.planManagementAction({
+      kind: "purgeCatalog",
+      backupDestinationHandleId: "backups",
+      backupFileName: "before-purge.zip",
+      confirm: true,
+    });
+    await client.planManagementAction({ kind: "cleanupOrphans", confirm: true });
+    expect(requests.map((request) => JSON.parse(request.init.body))).toEqual([
+      {
+        kind: "purgeCatalog",
+        backupDestinationHandleId: "backups",
+        backupFileName: "before-purge.zip",
+        confirm: true,
+      },
+      { kind: "cleanupOrphans", confirm: true },
+    ]);
   } finally {
     globalThis.fetch = original;
   }

@@ -5,7 +5,8 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use crate::extension_api::{AppError, AppState, ModelSummary};
 use library_core::{
     CatalogSettings, Folder, ImportResult, IndexRoot, LibraryDb, LibraryError, MetadataPatch,
-    Model, PrintAttempt, PrintAttemptInput, Tag, VersionedTarget,
+    Model, PrintAttempt, PrintAttemptImportItem, PrintAttemptImportResult, PrintAttemptInput,
+    PrintAttemptInputWithPrinter, Tag, VersionedTarget,
 };
 use library_runtime::{LibraryRuntime, RuntimeConfig, RuntimeIoGuard, RuntimeMaintenanceGuard};
 
@@ -157,6 +158,23 @@ impl LibraryState {
             .inner
             .runtime
             .begin_maintenance()
+            .map_err(AppError::from)?;
+        THUMBNAIL_RENDER_LIMITER.wait_idle();
+        Ok(guard)
+    }
+
+    pub(crate) fn begin_source_mutation_maintenance(
+        &self,
+    ) -> Result<RuntimeMaintenanceGuard, AppError> {
+        if self.scan_control().status().running {
+            return Err(AppError::Library {
+                message: "Library job is running".into(),
+            });
+        }
+        let guard = self
+            .inner
+            .runtime
+            .begin_source_mutation_maintenance()
             .map_err(AppError::from)?;
         THUMBNAIL_RENDER_LIMITER.wait_idle();
         Ok(guard)
@@ -318,6 +336,51 @@ pub fn library_create_print_attempt(
 }
 
 #[tauri::command]
+pub fn library_create_print_attempt_with_printer(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+    input: PrintAttemptInputWithPrinter,
+) -> Result<PrintAttempt, AppError> {
+    with_db(&state, |db| {
+        db.create_print_attempt_with_printer(&model_id, &input)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_import_print_attempt(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+    input: PrintAttemptInput,
+    created_at: Option<String>,
+    printer_id: Option<String>,
+    printer_name: Option<String>,
+) -> Result<PrintAttempt, AppError> {
+    with_db(&state, |db| {
+        db.import_print_attempt_with_printer(
+            &model_id,
+            &input,
+            created_at.as_deref(),
+            printer_id.as_deref(),
+            printer_name.as_deref(),
+        )
+        .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_import_print_attempts(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+    attempts: Vec<PrintAttemptImportItem>,
+) -> Result<PrintAttemptImportResult, AppError> {
+    with_db(&state, |db| {
+        db.import_print_attempts_deduplicated(&model_id, &attempts)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
 pub fn library_list_print_attempts(
     state: tauri::State<'_, LibraryState>,
     model_id: String,
@@ -345,6 +408,18 @@ pub fn library_update_print_attempt(
 ) -> Result<PrintAttempt, AppError> {
     with_db(&state, |db| {
         db.update_print_attempt(&attempt_id, &input)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_update_print_attempt_with_printer(
+    state: tauri::State<'_, LibraryState>,
+    attempt_id: String,
+    input: PrintAttemptInputWithPrinter,
+) -> Result<PrintAttempt, AppError> {
+    with_db(&state, |db| {
+        db.update_print_attempt_with_printer(&attempt_id, &input)
             .map_err(library_error)
     })
 }

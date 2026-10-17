@@ -1415,10 +1415,14 @@ dependencies = [
  "plist",
  "png 0.18.1",
  "quick-xml",
+ "reqwest",
+ "ring",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "stl-core",
  "tauri",
  "tauri-build",
@@ -1427,6 +1431,8 @@ dependencies = [
  "time",
  "tokio",
  "trash",
+ "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
  "zip",
 ]
@@ -2168,6 +2174,7 @@ dependencies = [
 name = "library-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2175,7 +2182,9 @@ dependencies = [
  "stl-core",
  "thiserror 2.0.20",
  "time",
+ "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

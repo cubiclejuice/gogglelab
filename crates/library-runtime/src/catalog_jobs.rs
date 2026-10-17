@@ -1,7 +1,5 @@
 //! Bounded catalog diagnostics and shared thumbnail jobs; never accepts host paths.
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::sync::Arc;
 
 use library_core::{LibraryError, Model};
@@ -98,6 +96,7 @@ impl LibraryRuntime {
                 message: "A scan or thumbnail job is already running".into(),
                 retryable: true,
                 current_version: None,
+                source_holds: Vec::new(),
             });
         }
         self.scan_control().set_thumbnail_progress(models.len());
@@ -214,53 +213,27 @@ fn render_model(
         .ok_or_else(|| invalid("Model has no content hash"))?;
     let _reservation = runtime.reserve_temp(ReservationKind::Owned, model.bytes)?;
     let bytes = runtime.verified_model_source_bytes(model)?;
-    let staging = runtime.root.join("staging");
-    let metadata = fs::symlink_metadata(&staging).map_err(|_| io_error())?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || staging.canonicalize().map_err(|_| io_error())? != staging
-    {
-        return Err(invalid("Thumbnail staging namespace is unsafe"));
+    let artifact = thumbnails::ensure_thumbnail_from_bytes(
+        &runtime.root,
+        &bytes,
+        hash,
+        bytes.len() as u64,
+        settings,
+        force,
+    )
+    .map_err(|_| invalid("Thumbnail render failed"))?;
+    if !runtime.scan_control().cancelled() {
+        runtime.mutate_db(|db| {
+            db.set_thumbnail_for_source_and_settings(
+                &model.id,
+                hash,
+                settings,
+                &artifact.png_hash,
+                &artifact.relative_path,
+            )
+        })?;
     }
-    let path = staging.join(format!(
-        "thumbnail-source-{}.part",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(&path).map_err(|_| io_error())?;
-        file.write_all(&bytes).map_err(|_| io_error())?;
-        file.sync_all().map_err(|_| io_error())?;
-        let artifact = thumbnails::ensure_thumbnail(
-            &runtime.root,
-            &path,
-            hash,
-            bytes.len() as u64,
-            settings,
-            force,
-        )
-        .map_err(|_| invalid("Thumbnail render failed"))?;
-        if !runtime.scan_control().cancelled() {
-            runtime.mutate_db(|db| {
-                db.set_thumbnail_for_source_and_settings(
-                    &model.id,
-                    hash,
-                    settings,
-                    &artifact.png_hash,
-                    &artifact.relative_path,
-                )
-            })?;
-        }
-        Ok(())
-    })();
-    let _ = fs::remove_file(path);
-    result
+    Ok(())
 }
 
 #[cfg(test)]
@@ -268,6 +241,7 @@ mod tests {
     use super::*;
     use crate::{RuntimeConfig, RuntimeRootPolicy};
     use library_protocol::RootAccess;
+    use std::fs;
 
     fn fixture() -> (
         tempfile::TempDir,

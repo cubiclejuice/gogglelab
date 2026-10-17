@@ -260,6 +260,10 @@ pub struct VersionedModelUpdate {
     pub model_id: String,
     pub expected_version: u64,
     pub patch: MetadataPatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filament_ids: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VersionedTarget {
@@ -310,11 +314,39 @@ pub struct Tag {
     pub category: Option<String>,
 }
 
+/// User-managed consumable hardware inventory, distinct from 3D geometry parts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PartStock {
+    pub id: String,
+    pub metadata_version: u64,
+    pub name: String,
+    pub category: Option<String>,
+    pub quantity: u64,
+    pub unit: String,
+    pub notes: String,
+    pub low_stock: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PartStockInput {
+    pub name: String,
+    pub category: Option<String>,
+    pub quantity: u32,
+    pub unit: String,
+    pub notes: String,
+    pub low_stock: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrintOutcome {
     Printed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -324,6 +356,84 @@ pub struct PrintAttemptInput {
     pub notes: String,
     pub filament_ids: Vec<String>,
     pub outcome: PrintOutcome,
+    #[serde(default, skip_serializing_if = "part_usages_absent_or_empty")]
+    pub parts: Option<Vec<PartUsageInput>>,
+}
+
+fn part_usages_absent_or_empty(value: &Option<Vec<PartUsageInput>>) -> bool {
+    value.as_ref().map_or(true, Vec::is_empty)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartUsageInput {
+    pub id: String,
+    /// Quantity consumed per copy of the model.
+    pub quantity: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<PartUsageSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartUsageSnapshot {
+    pub name: String,
+    pub category: Option<String>,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrintAttemptPart {
+    /// `None` means the part was deleted; its historical snapshot remains.
+    pub id: Option<String>,
+    pub name: String,
+    pub category: Option<String>,
+    pub unit: String,
+    pub quantity_per_copy: u32,
+    /// Total inventory consumed by this event across all copies.
+    pub quantity: u32,
+}
+
+/// Compatibility input for print attempts that can optionally identify a
+/// locally managed printer. The nested option preserves the wire distinction
+/// needed by updates: an omitted `printer_id` keeps existing attribution and
+/// an explicit JSON `null` clears it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrintAttemptInputWithPrinter {
+    #[serde(flatten)]
+    pub input: PrintAttemptInput,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub printer_id: Option<Option<String>>,
+}
+
+/// A single untrusted compatibility-history row whose printer reference has
+/// already been resolved to a local profile (or retained as a display-name
+/// snapshot only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintAttemptImportItem {
+    pub input: PrintAttemptInput,
+    pub created_at: Option<String>,
+    pub printer_id: Option<String>,
+    pub printer_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintAttemptImportResult {
+    pub added_count: usize,
+    pub skipped_count: usize,
+    pub metadata_version: u64,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -334,9 +444,251 @@ pub struct PrintAttempt {
     pub quantity: u32,
     pub notes: String,
     pub filament_ids: Vec<String>,
+    #[serde(default)]
+    pub parts: Vec<PrintAttemptPart>,
     pub outcome: PrintOutcome,
+    #[serde(default)]
+    pub stock_adjusted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_name: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterSourceKind {
+    Manual,
+    Discovered,
+    Imported,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterConnectionStatus {
+    #[default]
+    Unknown,
+    Online,
+    Offline,
+    AuthRequired,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterJobStatus {
+    #[default]
+    Unknown,
+    Idle,
+    Printing,
+    Paused,
+    Complete,
+}
+
+/// Catalog-owned printer record. `host` and `web_url` contain only endpoint
+/// locations; this contract deliberately has no credential or secret fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Printer {
+    pub id: String,
+    pub metadata_version: u64,
+    pub nickname: String,
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub printer_type: Option<String>,
+    pub firmware: Option<String>,
+    pub host: Option<String>,
+    pub web_url: Option<String>,
+    pub endpoint_approved: bool,
+    pub bed_mm: Option<[f32; 3]>,
+    pub notes: String,
+    pub source_kind: PrinterSourceKind,
+    pub connection_status: PrinterConnectionStatus,
+    pub job_status: PrinterJobStatus,
+    /// Connection and job state are a snapshot from the last explicit check.
+    /// Consumers should treat old timestamps as stale until a user checks again.
+    pub last_checked_at: Option<String>,
+    pub connection_error_code: Option<String>,
+    pub print_count: u64,
+    pub last_printed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterInput {
+    pub nickname: String,
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub printer_type: Option<String>,
+    pub firmware: Option<String>,
+    pub host: Option<String>,
+    pub web_url: Option<String>,
+    pub bed_mm: Option<[f32; 3]>,
+    pub notes: String,
+}
+
+/// Legacy settings records are imported once into the catalog without treating
+/// their endpoints as approved connection targets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegacyPrinter {
+    pub id: String,
+    pub name: String,
+    pub bed_mm: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyPrinterImportSummary {
+    pub inserted: usize,
+    pub already_present: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterMaintenanceInput {
+    pub title: String,
+    pub performed_at: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterMaintenanceLog {
+    pub id: String,
+    pub metadata_version: u64,
+    pub printer_id: Option<String>,
+    pub printer_nickname: String,
+    pub title: String,
+    pub performed_at: String,
+    pub notes: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterReminderStatus {
+    #[default]
+    Active,
+    Paused,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterReminderInput {
+    pub title: String,
+    pub notes: String,
+    pub due_at: String,
+    pub interval_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterReminder {
+    pub id: String,
+    pub metadata_version: u64,
+    pub printer_id: Option<String>,
+    pub printer_nickname: String,
+    pub title: String,
+    pub notes: String,
+    pub due_at: String,
+    pub interval_days: Option<u32>,
+    pub status: PrinterReminderStatus,
+    pub last_completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterReminderCompletionInput {
+    pub completed_at: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterReminderCompletion {
+    pub reminder: PrinterReminder,
+    pub maintenance_log: PrinterMaintenanceLog,
+}
+
+/// A bounded, user-reviewed import of printer profiles and their history.
+/// External references identify records only within the imported document.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterDataImport {
+    #[serde(default)]
+    pub printers: Vec<PrinterDataImportPrinter>,
+    #[serde(default)]
+    pub maintenance_logs: Vec<PrinterDataImportMaintenanceLog>,
+    #[serde(default)]
+    pub reminders: Vec<PrinterDataImportReminder>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterDataImportPrinter {
+    pub external_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_to_local_printer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    pub input: PrinterInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterDataImportMaintenanceLog {
+    pub external_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_external_ref: Option<String>,
+    /// Historical name snapshot from the source document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_nickname: Option<String>,
+    pub input: PrinterMaintenanceInput,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterDataImportReminder {
+    pub external_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_external_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printer_nickname: Option<String>,
+    pub input: PrinterReminderInput,
+    pub status: PrinterReminderStatus,
+    #[serde(default)]
+    pub last_completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterImportRefMapEntry {
+    pub external_ref: String,
+    pub local_printer_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterDataImportResult {
+    pub printer_ref_map: Vec<PrinterImportRefMapEntry>,
+    /// Newly created local printer profiles; mapped existing profiles are counted separately.
+    pub imported_printer_count: usize,
+    pub mapped_printer_count: usize,
+    pub imported_maintenance_log_count: usize,
+    pub imported_reminder_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

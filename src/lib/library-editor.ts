@@ -168,7 +168,7 @@ export class LibraryMetadataEditor {
       return input;
     };
     addField("designer", "Designer", text(metadata?.designer ?? ""));
-    addField("source_url", "Source URL", text(metadata?.source_url ?? "", "url"));
+    addField("source_url", "Source URL or origin", text(metadata?.source_url ?? ""));
     const notes = document.createElement("textarea");
     notes.rows = 4;
     notes.value = metadata?.notes ?? "";

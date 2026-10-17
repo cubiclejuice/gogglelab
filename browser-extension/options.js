@@ -1,5 +1,15 @@
+import { bindEnrichmentSetting, createEnrichmentSettings } from "./api-enrichment.js";
+
 const status = document.querySelector("#status");
 const queue = document.querySelector("#queue");
+const apiEnrichmentStatus = document.querySelector("#api-enrichment-status");
+const apiEnrichment = createEnrichmentSettings(chrome.storage.local, chrome.permissions);
+const apiEnrichmentSetting = bindEnrichmentSetting(
+  document.querySelector("#api-enrichment-enabled"),
+  apiEnrichmentStatus,
+  apiEnrichment,
+);
+void apiEnrichmentSetting.ready;
 
 async function database() {
   return await new Promise((resolve, reject) => {
@@ -23,7 +33,8 @@ async function storeHandle(handle) {
 document.querySelector("#choose").addEventListener("click", async () => {
   try {
     const handle = await showDirectoryPicker({ mode: "readwrite", id: "gogglelab-inbox" });
-    if (await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("Write permission was not granted");
+    if ((await handle.requestPermission({ mode: "readwrite" })) !== "granted")
+      throw new Error("Write permission was not granted");
     await storeHandle(handle);
     await chrome.storage.local.set({ inboxFolderName: handle.name });
     status.textContent = `Using ${handle.name}.`;
@@ -38,20 +49,26 @@ document.querySelector("#clear").addEventListener("click", async () => {
   status.textContent = "Using Downloads/GoggleLabInbox.";
 });
 
-chrome.runtime.sendMessage({ type: "queue.list" }).then(({ captureQueue = [], captureFailures = [] } = {}) => {
-  for (const item of captureQueue) {
-    const li = document.createElement("li");
-    li.textContent = `${item.page?.title || "Untitled"} · ${item.downloads?.length || 0} downloads`;
-    const retry = document.createElement("button");
-    retry.textContent = "Write inbox file again";
-    retry.addEventListener("click", async () => {
-      retry.disabled = true;
-      const result = await chrome.runtime.sendMessage({ type: "queue.retry", itemId: item.itemId });
-      status.textContent = result?.ok ? "Inbox file written." : result?.error || "Retry failed.";
-      retry.disabled = false;
-    });
-    li.append(" ", retry);
-    queue.append(li);
-  }
-  if (captureFailures.length) status.textContent = `${captureFailures.length} recent automatic capture failures are retained for diagnosis and retry.`;
-});
+chrome.runtime
+  .sendMessage({ type: "queue.list" })
+  .then(({ captureQueue = [], captureFailures = [] } = {}) => {
+    for (const item of captureQueue) {
+      const li = document.createElement("li");
+      li.textContent = `${item.page?.title || "Untitled"} · ${item.downloads?.length || 0} downloads`;
+      const retry = document.createElement("button");
+      retry.textContent = "Write inbox file again";
+      retry.addEventListener("click", async () => {
+        retry.disabled = true;
+        const result = await chrome.runtime.sendMessage({
+          type: "queue.retry",
+          itemId: item.itemId,
+        });
+        status.textContent = result?.ok ? "Inbox file written." : result?.error || "Retry failed.";
+        retry.disabled = false;
+      });
+      li.append(" ", retry);
+      queue.append(li);
+    }
+    if (captureFailures.length)
+      status.textContent = `${captureFailures.length} recent automatic capture failures are retained for diagnosis and retry.`;
+  });

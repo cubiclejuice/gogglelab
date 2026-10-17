@@ -8,6 +8,8 @@ use std::time::UNIX_EPOCH;
 use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipArchive};
 
+use crate::secure_fs::Directory;
+
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_TOTAL_INFLATED_BYTES: u64 = 512 * 1024 * 1024;
@@ -68,7 +70,15 @@ impl TemporaryArchiveMember {
 
 impl Drop for TemporaryArchiveMember {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let Some(name) = self.path.file_name() else {
+            return;
+        };
+        if let Ok(directory) = Directory::open(parent) {
+            let _ = directory.hold_entry(name);
+        }
     }
 }
 
@@ -132,6 +142,29 @@ pub fn extract_member_to_cache(
     expected_content_hash: &str,
     expected_bytes: u64,
 ) -> Result<PathBuf, String> {
+    extract_member_to_cache_with_publish_hook(
+        library_root,
+        outer_path,
+        member_path,
+        expected_outer_fingerprint,
+        expected_content_hash,
+        expected_bytes,
+        || {},
+    )
+}
+
+fn extract_member_to_cache_with_publish_hook<F>(
+    library_root: &Path,
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+    after_staging: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce(),
+{
     let bytes = read_verified_archive_member(
         outer_path,
         member_path,
@@ -152,20 +185,47 @@ pub fn extract_member_to_cache(
     create_real_directory(&hash_dir)?;
     let filename = sanitized_filename(member_path);
     let destination = hash_dir.join(filename);
-    if destination.exists() {
-        validate_cached_member(&destination, expected_content_hash, expected_bytes)?;
-        return Ok(destination);
+    let directory = Directory::open(&hash_dir).map_err(|error| error.to_string())?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| "Indexed cache filename is invalid".to_string())?;
+    match directory.open_file(destination_name) {
+        Ok(file) => {
+            validate_cached_member_file(file, expected_content_hash, expected_bytes)?;
+            return Ok(destination);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
     }
     let staging = hash_dir.join(format!(
         ".member-{}-{}.part",
         std::process::id(),
         CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&staging, &bytes).map_err(|error| error.to_string())?;
-    if let Err(error) = fs::rename(&staging, &destination) {
-        let _ = fs::remove_file(&staging);
-        if destination.exists() {
-            validate_cached_member(&destination, expected_content_hash, expected_bytes)?;
+    let staging_name = staging
+        .file_name()
+        .ok_or_else(|| "Indexed cache staging filename is invalid".to_string())?;
+    let mut file = directory
+        .create_new_file(staging_name)
+        .map_err(|error| error.to_string())?;
+    let write_result = (|| {
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = directory.hold_entry(staging_name);
+        return Err(error.to_string());
+    }
+    after_staging();
+    if let Err(error) = directory.rename_child_exclusive(staging_name, destination_name) {
+        let _ = directory.hold_entry(staging_name);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            let file = directory
+                .open_file(destination_name)
+                .map_err(|open_error| open_error.to_string())?;
+            validate_cached_member_file(file, expected_content_hash, expected_bytes)?;
             return Ok(destination);
         }
         return Err(error.to_string());
@@ -196,6 +256,7 @@ pub fn extract_member_to_temporary(
     }
     let staging = library_root.join("staging");
     create_real_directory(&staging)?;
+    let directory = Directory::open(&staging).map_err(|error| error.to_string())?;
     let extension = Path::new(member_path)
         .extension()
         .and_then(|value| value.to_str())
@@ -208,17 +269,18 @@ pub fn extract_member_to_temporary(
             CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             extension.to_ascii_lowercase()
         ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let name = path
+            .file_name()
+            .ok_or_else(|| "Temporary archive member filename is invalid".to_string())?;
+        match directory.create_new_file(name) {
             Ok(mut file) => {
                 use std::io::Write;
                 if let Err(error) = file.write_all(&bytes) {
-                    let _ = fs::remove_file(&path);
+                    drop(file);
+                    let _ = directory.hold_entry(name);
                     return Err(error.to_string());
                 }
+                file.sync_all().map_err(|error| error.to_string())?;
                 return Ok(TemporaryArchiveMember { path });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -509,17 +571,19 @@ fn create_real_directory(path: &Path) -> Result<(), String> {
     }
 }
 
-fn validate_cached_member(
-    path: &Path,
+fn validate_cached_member_file(
+    file: File,
     expected_hash: &str,
     expected_bytes: u64,
 ) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_bytes
-    {
-        return Err("Indexed cache entry is not the expected regular file".into());
+    if file.metadata().map_err(|error| error.to_string())?.len() != expected_bytes {
+        return Err("Indexed cache entry has an unexpected size".into());
     }
-    if hash_file(path, expected_bytes)? != expected_hash {
+    let mut bytes = Vec::new();
+    file.take(expected_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 != expected_bytes || hex_digest(&bytes) != expected_hash {
         return Err("Indexed cache entry hash is invalid".into());
     }
     Ok(())
@@ -701,11 +765,78 @@ mod tests {
         let temporary_path = temporary.path().to_path_buf();
         assert_eq!(fs::read(&temporary_path).unwrap(), model);
         assert!(cached.exists());
+        let replacement = b"concurrent replacement bytes";
+        fs::remove_file(&temporary_path).unwrap();
+        fs::write(&temporary_path, replacement).unwrap();
         drop(temporary);
         assert!(!temporary_path.exists());
+        let held = fs::read_dir(library.join("staging"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gogglelab-held-")
+                    && entry.file_name().to_string_lossy().ends_with(".data")
+            })
+            .find(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == replacement));
+        assert!(
+            held.is_some(),
+            "drop must preserve the replacement in a recoverable hold"
+        );
         assert!(
             cached.exists(),
             "viewer cache must survive thumbnail cleanup"
+        );
+        let _ = fs::remove_dir_all(library);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn cache_publication_preserves_a_destination_created_after_preflight() {
+        let library = temp_root("cache-race-library");
+        fs::create_dir(library.join("indexed-cache")).unwrap();
+        let source = temp_root("cache-race-source");
+        let archive = source.join("models.zip");
+        let model = empty_stl();
+        write_zip(&archive, &[("parts/selected.stl", &model)]);
+        let scan = scan_archive(&archive, 1024 * 1024).unwrap();
+        let selected = &scan.members[0];
+        let destination = library
+            .join("indexed-cache")
+            .join(&selected.content_hash)
+            .join("selected.stl");
+        let concurrent = b"concurrent cache replacement";
+
+        let result = extract_member_to_cache_with_publish_hook(
+            &library,
+            &archive,
+            &selected.member_path,
+            &scan.outer_fingerprint,
+            &selected.content_hash,
+            selected.bytes,
+            || {
+                fs::write(&destination, concurrent).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), concurrent);
+        let held = fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gogglelab-held-")
+                    && entry.file_name().to_string_lossy().ends_with(".data")
+            })
+            .find(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == model));
+        assert!(
+            held.is_some(),
+            "verified archive bytes must remain recoverable"
         );
         let _ = fs::remove_dir_all(library);
         let _ = fs::remove_dir_all(source);

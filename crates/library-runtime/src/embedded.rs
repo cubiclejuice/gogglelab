@@ -24,6 +24,7 @@ pub(crate) fn read_metadata(
             message: "Embedded metadata is available only for 3MF models".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         });
     }
     let fields = parse_standard_fields(&bytes)?;
@@ -194,6 +195,7 @@ fn invalid(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 

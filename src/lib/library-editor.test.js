@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   buildMetadataPatch,
   isMetadataVersionError,
+  LibraryMetadataEditor,
   matchesPrintedFilter,
   restoreLibraryFocus,
   selectionScopeIds,
@@ -34,6 +35,116 @@ test("batch metadata payload includes only explicitly applied fields and preserv
     tag_mode: "merge",
   });
   expect(patch.notes).toBeUndefined();
+});
+
+test("metadata editor renders and saves source origins as editable text", async () => {
+  class FakeElement {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.attributes = {};
+      this.listeners = {};
+      this.classList = { add() {}, toggle() {} };
+      this.open = false;
+      this.value = "";
+      this.type = "";
+    }
+
+    append(...children) {
+      this.children.push(...children);
+    }
+
+    replaceChildren(...children) {
+      this.children = [...children];
+    }
+
+    setAttribute(name, value) {
+      this.attributes[name] = value;
+    }
+
+    addEventListener(type, listener) {
+      this.listeners[type] = listener;
+    }
+    add(option) {
+      this.children.push(option);
+    }
+    click() {
+      this.listeners.click?.();
+    }
+    querySelector() {
+      return null;
+    }
+    reportValidity() {
+      return true;
+    }
+    showModal() {
+      this.open = true;
+    }
+    close() {
+      this.open = false;
+    }
+    focus() {}
+  }
+
+  const originalDocument = globalThis.document;
+  const originalOption = globalThis.Option;
+  const originalInput = globalThis.HTMLInputElement;
+  const editorModel = model("source-model", 1, {
+    source_url: "Thingiverse",
+    print_status: "unprinted",
+    rating: 0,
+    favorite: false,
+  });
+  editorModel.tags = [];
+  globalThis.document = {
+    createElement: (tagName) => new FakeElement(tagName),
+    createTextNode: (text) => ({ textContent: text }),
+  };
+  globalThis.Option = class FakeOption {
+    constructor(text, value) {
+      this.text = text;
+      this.value = value;
+    }
+  };
+  globalThis.HTMLInputElement = FakeElement;
+
+  try {
+    const container = new FakeElement("div");
+    const editor = new LibraryMetadataEditor(container);
+    const saved = [];
+    editor.onSave = async (targets, patch) => saved.push({ targets, patch });
+    editor.show([editorModel], [editorModel], [], [], new FakeElement("button"));
+    const findElement = (node, predicate) => {
+      if (node instanceof FakeElement && predicate(node)) return node;
+      for (const child of node.children ?? []) {
+        const found = findElement(child, predicate);
+        if (found) return found;
+      }
+      return null;
+    };
+    const originInput = findElement(
+      container,
+      (node) => node.tagName === "input" && node.value === "Thingiverse",
+    );
+    const saveButton = findElement(
+      container,
+      (node) => node.tagName === "button" && node.textContent === "Save",
+    );
+
+    expect(originInput.type).toBe("text");
+    expect(originInput.attributes["aria-label"]).toBe("Source URL or origin");
+    saveButton.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(saved[0].patch.source_url).toBe("Thingiverse");
+  } finally {
+    if (originalDocument === undefined) delete globalThis.document;
+    else globalThis.document = originalDocument;
+    if (originalOption === undefined) delete globalThis.Option;
+    else globalThis.Option = originalOption;
+    if (originalInput === undefined) delete globalThis.HTMLInputElement;
+    else globalThis.HTMLInputElement = originalInput;
+  }
 });
 
 test("ratings and favorite changes are versioned metadata fields for single and batch edits", () => {

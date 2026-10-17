@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use library_protocol::{
@@ -7,6 +7,7 @@ use library_protocol::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::secure_fs::Directory;
 use crate::LibraryRuntime;
 
 pub(crate) struct PreparedGeometry {
@@ -68,14 +69,17 @@ pub(crate) fn prepare_model_geometry(
     let packet = build_packet(mesh.triangle_count, &mesh.positions);
     let namespace = owned_geometry_namespace(runtime.host_library_root())?;
     let path = namespace.join(format!("geometry-{}.stl2", uuid::Uuid::new_v4().simple()));
+    let directory = Directory::open(&namespace).map_err(|_| io_error())?;
+    let name = path.file_name().ok_or_else(|| io_error())?;
+    let mut created = false;
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut file = directory
+            .create_new_file_read_write(name)
             .map_err(|_| io_error())?;
+        created = true;
         file.write_all(&packet).map_err(|_| io_error())?;
         file.sync_all().map_err(|_| io_error())?;
+        drop(file);
         Ok(PreparedGeometry {
             path: path.clone(),
             bytes: packet.len() as u64,
@@ -127,10 +131,28 @@ pub(crate) fn prepare_model_geometry(
             plate_warning: parsed.plate_warning,
         })
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&path);
+    match result {
+        Ok(prepared) => {
+            let file = directory.open_file(name).map_err(|_| io_error())?;
+            let mut bytes = Vec::new();
+            file.take(packet.len() as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| io_error())?;
+            if bytes.len() != packet.len()
+                || format!("{:x}", Sha256::digest(&bytes)) != prepared.sha256
+            {
+                let _ = directory.hold_entry(name);
+                return Err(invalid("Published geometry packet failed its hash check"));
+            }
+            Ok(prepared)
+        }
+        Err(error) => {
+            if created {
+                let _ = directory.hold_entry(name);
+            }
+            Err(error)
+        }
     }
-    result
 }
 
 fn map_plates(plates: &[stl_core::Plate]) -> Vec<GeometryPlate> {
@@ -189,6 +211,7 @@ fn invalid(message: &str) -> RuntimeError {
         message: message.into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }
 
@@ -198,5 +221,6 @@ fn io_error() -> RuntimeError {
         message: "Geometry packet filesystem operation failed".into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     }
 }

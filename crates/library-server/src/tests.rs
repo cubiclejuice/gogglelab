@@ -74,7 +74,26 @@ fn fake_unsupported<T>() -> Result<T, EngineError> {
         message: "unsupported".into(),
         retryable: false,
         current_version: None,
+        source_holds: Vec::new(),
     })
+}
+
+fn partial_source_action_error(action: &str) -> EngineError {
+    EngineError {
+        code: "io",
+        message: format!("{action} stopped after retaining source bytes"),
+        retryable: false,
+        current_version: None,
+        source_holds: vec![library_protocol::SourceHoldReceipt {
+            model_id: "partial-model".into(),
+            root_handle_id: "models".into(),
+            relative_path: "nested/part.stl".into(),
+            hold_name: ".part.stl.hold.data".into(),
+            journal_name: ".part.stl.hold.json".into(),
+            bytes: 19,
+            sha256: "b".repeat(64),
+        }],
+    }
 }
 macro_rules! fake_extended_engine {
     () => {
@@ -458,9 +477,13 @@ macro_rules! fake_extended_engine {
         fn execute_management_action(
             &self,
             _: &RequestContext,
-            _: &str,
+            token: &str,
         ) -> Result<library_protocol::ManagementResult, EngineError> {
-            fake_unsupported()
+            match token {
+                "partial-move" => Err(partial_source_action_error("Move")),
+                "partial-quarantine" => Err(partial_source_action_error("Quarantine")),
+                _ => fake_unsupported(),
+            }
         }
         fn list_captures(
             &self,
@@ -483,6 +506,8 @@ impl LibraryEngine for FakeEngine {
             features: FeatureSet {
                 reveal_source: false,
                 trash_source: false,
+                purge_catalog: false,
+                cleanup_orphans: false,
                 launch_slicer: false,
                 download_source: true,
                 download_bundle: true,
@@ -552,7 +577,21 @@ impl LibraryEngine for FakeEngine {
         })
     }
 
-    fn call_tool(&self, _: &RequestContext, name: &str, _: Value) -> Result<Value, EngineError> {
+    fn call_tool(
+        &self,
+        context: &RequestContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, EngineError> {
+        if name == "execute_management_action" {
+            let token = arguments
+                .get("token")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid_tool)?;
+            return self
+                .execute_management_action(context, token)
+                .and_then(|result| serde_json::to_value(result).map_err(|_| internal_tool()));
+        }
         Ok(json!({"tool":name,"ok":true}))
     }
 
@@ -605,6 +644,7 @@ impl LibraryEngine for FakeEngine {
             message: "unsupported".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
     }
     fn issue_model_download(
@@ -618,6 +658,7 @@ impl LibraryEngine for FakeEngine {
             message: "unsupported".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
     }
     fn stream_content(
@@ -636,6 +677,7 @@ impl LibraryEngine for FakeEngine {
                         message: "closed".into(),
                         retryable: false,
                         current_version: None,
+                        source_holds: Vec::new(),
                     })?;
             }
             return Ok(());
@@ -645,6 +687,7 @@ impl LibraryEngine for FakeEngine {
             message: "unsupported".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
     }
     fn describe_content(
@@ -669,6 +712,7 @@ impl LibraryEngine for FakeEngine {
             message: "unsupported".into(),
             retryable: false,
             current_version: None,
+            source_holds: Vec::new(),
         })
     }
 }
@@ -1495,6 +1539,124 @@ async fn mcp_source_action_aliases_require_confirm_and_route_to_the_named_tool()
     }
 }
 
+#[tokio::test]
+async fn partial_source_action_errors_return_typed_recovery_holds_over_rest_and_mcp() {
+    let app = test_router();
+    let rest = app
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/management/actions/execute", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"token":"partial-move"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let rest: Value =
+        serde_json::from_slice(&to_bytes(rest.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(rest["error"]["code"], "io");
+    assert_eq!(
+        rest["error"]["message"],
+        "Move stopped after retaining source bytes"
+    );
+    assert_eq!(rest["error"]["retryable"], false);
+    let rest_holds = rest["error"]["sourceHolds"].as_array().unwrap();
+    assert_eq!(rest_holds.len(), 1);
+    assert_eq!(rest_holds[0]["modelId"], "partial-model");
+    assert_eq!(rest_holds[0]["rootHandleId"], "models");
+    assert_eq!(rest_holds[0]["relativePath"], "nested/part.stl");
+    assert_eq!(rest_holds[0]["holdName"], ".part.stl.hold.data");
+    assert_eq!(rest_holds[0]["journalName"], ".part.stl.hold.json");
+    assert_eq!(rest_holds[0]["bytes"], "19");
+    assert_eq!(rest_holds[0]["sha256"], "b".repeat(64));
+    let hold_schema = &openapi_document()["components"]["schemas"]["Error"]["properties"]["error"]
+        ["properties"]["sourceHolds"];
+    assert_eq!(hold_schema["type"], "array");
+    assert!(hold_schema["items"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "sha256"));
+
+    let initialized = app
+        .clone()
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":1,"method":"initialize",
+                        "params":{"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session = initialized.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let initialized_notice = app
+        .clone()
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("mcp-session-id", &session)
+                .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initialized_notice.status(), StatusCode::ACCEPTED);
+
+    let mcp = app
+        .oneshot(
+            request("POST", "/mcp", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("mcp-session-id", &session)
+                .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+                .body(Body::from(
+                    json!({
+                        "jsonrpc":"2.0","id":2,"method":"tools/call",
+                        "params":{"name":"execute_management_action","arguments":{"token":"partial-quarantine"}}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mcp: Value =
+        serde_json::from_slice(&to_bytes(mcp.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(mcp["result"]["isError"], true);
+    assert_eq!(
+        mcp["result"]["content"][0]["text"],
+        "Quarantine stopped after retaining source bytes"
+    );
+    let error = &mcp["result"]["structuredContent"]["error"];
+    assert_eq!(error["code"], "io");
+    assert_eq!(error["retryable"], false);
+    let mcp_holds = error["sourceHolds"].as_array().unwrap();
+    assert_eq!(mcp_holds.len(), 1);
+    assert_eq!(mcp_holds[0]["modelId"], "partial-model");
+    assert_eq!(mcp_holds[0]["rootHandleId"], "models");
+    assert_eq!(mcp_holds[0]["relativePath"], "nested/part.stl");
+    assert_eq!(mcp_holds[0]["holdName"], ".part.stl.hold.data");
+    assert_eq!(mcp_holds[0]["journalName"], ".part.stl.hold.json");
+    assert_eq!(mcp_holds[0]["bytes"], "19");
+    assert_eq!(mcp_holds[0]["sha256"], "b".repeat(64));
+}
+
 #[test]
 fn confirmation_tokens_are_one_use_and_bound_to_principal_body_and_epoch() {
     let store = ConfirmationStore::new(Duration::from_secs(60), 4);
@@ -1600,18 +1762,60 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
         .into_iter()
         .find(|tool| tool["name"] == "plan_management_action")
         .unwrap();
-    for unsupported in [
-        "quarantineLooseSource",
-        "undoQuarantine",
-        "moveLooseSource",
-        "purgeCatalog",
-        "cleanupOrphans",
-    ] {
+    for unsupported in ["quarantineLooseSource", "undoQuarantine", "moveLooseSource"] {
         assert!(!management["inputSchema"].to_string().contains(unsupported));
     }
+    for supported in ["purgeCatalog", "cleanupOrphans"] {
+        assert!(management["inputSchema"].to_string().contains(supported));
+    }
+    assert!(
+        serde_json::from_value::<super::WireManagementAction>(json!({
+            "kind":"purgeCatalog",
+            "backupDestinationHandleId":"backups",
+            "backupFileName":"before-purge.zip"
+        }))
+        .is_err()
+    );
+    let purge_false_confirmation: super::WireManagementAction = serde_json::from_value(json!({
+        "kind":"purgeCatalog",
+        "backupDestinationHandleId":"backups",
+        "backupFileName":"before-purge.zip",
+        "confirm":false
+    }))
+    .unwrap();
+    assert!(purge_false_confirmation.parse().is_err());
+    let purge_with_confirmation: super::WireManagementAction = serde_json::from_value(json!({
+        "kind":"purgeCatalog",
+        "backupDestinationHandleId":"backups",
+        "backupFileName":"before-purge.zip",
+        "confirm":true
+    }))
+    .unwrap();
+    assert!(matches!(
+        purge_with_confirmation.parse().unwrap(),
+        library_protocol::ManagementAction::PurgeCatalog { .. }
+    ));
+    assert!(
+        serde_json::from_value::<super::WireManagementAction>(json!({
+            "kind":"cleanupOrphans"
+        }))
+        .is_err()
+    );
+    let cleanup_false_confirmation: super::WireManagementAction =
+        serde_json::from_value(json!({"kind":"cleanupOrphans","confirm":false})).unwrap();
+    assert!(cleanup_false_confirmation.parse().is_err());
+    let cleanup_with_confirmation: super::WireManagementAction =
+        serde_json::from_value(json!({"kind":"cleanupOrphans","confirm":true})).unwrap();
+    assert!(matches!(
+        cleanup_with_confirmation.parse().unwrap(),
+        library_protocol::ManagementAction::CleanupOrphans
+    ));
     for name in [
         "update_model",
         "save_filament",
+        "create_part_stock",
+        "update_part_stock",
+        "delete_part_stock",
         "log_print_event",
         "add_model_tags",
         "remove_model_tags",
@@ -1650,6 +1854,64 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
     assert!(
         super::validate_tool_shape("save_filament", &json!({"input":{},"extra":true})).is_err()
     );
+    let stock_input = json!({
+        "name":"M3 insert",
+        "category":"hardware",
+        "quantity":25,
+        "unit":"pcs",
+        "notes":"brass",
+        "lowStock":4
+    });
+    assert!(super::validate_tool_shape("list_part_stock", &json!({})).is_ok());
+    assert!(super::validate_tool_shape("create_part_stock", &json!({"input":stock_input})).is_ok());
+    assert!(super::validate_tool_shape(
+        "update_part_stock",
+        &json!({"partId":"part-1","expectedVersion":"3","input":stock_input})
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape(
+        "delete_part_stock",
+        &json!({"partId":"part-1","expectedVersion":"3"})
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape(
+        "create_part_stock",
+        &json!({"input":stock_input,"extra":true})
+    )
+    .is_err());
+    let history_tool = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "log_print_event")
+        .unwrap();
+    assert_eq!(
+        history_tool["inputSchema"]["properties"]["input"]["properties"]["parts"]["maxItems"],
+        256
+    );
+    let event_input = json!({
+        "printedAt":"2026-10-15T12:00:00Z",
+        "quantity":2,
+        "notes":"cancelled after setup",
+        "filamentIds":[],
+        "outcome":"cancelled",
+        "parts":[{"id":"part-1","quantity":3}]
+    });
+    assert!(super::validate_tool_shape(
+        "log_print_event",
+        &json!({"modelId":"model-1","input":event_input})
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape(
+        "log_print_event",
+        &json!({"modelId":"model-1","input":{
+            "printedAt":"2026-10-15T12:00:00Z",
+            "quantity":2,
+            "notes":"duplicate parts",
+            "filamentIds":[],
+            "outcome":"printed",
+            "parts":[{"id":"part-1","quantity":1},{"id":"part-1","quantity":2}]
+        }})
+    )
+    .is_err());
     for name in [
         "get_model",
         "get_hash_status",
@@ -2171,6 +2433,348 @@ async fn protocol_adapter_pages_the_real_runtime_without_paths() {
         .await
         .unwrap();
     assert_eq!(restored.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn phase9_parts_rest_mcp_and_history_contracts_adjust_stock_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let model = runtime
+        .mutate_db(|db| db.create_model("Parts API model", None))
+        .unwrap();
+    let adapter = Arc::new(ProtocolEngineAdapter::new(
+        Arc::clone(&runtime),
+        HostMode::Headless,
+    ));
+    let reader = RequestContext {
+        principal_id: "part-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead]),
+        request_id: "part-reader".into(),
+    };
+    let writer = RequestContext {
+        principal_id: "part-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "part-writer".into(),
+    };
+    assert!(adapter.supports_tool(&reader, "list_part_stock"));
+    assert!(!adapter.supports_tool(&reader, "create_part_stock"));
+    assert!(!adapter.supports_tool(&reader, "update_part_stock"));
+    assert!(!adapter.supports_tool(&reader, "delete_part_stock"));
+    for name in [
+        "create_part_stock",
+        "update_part_stock",
+        "delete_part_stock",
+    ] {
+        assert!(adapter.supports_tool(&writer, name));
+    }
+    assert_eq!(
+        adapter
+            .call_tool(
+                &reader,
+                "create_part_stock",
+                json!({"input":{"name":"blocked","quantity":1,"unit":"pcs","notes":"","lowStock":0}}),
+            )
+            .unwrap_err()
+            .code,
+        "forbidden"
+    );
+    let created_mcp = adapter
+        .call_tool(
+            &writer,
+            "create_part_stock",
+            json!({"input":{"name":"M3 insert","category":"hardware","quantity":5,"unit":"pcs","notes":"brass","lowStock":1}}),
+        )
+        .unwrap();
+    let part_id = created_mcp["id"].as_str().unwrap().to_owned();
+    assert_eq!(created_mcp["metadataVersion"], "1");
+    assert_eq!(created_mcp["quantity"], "5");
+    let updated_mcp = adapter
+        .call_tool(
+            &writer,
+            "update_part_stock",
+            json!({"partId":part_id,"expectedVersion":"1","input":{"name":"M3 insert","category":"hardware","quantity":10,"unit":"pcs","notes":"brass","lowStock":2}}),
+        )
+        .unwrap();
+    assert_eq!(updated_mcp["metadataVersion"], "2");
+    assert_eq!(updated_mcp["quantity"], "10");
+    let disposable_mcp = adapter
+        .call_tool(
+            &writer,
+            "create_part_stock",
+            json!({"input":{"name":"M2 nut","quantity":2,"unit":"pcs","notes":"","lowStock":0}}),
+        )
+        .unwrap();
+    let disposable_id = disposable_mcp["id"].as_str().unwrap();
+    let disposable_updated = adapter
+        .call_tool(
+            &writer,
+            "update_part_stock",
+            json!({"partId":disposable_id,"expectedVersion":"1","input":{"name":"M2 nut","quantity":3,"unit":"pcs","notes":"","lowStock":0}}),
+        )
+        .unwrap();
+    assert_eq!(disposable_updated["metadataVersion"], "2");
+    adapter
+        .call_tool(
+            &writer,
+            "delete_part_stock",
+            json!({"partId":disposable_id,"expectedVersion":"2"}),
+        )
+        .unwrap();
+    let listed_mcp = adapter
+        .call_tool(&reader, "list_part_stock", json!({}))
+        .unwrap();
+    assert_eq!(listed_mcp[0]["id"], part_id);
+    assert_eq!(listed_mcp[0]["metadataVersion"], "2");
+    assert_eq!(listed_mcp.as_array().unwrap().len(), 1);
+
+    let app = router(adapter.clone(), security(8));
+    let listed = app
+        .clone()
+        .oneshot(
+            request("GET", "/api/v1/parts", true)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(listed[0]["id"], part_id);
+    assert_eq!(listed[0]["metadataVersion"], "2");
+
+    let updated = app
+        .clone()
+        .oneshot(
+            request("PUT", &format!("/api/v1/parts/{part_id}"), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"expectedVersion":"2","input":{"name":"M3 insert","category":"hardware","quantity":10,"unit":"pcs","notes":"brass","lowStock":2}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value =
+        serde_json::from_slice(&to_bytes(updated.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(updated["metadataVersion"], "3");
+    assert_eq!(updated["quantity"], "10");
+    let stale_update = app
+        .clone()
+        .oneshot(
+            request("PUT", &format!("/api/v1/parts/{part_id}"), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"expectedVersion":"2","input":{"name":"M3 insert","category":"hardware","quantity":9,"unit":"pcs","notes":"brass","lowStock":2}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_update.status(), StatusCode::CONFLICT);
+
+    let created_event = app
+        .clone()
+        .oneshot(
+            request("POST", &format!("/api/v1/models/{}/history", model.id), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"printedAt":"2026-10-15T12:00:00Z","quantity":2,"notes":"cancelled setup","filamentIds":[],"outcome":"cancelled","parts":[{"id":part_id,"quantity":3}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_event.status(), StatusCode::OK);
+    let created_event: Value = serde_json::from_slice(
+        &to_bytes(created_event.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let event_id = created_event["id"].as_str().unwrap().to_owned();
+    assert_eq!(created_event["outcome"], "cancelled");
+    assert_eq!(created_event["parts"][0]["quantityPerCopy"], 3);
+    assert_eq!(created_event["parts"][0]["quantity"], 6);
+
+    let stock_after_create = app
+        .clone()
+        .oneshot(
+            request("GET", "/api/v1/parts", true)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let stock_after_create: Value = serde_json::from_slice(
+        &to_bytes(stock_after_create.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stock_after_create[0]["quantity"], "4");
+
+    let updated_event = app
+        .clone()
+        .oneshot(
+            request("PUT", &format!("/api/v1/history/{event_id}"), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"printedAt":"2026-10-15T12:00:00Z","quantity":1,"notes":"corrected copies","filamentIds":[],"outcome":"cancelled"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_event.status(), StatusCode::OK);
+    let updated_event: Value = serde_json::from_slice(
+        &to_bytes(updated_event.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(updated_event["parts"][0]["quantity"], 3);
+    let stock_after_update: Value = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(
+                    request("GET", "/api/v1/parts", true)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body(),
+            64 * 1024,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stock_after_update[0]["quantity"], "7");
+
+    let batch_payload = json!({
+        "idempotencyKey":"parts-http-replay",
+        "items":[{"modelId":model.id,"input":{
+            "printedAt":"2026-10-15T13:00:00Z",
+            "quantity":2,
+            "notes":"batch",
+            "filamentIds":[],
+            "outcome":"failed",
+            "parts":[{"id":part_id,"quantity":1}]
+        }}]
+    });
+    let first_batch = app
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/history/bulk", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(batch_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_batch.status(), StatusCode::OK);
+    let first_batch: Value =
+        serde_json::from_slice(&to_bytes(first_batch.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    let batch_event_id = first_batch[0]["id"].as_str().unwrap().to_owned();
+    let replay = app
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/history/bulk", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(batch_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: Value =
+        serde_json::from_slice(&to_bytes(replay.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(replay, first_batch);
+    let stock_after_replay: Value = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(
+                    request("GET", "/api/v1/parts", true)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body(),
+            64 * 1024,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stock_after_replay[0]["quantity"], "5");
+
+    for attempt_id in [&event_id, &batch_event_id] {
+        let deleted = app
+            .clone()
+            .oneshot(
+                request("DELETE", &format!("/api/v1/history/{attempt_id}"), true)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    }
+    let stock_after_delete: Value = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(
+                    request("GET", "/api/v1/parts", true)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body(),
+            64 * 1024,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stock_after_delete[0]["quantity"], "10");
+    let current_stock_version = stock_after_delete[0]["metadataVersion"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deleted_stock = app
+        .clone()
+        .oneshot(
+            request("DELETE", &format!("/api/v1/parts/{part_id}"), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"expectedVersion":"1"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_stock.status(), StatusCode::CONFLICT);
+    let deleted_stock = app
+        .clone()
+        .oneshot(
+            request("DELETE", &format!("/api/v1/parts/{part_id}"), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"expectedVersion":current_stock_version}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_stock.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -3411,20 +4015,32 @@ fn protocol_adapter_updates_heterogeneous_model_batches_atomically() {
             ))
         })
         .unwrap();
-    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
     let writer = RequestContext {
         principal_id: "metadata-writer".into(),
         capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
         request_id: "heterogeneous-update-batch".into(),
     };
+    let filament = runtime
+        .create_filament(
+            &writer,
+            library_protocol::FilamentInput {
+                brand: "Local".into(),
+                material: "PLA".into(),
+                color: "Blue".into(),
+                name: "PLA Blue".into(),
+                notes: String::new(),
+            },
+        )
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
 
     let result = adapter
         .call_tool(
             &writer,
             "update_models_batch",
             json!({"updates":[
-                {"modelId":first.id,"expectedVersion":first.metadata_version.to_string(),"patch":{"designer":"Ada","favorite":true}},
-                {"modelId":second.id,"expectedVersion":second.metadata_version.to_string(),"patch":{"notes":"Resin prototype","rating":4}}
+                {"modelId":first.id,"expectedVersion":first.metadata_version.to_string(),"patch":{"designer":"Ada","favorite":true},"tags":["Mechanical","Support"],"filamentIds":[filament.id]},
+                {"modelId":second.id,"expectedVersion":second.metadata_version.to_string(),"patch":{"notes":"Resin prototype","rating":4},"tags":["Draft"],"filamentIds":[]}
             ]}),
         )
         .unwrap();
@@ -3433,15 +4049,19 @@ fn protocol_adapter_updates_heterogeneous_model_batches_atomically() {
     let updated_second = adapter.get_model(&writer, &second.id).unwrap();
     assert_eq!(updated_first.designer.as_deref(), Some("Ada"));
     assert!(updated_first.favorite);
+    assert_eq!(updated_first.tags, ["Mechanical", "Support"]);
+    assert_eq!(updated_first.filament_ids, vec![filament.id.clone()]);
     assert_eq!(updated_second.notes.as_deref(), Some("Resin prototype"));
     assert_eq!(updated_second.rating, 4);
+    assert_eq!(updated_second.tags, ["Draft"]);
+    assert!(updated_second.filament_ids.is_empty());
 
     let stale_result = adapter.call_tool(
         &writer,
         "update_models_batch",
         json!({"updates":[
-            {"modelId":first.id,"expectedVersion":updated_first.metadata_version.clone(),"patch":{"notes":"Must roll back"}},
-            {"modelId":second.id,"expectedVersion":"999999999","patch":{"designer":"Must not apply"}}
+            {"modelId":first.id,"expectedVersion":updated_first.metadata_version.clone(),"patch":{"notes":"Must roll back"},"tags":["Must Roll Back"],"filamentIds":[]},
+            {"modelId":second.id,"expectedVersion":"999999999","patch":{"designer":"Must not apply"},"tags":[],"filamentIds":[]}
         ]}),
     );
     assert!(stale_result.is_err());
@@ -3454,6 +4074,14 @@ fn protocol_adapter_updates_heterogeneous_model_batches_atomically() {
         adapter.get_model(&writer, &second.id).unwrap().designer,
         None
     );
+    let unchanged_first = adapter.get_model(&writer, &first.id).unwrap();
+    assert_eq!(unchanged_first.tags, ["Mechanical", "Support"]);
+    assert_eq!(unchanged_first.filament_ids, vec![filament.id]);
+    assert!(!adapter
+        .list_tags(&writer)
+        .unwrap()
+        .iter()
+        .any(|tag| tag.name == "Must Roll Back"));
 }
 
 #[test]
@@ -3648,6 +4276,19 @@ fn source_management_aliases_require_source_write_capabilities_and_writable_root
         library_protocol::RootAccess::Writable,
     );
     let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+    let batch_tool = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "update_models_batch")
+        .unwrap();
+    let update_properties =
+        &batch_tool["inputSchema"]["properties"]["updates"]["items"]["properties"];
+    assert_eq!(update_properties["tags"]["uniqueItems"], true);
+    assert_eq!(update_properties["tags"]["items"]["minLength"], 1);
+    assert_eq!(
+        update_properties["tags"]["items"]["pattern"].as_str(),
+        Some(r"\S")
+    );
+    assert_eq!(update_properties["filamentIds"]["uniqueItems"], true);
     let writer = RequestContext {
         principal_id: "source-writer".into(),
         capabilities: BTreeSet::from([
@@ -3711,6 +4352,479 @@ fn source_management_aliases_require_source_write_capabilities_and_writable_root
         )
         .unwrap_err();
     assert_eq!(movement.code, "notFound");
+}
+
+#[test]
+fn mcp_purge_and_orphan_cleanup_use_confirmed_one_use_management_plans() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("library");
+    let backups = temp.path().join("backups");
+    std::fs::create_dir(&backups).unwrap();
+    let mut runtime_config = library_runtime::RuntimeConfig::desktop(
+        library.clone(),
+        temp.path().join("integrations.json"),
+    );
+    runtime_config
+        .roots
+        .push(library_runtime::RuntimeRootPolicy {
+            id: "backups".into(),
+            catalog_root_id: None,
+            label: "Backups".into(),
+            path: backups.clone(),
+            access: library_protocol::RootAccess::BackupOnly,
+        });
+    runtime_config
+        .capabilities
+        .remove(&Capability::PhysicalSourceWrite);
+    runtime_config.capabilities.insert(Capability::BackupWrite);
+    let runtime = library_runtime::LibraryRuntime::open(runtime_config).unwrap();
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let context = RequestContext {
+        principal_id: "confirmed-management-client".into(),
+        capabilities: BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::CatalogWrite,
+            Capability::Maintenance,
+            Capability::BackupWrite,
+            Capability::MediaWrite,
+        ]),
+        request_id: "management-mcp".into(),
+    };
+    assert!(adapter
+        .call_tool(
+            &context,
+            "plan_management_action",
+            json!({"action":{
+                "kind":"purgeCatalog",
+                "backupDestinationHandleId":"backups",
+                "backupFileName":"missing-confirm.zip"
+            }}),
+        )
+        .is_err());
+    let purge_plan = adapter
+        .call_tool(
+            &context,
+            "plan_management_action",
+            json!({"action":{
+                "kind":"purgeCatalog",
+                "backupDestinationHandleId":"backups",
+                "backupFileName":"mcp-before-purge.zip",
+                "confirm":true
+            }}),
+        )
+        .unwrap();
+    assert_eq!(purge_plan["actionKind"], "purgeCatalog");
+    let purge_result = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":purge_plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(purge_result["kind"], "purged");
+    assert!(backups.join("mcp-before-purge.zip").is_file());
+    assert!(adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":purge_plan["token"]}),
+        )
+        .is_err());
+
+    let thumbnail_dir = library.join("thumbnails");
+    std::fs::create_dir_all(&thumbnail_dir).unwrap();
+    let orphan = thumbnail_dir.join(format!("{}-isometric-v1-256-ffffff.png", "c".repeat(64)));
+    let orphan_bytes = b"generated orphan thumbnail".to_vec();
+    std::fs::write(&orphan, &orphan_bytes).unwrap();
+    assert!(adapter
+        .call_tool(
+            &context,
+            "plan_management_action",
+            json!({"action":{"kind":"cleanupOrphans"}}),
+        )
+        .is_err());
+    let cleanup_plan = adapter
+        .call_tool(
+            &context,
+            "plan_management_action",
+            json!({"action":{"kind":"cleanupOrphans","confirm":true}}),
+        )
+        .unwrap();
+    assert_eq!(cleanup_plan["actionKind"], "cleanupOrphans");
+    let cleanup_result = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":cleanup_plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(cleanup_result["kind"], "cleanupCompleted");
+    assert_eq!(cleanup_result["files"], "1");
+    assert_eq!(cleanup_result["bytes"], orphan_bytes.len().to_string());
+    assert!(!orphan.exists());
+    assert!(std::fs::read_dir(&thumbnail_dir).unwrap().next().is_none());
+}
+
+#[test]
+fn browser_capabilities_keep_maintenance_actions_separate_from_source_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("library");
+    let models = temp.path().join("models");
+    let backups = temp.path().join("backups");
+    std::fs::create_dir(&models).unwrap();
+    std::fs::create_dir(&backups).unwrap();
+    let bootstrap = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        library.clone(),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let model_root = bootstrap
+        .mutate_db(|db| db.add_index_root(&models, 60, 50 * 1024 * 1024))
+        .unwrap();
+    drop(bootstrap);
+
+    let mut runtime_config =
+        library_runtime::RuntimeConfig::desktop(library, temp.path().join("integrations.json"));
+    runtime_config.local_catalog_root_access = false;
+    runtime_config.roots = vec![
+        library_runtime::RuntimeRootPolicy {
+            id: "models".into(),
+            catalog_root_id: Some(model_root.id),
+            label: "Models".into(),
+            path: models,
+            access: library_protocol::RootAccess::Writable,
+        },
+        library_runtime::RuntimeRootPolicy {
+            id: "backups".into(),
+            catalog_root_id: None,
+            label: "Backups".into(),
+            path: backups,
+            access: library_protocol::RootAccess::BackupOnly,
+        },
+    ];
+    let granted = BTreeSet::from([
+        Capability::CatalogRead,
+        Capability::CatalogWrite,
+        Capability::Maintenance,
+        Capability::BackupWrite,
+        Capability::MediaWrite,
+        Capability::PhysicalSourceWrite,
+    ]);
+    runtime_config.capabilities = granted.clone();
+    let runtime = library_runtime::LibraryRuntime::open(runtime_config).unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
+
+    let context = |capabilities| RequestContext {
+        principal_id: "feature-visibility".into(),
+        capabilities,
+        request_id: "feature-visibility".into(),
+    };
+    let full = adapter
+        .capabilities(&context(granted.clone()))
+        .unwrap()
+        .features;
+    assert!(full.trash_source);
+    assert!(full.purge_catalog);
+    assert!(full.cleanup_orphans);
+
+    let without_source_write = BTreeSet::from([
+        Capability::CatalogRead,
+        Capability::CatalogWrite,
+        Capability::Maintenance,
+        Capability::BackupWrite,
+        Capability::MediaWrite,
+    ]);
+    let maintenance_only = adapter
+        .capabilities(&context(without_source_write))
+        .unwrap()
+        .features;
+    assert!(!maintenance_only.trash_source);
+    assert!(maintenance_only.purge_catalog);
+    assert!(maintenance_only.cleanup_orphans);
+
+    let without_backup_write = BTreeSet::from([
+        Capability::CatalogRead,
+        Capability::CatalogWrite,
+        Capability::Maintenance,
+        Capability::MediaWrite,
+        Capability::PhysicalSourceWrite,
+    ]);
+    let cleanup_only = adapter
+        .capabilities(&context(without_backup_write))
+        .unwrap()
+        .features;
+    assert!(!cleanup_only.purge_catalog);
+    assert!(cleanup_only.cleanup_orphans);
+}
+
+#[test]
+fn get_all_metadata_returns_counted_rows_without_arguments_and_keeps_get_model_separate() {
+    assert!(super::validate_tool_shape("get_all_metadata", &json!({})).is_ok());
+    assert!(super::validate_tool_shape("get_all_metadata", &json!({"modelId":"model-1"})).is_err());
+    assert!(super::validate_tool_shape("get_model", &json!({"modelId":"model-1"})).is_ok());
+
+    let metadata_tool = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "get_all_metadata")
+        .unwrap();
+    assert_eq!(metadata_tool["inputSchema"]["type"], "object");
+    assert_eq!(metadata_tool["inputSchema"]["additionalProperties"], false);
+    assert_eq!(metadata_tool["inputSchema"]["properties"], json!({}));
+    assert!(metadata_tool["inputSchema"].get("required").is_none());
+
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let parent = runtime
+        .mutate_db(|db| db.create_model("Parent model", None))
+        .unwrap();
+    let child_one = runtime
+        .mutate_db(|db| db.create_model("Child one", None))
+        .unwrap();
+    let child_two = runtime
+        .mutate_db(|db| db.create_model("Child two", None))
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let writer = RequestContext {
+        principal_id: "metadata-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "metadata-write".into(),
+    };
+    adapter
+        .update_metadata(
+            &writer,
+            VersionedTarget {
+                model_id: parent.id.clone(),
+                expected_version: parent.metadata_version,
+            },
+            MetadataPatch {
+                designer: Some("Alice".into()),
+                model_license: Some("CC0".into()),
+                ..MetadataPatch::default()
+            },
+        )
+        .unwrap();
+    adapter
+        .update_metadata(
+            &writer,
+            VersionedTarget {
+                model_id: child_one.id.clone(),
+                expected_version: child_one.metadata_version,
+            },
+            MetadataPatch {
+                designer: Some("Alice".into()),
+                model_license: Some("GPL".into()),
+                parent_model_id: Some(parent.id.clone()),
+                ..MetadataPatch::default()
+            },
+        )
+        .unwrap();
+    adapter
+        .update_metadata(
+            &writer,
+            VersionedTarget {
+                model_id: child_two.id.clone(),
+                expected_version: child_two.metadata_version,
+            },
+            MetadataPatch {
+                designer: Some("Bob".into()),
+                model_license: Some("CC0".into()),
+                parent_model_id: Some(parent.id.clone()),
+                ..MetadataPatch::default()
+            },
+        )
+        .unwrap();
+
+    let reader = RequestContext {
+        capabilities: BTreeSet::from([Capability::CatalogRead]),
+        ..writer
+    };
+    assert!(adapter
+        .call_tool(
+            &reader,
+            "get_all_metadata",
+            json!({"modelId":parent.id.clone()})
+        )
+        .is_err());
+    let all_metadata = adapter
+        .call_tool(&reader, "get_all_metadata", json!({}))
+        .unwrap();
+    assert_eq!(
+        all_metadata,
+        json!([
+            {"type":"designer","name":"Alice","model_count":2},
+            {"type":"designer","name":"Bob","model_count":1},
+            {"type":"license","name":"CC0","model_count":2},
+            {"type":"license","name":"GPL","model_count":1},
+            {"type":"parentModel","name":"Parent model","model_count":2}
+        ])
+    );
+    assert_eq!(
+        adapter
+            .call_tool(&reader, "get_model", json!({"modelId":parent.id}))
+            .unwrap()["displayName"],
+        "Parent model"
+    );
+
+    let removed_parent = runtime
+        .mutate_db(|db| db.create_model("Removed parent", None))
+        .unwrap();
+    let remaining_child = runtime
+        .mutate_db(|db| db.create_model("Remaining child", None))
+        .unwrap();
+    let remover = RequestContext {
+        principal_id: "metadata-parent-remover".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "remove-metadata-parent".into(),
+    };
+    adapter
+        .update_metadata(
+            &remover,
+            VersionedTarget {
+                model_id: remaining_child.id,
+                expected_version: remaining_child.metadata_version,
+            },
+            MetadataPatch {
+                parent_model_id: Some(removed_parent.id.clone()),
+                ..MetadataPatch::default()
+            },
+        )
+        .unwrap();
+    let removal_plan = adapter
+        .call_tool(
+            &remover,
+            "remove_model",
+            json!({
+                "modelId":removed_parent.id,
+                "expectedVersion":removed_parent.metadata_version.to_string(),
+                "confirm":true
+            }),
+        )
+        .unwrap();
+    adapter
+        .call_tool(
+            &remover,
+            "execute_management_action",
+            json!({"token":removal_plan["token"]}),
+        )
+        .unwrap();
+    let metadata_after_parent_removal = adapter
+        .call_tool(&reader, "get_all_metadata", json!({}))
+        .unwrap();
+    assert!(metadata_after_parent_removal
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| {
+            row == &json!({"type":"parentModel","name":"Removed parent","model_count":1})
+        }));
+}
+
+#[test]
+fn check_files_exist_allows_a_bounded_library_scan_without_paths() {
+    assert!(super::validate_tool_shape("check_files_exist", &json!({})).is_ok());
+    assert!(super::validate_tool_shape(
+        "check_files_exist",
+        &json!({"limit":2000,"missingOnly":true})
+    )
+    .is_ok());
+    assert!(super::validate_tool_shape("check_files_exist", &json!({"limit":2001})).is_err());
+
+    let tool = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "check_files_exist")
+        .unwrap();
+    assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 2000);
+    assert_eq!(
+        tool["inputSchema"]["properties"]["modelIds"]["uniqueItems"],
+        true
+    );
+    assert!(tool["description"].as_str().unwrap().contains("256 MiB"));
+    assert!(tool["inputSchema"]["required"]
+        .as_array()
+        .is_none_or(|required| !required.contains(&json!("modelIds"))));
+}
+
+#[test]
+fn check_files_exist_scans_only_the_requested_catalog_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("library");
+    let source_root = temp.path().join("models");
+    std::fs::create_dir(&source_root).unwrap();
+    let present_source = source_root.join("present.stl");
+    let missing_source = source_root.join("missing.stl");
+    let stl = b"solid check\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid check\n";
+    std::fs::write(&present_source, stl).unwrap();
+    std::fs::write(&missing_source, stl).unwrap();
+    let mut bootstrap_config = library_runtime::RuntimeConfig::desktop(
+        library.clone(),
+        temp.path().join("integrations.json"),
+    );
+    bootstrap_config.capabilities =
+        BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]);
+    let bootstrap = library_runtime::LibraryRuntime::open(bootstrap_config).unwrap();
+    let index_root = bootstrap
+        .mutate_db(|db| db.add_index_root(&source_root, 60, 50 * 1024 * 1024))
+        .unwrap();
+    drop(bootstrap);
+    let mut runtime_config =
+        library_runtime::RuntimeConfig::desktop(library, temp.path().join("integrations.json"));
+    runtime_config.local_catalog_root_access = false;
+    runtime_config.roots = vec![library_runtime::RuntimeRootPolicy {
+        id: "models".into(),
+        catalog_root_id: Some(index_root.id.clone()),
+        label: "Models".into(),
+        path: source_root.clone(),
+        access: library_protocol::RootAccess::ReadOnly,
+    }];
+    runtime_config.capabilities = BTreeSet::from([
+        Capability::CatalogRead,
+        Capability::CatalogWrite,
+        Capability::MediaRead,
+        Capability::Scan,
+    ]);
+    let runtime = library_runtime::LibraryRuntime::open(runtime_config).unwrap();
+    library_runtime::scanner::scan_root(&runtime, &index_root).unwrap();
+    let models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+    let missing_model_id = models
+        .iter()
+        .find(|model| model.original_name.as_deref() == Some("missing.stl"))
+        .unwrap()
+        .id
+        .clone();
+    std::fs::remove_file(&missing_source).unwrap();
+    library_runtime::scanner::scan_root(&runtime, &index_root).unwrap();
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let reader = RequestContext {
+        principal_id: "catalog-source-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::MediaRead]),
+        request_id: "catalog-source-check".into(),
+    };
+
+    let bounded = adapter
+        .call_tool(
+            &reader,
+            "check_files_exist",
+            json!({"limit":1,"missingOnly":false}),
+        )
+        .unwrap();
+    assert_eq!(bounded.as_array().unwrap().len(), 1);
+    let default_scan = adapter
+        .call_tool(&reader, "check_files_exist", json!({}))
+        .unwrap();
+    assert_eq!(default_scan.as_array().unwrap().len(), 1);
+    assert_eq!(default_scan[0]["modelId"], missing_model_id);
+    let explicit = adapter
+        .call_tool(
+            &reader,
+            "check_files_exist",
+            json!({"modelIds":models.iter().map(|model| model.id.clone()).collect::<Vec<_>>(),"missingOnly":false}),
+        )
+        .unwrap();
+    assert_eq!(explicit.as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -3795,6 +4909,26 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
     let source_handle_id = source_root_info.id.clone();
     let adapter = ProtocolEngineAdapter::new(runtime.clone(), HostMode::Headless);
 
+    fn assert_source_hold_receipt(
+        hold: &Value,
+        model_id: &str,
+        root_handle_id: &str,
+        relative_path: &str,
+        root: &std::path::Path,
+        bytes: &[u8],
+    ) {
+        assert_eq!(hold["modelId"], model_id);
+        assert_eq!(hold["rootHandleId"], root_handle_id);
+        assert_eq!(hold["relativePath"], relative_path);
+        assert_eq!(hold["bytes"], bytes.len().to_string());
+        assert_eq!(hold["sha256"], format!("{:x}", sha2::Sha256::digest(bytes)));
+        let hold_name = hold["holdName"].as_str().unwrap();
+        let journal_name = hold["journalName"].as_str().unwrap();
+        assert_eq!(std::fs::read(root.join(hold_name)).unwrap(), bytes);
+        assert!(root.join(journal_name).is_file());
+        assert!(!hold.to_string().contains(root.to_string_lossy().as_ref()));
+    }
+
     let trash_plan = adapter
         .call_tool(
             &context,
@@ -3835,6 +4969,16 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
         )
         .unwrap();
     assert_eq!(quarantined["kind"], "quarantined");
+    let source_holds = quarantined["sourceHolds"].as_array().unwrap();
+    assert_eq!(source_holds.len(), 1);
+    assert_source_hold_receipt(
+        &source_holds[0],
+        &model.id,
+        &source_handle_id,
+        "part.stl",
+        &source_root,
+        &source_bytes,
+    );
     assert!(!source.exists());
 
     let undo_plan = adapter
@@ -3886,6 +5030,24 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
         )
         .unwrap();
     assert_eq!(batch_trash_result["kind"], "quarantinedMany");
+    let batch_trash_holds = batch_trash_result["sourceHolds"].as_array().unwrap();
+    assert_eq!(batch_trash_holds.len(), 2);
+    for hold in batch_trash_holds {
+        let (id, relative_path) = if hold["modelId"] == model.id {
+            (model.id.as_str(), "part.stl")
+        } else {
+            assert_eq!(hold["modelId"], second_model.id);
+            (second_model.id.as_str(), "part-two.stl")
+        };
+        assert_source_hold_receipt(
+            hold,
+            id,
+            &source_handle_id,
+            relative_path,
+            &source_root,
+            &source_bytes,
+        );
+    }
     assert!(!source.exists());
     assert!(!second_source.exists());
 
@@ -3940,6 +5102,24 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
         )
         .unwrap();
     assert_eq!(batch_move_result["kind"], "movedMany");
+    let batch_move_holds = batch_move_result["sourceHolds"].as_array().unwrap();
+    assert_eq!(batch_move_holds.len(), 2);
+    for hold in batch_move_holds {
+        let (id, relative_path) = if hold["modelId"] == model.id {
+            (model.id.as_str(), "part.stl")
+        } else {
+            assert_eq!(hold["modelId"], second_model.id);
+            (second_model.id.as_str(), "part-two.stl")
+        };
+        assert_source_hold_receipt(
+            hold,
+            id,
+            &source_handle_id,
+            relative_path,
+            &source_root,
+            &source_bytes,
+        );
+    }
     assert!(!source.exists());
     assert!(!second_source.exists());
     assert_eq!(
@@ -3948,6 +5128,47 @@ fn protocol_adapter_source_action_aliases_plan_and_execute_without_client_paths(
     );
     assert_eq!(
         std::fs::read(destination_root.join("part-two-moved.stl")).unwrap(),
+        source_bytes
+    );
+
+    let active_after_batch_move = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+    let active_first = active_after_batch_move
+        .iter()
+        .find(|candidate| candidate.id == model.id)
+        .unwrap();
+    let single_move_plan = adapter
+        .call_tool(
+            &context,
+            "move_files",
+            json!({
+                "modelId":active_first.id,
+                "expectedVersion":active_first.metadata_version.to_string(),
+                "destinationHandleId":source_handle_id,
+                "fileName":"part-returned.stl",
+                "confirm":true
+            }),
+        )
+        .unwrap();
+    let single_move_result = adapter
+        .call_tool(
+            &context,
+            "execute_management_action",
+            json!({"token":single_move_plan["token"]}),
+        )
+        .unwrap();
+    assert_eq!(single_move_result["kind"], "moved");
+    let single_move_holds = single_move_result["sourceHolds"].as_array().unwrap();
+    assert_eq!(single_move_holds.len(), 1);
+    assert_source_hold_receipt(
+        &single_move_holds[0],
+        &model.id,
+        "destination",
+        "part-moved.stl",
+        &destination_root,
+        &source_bytes,
+    );
+    assert_eq!(
+        std::fs::read(source_root.join("part-returned.stl")).unwrap(),
         source_bytes
     );
 }
@@ -4439,15 +5660,45 @@ fn export_library_tool_plans_json_only_inside_backup_root() {
         access: library_protocol::RootAccess::BackupOnly,
     });
     let runtime = library_runtime::LibraryRuntime::open(config).unwrap();
-    let model = runtime
-        .mutate_db(|db| db.create_model("JSON export model", None))
+    let (parent, model) = runtime
+        .mutate_db(|db| {
+            let parent = db.create_model("Parent model", None)?;
+            db.create_tag("Mechanical", Some("Assembly"))?;
+            let model = db.create_model("JSON export model", None)?;
+            let model = db.add_model_tags_by_name(
+                &model.id,
+                model.metadata_version,
+                &["Mechanical".to_owned()],
+            )?;
+            Ok((parent, model))
+        })
         .unwrap();
-    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
     let context = RequestContext {
         principal_id: "backup-only-writer".into(),
-        capabilities: BTreeSet::from([Capability::Maintenance, Capability::BackupWrite]),
+        capabilities: BTreeSet::from([
+            Capability::CatalogWrite,
+            Capability::Maintenance,
+            Capability::BackupWrite,
+        ]),
         request_id: "export-library-json".into(),
     };
+    runtime
+        .update_metadata(
+            &context,
+            VersionedTarget {
+                model_id: model.id.clone(),
+                expected_version: model.metadata_version,
+            },
+            MetadataPatch {
+                parent_model_id: Some(parent.id.clone()),
+                print_status: Some(PrintStatus::Queued),
+                rating: Some(4),
+                favorite: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let adapter = ProtocolEngineAdapter::new(runtime, HostMode::Headless);
 
     assert!(adapter.supports_tool(&context, "export_library"));
     let plan = adapter
@@ -4473,11 +5724,24 @@ fn export_library_tool_plans_json_only_inside_backup_root() {
     let before = std::fs::read(&output_path).unwrap();
     let exported: Value = serde_json::from_slice(&before).unwrap();
     assert_eq!(exported["version"], "1.0");
-    assert_eq!(exported["models"].as_array().unwrap().len(), 1);
-    assert_eq!(exported["models"][0]["fileName"], "JSON export model");
-    assert!(exported["models"][0]["favorite"].is_boolean());
-    assert!(exported["models"][0]["printEvents"].is_array());
-    assert!(exported["models"][0].get("thumbnail").is_none());
+    let exported_models = exported["models"].as_array().unwrap();
+    assert_eq!(exported_models.len(), 2);
+    let exported_model = exported_models
+        .iter()
+        .find(|model| model["fileName"] == "JSON export model")
+        .unwrap();
+    assert_eq!(exported_model["parentModel"], "Parent model");
+    assert_eq!(exported_model["gogglelabParentModelId"], parent.id);
+    assert_eq!(exported_model["print_status"], "queued");
+    assert_eq!(exported_model["rating"], 4);
+    assert_eq!(exported_model["favorite"], true);
+    assert_eq!(exported_model["tags"], json!(["Mechanical"]));
+    assert_eq!(
+        exported_model["gogglelabTags"],
+        json!([{"name":"Mechanical","category":"Assembly"}])
+    );
+    assert!(exported_model["printEvents"].is_array());
+    assert!(exported_model.get("thumbnail").is_none());
     assert!(!result.to_string().contains(temp.path().to_str().unwrap()));
 
     let raced = adapter

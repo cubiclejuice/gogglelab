@@ -23,6 +23,13 @@ output/
 *.pfx
 .perplexity-research/
 
+# Public test certificates only; corresponding private keys are not stored.
+!src-tauri/src/testdata/bambu-test-root.pem
+!src-tauri/src/testdata/bambu-test-leaf.pem
+!src-tauri/src/testdata/bambu-chain-root.pem
+!src-tauri/src/testdata/bambu-cross-intermediate.pem
+!src-tauri/src/testdata/bambu-cross-leaf.pem
+
 !docs/ARCHITECTURE.md
 !docs/F3D-PREVIEW.md
 
@@ -56,3 +63,4 @@ release-smoke.log
 dist-browser/
 
 !docs/SERVER-INSTALL.md
+!docs/WINDOWS-FRIEND-ACCEPTANCE.md

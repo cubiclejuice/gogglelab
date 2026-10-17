@@ -1,29 +1,62 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::catalog_vfs::CatalogVfs;
 use crate::error::{io, LibraryError};
 use crate::models::{
     CaptureDownloadRecord, CaptureReceipt, CaptureReceiptInput, CaptureSummary, CatalogFacetValue,
     CatalogFacets, CatalogSettings, CatalogStats, DuplicateGroup, Filament, FilamentInput,
     FilamentOrigin, FilamentResourceKind, FilamentSyncSummary, Folder, ImportResult, IndexRoot,
-    IndexedModelMove, IndexedSourceMetadata, MetadataPatch, Model, ModelFilamentAssignment,
-    ModelGroupFilter, ModelMetadata, ModelPageQuery, ModelSort, PrintAttempt,
-    PrintAttemptBatchItem, PrintAttemptInput, PrintOutcome, PrintStatus, RemovalResult,
-    RemovedModel, ResolvedModelSource, ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile,
-    ScannedModel, SortDirection, SourceRef, SpoolmanFilamentRecord, SpoolmanSource,
-    SpoolmanSpoolRecord, Tag, TagMode, ThumbnailCacheEntry, ThumbnailGalleryItem,
-    VersionedModelUpdate, VersionedTarget, MAX_MODEL_PAGE_OFFSET,
+    IndexedModelMove, IndexedSourceMetadata, LegacyPrinter, LegacyPrinterImportSummary,
+    MetadataPatch, Model, ModelFilamentAssignment, ModelGroupFilter, ModelMetadata, ModelPageQuery,
+    ModelSort, PartStock, PartStockInput, PartUsageInput, PartUsageSnapshot, PrintAttempt,
+    PrintAttemptBatchItem, PrintAttemptImportItem, PrintAttemptImportResult, PrintAttemptInput,
+    PrintAttemptInputWithPrinter, PrintAttemptPart, PrintOutcome, PrintStatus, Printer,
+    PrinterConnectionStatus, PrinterDataImport, PrinterDataImportResult, PrinterImportRefMapEntry,
+    PrinterInput, PrinterJobStatus, PrinterMaintenanceInput, PrinterMaintenanceLog,
+    PrinterReminder, PrinterReminderCompletion, PrinterReminderCompletionInput,
+    PrinterReminderInput, PrinterReminderStatus, PrinterSourceKind, RemovalResult, RemovedModel,
+    ResolvedModelSource, ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel,
+    SortDirection, SourceRef, SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag,
+    TagMode, ThumbnailCacheEntry, ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
+    MAX_MODEL_PAGE_OFFSET,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 const MAX_GLOBAL_METADATA_TARGETS: i64 = 50_000;
+const MAX_PRINTERS: usize = 5_000;
+const MAX_PRINTER_IMPORT_COUNT: usize = 5_000;
+const MAX_PRINTER_DATA_IMPORT_PRINTERS: usize = MAX_PRINTER_IMPORT_COUNT;
+const MAX_DISCOVERED_PRINTER_BATCH: usize = 32;
+pub const MAX_PRINTER_JSON_EXPORT_PRINTERS: usize = MAX_PRINTERS;
+pub const MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS: usize = 50_000;
+pub const MAX_PRINTER_JSON_EXPORT_REMINDERS: usize = 10_000;
+pub const MAX_PRINTER_JSON_EXPORT_RECORDS: usize = MAX_PRINTER_JSON_EXPORT_PRINTERS
+    + MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS
+    + MAX_PRINTER_JSON_EXPORT_REMINDERS;
+const MAX_PRINTER_UI_MAINTENANCE_LOG_ROWS: usize = MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS;
+const MAX_PRINTER_UI_REMINDER_ROWS: usize = MAX_PRINTER_JSON_EXPORT_REMINDERS;
+const MAX_PRINTER_DATA_IMPORT_RECORDS: usize = MAX_PRINTER_JSON_EXPORT_RECORDS;
+pub const MAX_LIBRARY_JSON_EXPORT_MODELS: usize = 5_000;
+const PRINTER_JSON_EXPORT_PAGE_ROWS: usize = 500;
+const MAX_PRINT_ATTEMPTS_PER_IMPORT_BATCH: usize = 1_000;
+const MAX_PRINT_ATTEMPT_PARTS: usize = 256;
+const MAX_PRINTER_TEXT_CHARS: usize = 128;
+const MAX_PRINTER_NOTES_BYTES: usize = 20_000;
+const MAX_PART_STOCK_RECORDS: usize = 10_000;
+const MAX_PART_STOCK_QUANTITY: u32 = 1_000_000;
+const PRINTVENTORY_ORPHAN_PART_ID_PREFIX: &str = "printventory_orphan_";
 pub const ROOT_FOLDER_ID: &str = "root";
 pub const MIN_SCAN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_SCAN_INTERVAL_MINUTES: u32 = 1_440;
@@ -31,6 +64,27 @@ pub const MAX_INDEXED_FILE_BYTES: u64 = stl_core::limits::MAX_FILE_BYTES;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_CACHED_THUMBNAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+const PRINTER_SELECT_COLUMNS: &str = "p.id,p.metadata_version,p.nickname,p.make,p.model,
+    p.printer_type,p.firmware,p.host,p.web_url,p.endpoint_approved,p.bed_x_mm,p.bed_y_mm,
+    p.bed_z_mm,p.notes,p.source_kind,p.connection_status,p.job_status,p.last_checked_at,
+    p.connection_error_code,
+    COALESCE((SELECT SUM(a.quantity) FROM print_attempts a WHERE a.printer_id=p.id AND a.outcome='printed'),0),
+    (SELECT MAX(a.printed_at) FROM print_attempts a WHERE a.printer_id=p.id AND a.outcome='printed'),
+    p.created_at,p.updated_at";
+const PRINTER_REMINDER_SELECT_BY_ID: &str =
+    "SELECT id,metadata_version,printer_id,printer_nickname,
+    title,notes,due_at,interval_days,status,last_completed_at,created_at,updated_at
+    FROM printer_reminders WHERE id=?1";
+const PART_STOCK_SELECT_COLUMNS: &str =
+    "id,metadata_version,name,category,quantity,unit,notes,low_stock,created_at,updated_at";
+
+/// Generate an ID for a native source-trash transaction before its file hold
+/// is created. The prefix lets crash recovery distinguish it from catalog-only
+/// removals.
+pub fn new_source_trash_snapshot_id() -> String {
+    new_id("source-trash")
+}
 
 // Internal SQLite projection shared by managed and indexed source resolution.
 type SourceResolutionRow = (
@@ -47,17 +101,210 @@ type SourceResolutionRow = (
 
 pub struct LibraryDb {
     conn: Connection,
+    catalog_vfs: Option<CatalogVfs>,
     root: PathBuf,
+    catalog_file: Option<Arc<CatalogPin>>,
 }
+
+/// A bounded, consistent snapshot used by library JSON export.
+#[derive(Debug)]
+pub struct PrinterDataExportSnapshot {
+    pub printers: Vec<Printer>,
+    pub maintenance_logs: Vec<PrinterMaintenanceLog>,
+    pub reminders: Vec<PrinterReminder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrinterDataExportCounts {
+    pub printers: usize,
+    pub maintenance_logs: usize,
+    pub reminders: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrinterExportAttribution {
+    pub id: String,
+    pub nickname: String,
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub printer_type: Option<String>,
+}
+
+struct CatalogPin {
+    root: PathBuf,
+    file: File,
+    #[cfg(test)]
+    before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_commit_identity_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl CatalogPin {
+    fn matches_path(&self) -> bool {
+        catalog_file_matches_path(&self.root, &self.file)
+    }
+
+    #[cfg(test)]
+    fn install_before_commit_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_commit.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_commit_hook(&self) {
+        if let Some(hook) = self.before_commit.lock().unwrap().take() {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn install_after_commit_identity_check_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_commit_identity_check.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_commit_identity_check_hook(&self) {
+        if let Some(hook) = self.after_commit_identity_check.lock().unwrap().take() {
+            hook();
+        }
+    }
+}
+
+fn pin_catalog_file(path: &Path) -> std::io::Result<File> {
+    match open_catalog_path(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match create_catalog_path(path) {
+                Ok(file) => Ok(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_catalog_path(path)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_catalog_path(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn create_catalog_path(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn catalog_file_matches_path(root: &Path, pinned: &File) -> bool {
+    let path = root.join("library.sqlite3");
+    let Ok(path_metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return false;
+    }
+    let Ok(current) = open_catalog_path(&path) else {
+        return false;
+    };
+    let Ok(current_metadata) = current.metadata() else {
+        return false;
+    };
+    if !current_metadata.is_file() || is_reparse_point(&current_metadata) {
+        return false;
+    }
+    crate::catalog_vfs::same_file_identity(pinned, &current).is_ok_and(|matches| matches)
+}
+
+#[cfg(unix)]
+fn sqlite_file_has_moved(connection: &Connection) -> Option<bool> {
+    let mut has_moved: std::ffi::c_int = 0;
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut has_moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    (result == rusqlite::ffi::SQLITE_OK).then_some(has_moved != 0)
+}
+
+#[cfg(unix)]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 impl LibraryDb {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, LibraryError> {
+        Self::open_inner(root, || {}, || {})
+    }
+
+    #[cfg(test)]
+    fn open_with_hooks<B, A>(
+        root: impl AsRef<Path>,
+        before_connection_open: B,
+        after_connection_open: A,
+    ) -> Result<Self, LibraryError>
+    where
+        B: FnOnce(),
+        A: FnOnce(),
+    {
+        Self::open_inner(root, before_connection_open, after_connection_open)
+    }
+
+    fn open_inner<B, A>(
+        root: impl AsRef<Path>,
+        before_connection_open: B,
+        after_connection_open: A,
+    ) -> Result<Self, LibraryError>
+    where
+        B: FnOnce(),
+        A: FnOnce(),
+    {
         let root = root.as_ref().to_path_buf();
         match std::fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(LibraryError::InvalidInput(
                     "library root must be a real directory".into(),
-                ))
+                ));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -74,13 +321,42 @@ impl LibraryDb {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(LibraryError::InvalidInput(
                     "library database must be a regular owned file".into(),
-                ))
+                ));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io(&db_path, error)),
         }
-        let conn = Connection::open(&db_path)?;
+        let catalog_file = pin_catalog_file(&db_path).map_err(|error| io(&db_path, error))?;
+        if !catalog_file
+            .metadata()
+            .map_err(|error| io(&db_path, error))?
+            .is_file()
+        {
+            return Err(LibraryError::InvalidInput(
+                "library database must be a regular owned file".into(),
+            ));
+        }
+        let catalog_pin = Arc::new(CatalogPin {
+            root: root.clone(),
+            file: catalog_file,
+            #[cfg(test)]
+            before_commit: Mutex::new(None),
+            #[cfg(test)]
+            after_commit_identity_check: Mutex::new(None),
+        });
+        let catalog_vfs =
+            CatalogVfs::new(&db_path, &catalog_pin.file).map_err(|error| io(&db_path, error))?;
+        before_connection_open();
+        let connection_result = Connection::open_with_flags_and_vfs(
+            catalog_vfs.sqlite_path(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            catalog_vfs.vfs_name(),
+        );
+        after_connection_open();
+        let conn = connection_result?;
         let opened_db = std::fs::symlink_metadata(&db_path).map_err(|error| io(&db_path, error))?;
         if opened_db.file_type().is_symlink()
             || !opened_db.is_file()
@@ -94,14 +370,57 @@ impl LibraryDb {
                 "library database identity changed".into(),
             ));
         }
-        Self::initialize(conn, root)
+        if !catalog_pin.matches_path() {
+            return Err(LibraryError::InvalidInput(
+                "library database identity changed".into(),
+            ));
+        }
+        if catalog_vfs.check_connection(&conn).is_err() {
+            return Err(LibraryError::InvalidInput(
+                "SQLite opened a different library database file".into(),
+            ));
+        }
+        #[cfg(unix)]
+        if sqlite_file_has_moved(&conn) != Some(false) {
+            return Err(LibraryError::InvalidInput(
+                "SQLite opened a different library database file".into(),
+            ));
+        }
+        let db = Self::initialize(conn, root, Some(catalog_pin), Some(catalog_vfs))?;
+        if !db.catalog_path_matches() {
+            return Err(LibraryError::InvalidInput(
+                "library database identity changed".into(),
+            ));
+        }
+        Ok(db)
     }
 
     pub fn open_in_memory() -> Result<Self, LibraryError> {
-        Self::initialize(Connection::open_in_memory()?, PathBuf::from("."))
+        Self::initialize(
+            Connection::open_in_memory()?,
+            PathBuf::from("."),
+            None,
+            None,
+        )
     }
 
-    fn initialize(conn: Connection, root: PathBuf) -> Result<Self, LibraryError> {
+    fn initialize(
+        conn: Connection,
+        root: PathBuf,
+        catalog_file: Option<Arc<CatalogPin>>,
+        catalog_vfs: Option<CatalogVfs>,
+    ) -> Result<Self, LibraryError> {
+        if let Some(catalog_file) = catalog_file.as_ref() {
+            let commit_pin = Arc::clone(catalog_file);
+            conn.commit_hook(Some(move || {
+                #[cfg(test)]
+                commit_pin.run_before_commit_hook();
+                let matches_path = commit_pin.matches_path();
+                #[cfg(test)]
+                commit_pin.run_after_commit_identity_check_hook();
+                !matches_path
+            }))?;
+        }
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > CURRENT_SCHEMA_VERSION {
@@ -114,38 +433,105 @@ impl LibraryDb {
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         } else if version == 1 {
-            create_migration_backup(&conn, &root, version)?;
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
             conn.execute_batch(MIGRATE_V1_TO_V2)?;
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
             conn.execute_batch(MIGRATE_V5_TO_V6)?;
+            conn.execute_batch(MIGRATE_V6_TO_V7)?;
+            conn.execute_batch(MIGRATE_V7_TO_V8)?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
         } else if version == 2 {
-            create_migration_backup(&conn, &root, version)?;
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
             conn.execute_batch(MIGRATE_V2_TO_V3)?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
             conn.execute_batch(MIGRATE_V5_TO_V6)?;
+            conn.execute_batch(MIGRATE_V6_TO_V7)?;
+            conn.execute_batch(MIGRATE_V7_TO_V8)?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
         } else if version == 3 {
-            create_migration_backup(&conn, &root, version)?;
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
             conn.execute_batch(MIGRATE_V3_TO_V4)?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
             conn.execute_batch(MIGRATE_V5_TO_V6)?;
+            conn.execute_batch(MIGRATE_V6_TO_V7)?;
+            conn.execute_batch(MIGRATE_V7_TO_V8)?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
         } else if version == 4 {
-            create_migration_backup(&conn, &root, version)?;
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
             conn.execute_batch(MIGRATE_V4_TO_V5)?;
             conn.execute_batch(MIGRATE_V5_TO_V6)?;
+            conn.execute_batch(MIGRATE_V6_TO_V7)?;
+            conn.execute_batch(MIGRATE_V7_TO_V8)?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
         } else if version == 5 {
-            create_migration_backup(&conn, &root, version)?;
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
             conn.execute_batch(MIGRATE_V5_TO_V6)?;
+            conn.execute_batch(MIGRATE_V6_TO_V7)?;
+            conn.execute_batch(MIGRATE_V7_TO_V8)?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
+        } else if version == 6 {
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
+            conn.execute_batch(MIGRATE_V6_TO_V7)?;
+            conn.execute_batch(MIGRATE_V7_TO_V8)?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
+        } else if version == 7 {
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
+            conn.execute_batch(MIGRATE_V7_TO_V8)?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
+        } else if version == 8 {
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
+            conn.execute_batch(MIGRATE_V8_TO_V9)?;
+        } else if version == 9 {
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
+        } else if version == 10 {
+            create_migration_backup(&conn, &root, version, catalog_vfs.as_ref())?;
+        }
+        if (1..=9).contains(&version) {
+            conn.execute_batch(MIGRATE_V9_TO_V10)?;
+        }
+        if (1..=10).contains(&version) {
+            conn.execute_batch(MIGRATE_V10_TO_V11)?;
         }
         conn.execute_batch(ENSURE_CATALOG_SETTINGS)?;
         conn.execute_batch(ENSURE_PRINT_BATCH_RECEIPTS)?;
-        Ok(Self { conn, root })
+        Ok(Self {
+            conn,
+            catalog_vfs,
+            root,
+            catalog_file,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Checks that the visible catalog path still names the regular file pinned
+    /// when this connection opened. SQLite accepts paths rather than file
+    /// handles, so callers that perform multi-step source mutations must refuse
+    /// to continue after a same-user path replacement.
+    pub fn catalog_path_matches(&self) -> bool {
+        let Some(catalog_file) = self.catalog_file.as_ref() else {
+            return true;
+        };
+        if !catalog_file.matches_path() {
+            return false;
+        }
+        if self
+            .catalog_vfs
+            .as_ref()
+            .is_some_and(|vfs| vfs.check_connection(&self.conn).is_err())
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        if sqlite_file_has_moved(&self.conn) != Some(false) {
+            return false;
+        }
+        true
     }
 
     pub fn total_changes(&self) -> u64 {
@@ -247,6 +633,120 @@ impl LibraryDb {
             model.filament_ids = filaments.remove(&model.id).unwrap_or_default();
         }
         Ok(models)
+    }
+
+    /// Lists the full library JSON model set only when it stays within
+    /// the importer limit. Counting and materialization share one SQLite
+    /// snapshot so a concurrent insert cannot bypass the limit.
+    pub fn list_models_for_json_export(&self) -> Result<Vec<Model>, LibraryError> {
+        if self.conn.is_autocommit() {
+            self.with_json_export_snapshot(|db| db.list_models_for_json_export_in_snapshot())
+        } else {
+            self.list_models_for_json_export_in_snapshot()
+        }
+    }
+
+    fn list_models_for_json_export_in_snapshot(&self) -> Result<Vec<Model>, LibraryError> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let count = checked_export_count(count, "models", MAX_LIBRARY_JSON_EXPORT_MODELS)?;
+        let models = self.list_models(None, None)?;
+        if models.len() != count {
+            return Err(LibraryError::InvalidInput(
+                "JSON export snapshot did not read every counted model".into(),
+            ));
+        }
+        Ok(models)
+    }
+
+    /// Runs every library JSON export read on one deferred SQLite snapshot.
+    /// The first count read pins the snapshot before the caller begins paging.
+    pub fn with_json_export_snapshot<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, LibraryError>,
+    ) -> Result<T, LibraryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.query_row(
+            "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let result = operation(self)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Counts the active model rows permitted in a library JSON export.
+    pub fn count_models_for_json_export(&self) -> Result<usize, LibraryError> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        checked_export_count(count, "models", MAX_LIBRARY_JSON_EXPORT_MODELS)
+    }
+
+    /// Reads a small, stable-order page for streaming library JSON export.
+    pub fn list_models_for_json_export_page(
+        &self,
+        offset: usize,
+        limit: u16,
+    ) -> Result<Vec<Model>, LibraryError> {
+        if limit == 0 || limit > 100 || offset > MAX_LIBRARY_JSON_EXPORT_MODELS {
+            return Err(LibraryError::InvalidInput(
+                "JSON export model page request is invalid".into(),
+            ));
+        }
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM models WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        checked_export_count(count, "models", MAX_LIBRARY_JSON_EXPORT_MODELS)?;
+        let mut statement = self.conn.prepare(&format!(
+            "{MODEL_SELECT} WHERE m.deleted_at IS NULL
+             ORDER BY m.created_at,m.id LIMIT ?1 OFFSET ?2"
+        ))?;
+        let rows = statement.query_map(params![i64::from(limit), offset as i64], model_from_row)?;
+        let mut models = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for model in &mut models {
+            model.tags = self.tags_for(&model.id)?;
+            model.filament_ids = self.filament_ids_for_model(&model.id)?;
+        }
+        Ok(models)
+    }
+
+    pub fn active_model_display_name_for_json_export(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<String>, LibraryError> {
+        self.conn
+            .query_row(
+                "SELECT display_name FROM models WHERE id=?1 AND deleted_at IS NULL",
+                params![model_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn tag_category_for_json_export(
+        &self,
+        tag_name: &str,
+    ) -> Result<Option<String>, LibraryError> {
+        self.conn
+            .query_row(
+                "SELECT category FROM tags WHERE lower(name)=lower(?1)",
+                params![tag_name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|category| category.flatten())
+            .map_err(Into::into)
     }
 
     pub fn list_models_page(
@@ -1052,18 +1552,7 @@ impl LibraryDb {
         let hash = hex_digest(&bytes);
         let relative_path = format!("originals/{hash}.{extension}");
         let originals = ensure_owned_directory(&self.root, "originals")?;
-        let staging_root = ensure_owned_directory(&self.root, "staging")?;
         let destination = originals.join(format!("{hash}.{extension}"));
-        let staging = staging_root.join(format!("{}.part", Uuid::new_v4()));
-        let mut staged = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-            .map_err(|error| io(&staging, error))?;
-        staged
-            .write_all(&bytes)
-            .map_err(|error| io(&staging, error))?;
-        drop(staged);
         let blob = self
             .conn
             .query_row(
@@ -1075,34 +1564,51 @@ impl LibraryDb {
         let mut reused_blob = blob.is_some();
         if let Some((stored, stored_bytes)) = blob {
             if stored != relative_path || stored_bytes != bytes.len() as i64 {
-                let _ = std::fs::remove_file(&staging);
                 return Err(LibraryError::InvalidInput(
                     "blob catalog metadata is inconsistent".into(),
                 ));
             }
-            if let Err(error) = validate_managed_blob(&destination, &hash, bytes.len() as u64) {
-                let _ = std::fs::remove_file(&staging);
-                return Err(error);
-            }
-            let _ = std::fs::remove_file(&staging);
+            validate_managed_blob(&destination, &hash, bytes.len() as u64)?;
         } else {
+            let staging_root = ensure_owned_directory(&self.root, "staging")?;
+            let staging = staging_root.join(format!("{}.part", Uuid::new_v4()));
+            let mut staged = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging)
+                .map_err(|error| io(&staging, error))?;
+            staged
+                .write_all(&bytes)
+                .map_err(|error| io(&staging, error))?;
+            staged.sync_all().map_err(|error| io(&staging, error))?;
+            drop(staged);
+
+            // Keep the staging name. A path-based unlink here could remove a
+            // same-user replacement installed after the file was staged. On
+            // the common path this remains a hard-link alias of the managed
+            // blob, so it does not duplicate the model's data blocks.
             match std::fs::hard_link(&staging, &destination) {
                 Ok(()) => {
-                    let _ = std::fs::remove_file(&staging);
+                    validate_managed_blob(&destination, &hash, bytes.len() as u64)
+                        .map_err(|error| retained_import_staging_error(&staging, error))?;
+                    retain_import_staging(&staging)
+                        .map_err(|error| retained_import_staging_error(&staging, error))?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Err(error) =
                         validate_managed_blob(&destination, &hash, bytes.len() as u64)
                     {
-                        let _ = std::fs::remove_file(&staging);
-                        return Err(error);
+                        return Err(retained_import_staging_error(&staging, error));
                     }
-                    let _ = std::fs::remove_file(&staging);
+                    retain_import_staging(&staging)
+                        .map_err(|error| retained_import_staging_error(&staging, error))?;
                     reused_blob = true;
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(&staging);
-                    return Err(io(&destination, error));
+                    return Err(retained_import_staging_error(
+                        &staging,
+                        io(&destination, error),
+                    ));
                 }
             }
         }
@@ -1175,6 +1681,74 @@ impl LibraryDb {
         )?;
         let rows = stmt.query_map([], index_root_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Seed an empty replacement catalog with the root mappings and catalog
+    /// rendering/scanning settings from an existing database. Purge keeps root
+    /// IDs stable so admitted server handles remain mapped after replacement.
+    pub fn copy_catalog_configuration_from(&self, source: &LibraryDb) -> Result<(), LibraryError> {
+        let roots = source.list_index_roots()?;
+        let settings = source.get_catalog_settings()?;
+        validate_catalog_settings(&settings)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let model_count: i64 = tx.query_row("SELECT COUNT(*) FROM models", [], |row| row.get(0))?;
+        let root_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM index_roots", [], |row| row.get(0))?;
+        if model_count != 0 || root_count != 0 {
+            return Err(LibraryError::InvalidInput(
+                "Catalog configuration can only be copied into an empty library".into(),
+            ));
+        }
+        let mut root_ids = HashSet::new();
+        for root in roots {
+            if root.id.is_empty()
+                || root.id.len() > 128
+                || !root
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(LibraryError::InvalidInput(
+                    "Index root identity is invalid".into(),
+                ));
+            }
+            validate_root_limits(root.scan_interval_minutes, root.max_file_bytes)?;
+            if !root_ids.insert(root.id.clone()) {
+                return Err(LibraryError::InvalidInput(
+                    "Index root identity is duplicated".into(),
+                ));
+            }
+            if !root.path.is_absolute() {
+                return Err(LibraryError::InvalidInput(
+                    "Index root path must be absolute".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO index_roots
+                 (id, path, enabled, last_scanned_at, scan_interval_minutes, max_file_bytes, scan_zip)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                params![
+                    root.id,
+                    root.path.to_string_lossy(),
+                    root.enabled,
+                    i64::from(root.scan_interval_minutes),
+                    root.max_file_bytes as i64,
+                    root.scan_zip,
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE catalog_settings SET thumbnail_size=?1, thumbnail_background=?2,
+                    thumbnail_concurrency=?3, scan_batch_size=?4 WHERE id='local'",
+            params![
+                i64::from(settings.thumbnail_size),
+                settings.thumbnail_background,
+                i64::from(settings.thumbnail_concurrency),
+                i64::from(settings.scan_batch_size),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_catalog_settings(&self) -> Result<CatalogSettings, LibraryError> {
@@ -3104,6 +3678,8 @@ impl LibraryDb {
             model_id: model_id.into(),
             expected_version,
             patch: patch.clone(),
+            tags: None,
+            filament_ids: None,
         }])?
         .into_iter()
         .next()
@@ -3133,7 +3709,9 @@ impl LibraryDb {
                     old_name,
                     new_name,
                     format!("SELECT COUNT(*) FROM models WHERE deleted_at IS NULL AND {column}=?1"),
-                    format!("UPDATE models SET {column}=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE deleted_at IS NULL AND {column}=?3"),
+                    format!(
+                        "UPDATE models SET {column}=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE deleted_at IS NULL AND {column}=?3"
+                    ),
                 )
             }
             "parentModel" => {
@@ -3154,7 +3732,7 @@ impl LibraryDb {
             _ => {
                 return Err(LibraryError::InvalidInput(
                     "Metadata kind must be designer, parentModel, or license".into(),
-                ))
+                ));
             }
         };
         if old_name == new_name {
@@ -3181,7 +3759,7 @@ impl LibraryDb {
             _ => {
                 return Err(LibraryError::InvalidInput(
                     "Metadata kind must be designer, parentModel, or license".into(),
-                ))
+                ));
             }
         };
         let (count_sql, update_sql) = match kind {
@@ -3226,8 +3804,25 @@ impl LibraryDb {
                 ));
             }
             validate_metadata_patch(&update.patch)?;
+            if let Some(tags) = &update.tags {
+                if !tags.is_empty() {
+                    clean_model_tag_names(tags)?;
+                } else if tags.len() > 200 {
+                    return Err(LibraryError::InvalidInput("too many tags".into()));
+                }
+            }
+            if let Some(filament_ids) = &update.filament_ids {
+                validate_filament_ids(filament_ids)?;
+            }
         }
         let tx = self.conn.unchecked_transaction()?;
+        let filament_ids = updates
+            .iter()
+            .filter_map(|update| update.filament_ids.as_ref())
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_catalog_filament_ids(&tx, &filament_ids)?;
         for update in updates {
             apply_metadata_patch(
                 &tx,
@@ -3235,6 +3830,17 @@ impl LibraryDb {
                 update.expected_version,
                 &update.patch,
             )?;
+            if let Some(tags) = &update.tags {
+                let names = if tags.is_empty() {
+                    Vec::new()
+                } else {
+                    clean_model_tag_names(tags)?
+                };
+                replace_model_tags_by_name_tx(&tx, &update.model_id, &names)?;
+            }
+            if let Some(filament_ids) = &update.filament_ids {
+                replace_model_filaments_tx(&tx, &update.model_id, filament_ids)?;
+            }
         }
         tx.commit()?;
         updates
@@ -3276,17 +3882,1911 @@ impl LibraryDb {
             .collect()
     }
 
+    pub fn create_part_stock(&self, input: &PartStockInput) -> Result<PartStock, LibraryError> {
+        let input = normalize_part_stock_input(input)?;
+        let id = new_id("part");
+        let now = timestamp();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM parts_stock", [], |row| row.get(0))?;
+        if count >= MAX_PART_STOCK_RECORDS as i64 {
+            return Err(LibraryError::InvalidInput(
+                "parts stock exceeds its record limit".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO parts_stock
+             (id,metadata_version,name,category,quantity,unit,notes,low_stock,created_at,updated_at)
+             VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?8)",
+            params![
+                id,
+                input.name,
+                input.category,
+                input.quantity,
+                input.unit,
+                input.notes,
+                input.low_stock,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_part_stock(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("created part is missing".into()))
+    }
+
+    pub fn get_part_stock(&self, id: &str) -> Result<Option<PartStock>, LibraryError> {
+        validate_record_id(id, "part ID")?;
+        self.conn
+            .query_row(
+                &format!("SELECT {PART_STOCK_SELECT_COLUMNS} FROM parts_stock WHERE id=?1"),
+                params![id],
+                part_stock_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_part_stock(&self) -> Result<Vec<PartStock>, LibraryError> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {PART_STOCK_SELECT_COLUMNS} FROM parts_stock ORDER BY name COLLATE NOCASE,id"
+        ))?;
+        let rows = statement.query_map([], part_stock_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn update_part_stock(
+        &self,
+        id: &str,
+        expected_version: u64,
+        input: &PartStockInput,
+    ) -> Result<PartStock, LibraryError> {
+        validate_record_id(id, "part ID")?;
+        let input = normalize_part_stock_input(input)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let actual_version: i64 = tx
+            .query_row(
+                "SELECT metadata_version FROM parts_stock WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("part not found".into()))?;
+        ensure_part_stock_version(id, expected_version, actual_version)?;
+        tx.execute(
+            "UPDATE parts_stock SET metadata_version=metadata_version+1,name=?1,category=?2,
+             quantity=?3,unit=?4,notes=?5,low_stock=?6,updated_at=?7 WHERE id=?8",
+            params![
+                input.name,
+                input.category,
+                input.quantity,
+                input.unit,
+                input.notes,
+                input.low_stock,
+                timestamp(),
+                id,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_part_stock(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("updated part is missing".into()))
+    }
+
+    pub fn delete_part_stock(&self, id: &str, expected_version: u64) -> Result<(), LibraryError> {
+        validate_record_id(id, "part ID")?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let actual_version: i64 = tx
+            .query_row(
+                "SELECT metadata_version FROM parts_stock WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("part not found".into()))?;
+        ensure_part_stock_version(id, expected_version, actual_version)?;
+        // Event rows keep the part ID and name snapshot; deleting a part does
+        // not restore stock, and later event deletion cannot credit a new part.
+        tx.execute("DELETE FROM parts_stock WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Creates a user-managed printer. Approval is a separate explicit input
+    /// from the local Add/Edit flow; compatibility imports always pass false.
+    pub fn create_printer(
+        &self,
+        input: &PrinterInput,
+        endpoint_approved: bool,
+    ) -> Result<Printer, LibraryError> {
+        let input = normalize_printer_input(input)?;
+        validate_endpoint_approval(&input, endpoint_approved)?;
+        let id = new_id("printer");
+        let now = timestamp();
+        let (bed_x, bed_y, bed_z) = printer_bed_columns(input.bed_mm);
+        let tx = self.conn.unchecked_transaction()?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM printers", [], |row| row.get(0))?;
+        if count >= MAX_PRINTERS as i64 {
+            return Err(LibraryError::InvalidInput(
+                "printer catalog exceeds its record limit".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO printers (
+                id,metadata_version,nickname,make,model,printer_type,firmware,host,web_url,
+                endpoint_approved,bed_x_mm,bed_y_mm,bed_z_mm,notes,source_kind,
+                connection_status,job_status,last_checked_at,connection_error_code,created_at,updated_at
+             ) VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'manual',
+                      'unknown','unknown',NULL,NULL,?14,?14)",
+            params![
+                id,
+                input.nickname,
+                input.make,
+                input.model,
+                input.printer_type,
+                input.firmware,
+                input.host,
+                input.web_url,
+                endpoint_approved,
+                bed_x,
+                bed_y,
+                bed_z,
+                input.notes,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_printer(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("created printer is missing".into()))
+    }
+
+    /// Saves a reviewed set of discovery suggestions in one transaction.
+    /// Endpoint approval remains an explicit per-printer choice.
+    pub fn create_discovered_printers(
+        &self,
+        items: &[(PrinterInput, bool)],
+    ) -> Result<Vec<Printer>, LibraryError> {
+        if items.is_empty() || items.len() > MAX_DISCOVERED_PRINTER_BATCH {
+            return Err(LibraryError::InvalidInput(
+                "discovered printer batch must contain 1 to 32 records".into(),
+            ));
+        }
+
+        let now = timestamp();
+        let mut prepared = Vec::with_capacity(items.len());
+        for (input, endpoint_approved) in items {
+            let input = normalize_printer_input(input)?;
+            validate_endpoint_approval(&input, *endpoint_approved)?;
+            let bed = printer_bed_columns(input.bed_mm);
+            prepared.push((new_id("printer"), input, *endpoint_approved, bed));
+        }
+        let ids = prepared
+            .iter()
+            .map(|(id, _, _, _)| id.clone())
+            .collect::<Vec<_>>();
+
+        let tx = self.conn.unchecked_transaction()?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM printers", [], |row| row.get(0))?;
+        if count + items.len() as i64 > MAX_PRINTERS as i64 {
+            return Err(LibraryError::InvalidInput(
+                "printer catalog exceeds its record limit".into(),
+            ));
+        }
+        for (id, input, endpoint_approved, (bed_x, bed_y, bed_z)) in prepared {
+            tx.execute(
+                "INSERT INTO printers (
+                    id,metadata_version,nickname,make,model,printer_type,firmware,host,web_url,
+                    endpoint_approved,bed_x_mm,bed_y_mm,bed_z_mm,notes,source_kind,
+                    connection_status,job_status,last_checked_at,connection_error_code,created_at,updated_at
+                 ) VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'discovered',
+                          'unknown','unknown',NULL,NULL,?14,?14)",
+                params![
+                    id,
+                    input.nickname,
+                    input.make,
+                    input.model,
+                    input.printer_type,
+                    input.firmware,
+                    input.host,
+                    input.web_url,
+                    endpoint_approved,
+                    bed_x,
+                    bed_y,
+                    bed_z,
+                    input.notes,
+                    now,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        ids.iter()
+            .map(|id| {
+                self.get_printer(id)?
+                    .ok_or_else(|| LibraryError::InvalidInput("created printer is missing".into()))
+            })
+            .collect()
+    }
+
+    /// Updates editable printer metadata using a version check. Omitting the
+    /// approval change preserves the existing confirmation state.
+    pub fn update_printer(
+        &self,
+        id: &str,
+        expected_version: u64,
+        input: &PrinterInput,
+        endpoint_approved: Option<bool>,
+    ) -> Result<Printer, LibraryError> {
+        validate_record_id(id, "printer ID")?;
+        let input = normalize_printer_input(input)?;
+        let (bed_x, bed_y, bed_z) = printer_bed_columns(input.bed_mm);
+        let tx = self.conn.unchecked_transaction()?;
+        let (actual_version, prior_approval, prior_host, prior_web_url): (
+            i64,
+            bool,
+            Option<String>,
+            Option<String>,
+        ) = tx
+            .query_row(
+                "SELECT metadata_version,endpoint_approved,host,web_url FROM printers WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+        ensure_record_version("printer", expected_version, actual_version)?;
+        let same_endpoint = prior_host == input.host && prior_web_url == input.web_url;
+        let approved = endpoint_approved.unwrap_or(prior_approval && same_endpoint);
+        validate_endpoint_approval(&input, approved)?;
+        let reset_status = !same_endpoint || !approved;
+        tx.execute(
+            "UPDATE printers SET
+                metadata_version=metadata_version+1,nickname=?1,make=?2,model=?3,
+                printer_type=?4,firmware=?5,host=?6,web_url=?7,endpoint_approved=?8,
+                bed_x_mm=?9,bed_y_mm=?10,bed_z_mm=?11,notes=?12,
+                connection_status=CASE WHEN ?13 THEN 'unknown' ELSE connection_status END,
+                job_status=CASE WHEN ?13 THEN 'unknown' ELSE job_status END,
+                last_checked_at=CASE WHEN ?13 THEN NULL ELSE last_checked_at END,
+                connection_error_code=CASE WHEN ?13 THEN NULL ELSE connection_error_code END,
+                updated_at=?14 WHERE id=?15",
+            params![
+                input.nickname,
+                input.make,
+                input.model,
+                input.printer_type,
+                input.firmware,
+                input.host,
+                input.web_url,
+                approved,
+                bed_x,
+                bed_y,
+                bed_z,
+                input.notes,
+                reset_status,
+                timestamp(),
+                id,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_printer(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("updated printer is missing".into()))
+    }
+
+    pub fn get_printer(&self, id: &str) -> Result<Option<Printer>, LibraryError> {
+        validate_record_id(id, "printer ID")?;
+        let query = format!("SELECT {PRINTER_SELECT_COLUMNS} FROM printers p WHERE p.id=?1");
+        self.conn
+            .query_row(&query, params![id], printer_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_printers(&self) -> Result<Vec<Printer>, LibraryError> {
+        let query = format!(
+            "SELECT {PRINTER_SELECT_COLUMNS} FROM printers p ORDER BY lower(p.nickname),p.id"
+        );
+        let mut statement = self.conn.prepare(&query)?;
+        let rows = statement.query_map([], printer_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Returns every printer profile and related history row allowed by the
+    /// JSON interchange limits. UI list methods intentionally remain capped
+    /// separately. A single deferred transaction holds the same SQLite read
+    /// snapshot across all count checks and keyset pages.
+    pub fn export_printer_data_snapshot(&self) -> Result<PrinterDataExportSnapshot, LibraryError> {
+        if self.conn.is_autocommit() {
+            self.with_json_export_snapshot(|db| db.export_printer_data_snapshot_in_snapshot())
+        } else {
+            self.export_printer_data_snapshot_in_snapshot()
+        }
+    }
+
+    fn export_printer_data_snapshot_in_snapshot(
+        &self,
+    ) -> Result<PrinterDataExportSnapshot, LibraryError> {
+        let printer_count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM printers", [], |row| row.get(0))?;
+        let maintenance_count =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM printer_maintenance_logs", [], |row| {
+                    row.get(0)
+                })?;
+        let reminder_count =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM printer_reminders", [], |row| {
+                    row.get(0)
+                })?;
+        let printer_count =
+            checked_export_count(printer_count, "printers", MAX_PRINTER_JSON_EXPORT_PRINTERS)?;
+        let maintenance_count = checked_export_count(
+            maintenance_count,
+            "maintenance logs",
+            MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS,
+        )?;
+        let reminder_count = checked_export_count(
+            reminder_count,
+            "maintenance reminders",
+            MAX_PRINTER_JSON_EXPORT_REMINDERS,
+        )?;
+        let record_count = printer_count
+            .checked_add(maintenance_count)
+            .and_then(|count| count.checked_add(reminder_count))
+            .ok_or_else(|| {
+                LibraryError::InvalidInput("printer export record count overflowed".into())
+            })?;
+        if record_count > MAX_PRINTER_JSON_EXPORT_RECORDS {
+            return Err(LibraryError::InvalidInput(
+                "printer export exceeds its total record limit".into(),
+            ));
+        }
+
+        let mut printers = Vec::with_capacity(printer_count);
+        let mut after_id: Option<String> = None;
+        loop {
+            let page = {
+                let mut statement = self.conn.prepare(&format!(
+                    "SELECT {PRINTER_SELECT_COLUMNS} FROM printers p
+                     WHERE (?1 IS NULL OR p.id>?1) ORDER BY p.id ASC LIMIT ?2"
+                ))?;
+                let rows = statement.query_map(
+                    params![after_id.as_deref(), PRINTER_JSON_EXPORT_PAGE_ROWS as i64],
+                    printer_from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if page.is_empty() {
+                break;
+            }
+            after_id = page.last().map(|printer| printer.id.clone());
+            printers.extend(page);
+        }
+        if printers.len() != printer_count {
+            return Err(LibraryError::InvalidInput(
+                "printer export snapshot did not read every counted profile".into(),
+            ));
+        }
+        for printer in &mut printers {
+            printer.web_url = normalize_printer_web_url(printer.web_url.as_deref())?;
+        }
+
+        let mut maintenance_logs = Vec::with_capacity(maintenance_count);
+        after_id = None;
+        loop {
+            let page = {
+                let mut statement = self.conn.prepare(
+                    "SELECT id,printer_id,printer_nickname,title,performed_at,notes,created_at,metadata_version
+                     FROM printer_maintenance_logs
+                     WHERE (?1 IS NULL OR id>?1) ORDER BY id ASC LIMIT ?2",
+                )?;
+                let rows = statement.query_map(
+                    params![after_id.as_deref(), PRINTER_JSON_EXPORT_PAGE_ROWS as i64],
+                    maintenance_log_from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if page.is_empty() {
+                break;
+            }
+            after_id = page.last().map(|log| log.id.clone());
+            maintenance_logs.extend(page);
+        }
+        if maintenance_logs.len() != maintenance_count {
+            return Err(LibraryError::InvalidInput(
+                "printer export snapshot did not read every counted maintenance log".into(),
+            ));
+        }
+
+        let mut reminders = Vec::with_capacity(reminder_count);
+        after_id = None;
+        loop {
+            let page = {
+                let mut statement = self.conn.prepare(
+                    "SELECT id,metadata_version,printer_id,printer_nickname,title,notes,due_at,
+                            interval_days,status,last_completed_at,created_at,updated_at
+                     FROM printer_reminders
+                     WHERE (?1 IS NULL OR id>?1) ORDER BY id ASC LIMIT ?2",
+                )?;
+                let rows = statement.query_map(
+                    params![after_id.as_deref(), PRINTER_JSON_EXPORT_PAGE_ROWS as i64],
+                    printer_reminder_from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if page.is_empty() {
+                break;
+            }
+            after_id = page.last().map(|reminder| reminder.id.clone());
+            reminders.extend(page);
+        }
+        if reminders.len() != reminder_count {
+            return Err(LibraryError::InvalidInput(
+                "printer export snapshot did not read every counted reminder".into(),
+            ));
+        }
+
+        Ok(PrinterDataExportSnapshot {
+            printers,
+            maintenance_logs,
+            reminders,
+        })
+    }
+
+    /// Counts the rows permitted in the streaming printer portion of an
+    /// interchange export without materializing any of those rows.
+    pub fn printer_data_export_counts(&self) -> Result<PrinterDataExportCounts, LibraryError> {
+        let printer_count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM printers", [], |row| row.get(0))?;
+        let maintenance_count =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM printer_maintenance_logs", [], |row| {
+                    row.get(0)
+                })?;
+        let reminder_count =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM printer_reminders", [], |row| {
+                    row.get(0)
+                })?;
+        let counts = PrinterDataExportCounts {
+            printers: checked_export_count(
+                printer_count,
+                "printers",
+                MAX_PRINTER_JSON_EXPORT_PRINTERS,
+            )?,
+            maintenance_logs: checked_export_count(
+                maintenance_count,
+                "maintenance logs",
+                MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS,
+            )?,
+            reminders: checked_export_count(
+                reminder_count,
+                "maintenance reminders",
+                MAX_PRINTER_JSON_EXPORT_REMINDERS,
+            )?,
+        };
+        let record_count = counts
+            .printers
+            .checked_add(counts.maintenance_logs)
+            .and_then(|value| value.checked_add(counts.reminders))
+            .ok_or_else(|| {
+                LibraryError::InvalidInput("printer export record count overflowed".into())
+            })?;
+        if record_count > MAX_PRINTER_JSON_EXPORT_RECORDS {
+            return Err(LibraryError::InvalidInput(
+                "printer export exceeds its total record limit".into(),
+            ));
+        }
+        Ok(counts)
+    }
+
+    pub fn list_printers_for_json_export_page(
+        &self,
+        after_id: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<Printer>, LibraryError> {
+        if limit == 0 || limit > 100 {
+            return Err(LibraryError::InvalidInput(
+                "JSON export printer page request is invalid".into(),
+            ));
+        }
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {PRINTER_SELECT_COLUMNS} FROM printers p
+             WHERE (?1 IS NULL OR p.id>?1) ORDER BY p.id ASC LIMIT ?2"
+        ))?;
+        let rows = statement.query_map(params![after_id, i64::from(limit)], printer_from_row)?;
+        let mut printers = rows.collect::<Result<Vec<_>, _>>()?;
+        for printer in &mut printers {
+            printer.web_url = normalize_printer_web_url(printer.web_url.as_deref())?;
+        }
+        Ok(printers)
+    }
+
+    pub fn list_printer_export_attributions(
+        &self,
+    ) -> Result<Vec<PrinterExportAttribution>, LibraryError> {
+        let count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM printers", [], |row| row.get(0))?;
+        checked_export_count(count, "printers", MAX_PRINTER_JSON_EXPORT_PRINTERS)?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT id,nickname,make,model,printer_type FROM printers ORDER BY id ASC")?;
+        let rows = statement.query_map([], |row| {
+            Ok(PrinterExportAttribution {
+                id: row.get(0)?,
+                nickname: row.get(1)?,
+                make: row.get(2)?,
+                model: row.get(3)?,
+                printer_type: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_printer_maintenance_logs_for_json_export_page(
+        &self,
+        after_id: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<PrinterMaintenanceLog>, LibraryError> {
+        if limit == 0 || limit > 100 {
+            return Err(LibraryError::InvalidInput(
+                "JSON export maintenance page request is invalid".into(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id,printer_id,printer_nickname,title,performed_at,notes,created_at,metadata_version
+             FROM printer_maintenance_logs
+             WHERE (?1 IS NULL OR id>?1) ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![after_id, i64::from(limit)],
+            maintenance_log_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_printer_reminders_for_json_export_page(
+        &self,
+        after_id: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<PrinterReminder>, LibraryError> {
+        if limit == 0 || limit > 100 {
+            return Err(LibraryError::InvalidInput(
+                "JSON export reminder page request is invalid".into(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id,metadata_version,printer_id,printer_nickname,title,notes,due_at,
+                    interval_days,status,last_completed_at,created_at,updated_at
+             FROM printer_reminders
+             WHERE (?1 IS NULL OR id>?1) ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![after_id, i64::from(limit)],
+            printer_reminder_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Imports prior settings.json entries by stable ID. Existing rows are
+    /// never overwritten, making repeated startup imports safe after edits.
+    pub fn import_legacy_printers(
+        &self,
+        legacy: &[LegacyPrinter],
+    ) -> Result<LegacyPrinterImportSummary, LibraryError> {
+        if legacy.len() > MAX_PRINTER_IMPORT_COUNT {
+            return Err(LibraryError::InvalidInput(
+                "legacy printer import exceeds its record limit".into(),
+            ));
+        }
+        let mut ids = HashSet::with_capacity(legacy.len());
+        let mut normalized = Vec::with_capacity(legacy.len());
+        for value in legacy {
+            let id = validate_record_id(&value.id, "printer ID")?;
+            if !ids.insert(id.clone()) {
+                return Err(LibraryError::InvalidInput(
+                    "legacy printer IDs must be unique".into(),
+                ));
+            }
+            let input = normalize_printer_input(&PrinterInput {
+                nickname: value.name.clone(),
+                make: None,
+                model: None,
+                printer_type: None,
+                firmware: None,
+                host: None,
+                web_url: None,
+                bed_mm: Some(value.bed_mm),
+                notes: String::new(),
+            })?;
+            normalized.push((id, input));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut summary = LegacyPrinterImportSummary::default();
+        for (id, input) in normalized {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM printers WHERE id=?1)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                summary.already_present += 1;
+                continue;
+            }
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM printers", [], |row| row.get(0))?;
+            if count >= MAX_PRINTERS as i64 {
+                return Err(LibraryError::InvalidInput(
+                    "printer catalog exceeds its record limit".into(),
+                ));
+            }
+            let (bed_x, bed_y, bed_z) = printer_bed_columns(input.bed_mm);
+            let now = timestamp();
+            tx.execute(
+                "INSERT INTO printers (
+                    id,metadata_version,nickname,make,model,printer_type,firmware,host,web_url,
+                    endpoint_approved,bed_x_mm,bed_y_mm,bed_z_mm,notes,source_kind,
+                    connection_status,job_status,last_checked_at,connection_error_code,created_at,updated_at
+                 ) VALUES (?1,1,?2,NULL,NULL,NULL,NULL,NULL,NULL,0,?3,?4,?5,'','manual',
+                          'unknown','unknown',NULL,NULL,?6,?6)",
+                params![id, input.nickname, bed_x, bed_y, bed_z, now],
+            )?;
+            summary.inserted += 1;
+        }
+        tx.commit()?;
+        Ok(summary)
+    }
+
+    /// Imports printer profiles and their history atomically. External refs
+    /// only connect rows inside this batch; all persisted IDs are generated
+    /// locally or selected from existing local printers.
+    pub fn import_printer_data(
+        &self,
+        batch: &PrinterDataImport,
+    ) -> Result<PrinterDataImportResult, LibraryError> {
+        if batch.printers.len() > MAX_PRINTER_DATA_IMPORT_PRINTERS
+            || batch.maintenance_logs.len() > MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS
+            || batch.reminders.len() > MAX_PRINTER_JSON_EXPORT_REMINDERS
+        {
+            return Err(LibraryError::InvalidInput(
+                "printer data import exceeds a record limit".into(),
+            ));
+        }
+        let total_records = batch
+            .printers
+            .len()
+            .checked_add(batch.maintenance_logs.len())
+            .and_then(|total| total.checked_add(batch.reminders.len()));
+        if total_records.is_none_or(|total| total > MAX_PRINTER_DATA_IMPORT_RECORDS) {
+            return Err(LibraryError::InvalidInput(
+                "printer data import exceeds its total record limit".into(),
+            ));
+        }
+
+        struct PreparedPrinter {
+            external_ref: String,
+            map_to_local_printer_id: Option<String>,
+            created_at: String,
+            updated_at: String,
+            input: PrinterInput,
+        }
+        struct PreparedMaintenanceLog {
+            printer_external_ref: Option<String>,
+            printer_nickname: Option<String>,
+            input: PrinterMaintenanceInput,
+            created_at: String,
+        }
+        struct PreparedReminder {
+            printer_external_ref: Option<String>,
+            printer_nickname: Option<String>,
+            input: PrinterReminderInput,
+            status: PrinterReminderStatus,
+            last_completed_at: Option<String>,
+            created_at: String,
+            updated_at: String,
+        }
+
+        let import_timestamp = timestamp();
+        let mut prepared_printers = Vec::with_capacity(batch.printers.len());
+        let mut printer_refs = HashSet::with_capacity(batch.printers.len());
+        for record in &batch.printers {
+            let external_ref =
+                validate_import_external_ref(&record.external_ref, "printer external reference")?;
+            if !printer_refs.insert(external_ref.clone()) {
+                return Err(LibraryError::InvalidInput(
+                    "printer external references must be unique".into(),
+                ));
+            }
+            let map_to_local_printer_id = record
+                .map_to_local_printer_id
+                .as_deref()
+                .map(|id| validate_record_id(id, "local printer ID"))
+                .transpose()?;
+            prepared_printers.push(PreparedPrinter {
+                external_ref,
+                map_to_local_printer_id,
+                created_at: record
+                    .created_at
+                    .as_deref()
+                    .map(|value| validate_import_timestamp(value, "printer created_at"))
+                    .transpose()?
+                    .unwrap_or_else(|| import_timestamp.clone()),
+                updated_at: record
+                    .updated_at
+                    .as_deref()
+                    .map(|value| validate_import_timestamp(value, "printer updated_at"))
+                    .transpose()?
+                    .unwrap_or_else(|| import_timestamp.clone()),
+                input: normalize_printer_input(&record.input)?,
+            });
+        }
+
+        let mut prepared_logs = Vec::with_capacity(batch.maintenance_logs.len());
+        let mut maintenance_refs = HashSet::with_capacity(batch.maintenance_logs.len());
+        for record in &batch.maintenance_logs {
+            let external_ref = validate_import_external_ref(
+                &record.external_ref,
+                "maintenance external reference",
+            )?;
+            if !maintenance_refs.insert(external_ref) {
+                return Err(LibraryError::InvalidInput(
+                    "maintenance log external references must be unique".into(),
+                ));
+            }
+            let printer_external_ref = record
+                .printer_external_ref
+                .as_deref()
+                .map(|value| {
+                    validate_import_external_ref(value, "maintenance printer external reference")
+                })
+                .transpose()?;
+            prepared_logs.push(PreparedMaintenanceLog {
+                printer_external_ref,
+                printer_nickname: validate_optional_import_snapshot_name(
+                    record.printer_nickname.as_deref(),
+                )?,
+                input: normalize_maintenance_input(&record.input)?,
+                created_at: record
+                    .created_at
+                    .as_deref()
+                    .map(|value| validate_import_timestamp(value, "maintenance created_at"))
+                    .transpose()?
+                    .unwrap_or_else(|| import_timestamp.clone()),
+            });
+        }
+
+        let mut prepared_reminders = Vec::with_capacity(batch.reminders.len());
+        let mut reminder_refs = HashSet::with_capacity(batch.reminders.len());
+        for record in &batch.reminders {
+            let external_ref =
+                validate_import_external_ref(&record.external_ref, "reminder external reference")?;
+            if !reminder_refs.insert(external_ref) {
+                return Err(LibraryError::InvalidInput(
+                    "reminder external references must be unique".into(),
+                ));
+            }
+            let printer_external_ref = record
+                .printer_external_ref
+                .as_deref()
+                .map(|value| {
+                    validate_import_external_ref(value, "reminder printer external reference")
+                })
+                .transpose()?;
+            prepared_reminders.push(PreparedReminder {
+                printer_external_ref,
+                printer_nickname: validate_optional_import_snapshot_name(
+                    record.printer_nickname.as_deref(),
+                )?,
+                input: normalize_printer_reminder_input(&record.input)?,
+                status: record.status,
+                last_completed_at: record
+                    .last_completed_at
+                    .as_deref()
+                    .map(|value| normalize_rfc3339_field(value, "last_completed_at"))
+                    .transpose()?,
+                created_at: validate_import_timestamp(&record.created_at, "reminder created_at")?,
+                updated_at: validate_import_timestamp(&record.updated_at, "reminder updated_at")?,
+            });
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let maintenance_count =
+            tx.query_row("SELECT COUNT(*) FROM printer_maintenance_logs", [], |row| {
+                row.get(0)
+            })?;
+        ensure_printer_history_capacity(
+            maintenance_count,
+            prepared_logs.len(),
+            "maintenance log",
+            MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS,
+        )?;
+        let reminder_count = tx.query_row("SELECT COUNT(*) FROM printer_reminders", [], |row| {
+            row.get(0)
+        })?;
+        ensure_printer_history_capacity(
+            reminder_count,
+            prepared_reminders.len(),
+            "reminder",
+            MAX_PRINTER_JSON_EXPORT_REMINDERS,
+        )?;
+        let mut local_id_by_printer_ref = HashMap::with_capacity(prepared_printers.len());
+        let mut new_printers = Vec::new();
+        let mut result = PrinterDataImportResult::default();
+        for printer in prepared_printers {
+            let local_printer_id = if let Some(id) = printer.map_to_local_printer_id {
+                let existing_id: Option<String> = tx
+                    .query_row("SELECT id FROM printers WHERE id=?1", params![id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let existing_id = existing_id.ok_or_else(|| {
+                    LibraryError::InvalidInput("mapped local printer was not found".into())
+                })?;
+                result.mapped_printer_count += 1;
+                existing_id
+            } else {
+                let id = new_id("printer");
+                new_printers.push((
+                    id.clone(),
+                    printer.input,
+                    printer.created_at,
+                    printer.updated_at,
+                ));
+                result.imported_printer_count += 1;
+                id
+            };
+            local_id_by_printer_ref.insert(printer.external_ref.clone(), local_printer_id.clone());
+            result.printer_ref_map.push(PrinterImportRefMapEntry {
+                external_ref: printer.external_ref,
+                local_printer_id,
+            });
+        }
+
+        let printer_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM printers", [], |row| row.get(0))?;
+        if printer_count + new_printers.len() as i64 > MAX_PRINTERS as i64 {
+            return Err(LibraryError::InvalidInput(
+                "printer catalog exceeds its record limit".into(),
+            ));
+        }
+        for (id, input, created_at, updated_at) in new_printers {
+            let (bed_x, bed_y, bed_z) = printer_bed_columns(input.bed_mm);
+            tx.execute(
+                "INSERT INTO printers (
+                    id,metadata_version,nickname,make,model,printer_type,firmware,host,web_url,
+                    endpoint_approved,bed_x_mm,bed_y_mm,bed_z_mm,notes,source_kind,
+                    connection_status,job_status,last_checked_at,connection_error_code,created_at,updated_at
+                 ) VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,'imported',
+                          'unknown','unknown',NULL,NULL,?13,?14)",
+                params![
+                    id,
+                    input.nickname,
+                    input.make,
+                    input.model,
+                    input.printer_type,
+                    input.firmware,
+                    input.host,
+                    input.web_url,
+                    bed_x,
+                    bed_y,
+                    bed_z,
+                    input.notes,
+                    created_at,
+                    updated_at,
+                ],
+            )?;
+        }
+
+        for log in prepared_logs {
+            let printer_id = log
+                .printer_external_ref
+                .as_deref()
+                .and_then(|external_ref| local_id_by_printer_ref.get(external_ref));
+            let printer_nickname = match log.printer_nickname {
+                Some(snapshot) => snapshot,
+                None => match printer_id {
+                    Some(printer_id) => tx
+                        .query_row(
+                            "SELECT nickname FROM printers WHERE id=?1",
+                            params![printer_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?,
+                    None => String::new(),
+                },
+            };
+            tx.execute(
+                "INSERT INTO printer_maintenance_logs
+                 (id,printer_id,printer_nickname,title,performed_at,notes,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    new_id("maintenance"),
+                    printer_id,
+                    printer_nickname,
+                    log.input.title,
+                    log.input.performed_at,
+                    log.input.notes,
+                    log.created_at,
+                ],
+            )?;
+            result.imported_maintenance_log_count += 1;
+        }
+
+        for reminder in prepared_reminders {
+            let printer_id = reminder
+                .printer_external_ref
+                .as_deref()
+                .and_then(|external_ref| local_id_by_printer_ref.get(external_ref));
+            let printer_nickname = match reminder.printer_nickname {
+                Some(snapshot) => snapshot,
+                None => match printer_id {
+                    Some(printer_id) => tx
+                        .query_row(
+                            "SELECT nickname FROM printers WHERE id=?1",
+                            params![printer_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?,
+                    None => String::new(),
+                },
+            };
+            tx.execute(
+                "INSERT INTO printer_reminders
+                 (id,metadata_version,printer_id,printer_nickname,title,notes,due_at,interval_days,
+                  status,last_completed_at,created_at,updated_at)
+                 VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    new_id("reminder"),
+                    printer_id,
+                    printer_nickname,
+                    reminder.input.title,
+                    reminder.input.notes,
+                    reminder.input.due_at,
+                    reminder.input.interval_days,
+                    printer_reminder_status_value(&reminder.status),
+                    reminder.last_completed_at,
+                    reminder.created_at,
+                    reminder.updated_at,
+                ],
+            )?;
+            result.imported_reminder_count += 1;
+        }
+
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Source provenance is not part of ordinary editable metadata. Changing
+    /// it requires this explicit operation so imports cannot impersonate
+    /// discovered devices.
+    pub fn set_printer_source_kind(
+        &self,
+        id: &str,
+        expected_version: u64,
+        source_kind: PrinterSourceKind,
+    ) -> Result<Printer, LibraryError> {
+        validate_record_id(id, "printer ID")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let actual: i64 = tx
+            .query_row(
+                "SELECT metadata_version FROM printers WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+        ensure_record_version("printer", expected_version, actual)?;
+        tx.execute(
+            "UPDATE printers SET source_kind=?1,metadata_version=metadata_version+1,updated_at=?2 WHERE id=?3",
+            params![printer_source_kind_value(&source_kind), timestamp(), id],
+        )?;
+        tx.commit()?;
+        self.get_printer(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("updated printer is missing".into()))
+    }
+
+    /// Persists only the bounded state code returned by an explicit local
+    /// connection check. Raw device responses and credentials are not stored.
+    pub fn record_printer_status(
+        &self,
+        id: &str,
+        connection_status: PrinterConnectionStatus,
+        job_status: PrinterJobStatus,
+        last_checked_at: &str,
+        connection_error_code: Option<&str>,
+    ) -> Result<Printer, LibraryError> {
+        validate_record_id(id, "printer ID")?;
+        let expected = self
+            .get_printer(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+        self.record_printer_status_if_current(
+            &expected,
+            connection_status,
+            job_status,
+            last_checked_at,
+            connection_error_code,
+        )
+    }
+
+    /// Commits a check only if the record and approved endpoint still match
+    /// the snapshot used for the network request.
+    pub fn record_printer_status_if_current(
+        &self,
+        expected: &Printer,
+        connection_status: PrinterConnectionStatus,
+        job_status: PrinterJobStatus,
+        last_checked_at: &str,
+        connection_error_code: Option<&str>,
+    ) -> Result<Printer, LibraryError> {
+        validate_record_id(&expected.id, "printer ID")?;
+        let checked_at = normalize_rfc3339_field(last_checked_at, "last_checked_at")?;
+        validate_printer_status(connection_status, job_status, connection_error_code)?;
+        if !expected.endpoint_approved {
+            return Err(LibraryError::InvalidInput(
+                "printer endpoint requires explicit local approval before checking".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let current: Option<(i64, bool, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT metadata_version,endpoint_approved,host,web_url FROM printers WHERE id=?1",
+                params![expected.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let (actual_version, approved, host, web_url) =
+            current.ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+        ensure_record_version("printer", expected.metadata_version, actual_version)?;
+        if host.as_deref() != expected.host.as_deref()
+            || web_url.as_deref() != expected.web_url.as_deref()
+        {
+            return Err(LibraryError::InvalidInput(
+                "printer endpoint changed during the connection check".into(),
+            ));
+        }
+        let has_endpoint = host.is_some() || web_url.is_some();
+        if !approved || !has_endpoint {
+            return Err(LibraryError::InvalidInput(
+                "printer endpoint requires explicit local approval before checking".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE printers SET connection_status=?1,job_status=?2,last_checked_at=?3,
+                connection_error_code=?4,metadata_version=metadata_version+1,updated_at=?5
+             WHERE id=?6",
+            params![
+                printer_connection_status_value(&connection_status),
+                printer_job_status_value(&job_status),
+                checked_at,
+                connection_error_code,
+                timestamp(),
+                expected.id.as_str(),
+            ],
+        )?;
+        tx.commit()?;
+        self.get_printer(&expected.id)?
+            .ok_or_else(|| LibraryError::InvalidInput("updated printer is missing".into()))
+    }
+
+    pub fn delete_printer(&self, id: &str, expected_version: u64) -> Result<(), LibraryError> {
+        validate_record_id(id, "printer ID")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let actual: i64 = tx
+            .query_row(
+                "SELECT metadata_version FROM printers WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+        ensure_record_version("printer", expected_version, actual)?;
+        let now = timestamp();
+        tx.execute(
+            "UPDATE printer_reminders SET printer_id=NULL,status='paused',
+                metadata_version=metadata_version+1,updated_at=?1 WHERE printer_id=?2",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE printer_maintenance_logs
+             SET printer_id=NULL,metadata_version=metadata_version+1 WHERE printer_id=?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM printers WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn create_printer_maintenance_log(
+        &self,
+        printer_id: &str,
+        input: &PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, LibraryError> {
+        validate_record_id(printer_id, "printer ID")?;
+        let input = normalize_maintenance_input(input)?;
+        let id = new_id("maintenance");
+        let created_at = timestamp();
+        let tx = self.conn.unchecked_transaction()?;
+        let printer_nickname: String = tx
+            .query_row(
+                "SELECT nickname FROM printers WHERE id=?1",
+                params![printer_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+        let maintenance_count =
+            tx.query_row("SELECT COUNT(*) FROM printer_maintenance_logs", [], |row| {
+                row.get(0)
+            })?;
+        ensure_printer_history_capacity(
+            maintenance_count,
+            1,
+            "maintenance log",
+            MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS,
+        )?;
+        tx.execute(
+            "INSERT INTO printer_maintenance_logs
+             (id,printer_id,printer_nickname,title,performed_at,notes,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                printer_id,
+                printer_nickname,
+                input.title,
+                input.performed_at,
+                input.notes,
+                created_at,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_printer_maintenance_log(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("created maintenance log is missing".into()))
+    }
+
+    pub fn get_printer_maintenance_log(
+        &self,
+        id: &str,
+    ) -> Result<Option<PrinterMaintenanceLog>, LibraryError> {
+        validate_record_id(id, "maintenance log ID")?;
+        self.conn
+            .query_row(
+                "SELECT id,printer_id,printer_nickname,title,performed_at,notes,created_at,metadata_version
+                 FROM printer_maintenance_logs WHERE id=?1",
+                params![id],
+                maintenance_log_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_printer_maintenance_logs(
+        &self,
+        printer_id: Option<&str>,
+    ) -> Result<Vec<PrinterMaintenanceLog>, LibraryError> {
+        if let Some(id) = printer_id {
+            validate_record_id(id, "printer ID")?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let count = tx.query_row(
+            "SELECT COUNT(*) FROM printer_maintenance_logs WHERE (?1 IS NULL OR printer_id=?1)",
+            params![printer_id],
+            |row| row.get(0),
+        )?;
+        let count = checked_history_list_count(
+            count,
+            "maintenance log",
+            MAX_PRINTER_UI_MAINTENANCE_LOG_ROWS,
+        )?;
+        let mut statement = tx.prepare(
+            "SELECT id,printer_id,printer_nickname,title,performed_at,notes,created_at,metadata_version
+             FROM printer_maintenance_logs WHERE (?1 IS NULL OR printer_id=?1)
+             ORDER BY performed_at DESC,id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![printer_id, MAX_PRINTER_UI_MAINTENANCE_LOG_ROWS as i64],
+            maintenance_log_from_row,
+        )?;
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if records.len() != count {
+            return Err(LibraryError::InvalidInput(
+                "printer maintenance log list did not read every counted record".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(records)
+    }
+
+    pub fn update_printer_maintenance_log(
+        &self,
+        id: &str,
+        expected_version: u64,
+        input: &PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, LibraryError> {
+        validate_record_id(id, "maintenance log ID")?;
+        let input = normalize_maintenance_input(input)?;
+        let expected_version = i64::try_from(expected_version).map_err(|_| {
+            LibraryError::InvalidInput("maintenance log version is out of range".into())
+        })?;
+        let changed = self.conn.execute(
+            "UPDATE printer_maintenance_logs
+             SET title=?1,performed_at=?2,notes=?3,metadata_version=metadata_version+1
+             WHERE id=?4 AND metadata_version=?5",
+            params![
+                input.title,
+                input.performed_at,
+                input.notes,
+                id,
+                expected_version
+            ],
+        )?;
+        if changed == 0 {
+            ensure_printer_maintenance_log_version(&self.conn, id, expected_version as u64)?;
+        }
+        self.get_printer_maintenance_log(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("maintenance log not found".into()))
+    }
+
+    pub fn delete_printer_maintenance_log(
+        &self,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), LibraryError> {
+        validate_record_id(id, "maintenance log ID")?;
+        let expected_version = i64::try_from(expected_version).map_err(|_| {
+            LibraryError::InvalidInput("maintenance log version is out of range".into())
+        })?;
+        let deleted = self.conn.execute(
+            "DELETE FROM printer_maintenance_logs WHERE id=?1 AND metadata_version=?2",
+            params![id, expected_version],
+        )?;
+        if deleted == 0 {
+            ensure_printer_maintenance_log_version(&self.conn, id, expected_version as u64)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_printer_reminder(
+        &self,
+        printer_id: &str,
+        input: &PrinterReminderInput,
+    ) -> Result<PrinterReminder, LibraryError> {
+        validate_record_id(printer_id, "printer ID")?;
+        let input = normalize_printer_reminder_input(input)?;
+        let id = new_id("reminder");
+        let now = timestamp();
+        let tx = self.conn.unchecked_transaction()?;
+        let printer_nickname: String = tx
+            .query_row(
+                "SELECT nickname FROM printers WHERE id=?1",
+                params![printer_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+        let reminder_count = tx.query_row("SELECT COUNT(*) FROM printer_reminders", [], |row| {
+            row.get(0)
+        })?;
+        ensure_printer_history_capacity(
+            reminder_count,
+            1,
+            "reminder",
+            MAX_PRINTER_JSON_EXPORT_REMINDERS,
+        )?;
+        tx.execute(
+            "INSERT INTO printer_reminders
+             (id,metadata_version,printer_id,printer_nickname,title,notes,due_at,interval_days,
+              status,last_completed_at,created_at,updated_at)
+             VALUES(?1,1,?2,?3,?4,?5,?6,?7,'active',NULL,?8,?8)",
+            params![
+                id,
+                printer_id,
+                printer_nickname,
+                input.title,
+                input.notes,
+                input.due_at,
+                input.interval_days,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_printer_reminder(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("created printer reminder is missing".into()))
+    }
+
+    pub fn get_printer_reminder(&self, id: &str) -> Result<Option<PrinterReminder>, LibraryError> {
+        validate_record_id(id, "printer reminder ID")?;
+        self.conn
+            .query_row(
+                PRINTER_REMINDER_SELECT_BY_ID,
+                params![id],
+                printer_reminder_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_printer_reminders(
+        &self,
+        printer_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<PrinterReminder>, LibraryError> {
+        if let Some(id) = printer_id {
+            validate_record_id(id, "printer ID")?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let count = tx.query_row(
+            "SELECT COUNT(*) FROM printer_reminders
+             WHERE (?1 IS NULL OR printer_id=?1) AND (?2=1 OR status!='completed')",
+            params![printer_id, include_completed],
+            |row| row.get(0),
+        )?;
+        let count = checked_history_list_count(count, "reminder", MAX_PRINTER_UI_REMINDER_ROWS)?;
+        let mut statement = tx.prepare(
+            "SELECT id,metadata_version,printer_id,printer_nickname,title,notes,due_at,
+                    interval_days,status,last_completed_at,created_at,updated_at
+             FROM printer_reminders
+             WHERE (?1 IS NULL OR printer_id=?1) AND (?2=1 OR status!='completed')
+             ORDER BY due_at,id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                printer_id,
+                include_completed,
+                MAX_PRINTER_UI_REMINDER_ROWS as i64
+            ],
+            printer_reminder_from_row,
+        )?;
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if records.len() != count {
+            return Err(LibraryError::InvalidInput(
+                "printer reminder list did not read every counted record".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(records)
+    }
+
+    pub fn update_printer_reminder(
+        &self,
+        id: &str,
+        expected_version: u64,
+        input: &PrinterReminderInput,
+    ) -> Result<PrinterReminder, LibraryError> {
+        validate_record_id(id, "printer reminder ID")?;
+        let input = normalize_printer_reminder_input(input)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let (actual, status): (i64, String) = tx
+            .query_row(
+                "SELECT metadata_version,status FROM printer_reminders WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))?;
+        ensure_record_version("printer reminder", expected_version, actual)?;
+        if status == "completed" {
+            return Err(LibraryError::InvalidInput(
+                "completed printer reminder cannot be edited".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE printer_reminders SET title=?1,notes=?2,due_at=?3,interval_days=?4,
+                metadata_version=metadata_version+1,updated_at=?5 WHERE id=?6",
+            params![
+                input.title,
+                input.notes,
+                input.due_at,
+                input.interval_days,
+                timestamp(),
+                id,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_printer_reminder(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))
+    }
+
+    pub fn reschedule_printer_reminder(
+        &self,
+        id: &str,
+        expected_version: u64,
+        due_at: &str,
+    ) -> Result<PrinterReminder, LibraryError> {
+        validate_record_id(id, "printer reminder ID")?;
+        let due_at = normalize_rfc3339_field(due_at, "due_at")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let (actual, status): (i64, String) = tx
+            .query_row(
+                "SELECT metadata_version,status FROM printer_reminders WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))?;
+        ensure_record_version("printer reminder", expected_version, actual)?;
+        if status == "completed" {
+            return Err(LibraryError::InvalidInput(
+                "completed printer reminder cannot be rescheduled".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE printer_reminders SET due_at=?1,status='active',
+                metadata_version=metadata_version+1,updated_at=?2 WHERE id=?3",
+            params![due_at, timestamp(), id],
+        )?;
+        tx.commit()?;
+        self.get_printer_reminder(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))
+    }
+
+    pub fn set_printer_reminder_paused(
+        &self,
+        id: &str,
+        expected_version: u64,
+        paused: bool,
+    ) -> Result<PrinterReminder, LibraryError> {
+        validate_record_id(id, "printer reminder ID")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let (actual, status): (i64, String) = tx
+            .query_row(
+                "SELECT metadata_version,status FROM printer_reminders WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))?;
+        ensure_record_version("printer reminder", expected_version, actual)?;
+        if status == "completed" {
+            return Err(LibraryError::InvalidInput(
+                "completed printer reminder cannot be paused".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE printer_reminders SET status=?1,metadata_version=metadata_version+1,
+                updated_at=?2 WHERE id=?3",
+            params![if paused { "paused" } else { "active" }, timestamp(), id],
+        )?;
+        tx.commit()?;
+        self.get_printer_reminder(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))
+    }
+
+    pub fn complete_printer_reminder(
+        &self,
+        id: &str,
+        expected_version: u64,
+        completion: &PrinterReminderCompletionInput,
+    ) -> Result<PrinterReminderCompletion, LibraryError> {
+        validate_record_id(id, "printer reminder ID")?;
+        let completed_at = normalize_rfc3339_field(&completion.completed_at, "completed_at")?;
+        let notes = clean_bounded_notes(&completion.notes, "maintenance notes")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let reminder = tx
+            .query_row(
+                PRINTER_REMINDER_SELECT_BY_ID,
+                params![id],
+                printer_reminder_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))?;
+        ensure_record_version(
+            "printer reminder",
+            expected_version,
+            reminder.metadata_version as i64,
+        )?;
+        if reminder.status != PrinterReminderStatus::Active {
+            return Err(LibraryError::InvalidInput(
+                "only an active printer reminder can be completed".into(),
+            ));
+        }
+        let maintenance_count =
+            tx.query_row("SELECT COUNT(*) FROM printer_maintenance_logs", [], |row| {
+                row.get(0)
+            })?;
+        ensure_printer_history_capacity(
+            maintenance_count,
+            1,
+            "maintenance log",
+            MAX_PRINTER_JSON_EXPORT_MAINTENANCE_LOGS,
+        )?;
+        let (due_at, status) = if let Some(interval_days) = reminder.interval_days {
+            (
+                add_rfc3339_days(&completed_at, interval_days)?,
+                PrinterReminderStatus::Active,
+            )
+        } else {
+            (reminder.due_at.clone(), PrinterReminderStatus::Completed)
+        };
+        let now = timestamp();
+        tx.execute(
+            "UPDATE printer_reminders SET due_at=?1,status=?2,last_completed_at=?3,
+                metadata_version=metadata_version+1,updated_at=?4 WHERE id=?5",
+            params![
+                due_at,
+                printer_reminder_status_value(&status),
+                completed_at,
+                now,
+                id,
+            ],
+        )?;
+        let log_id = new_id("maintenance");
+        tx.execute(
+            "INSERT INTO printer_maintenance_logs
+             (id,printer_id,printer_nickname,title,performed_at,notes,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                log_id,
+                reminder.printer_id,
+                reminder.printer_nickname,
+                reminder.title,
+                completed_at,
+                notes,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        let reminder = self
+            .get_printer_reminder(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder disappeared".into()))?;
+        let maintenance_log = self
+            .get_printer_maintenance_log(&log_id)?
+            .ok_or_else(|| LibraryError::InvalidInput("maintenance log disappeared".into()))?;
+        Ok(PrinterReminderCompletion {
+            reminder,
+            maintenance_log,
+        })
+    }
+
+    pub fn delete_printer_reminder(
+        &self,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), LibraryError> {
+        validate_record_id(id, "printer reminder ID")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let actual: i64 = tx
+            .query_row(
+                "SELECT metadata_version FROM printer_reminders WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("printer reminder not found".into()))?;
+        ensure_record_version("printer reminder", expected_version, actual)?;
+        tx.execute("DELETE FROM printer_reminders WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn create_print_attempt(
         &self,
         model_id: &str,
         input: &PrintAttemptInput,
     ) -> Result<PrintAttempt, LibraryError> {
+        self.create_print_attempt_with_creation_time(model_id, input, None)
+    }
+
+    pub fn create_print_attempt_with_printer(
+        &self,
+        model_id: &str,
+        input: &PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, LibraryError> {
+        validate_print_attempt(&input.input)?;
+        self.ensure_model(model_id)?;
+        let id = new_id("print");
+        let now = timestamp();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        write_print_attempt(&tx, &id, model_id, &input.input, &now, true, None, true)?;
+        if let Some(Some(printer_id)) = input.printer_id.as_ref() {
+            write_print_attempt_printer(&tx, &id, Some(printer_id))?;
+        }
+        recompute_print_summary(&tx, model_id)?;
+        tx.commit()?;
+        self.get_print_attempt(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt missing".into()))
+    }
+
+    pub fn import_print_attempt(
+        &self,
+        model_id: &str,
+        input: &PrintAttemptInput,
+        created_at: &str,
+    ) -> Result<PrintAttempt, LibraryError> {
+        let created_at = normalize_rfc3339(created_at)?;
+        self.create_print_attempt_with_creation_time(model_id, input, Some(&created_at))
+    }
+
+    /// Imports a print event with already-resolved local printer attribution.
+    /// The optional name is a historical snapshot and may be supplied without
+    /// a local printer link when the source printer was not imported or mapped.
+    pub fn import_print_attempt_with_printer(
+        &self,
+        model_id: &str,
+        input: &PrintAttemptInput,
+        created_at: Option<&str>,
+        printer_id: Option<&str>,
+        printer_name: Option<&str>,
+    ) -> Result<PrintAttempt, LibraryError> {
+        validate_print_attempt(input)?;
+        self.ensure_model(model_id)?;
+        let imported_created_at = created_at
+            .map(|value| validate_import_timestamp(value, "print attempt created_at"))
+            .transpose()?;
+        let printer_name_snapshot = printer_name
+            .map(validate_import_snapshot_name)
+            .transpose()?;
+        let mapped_printer_id = printer_id
+            .map(|value| validate_record_id(value, "printer ID"))
+            .transpose()?;
+
+        let id = new_id("print");
+        let now = timestamp();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let printer_attribution = if let Some(local_printer_id) = mapped_printer_id {
+            let current_name: Option<String> = tx
+                .query_row(
+                    "SELECT nickname FROM printers WHERE id=?1",
+                    params![local_printer_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let current_name = current_name
+                .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+            Some((
+                local_printer_id,
+                printer_name_snapshot.clone().unwrap_or(current_name),
+            ))
+        } else {
+            None
+        };
+
+        write_print_attempt(
+            &tx,
+            &id,
+            model_id,
+            input,
+            &now,
+            true,
+            imported_created_at.as_deref(),
+            false,
+        )?;
+        if let Some((local_printer_id, snapshot)) = printer_attribution {
+            tx.execute(
+                "UPDATE print_attempts SET printer_id=?1,printer_name=?2 WHERE id=?3",
+                params![local_printer_id, snapshot, id],
+            )?;
+        } else if let Some(snapshot) = printer_name_snapshot {
+            tx.execute(
+                "UPDATE print_attempts SET printer_name=?1 WHERE id=?2",
+                params![snapshot, id],
+            )?;
+        }
+        recompute_print_summary(&tx, model_id)?;
+        tx.commit()?;
+        self.get_print_attempt(&id)?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt missing".into()))
+    }
+
+    /// Imports a reviewed history batch as one serialized database mutation.
+    /// Existing matching events are counted before inserts, preserving duplicate
+    /// event multiplicity within the batch while making concurrent replays safe.
+    pub fn import_print_attempts_deduplicated(
+        &self,
+        model_id: &str,
+        attempts: &[PrintAttemptImportItem],
+    ) -> Result<PrintAttemptImportResult, LibraryError> {
+        let model_id = validate_record_id(model_id, "model ID")?;
+        if attempts.len() > MAX_PRINT_ATTEMPTS_PER_IMPORT_BATCH {
+            return Err(LibraryError::InvalidInput(format!(
+                "print history import exceeds the {MAX_PRINT_ATTEMPTS_PER_IMPORT_BATCH}-event limit"
+            )));
+        }
+        for item in attempts {
+            validate_print_attempt(&item.input)?;
+            if let Some(created_at) = item.created_at.as_deref() {
+                validate_import_timestamp(created_at, "print attempt created_at")?;
+            }
+            if let Some(printer_name) = item.printer_name.as_deref() {
+                validate_print_attempt_printer_snapshot(printer_name)?;
+            }
+            if let Some(printer_id) = item.printer_id.as_deref() {
+                validate_record_id(printer_id, "printer ID")?;
+            }
+        }
+
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let model_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM models WHERE id=?1)",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        if !model_exists {
+            return Err(LibraryError::ModelNotFound(model_id));
+        }
+
+        let existing_rows = {
+            let mut stmt = tx.prepare(
+                "SELECT id,printed_at,quantity,notes,outcome,printer_id,printer_name \
+                 FROM print_attempts WHERE model_id=?1",
+            )?;
+            let rows = stmt.query_map(params![model_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u32,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut remaining_existing = HashMap::new();
+        for (id, printed_at, quantity, notes, outcome, printer_id, printer_name) in existing_rows {
+            let filament_ids = attempt_filaments(&tx, &id)?;
+            let parts = attempt_parts(&tx, &id)?
+                .into_iter()
+                .filter_map(|part| {
+                    part.id.map(|id| PartUsageInput {
+                        id,
+                        quantity: part.quantity_per_copy,
+                        snapshot: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let identity = print_attempt_import_identity(
+                &printed_at,
+                quantity,
+                &notes,
+                &filament_ids,
+                &parts,
+                &outcome,
+                printer_id,
+                printer_name,
+            )?;
+            *remaining_existing.entry(identity).or_insert(0usize) += 1;
+        }
+
+        let mut added_count = 0usize;
+        let mut skipped_count = 0usize;
+        for item in attempts {
+            let imported_created_at = item
+                .created_at
+                .as_deref()
+                .map(|value| validate_import_timestamp(value, "print attempt created_at"))
+                .transpose()?;
+            let supplied_printer_name = item
+                .printer_name
+                .as_deref()
+                .map(validate_print_attempt_printer_snapshot)
+                .transpose()?;
+            let printer_id = item
+                .printer_id
+                .as_deref()
+                .map(|value| validate_record_id(value, "printer ID"))
+                .transpose()?;
+            let (printer_id, printer_name) = if let Some(printer_id) = printer_id {
+                let current_name: Option<String> = tx
+                    .query_row(
+                        "SELECT nickname FROM printers WHERE id=?1",
+                        params![printer_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let current_name = current_name
+                    .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+                let printer_name = supplied_printer_name.unwrap_or(current_name);
+                (Some(printer_id), Some(printer_name))
+            } else {
+                (None, supplied_printer_name)
+            };
+            let identity = print_attempt_import_identity(
+                &item.input.printed_at,
+                item.input.quantity,
+                &item.input.notes,
+                &item.input.filament_ids,
+                item.input.parts.as_deref().unwrap_or_default(),
+                print_outcome_value(&item.input.outcome),
+                printer_id.clone(),
+                printer_name.clone(),
+            )?;
+            if let Some(remaining) = remaining_existing.get_mut(&identity) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+
+            let id = new_id("print");
+            let now = timestamp();
+            write_print_attempt(
+                &tx,
+                &id,
+                &model_id,
+                &item.input,
+                &now,
+                true,
+                imported_created_at.as_deref(),
+                false,
+            )?;
+            if let Some(printer_id) = printer_id {
+                tx.execute(
+                    "UPDATE print_attempts SET printer_id=?1,printer_name=?2 WHERE id=?3",
+                    params![printer_id, printer_name, id],
+                )?;
+            } else if let Some(printer_name) = printer_name {
+                tx.execute(
+                    "UPDATE print_attempts SET printer_name=?1 WHERE id=?2",
+                    params![printer_name, id],
+                )?;
+            }
+            added_count += 1;
+        }
+
+        if added_count > 0 {
+            recompute_print_summary(&tx, &model_id)?;
+        }
+        let metadata_version: i64 = tx.query_row(
+            "SELECT metadata_version FROM models WHERE id=?1",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        let metadata_version = u64::try_from(metadata_version)
+            .map_err(|_| LibraryError::InvalidInput("model version is invalid".into()))?;
+        tx.commit()?;
+        Ok(PrintAttemptImportResult {
+            added_count,
+            skipped_count,
+            metadata_version,
+        })
+    }
+
+    fn create_print_attempt_with_creation_time(
+        &self,
+        model_id: &str,
+        input: &PrintAttemptInput,
+        imported_created_at: Option<&str>,
+    ) -> Result<PrintAttempt, LibraryError> {
         validate_print_attempt(input)?;
         self.ensure_model(model_id)?;
         let id = new_id("print");
         let now = timestamp();
-        let tx = self.conn.unchecked_transaction()?;
-        write_print_attempt(&tx, &id, model_id, input, &now, true)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        write_print_attempt(
+            &tx,
+            &id,
+            model_id,
+            input,
+            &now,
+            true,
+            imported_created_at,
+            imported_created_at.is_none(),
+        )?;
         recompute_print_summary(&tx, model_id)?;
         tx.commit()?;
         self.get_print_attempt(&id)?
@@ -3335,7 +5835,36 @@ impl LibraryDb {
                 .collect();
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        // A competing request may have committed after the fast preflight
+        // read above. Recheck under the write reservation before charging stock.
+        if let Some((stored_hash, attempt_ids_json)) = tx
+            .query_row(
+                "SELECT payload_hash,attempt_ids_json FROM print_batch_receipts
+                 WHERE idempotency_key=?1",
+                params![idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_hash != payload_hash {
+                return Err(LibraryError::IdempotencyConflict(idempotency_key.into()));
+            }
+            let ids: Vec<String> = serde_json::from_str(&attempt_ids_json)
+                .map_err(|_| LibraryError::InvalidInput("print batch receipt is corrupt".into()))?;
+            tx.commit()?;
+            return ids
+                .into_iter()
+                .map(|id| {
+                    self.get_print_attempt(&id)?.ok_or_else(|| {
+                        LibraryError::InvalidInput("print batch receipt target is missing".into())
+                    })
+                })
+                .collect();
+        }
         let mut affected = BTreeSet::new();
         for item in items {
             let active: bool = tx.query_row(
@@ -3352,7 +5881,16 @@ impl LibraryDb {
         let mut ids = Vec::with_capacity(items.len());
         for item in items {
             let id = new_id("print");
-            write_print_attempt(&tx, &id, &item.model_id, &item.input, &now, true)?;
+            write_print_attempt(
+                &tx,
+                &id,
+                &item.model_id,
+                &item.input,
+                &now,
+                true,
+                None,
+                true,
+            )?;
             ids.push(id);
         }
         for model_id in affected {
@@ -3380,20 +5918,53 @@ impl LibraryDb {
             .collect()
     }
     pub fn list_print_attempts(&self, model_id: &str) -> Result<Vec<PrintAttempt>, LibraryError> {
-        let mut stmt=self.conn.prepare("SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at FROM print_attempts WHERE model_id=?1 ORDER BY printed_at DESC,id DESC")?;
+        let mut stmt=self.conn.prepare("SELECT id,model_id,printed_at,quantity,notes,outcome,printer_id,printer_name,created_at,updated_at,stock_adjusted FROM print_attempts WHERE model_id=?1 ORDER BY printed_at DESC,id DESC")?;
         let rows = stmt.query_map(params![model_id], attempt_from_row)?;
         let mut out = Vec::new();
         for row in rows {
             let mut a = row?;
             a.filament_ids = attempt_filaments(&self.conn, &a.id)?;
+            a.parts = attempt_parts(&self.conn, &a.id)?;
             out.push(a);
         }
         Ok(out)
     }
+
+    pub fn list_print_attempts_for_json_export_page(
+        &self,
+        model_id: &str,
+        after_printed_at: Option<&str>,
+        after_id: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<PrintAttempt>, LibraryError> {
+        if limit == 0 || limit > 100 || after_printed_at.is_some() != after_id.is_some() {
+            return Err(LibraryError::InvalidInput(
+                "JSON export print-event page request is invalid".into(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id,model_id,printed_at,quantity,notes,outcome,printer_id,printer_name,created_at,updated_at,stock_adjusted
+             FROM print_attempts WHERE model_id=?1
+             AND (?2 IS NULL OR printed_at<?2 OR (printed_at=?2 AND id<?3))
+             ORDER BY printed_at DESC,id DESC LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![model_id, after_printed_at, after_id, i64::from(limit)],
+            attempt_from_row,
+        )?;
+        let mut attempts = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for attempt in &mut attempts {
+            attempt.filament_ids = attempt_filaments(&self.conn, &attempt.id)?;
+            attempt.parts = attempt_parts(&self.conn, &attempt.id)?;
+        }
+        Ok(attempts)
+    }
     pub fn get_print_attempt(&self, id: &str) -> Result<Option<PrintAttempt>, LibraryError> {
-        let mut a=self.conn.query_row("SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at FROM print_attempts WHERE id=?1",params![id],attempt_from_row).optional()?;
+        let mut a=self.conn.query_row("SELECT id,model_id,printed_at,quantity,notes,outcome,printer_id,printer_name,created_at,updated_at,stock_adjusted FROM print_attempts WHERE id=?1",params![id],attempt_from_row).optional()?;
         if let Some(ref mut value) = a {
             value.filament_ids = attempt_filaments(&self.conn, id)?;
+            value.parts = attempt_parts(&self.conn, id)?;
         }
         Ok(a)
     }
@@ -3403,7 +5974,10 @@ impl LibraryDb {
         input: &PrintAttemptInput,
     ) -> Result<PrintAttempt, LibraryError> {
         validate_print_attempt(input)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let model_id: String = tx
             .query_row(
                 "SELECT model_id FROM print_attempts WHERE id=?1",
@@ -3412,14 +5986,56 @@ impl LibraryDb {
             )
             .optional()?
             .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))?;
-        write_print_attempt(&tx, id, &model_id, input, &timestamp(), false)?;
+        write_print_attempt(&tx, id, &model_id, input, &timestamp(), false, None, true)?;
+        recompute_print_summary(&tx, &model_id)?;
+        tx.commit()?;
+        self.get_print_attempt(id)?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))
+    }
+
+    pub fn update_print_attempt_with_printer(
+        &self,
+        id: &str,
+        input: &PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, LibraryError> {
+        validate_record_id(id, "print attempt ID")?;
+        validate_print_attempt(&input.input)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let model_id: String = tx
+            .query_row(
+                "SELECT model_id FROM print_attempts WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))?;
+        write_print_attempt(
+            &tx,
+            id,
+            &model_id,
+            &input.input,
+            &timestamp(),
+            false,
+            None,
+            true,
+        )?;
+        if let Some(printer_id) = input.printer_id.as_ref() {
+            write_print_attempt_printer(&tx, id, printer_id.as_deref())?;
+        }
         recompute_print_summary(&tx, &model_id)?;
         tx.commit()?;
         self.get_print_attempt(id)?
             .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))
     }
     pub fn delete_print_attempt(&self, id: &str) -> Result<(), LibraryError> {
-        let tx = self.conn.unchecked_transaction()?;
+        validate_record_id(id, "print attempt ID")?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let model_id: String = tx
             .query_row(
                 "SELECT model_id FROM print_attempts WHERE id=?1",
@@ -3428,6 +6044,7 @@ impl LibraryDb {
             )
             .optional()?
             .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))?;
+        restore_print_attempt_parts(&tx, id)?;
         tx.execute("DELETE FROM print_attempts WHERE id=?1", params![id])?;
         recompute_print_summary(&tx, &model_id)?;
         tx.commit()?;
@@ -4145,7 +6762,7 @@ impl LibraryDb {
                 Some(Some(_)) => {
                     return Err(LibraryError::InvalidInput(
                         "automatic source bundles are managed by scanning".into(),
-                    ))
+                    ));
                 }
                 Some(None) => {}
             }
@@ -4371,8 +6988,102 @@ CREATE INDEX indexed_model_hash_idx ON indexed_model_data(content_hash, model_id
 CREATE UNIQUE INDEX indexed_model_source_idx ON models(source_root_id, source_path, COALESCE(source_archive_member,''))
     WHERE source_kind = 'indexed';
 CREATE TABLE bundles (id TEXT PRIMARY KEY, source_root_id TEXT, source_path TEXT, created_at TEXT NOT NULL, UNIQUE(source_root_id,source_path));
-CREATE TABLE print_attempts (id TEXT PRIMARY KEY, model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE, printed_at TEXT NOT NULL, quantity INTEGER NOT NULL, notes TEXT NOT NULL, outcome TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE printers (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    nickname TEXT NOT NULL CHECK(length(nickname) BETWEEN 1 AND 128),
+    make TEXT CHECK(make IS NULL OR length(make) <= 128),
+    model TEXT CHECK(model IS NULL OR length(model) <= 128),
+    printer_type TEXT CHECK(printer_type IS NULL OR length(printer_type) <= 128),
+    firmware TEXT CHECK(firmware IS NULL OR length(firmware) <= 128),
+    host TEXT CHECK(host IS NULL OR length(host) <= 255),
+    web_url TEXT CHECK(web_url IS NULL OR length(web_url) <= 2048),
+    endpoint_approved INTEGER NOT NULL DEFAULT 0 CHECK(endpoint_approved IN (0,1)),
+    bed_x_mm REAL, bed_y_mm REAL, bed_z_mm REAL,
+    notes TEXT NOT NULL DEFAULT '' CHECK(length(notes) <= 20000),
+    source_kind TEXT NOT NULL DEFAULT 'manual' CHECK(source_kind IN ('manual','discovered','imported')),
+    connection_status TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(connection_status IN ('unknown','online','offline','auth_required','error')),
+    job_status TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(job_status IN ('unknown','idle','printing','paused','complete')),
+    last_checked_at TEXT,
+    connection_error_code TEXT CHECK(connection_error_code IS NULL OR length(connection_error_code) <= 64),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((bed_x_mm IS NULL AND bed_y_mm IS NULL AND bed_z_mm IS NULL)
+       OR (bed_x_mm BETWEEN 0.1 AND 10000 AND bed_y_mm BETWEEN 0.1 AND 10000 AND bed_z_mm BETWEEN 0.1 AND 10000)),
+    CHECK(connection_status='online' OR job_status='unknown')
+);
+CREATE INDEX printers_name_idx ON printers(nickname COLLATE NOCASE,id);
+CREATE TABLE printer_maintenance_logs (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+    printer_nickname TEXT NOT NULL CHECK(length(printer_nickname) BETWEEN 0 AND 128),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 128),
+    performed_at TEXT NOT NULL,
+    notes TEXT NOT NULL CHECK(length(notes) <= 20000),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX printer_maintenance_printer_idx ON printer_maintenance_logs(printer_id,performed_at DESC,id);
+CREATE TABLE printer_reminders (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+    printer_nickname TEXT NOT NULL CHECK(length(printer_nickname) BETWEEN 0 AND 128),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 128),
+    notes TEXT NOT NULL CHECK(length(notes) <= 20000),
+    due_at TEXT NOT NULL,
+    interval_days INTEGER CHECK(interval_days IS NULL OR interval_days BETWEEN 1 AND 36500),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','completed')),
+    last_completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX printer_reminders_due_idx ON printer_reminders(status,due_at,id);
+CREATE INDEX printer_reminders_printer_idx ON printer_reminders(printer_id,status,due_at,id);
+CREATE TABLE print_attempts (
+    id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    printed_at TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    notes TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    stock_adjusted INTEGER NOT NULL DEFAULT 1 CHECK(stock_adjusted IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+    printer_name TEXT
+);
+CREATE INDEX print_attempt_printer_idx ON print_attempts(printer_id,printed_at DESC,id);
 CREATE TABLE print_attempt_filaments (attempt_id TEXT NOT NULL REFERENCES print_attempts(id) ON DELETE CASCADE, filament_id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(attempt_id,filament_id));
+CREATE TABLE parts_stock (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    category TEXT CHECK(category IS NULL OR length(category) <= 128),
+    quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+    unit TEXT NOT NULL DEFAULT 'pcs' CHECK(length(unit) BETWEEN 1 AND 128),
+    notes TEXT NOT NULL DEFAULT '' CHECK(length(notes) <= 20000),
+    low_stock INTEGER NOT NULL DEFAULT 0 CHECK(low_stock BETWEEN 0 AND 1000000),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX parts_stock_name_idx ON parts_stock(name COLLATE NOCASE,id);
+CREATE TABLE print_attempt_parts (
+    attempt_id TEXT NOT NULL REFERENCES print_attempts(id) ON DELETE CASCADE,
+    part_id TEXT NOT NULL,
+    part_name TEXT NOT NULL CHECK(length(part_name) BETWEEN 1 AND 128),
+    category TEXT,
+    unit TEXT NOT NULL,
+    quantity_per_copy INTEGER NOT NULL CHECK(quantity_per_copy BETWEEN 1 AND 9999),
+    quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 100000000),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    PRIMARY KEY(attempt_id,ordinal)
+);
+CREATE UNIQUE INDEX print_attempt_parts_unique_part_idx
+    ON print_attempt_parts(attempt_id,part_id) WHERE part_id IS NOT NULL;
+CREATE INDEX print_attempt_parts_part_idx ON print_attempt_parts(part_id,attempt_id);
 CREATE TABLE filament_sources (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK(kind='spoolman'),
@@ -4588,6 +7299,167 @@ BEGIN IMMEDIATE;
 ALTER TABLE models ADD COLUMN rating INTEGER NOT NULL DEFAULT 0 CHECK(rating BETWEEN 0 AND 5);
 ALTER TABLE models ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0 CHECK(favorite IN (0,1));
 PRAGMA user_version=6;
+COMMIT;
+"#;
+
+const MIGRATE_V6_TO_V7: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE printers (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    nickname TEXT NOT NULL CHECK(length(nickname) BETWEEN 1 AND 128),
+    make TEXT CHECK(make IS NULL OR length(make) <= 128),
+    model TEXT CHECK(model IS NULL OR length(model) <= 128),
+    printer_type TEXT CHECK(printer_type IS NULL OR length(printer_type) <= 128),
+    firmware TEXT CHECK(firmware IS NULL OR length(firmware) <= 128),
+    host TEXT CHECK(host IS NULL OR length(host) <= 255),
+    web_url TEXT CHECK(web_url IS NULL OR length(web_url) <= 2048),
+    endpoint_approved INTEGER NOT NULL DEFAULT 0 CHECK(endpoint_approved IN (0,1)),
+    bed_x_mm REAL, bed_y_mm REAL, bed_z_mm REAL,
+    notes TEXT NOT NULL DEFAULT '' CHECK(length(notes) <= 20000),
+    source_kind TEXT NOT NULL DEFAULT 'manual' CHECK(source_kind IN ('manual','discovered','imported')),
+    connection_status TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(connection_status IN ('unknown','online','offline','auth_required','error')),
+    job_status TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(job_status IN ('unknown','idle','printing','paused','complete')),
+    last_checked_at TEXT,
+    connection_error_code TEXT CHECK(connection_error_code IS NULL OR length(connection_error_code) <= 64),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((bed_x_mm IS NULL AND bed_y_mm IS NULL AND bed_z_mm IS NULL)
+       OR (bed_x_mm BETWEEN 0.1 AND 10000 AND bed_y_mm BETWEEN 0.1 AND 10000 AND bed_z_mm BETWEEN 0.1 AND 10000)),
+    CHECK(connection_status='online' OR job_status='unknown')
+);
+CREATE INDEX printers_name_idx ON printers(nickname COLLATE NOCASE,id);
+CREATE TABLE printer_maintenance_logs (
+    id TEXT PRIMARY KEY,
+    printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+    printer_nickname TEXT NOT NULL CHECK(length(printer_nickname) BETWEEN 1 AND 128),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 128),
+    performed_at TEXT NOT NULL,
+    notes TEXT NOT NULL CHECK(length(notes) <= 20000),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX printer_maintenance_printer_idx ON printer_maintenance_logs(printer_id,performed_at DESC,id);
+CREATE TABLE printer_reminders (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+    printer_nickname TEXT NOT NULL CHECK(length(printer_nickname) BETWEEN 1 AND 128),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 128),
+    notes TEXT NOT NULL CHECK(length(notes) <= 20000),
+    due_at TEXT NOT NULL,
+    interval_days INTEGER CHECK(interval_days IS NULL OR interval_days BETWEEN 1 AND 36500),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','completed')),
+    last_completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX printer_reminders_due_idx ON printer_reminders(status,due_at,id);
+CREATE INDEX printer_reminders_printer_idx ON printer_reminders(printer_id,status,due_at,id);
+ALTER TABLE print_attempts ADD COLUMN printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL;
+ALTER TABLE print_attempts ADD COLUMN printer_name TEXT;
+CREATE INDEX print_attempt_printer_idx ON print_attempts(printer_id,printed_at DESC,id);
+PRAGMA user_version=7;
+COMMIT;
+"#;
+
+const MIGRATE_V7_TO_V8: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE printer_maintenance_logs
+    ADD COLUMN metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0);
+PRAGMA user_version=8;
+COMMIT;
+"#;
+
+const MIGRATE_V8_TO_V9: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE parts_stock (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    category TEXT CHECK(category IS NULL OR length(category) <= 128),
+    quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+    unit TEXT NOT NULL DEFAULT 'pcs' CHECK(length(unit) BETWEEN 1 AND 128),
+    notes TEXT NOT NULL DEFAULT '' CHECK(length(notes) <= 20000),
+    low_stock INTEGER NOT NULL DEFAULT 0 CHECK(low_stock BETWEEN 0 AND 1000000),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX parts_stock_name_idx ON parts_stock(name COLLATE NOCASE,id);
+CREATE TABLE print_attempt_parts (
+    attempt_id TEXT NOT NULL REFERENCES print_attempts(id) ON DELETE CASCADE,
+    part_id TEXT NOT NULL,
+    part_name TEXT NOT NULL CHECK(length(part_name) BETWEEN 1 AND 128),
+    category TEXT,
+    unit TEXT NOT NULL,
+    quantity_per_copy INTEGER NOT NULL CHECK(quantity_per_copy BETWEEN 1 AND 9999),
+    quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 100000000),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    PRIMARY KEY(attempt_id,ordinal)
+);
+CREATE UNIQUE INDEX print_attempt_parts_unique_part_idx
+    ON print_attempt_parts(attempt_id,part_id) WHERE part_id IS NOT NULL;
+CREATE INDEX print_attempt_parts_part_idx ON print_attempt_parts(part_id,attempt_id);
+PRAGMA user_version=9;
+COMMIT;
+"#;
+
+const MIGRATE_V9_TO_V10: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE print_attempts
+    ADD COLUMN stock_adjusted INTEGER CHECK(stock_adjusted IN (0,1));
+PRAGMA user_version=10;
+COMMIT;
+"#;
+
+const MIGRATE_V10_TO_V11: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE printer_maintenance_logs_v11 (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+    printer_nickname TEXT NOT NULL CHECK(length(printer_nickname) BETWEEN 0 AND 128),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 128),
+    performed_at TEXT NOT NULL,
+    notes TEXT NOT NULL CHECK(length(notes) <= 20000),
+    created_at TEXT NOT NULL
+);
+INSERT INTO printer_maintenance_logs_v11
+    (id,metadata_version,printer_id,printer_nickname,title,performed_at,notes,created_at)
+SELECT id,metadata_version,printer_id,printer_nickname,title,performed_at,notes,created_at
+FROM printer_maintenance_logs;
+DROP TABLE printer_maintenance_logs;
+ALTER TABLE printer_maintenance_logs_v11 RENAME TO printer_maintenance_logs;
+CREATE INDEX printer_maintenance_printer_idx
+    ON printer_maintenance_logs(printer_id,performed_at DESC,id);
+
+CREATE TABLE printer_reminders_v11 (
+    id TEXT PRIMARY KEY,
+    metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0),
+    printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+    printer_nickname TEXT NOT NULL CHECK(length(printer_nickname) BETWEEN 0 AND 128),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 128),
+    notes TEXT NOT NULL CHECK(length(notes) <= 20000),
+    due_at TEXT NOT NULL,
+    interval_days INTEGER CHECK(interval_days IS NULL OR interval_days BETWEEN 1 AND 36500),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','completed')),
+    last_completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO printer_reminders_v11
+    (id,metadata_version,printer_id,printer_nickname,title,notes,due_at,interval_days,
+     status,last_completed_at,created_at,updated_at)
+SELECT id,metadata_version,printer_id,printer_nickname,title,notes,due_at,interval_days,
+       status,last_completed_at,created_at,updated_at
+FROM printer_reminders;
+DROP TABLE printer_reminders;
+ALTER TABLE printer_reminders_v11 RENAME TO printer_reminders;
+CREATE INDEX printer_reminders_due_idx ON printer_reminders(status,due_at,id);
+CREATE INDEX printer_reminders_printer_idx
+    ON printer_reminders(printer_id,status,due_at,id);
+PRAGMA user_version=11;
 COMMIT;
 "#;
 
@@ -4820,6 +7692,39 @@ fn clean_model_tag_names(values: &[String]) -> Result<Vec<String>, LibraryError>
     Ok(names)
 }
 
+fn replace_model_tags_by_name_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    names: &[String],
+) -> Result<(), LibraryError> {
+    tx.execute(
+        "DELETE FROM model_tags WHERE model_id=?1",
+        params![model_id],
+    )?;
+    for name in names {
+        let tag_id = tx
+            .query_row("SELECT id FROM tags WHERE name=?1", params![name], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let tag_id = if let Some(id) = tag_id {
+            id
+        } else {
+            let id = new_id("tag");
+            tx.execute(
+                "INSERT INTO tags(id,name,category) VALUES(?1,?2,NULL)",
+                params![id, name],
+            )?;
+            id
+        };
+        tx.execute(
+            "INSERT INTO model_tags(model_id,tag_id) VALUES(?1,?2)",
+            params![model_id, tag_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4844,6 +7749,7 @@ fn create_migration_backup(
     conn: &Connection,
     root: &Path,
     version: i64,
+    catalog_vfs: Option<&CatalogVfs>,
 ) -> Result<(), LibraryError> {
     let mut backup = root.join(format!("library.sqlite3.schema-v{version}.backup"));
     if backup.exists() {
@@ -4852,6 +7758,14 @@ fn create_migration_backup(
             Uuid::new_v4().simple()
         ));
     }
+    catalog_vfs
+        .ok_or_else(|| {
+            LibraryError::InvalidInput(
+                "schema migration backup requires a pinned catalog VFS".into(),
+            )
+        })?
+        .allow_output_path(&backup)
+        .map_err(|error| io(&backup, error))?;
     conn.execute("VACUUM INTO ?1", params![backup.to_string_lossy()])?;
     Ok(())
 }
@@ -4872,7 +7786,7 @@ fn ensure_owned_directory(root: &Path, name: &str) -> Result<PathBuf, LibraryErr
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(LibraryError::InvalidInput(format!(
                 "managed {name} namespace is unsafe"
-            )))
+            )));
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -4913,6 +7827,22 @@ fn validate_managed_blob(
         ));
     }
     Ok(())
+}
+
+fn retained_import_staging_error(staging: &Path, error: LibraryError) -> LibraryError {
+    LibraryError::InvalidInput(format!(
+        "{error}; import staging preserved at {}",
+        staging.display()
+    ))
+}
+
+fn retain_import_staging(staging: &Path) -> Result<(), LibraryError> {
+    // Observe that the staged entry remains available, but never remove it by
+    // path: another same-user process can replace it between any identity
+    // check and an unlink. For new blobs this is normally a hard-link alias.
+    std::fs::symlink_metadata(staging)
+        .map(|_| ())
+        .map_err(|error| io(staging, error))
 }
 
 fn validated_relative_path(path: &Path) -> Result<String, LibraryError> {
@@ -5399,6 +8329,19 @@ fn write_model_filaments_tx(
     model_id: &str,
     filament_ids: &[String],
 ) -> Result<(), LibraryError> {
+    replace_model_filaments_tx(tx, model_id, filament_ids)?;
+    tx.execute(
+        "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
+        params![timestamp(), model_id],
+    )?;
+    Ok(())
+}
+
+fn replace_model_filaments_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    filament_ids: &[String],
+) -> Result<(), LibraryError> {
     tx.execute(
         "DELETE FROM model_filaments WHERE model_id=?1",
         params![model_id],
@@ -5409,10 +8352,6 @@ fn write_model_filaments_tx(
             params![model_id, filament_id, ordinal as i64],
         )?;
     }
-    tx.execute(
-        "UPDATE models SET metadata_version=metadata_version+1,updated_at=?1 WHERE id=?2",
-        params![timestamp(), model_id],
-    )?;
     Ok(())
 }
 
@@ -5699,6 +8638,15 @@ fn print_outcome_value(value: &PrintOutcome) -> &'static str {
     match value {
         PrintOutcome::Printed => "printed",
         PrintOutcome::Failed => "failed",
+        PrintOutcome::Cancelled => "cancelled",
+    }
+}
+fn print_status_for_outcome(value: &PrintOutcome) -> &'static str {
+    match value {
+        PrintOutcome::Printed => "printed",
+        PrintOutcome::Failed => "failed",
+        // A cancelled job is queued again without counting it as printed.
+        PrintOutcome::Cancelled => "queued",
     }
 }
 fn validate_metadata_patch(p: &MetadataPatch) -> Result<(), LibraryError> {
@@ -5708,13 +8656,26 @@ fn validate_metadata_patch(p: &MetadataPatch) -> Result<(), LibraryError> {
         ));
     }
     clean_optional(p.designer.as_deref(), 200)?;
-    clean_optional(p.source_url.as_deref(), 2048)?;
+    if p.source_url
+        .as_deref()
+        .is_some_and(|source| source.chars().any(char::is_control))
+    {
+        return Err(LibraryError::InvalidInput(
+            "source must be an http or https URL or a safe origin label".into(),
+        ));
+    }
+    let cleaned_source = clean_optional(p.source_url.as_deref(), 2048)?;
     clean_optional(p.notes.as_deref(), 20_000)?;
     clean_optional(p.model_license.as_deref(), 200)?;
-    if let Some(url) = clean_optional(p.source_url.as_deref(), 2048)? {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
+    if cleaned_source.is_some() {
+        let is_http_url = p.source_url.as_deref().is_some_and(is_safe_http_source_url);
+        let is_origin_label = p
+            .source_url
+            .as_deref()
+            .is_some_and(is_safe_source_origin_label);
+        if !is_http_url && !is_origin_label {
             return Err(LibraryError::InvalidInput(
-                "source URL must use http or https".into(),
+                "source must be an http or https URL or a safe origin label".into(),
             ));
         }
     }
@@ -5725,6 +8686,36 @@ fn validate_metadata_patch(p: &MetadataPatch) -> Result<(), LibraryError> {
     }
     Ok(())
 }
+
+fn is_safe_http_source_url(value: &str) -> bool {
+    let value = value.trim();
+    let Some((_, after_scheme)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn is_safe_source_origin_label(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value.chars().any(char::is_control)
+        && !value
+            .chars()
+            .any(|character| matches!(character, ':' | '/' | '\\' | '?' | '#'))
+}
+
 fn apply_metadata_patch(
     tx: &rusqlite::Transaction<'_>,
     model_id: &str,
@@ -5867,8 +8858,66 @@ fn validate_print_attempt(i: &PrintAttemptInput) -> Result<(), LibraryError> {
     {
         return Err(LibraryError::InvalidInput("invalid print attempt".into()));
     }
+    if let Some(parts) = &i.parts {
+        if parts.len() > MAX_PRINT_ATTEMPT_PARTS {
+            return Err(LibraryError::InvalidInput(
+                "print attempt has too many stock parts".into(),
+            ));
+        }
+        let mut seen_parts = HashSet::new();
+        for part in parts {
+            validate_record_id(&part.id, "part ID")?;
+            if part.quantity == 0 || part.quantity > 9_999 || !seen_parts.insert(part.id.as_str()) {
+                return Err(LibraryError::InvalidInput(
+                    "invalid or duplicate print attempt part usage".into(),
+                ));
+            }
+            if let Some(snapshot) = &part.snapshot {
+                normalize_part_usage_snapshot(snapshot)?;
+            }
+        }
+    }
     Ok(())
 }
+
+type PrintAttemptImportIdentity = (
+    String,
+    u32,
+    String,
+    Vec<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Vec<(String, u32)>,
+);
+
+fn print_attempt_import_identity(
+    printed_at: &str,
+    quantity: u32,
+    notes: &str,
+    filament_ids: &[String],
+    parts: &[PartUsageInput],
+    outcome: &str,
+    printer_id: Option<String>,
+    printer_name: Option<String>,
+) -> Result<PrintAttemptImportIdentity, LibraryError> {
+    let mut part_identity = parts
+        .iter()
+        .map(|part| (part.id.clone(), part.quantity))
+        .collect::<Vec<_>>();
+    part_identity.sort();
+    Ok((
+        normalize_rfc3339(printed_at)?,
+        quantity,
+        notes.to_owned(),
+        filament_ids.to_vec(),
+        outcome.to_owned(),
+        printer_id,
+        printer_name,
+        part_identity,
+    ))
+}
+
 fn write_print_attempt(
     tx: &rusqlite::Transaction<'_>,
     id: &str,
@@ -5876,11 +8925,25 @@ fn write_print_attempt(
     i: &PrintAttemptInput,
     now: &str,
     create: bool,
+    imported_created_at: Option<&str>,
+    adjust_stock: bool,
 ) -> Result<(), LibraryError> {
     let printed_at = normalize_rfc3339(&i.printed_at)?;
+    if adjust_stock
+        && i.parts
+            .as_ref()
+            .is_some_and(|parts| parts.iter().any(|part| part.snapshot.is_some()))
+    {
+        return Err(LibraryError::InvalidInput(
+            "historical part snapshots are only accepted during history import".into(),
+        ));
+    }
     if create {
+        let created_at = imported_created_at.unwrap_or(now);
         tx.execute(
-            "INSERT INTO print_attempts VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+            "INSERT INTO print_attempts
+             (id,model_id,printed_at,quantity,notes,outcome,stock_adjusted,created_at,updated_at,printer_id,printer_name)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,NULL)",
             params![
                 id,
                 model,
@@ -5888,10 +8951,14 @@ fn write_print_attempt(
                 i.quantity,
                 i.notes,
                 print_outcome_value(&i.outcome),
+                adjust_stock,
+                created_at,
                 now
             ],
         )?;
+        apply_print_attempt_parts(tx, id, i, true, adjust_stock)?;
     } else {
+        apply_print_attempt_parts(tx, id, i, false, adjust_stock)?;
         tx.execute("UPDATE print_attempts SET printed_at=?1,quantity=?2,notes=?3,outcome=?4,updated_at=?5 WHERE id=?6",params![printed_at,i.quantity,i.notes,print_outcome_value(&i.outcome),now,id])?;
         tx.execute(
             "DELETE FROM print_attempt_filaments WHERE attempt_id=?1",
@@ -5900,7 +8967,7 @@ fn write_print_attempt(
     }
     tx.execute(
         "UPDATE models SET print_status=?1 WHERE id=?2",
-        params![print_outcome_value(&i.outcome), model],
+        params![print_status_for_outcome(&i.outcome), model],
     )?;
     let mut seen = HashSet::new();
     for (n, f) in i.filament_ids.iter().enumerate() {
@@ -5914,6 +8981,329 @@ fn write_print_attempt(
     }
     Ok(())
 }
+
+fn print_attempt_part_total(quantity_per_copy: u32, copies: u32) -> Result<i64, LibraryError> {
+    let total = u64::from(quantity_per_copy)
+        .checked_mul(u64::from(copies))
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| LibraryError::InvalidInput("print part quantity is too large".into()))?;
+    Ok(total)
+}
+
+fn apply_print_attempt_parts(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    input: &PrintAttemptInput,
+    create: bool,
+    adjust_stock: bool,
+) -> Result<(), LibraryError> {
+    let preserve_existing = !create && input.parts.is_none();
+    let old_stock_adjusted = if create {
+        Some(adjust_stock)
+    } else {
+        tx.query_row(
+            "SELECT stock_adjusted FROM print_attempts WHERE id=?1",
+            params![attempt_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))?
+        .map(|value| value != 0)
+    };
+    let should_adjust_stock = adjust_stock && old_stock_adjusted == Some(true);
+    let mut old_parts = HashMap::new();
+    let mut existing_usages = Vec::new();
+    if !create {
+        let mut statement = tx.prepare(
+            "SELECT part_id,part_name,category,unit,quantity_per_copy,quantity
+             FROM print_attempt_parts WHERE attempt_id=?1 ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map(params![attempt_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? as u32,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, name, category, unit, quantity_per_copy, total) = row?;
+            old_parts.insert(id.clone(), (quantity_per_copy, name, category, unit, total));
+            existing_usages.push(PartUsageInput {
+                id,
+                quantity: quantity_per_copy,
+                snapshot: None,
+            });
+        }
+    }
+    let input_parts = if preserve_existing {
+        existing_usages
+    } else {
+        input.parts.clone().unwrap_or_default()
+    };
+
+    let new_usages = input_parts
+        .iter()
+        .map(|usage| (usage.id.clone(), usage.quantity))
+        .collect::<HashMap<_, _>>();
+    if new_usages.len() != input_parts.len() {
+        return Err(LibraryError::InvalidInput("duplicate part".into()));
+    }
+    let mut snapshots = HashMap::new();
+    let mut stock_records = HashMap::new();
+    for usage in &input_parts {
+        let is_orphan_id = usage.id.starts_with(PRINTVENTORY_ORPHAN_PART_ID_PREFIX);
+        if is_orphan_id && should_adjust_stock {
+            return Err(LibraryError::InvalidInput(
+                "an unlinked historical part cannot be used as stock".into(),
+            ));
+        }
+        let part = if is_orphan_id {
+            None
+        } else {
+            tx.query_row(
+                &format!("SELECT {PART_STOCK_SELECT_COLUMNS} FROM parts_stock WHERE id=?1"),
+                params![usage.id],
+                part_stock_from_row,
+            )
+            .optional()?
+        };
+        if let Some(part) = part {
+            stock_records.insert(usage.id.clone(), part);
+        }
+        if preserve_existing {
+            if let Some((_, name, category, unit, _)) = old_parts.get(&usage.id) {
+                snapshots.insert(
+                    usage.id.clone(),
+                    (name.clone(), category.clone(), unit.clone()),
+                );
+                continue;
+            }
+        }
+        if let Some(part) = stock_records.get(&usage.id) {
+            snapshots.insert(
+                usage.id.clone(),
+                (part.name.clone(), part.category.clone(), part.unit.clone()),
+            );
+        } else if let Some((_, name, category, unit, _)) = old_parts.get(&usage.id) {
+            // A previously logged part may have been deleted. Keep its
+            // historical usage when editing the rest of the event.
+            snapshots.insert(
+                usage.id.clone(),
+                (name.clone(), category.clone(), unit.clone()),
+            );
+        } else if !adjust_stock {
+            let imported_snapshot = usage
+                .snapshot
+                .as_ref()
+                .ok_or_else(|| LibraryError::InvalidInput("part snapshot is missing".into()))?;
+            let normalized = normalize_part_usage_snapshot(imported_snapshot)?;
+            snapshots.insert(
+                usage.id.clone(),
+                (normalized.name, normalized.category, normalized.unit),
+            );
+        } else {
+            return Err(LibraryError::InvalidInput("part not found".into()));
+        }
+    }
+
+    let mut all_ids = BTreeSet::new();
+    all_ids.extend(old_parts.keys().cloned());
+    all_ids.extend(new_usages.keys().cloned());
+    if should_adjust_stock {
+        for part_id in all_ids {
+            let old_total = old_parts
+                .get(&part_id)
+                .map(|(_, _, _, _, total)| *total)
+                .unwrap_or(0);
+            let new_per_copy = new_usages.get(&part_id).copied().unwrap_or(0);
+            let new_total = print_attempt_part_total(new_per_copy, input.quantity)?;
+            let delta = new_total - old_total;
+            if delta == 0 {
+                continue;
+            }
+
+            let part = match stock_records.get(&part_id) {
+                Some(part) => Some(part.clone()),
+                None => tx
+                    .query_row(
+                        &format!("SELECT {PART_STOCK_SELECT_COLUMNS} FROM parts_stock WHERE id=?1"),
+                        params![part_id],
+                        part_stock_from_row,
+                    )
+                    .optional()?,
+            };
+            let Some(part) = part else {
+                if old_parts.contains_key(&part_id) {
+                    // The part was deleted. Its stock no longer exists to restore
+                    // or deduct, but its event snapshot remains in the link row.
+                    continue;
+                }
+                return Err(LibraryError::InvalidInput("part not found".into()));
+            };
+            apply_part_stock_delta(tx, &part, delta)?;
+        }
+    }
+
+    if preserve_existing {
+        for usage in &input_parts {
+            let total = print_attempt_part_total(usage.quantity, input.quantity)?;
+            tx.execute(
+                "UPDATE print_attempt_parts SET quantity=?1 WHERE attempt_id=?2 AND part_id=?3",
+                params![total, attempt_id, usage.id],
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !create {
+        tx.execute(
+            "DELETE FROM print_attempt_parts WHERE attempt_id=?1",
+            params![attempt_id],
+        )?;
+    }
+    for (ordinal, usage) in input_parts.iter().enumerate() {
+        let (name, category, unit) = snapshots
+            .get(&usage.id)
+            .ok_or_else(|| LibraryError::InvalidInput("part snapshot is missing".into()))?;
+        let total = print_attempt_part_total(usage.quantity, input.quantity)?;
+        tx.execute(
+            "INSERT INTO print_attempt_parts
+             (attempt_id,part_id,part_name,category,unit,quantity_per_copy,quantity,ordinal)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                attempt_id,
+                usage.id,
+                name,
+                category,
+                unit,
+                usage.quantity,
+                total,
+                ordinal as i64,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_part_stock_delta(
+    tx: &rusqlite::Transaction<'_>,
+    part: &PartStock,
+    delta: i64,
+) -> Result<(), LibraryError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let current = i64::try_from(part.quantity)
+        .map_err(|_| LibraryError::InvalidInput("part stock quantity is invalid".into()))?;
+    if delta > current {
+        return Err(LibraryError::InvalidInput(format!(
+            "Not enough \"{}\" in stock ({} available, {} needed).",
+            part.name, current, delta
+        )));
+    }
+    let updated = current
+        .checked_sub(delta)
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| LibraryError::InvalidInput("part stock quantity overflowed".into()))?;
+    let expected_version = i64::try_from(part.metadata_version)
+        .map_err(|_| LibraryError::InvalidInput("part stock version is invalid".into()))?;
+    let changed = tx.execute(
+        "UPDATE parts_stock SET quantity=?1,metadata_version=metadata_version+1,updated_at=?2
+         WHERE id=?3 AND metadata_version=?4",
+        params![updated, timestamp(), part.id, expected_version],
+    )?;
+    if changed != 1 {
+        return Err(LibraryError::InvalidInput(
+            "part changed during print event; retry the operation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn restore_print_attempt_parts(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+) -> Result<(), LibraryError> {
+    let stock_adjusted: Option<bool> = tx
+        .query_row(
+            "SELECT stock_adjusted FROM print_attempts WHERE id=?1",
+            params![attempt_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| LibraryError::InvalidInput("print attempt not found".into()))?
+        .map(|value| value != 0);
+    if stock_adjusted != Some(true) {
+        return Ok(());
+    }
+    let rows = {
+        let mut statement =
+            tx.prepare("SELECT part_id,quantity FROM print_attempt_parts WHERE attempt_id=?1")?;
+        let rows = statement.query_map(params![attempt_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (part_id, quantity) in rows {
+        if quantity <= 0 {
+            return Err(LibraryError::InvalidInput(
+                "persisted print part quantity is invalid".into(),
+            ));
+        }
+        let part = tx
+            .query_row(
+                &format!("SELECT {PART_STOCK_SELECT_COLUMNS} FROM parts_stock WHERE id=?1"),
+                params![part_id],
+                part_stock_from_row,
+            )
+            .optional()?;
+        if let Some(part) = part {
+            apply_part_stock_delta(
+                tx,
+                &part,
+                quantity
+                    .checked_neg()
+                    .ok_or_else(|| LibraryError::InvalidInput("part quantity overflowed".into()))?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_print_attempt_printer(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    printer_id: Option<&str>,
+) -> Result<(), LibraryError> {
+    match printer_id {
+        Some(printer_id) => {
+            let printer_id = validate_record_id(printer_id, "printer ID")?;
+            let printer_name: String = tx
+                .query_row(
+                    "SELECT nickname FROM printers WHERE id=?1",
+                    params![printer_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| LibraryError::InvalidInput("printer not found".into()))?;
+            tx.execute(
+                "UPDATE print_attempts SET printer_id=?1,printer_name=?2 WHERE id=?3",
+                params![printer_id, printer_name, attempt_id],
+            )?;
+        }
+        None => {
+            tx.execute(
+                "UPDATE print_attempts SET printer_id=NULL,printer_name=NULL WHERE id=?1",
+                params![attempt_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn recompute_print_summary(
     tx: &rusqlite::Transaction<'_>,
     model: &str,
@@ -5924,6 +9314,12 @@ fn recompute_print_summary(
 }
 fn attempt_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrintAttempt> {
     let o: String = r.get(5)?;
+    let outcome = match o.as_str() {
+        "printed" => PrintOutcome::Printed,
+        "failed" => PrintOutcome::Failed,
+        "cancelled" => PrintOutcome::Cancelled,
+        _ => return Err(invalid_persisted_text(5, "unknown print outcome")),
+    };
     Ok(PrintAttempt {
         id: r.get(0)?,
         model_id: r.get(1)?,
@@ -5931,14 +9327,214 @@ fn attempt_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrintAttempt> {
         quantity: r.get::<_, i64>(3)? as u32,
         notes: r.get(4)?,
         filament_ids: Vec::new(),
-        outcome: if o == "printed" {
-            PrintOutcome::Printed
-        } else {
-            PrintOutcome::Failed
-        },
-        created_at: r.get(6)?,
-        updated_at: r.get(7)?,
+        parts: Vec::new(),
+        outcome,
+        stock_adjusted: r.get(10)?,
+        printer_id: r.get(6)?,
+        printer_name: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
+}
+
+fn printer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Printer> {
+    let bed_values = (
+        row.get::<_, Option<f64>>(10)?,
+        row.get::<_, Option<f64>>(11)?,
+        row.get::<_, Option<f64>>(12)?,
+    );
+    let bed_mm = match bed_values {
+        (Some(x), Some(y), Some(z)) => Some([x as f32, y as f32, z as f32]),
+        (None, None, None) => None,
+        _ => {
+            return Err(invalid_persisted_text(
+                10,
+                "printer bed dimensions are incomplete",
+            ));
+        }
+    };
+    let source: String = row.get(14)?;
+    let connection: String = row.get(15)?;
+    let job: String = row.get(16)?;
+    Ok(Printer {
+        id: row.get(0)?,
+        metadata_version: persisted_version(row.get(1)?, 1)?,
+        nickname: row.get(2)?,
+        make: row.get(3)?,
+        model: row.get(4)?,
+        printer_type: row.get(5)?,
+        firmware: row.get(6)?,
+        host: row.get(7)?,
+        web_url: row.get(8)?,
+        endpoint_approved: row.get(9)?,
+        bed_mm,
+        notes: row.get(13)?,
+        source_kind: parse_printer_source_kind(&source)
+            .ok_or_else(|| invalid_persisted_text(14, "unknown printer source kind"))?,
+        connection_status: parse_printer_connection_status(&connection)
+            .ok_or_else(|| invalid_persisted_text(15, "unknown printer connection status"))?,
+        job_status: parse_printer_job_status(&job)
+            .ok_or_else(|| invalid_persisted_text(16, "unknown printer job status"))?,
+        last_checked_at: row.get(17)?,
+        connection_error_code: row.get(18)?,
+        print_count: persisted_version(row.get(19)?, 19)?,
+        last_printed_at: row.get(20)?,
+        created_at: row.get(21)?,
+        updated_at: row.get(22)?,
+    })
+}
+
+fn part_stock_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PartStock> {
+    Ok(PartStock {
+        id: row.get(0)?,
+        metadata_version: persisted_version(row.get(1)?, 1)?,
+        name: row.get(2)?,
+        category: row.get(3)?,
+        quantity: persisted_version(row.get(4)?, 4)?,
+        unit: row.get(5)?,
+        notes: row.get(6)?,
+        low_stock: row.get::<_, i64>(7)? as u32,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn maintenance_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrinterMaintenanceLog> {
+    Ok(PrinterMaintenanceLog {
+        id: row.get(0)?,
+        printer_id: row.get(1)?,
+        printer_nickname: row.get(2)?,
+        title: row.get(3)?,
+        performed_at: row.get(4)?,
+        notes: row.get(5)?,
+        created_at: row.get(6)?,
+        metadata_version: persisted_version(row.get(7)?, 7)?,
+    })
+}
+
+fn printer_reminder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrinterReminder> {
+    let status: String = row.get(8)?;
+    let interval: Option<i64> = row.get(7)?;
+    let interval_days = interval
+        .map(|value| {
+            u32::try_from(value)
+                .map_err(|_| invalid_persisted_integer(7, "printer reminder interval is invalid"))
+        })
+        .transpose()?;
+    Ok(PrinterReminder {
+        id: row.get(0)?,
+        metadata_version: persisted_version(row.get(1)?, 1)?,
+        printer_id: row.get(2)?,
+        printer_nickname: row.get(3)?,
+        title: row.get(4)?,
+        notes: row.get(5)?,
+        due_at: row.get(6)?,
+        interval_days,
+        status: parse_printer_reminder_status(&status)
+            .ok_or_else(|| invalid_persisted_text(8, "unknown printer reminder status"))?,
+        last_completed_at: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn invalid_persisted_text(index: usize, message: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message.to_owned(),
+        )),
+    )
+}
+
+fn persisted_version(value: i64, index: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| invalid_persisted_integer(index, "persisted version is invalid"))
+}
+
+fn parse_printer_source_kind(value: &str) -> Option<PrinterSourceKind> {
+    match value {
+        "manual" => Some(PrinterSourceKind::Manual),
+        "discovered" => Some(PrinterSourceKind::Discovered),
+        "imported" => Some(PrinterSourceKind::Imported),
+        _ => None,
+    }
+}
+
+fn printer_source_kind_value(value: &PrinterSourceKind) -> &'static str {
+    match value {
+        PrinterSourceKind::Manual => "manual",
+        PrinterSourceKind::Discovered => "discovered",
+        PrinterSourceKind::Imported => "imported",
+    }
+}
+
+fn parse_printer_connection_status(value: &str) -> Option<PrinterConnectionStatus> {
+    match value {
+        "unknown" => Some(PrinterConnectionStatus::Unknown),
+        "online" => Some(PrinterConnectionStatus::Online),
+        "offline" => Some(PrinterConnectionStatus::Offline),
+        "auth_required" => Some(PrinterConnectionStatus::AuthRequired),
+        "error" => Some(PrinterConnectionStatus::Error),
+        _ => None,
+    }
+}
+
+fn printer_connection_status_value(value: &PrinterConnectionStatus) -> &'static str {
+    match value {
+        PrinterConnectionStatus::Unknown => "unknown",
+        PrinterConnectionStatus::Online => "online",
+        PrinterConnectionStatus::Offline => "offline",
+        PrinterConnectionStatus::AuthRequired => "auth_required",
+        PrinterConnectionStatus::Error => "error",
+    }
+}
+
+fn parse_printer_job_status(value: &str) -> Option<PrinterJobStatus> {
+    match value {
+        "unknown" => Some(PrinterJobStatus::Unknown),
+        "idle" => Some(PrinterJobStatus::Idle),
+        "printing" => Some(PrinterJobStatus::Printing),
+        "paused" => Some(PrinterJobStatus::Paused),
+        "complete" => Some(PrinterJobStatus::Complete),
+        _ => None,
+    }
+}
+
+fn printer_job_status_value(value: &PrinterJobStatus) -> &'static str {
+    match value {
+        PrinterJobStatus::Unknown => "unknown",
+        PrinterJobStatus::Idle => "idle",
+        PrinterJobStatus::Printing => "printing",
+        PrinterJobStatus::Paused => "paused",
+        PrinterJobStatus::Complete => "complete",
+    }
+}
+
+fn parse_printer_reminder_status(value: &str) -> Option<PrinterReminderStatus> {
+    match value {
+        "active" => Some(PrinterReminderStatus::Active),
+        "paused" => Some(PrinterReminderStatus::Paused),
+        "completed" => Some(PrinterReminderStatus::Completed),
+        _ => None,
+    }
+}
+
+fn printer_reminder_status_value(value: &PrinterReminderStatus) -> &'static str {
+    match value {
+        PrinterReminderStatus::Active => "active",
+        PrinterReminderStatus::Paused => "paused",
+        PrinterReminderStatus::Completed => "completed",
+    }
+}
+
+fn printer_bed_columns(bed_mm: Option<[f32; 3]>) -> (Option<f32>, Option<f32>, Option<f32>) {
+    match bed_mm {
+        Some([x, y, z]) => (Some(x), Some(y), Some(z)),
+        None => (None, None, None),
+    }
 }
 fn attempt_filaments(conn: &Connection, id: &str) -> Result<Vec<String>, LibraryError> {
     let mut s = conn.prepare(
@@ -5947,27 +9543,465 @@ fn attempt_filaments(conn: &Connection, id: &str) -> Result<Vec<String>, Library
     let r = s.query_map(params![id], |row| row.get(0))?;
     Ok(r.collect::<Result<Vec<_>, _>>()?)
 }
+
+fn attempt_parts(conn: &Connection, id: &str) -> Result<Vec<PrintAttemptPart>, LibraryError> {
+    let mut statement = conn.prepare(
+        "SELECT pap.part_id,COALESCE(parts.name,pap.part_name),
+                CASE WHEN parts.id IS NULL THEN pap.category ELSE parts.category END,
+                CASE WHEN parts.id IS NULL THEN pap.unit ELSE parts.unit END,
+                pap.quantity_per_copy,pap.quantity
+         FROM print_attempt_parts pap
+         LEFT JOIN parts_stock parts ON parts.id=pap.part_id
+         WHERE pap.attempt_id=?1
+         ORDER BY lower(COALESCE(parts.name,pap.part_name)),pap.ordinal",
+    )?;
+    let rows = statement.query_map(params![id], |row| {
+        Ok(PrintAttemptPart {
+            id: Some(row.get(0)?),
+            name: row.get(1)?,
+            category: row.get(2)?,
+            unit: row.get(3)?,
+            quantity_per_copy: row.get::<_, i64>(4)? as u32,
+            quantity: row.get::<_, i64>(5)? as u32,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn normalize_rfc3339(value: &str) -> Result<String, LibraryError> {
+    normalize_rfc3339_field(value, "printed_at")
+}
+
+fn normalize_rfc3339_field(value: &str, field: &str) -> Result<String, LibraryError> {
     use time::format_description::well_known::Rfc3339;
     use time::{OffsetDateTime, UtcOffset};
     let parsed = OffsetDateTime::parse(value, &Rfc3339)
-        .map_err(|_| LibraryError::InvalidInput("printed_at must be RFC3339".into()))?
+        .map_err(|_| LibraryError::InvalidInput(format!("{field} must be RFC3339")))?
         .to_offset(UtcOffset::UTC);
     let millis = parsed.unix_timestamp_nanos().div_euclid(1_000_000);
     let normalized = OffsetDateTime::from_unix_timestamp_nanos(millis * 1_000_000)
-        .map_err(|_| LibraryError::InvalidInput("printed_at is outside supported range".into()))?;
+        .map_err(|_| LibraryError::InvalidInput(format!("{field} is outside supported range")))?;
     let format = time::format_description::parse_borrowed::<2>(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
     )
     .map_err(|_| LibraryError::InvalidInput("timestamp format is unavailable".into()))?;
     normalized
         .format(&format)
-        .map_err(|_| LibraryError::InvalidInput("printed_at is outside supported range".into()))
+        .map_err(|_| LibraryError::InvalidInput(format!("{field} is outside supported range")))
+}
+
+fn add_rfc3339_days(value: &str, days: u32) -> Result<String, LibraryError> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    let parsed = OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| LibraryError::InvalidInput("completed_at must be RFC3339".into()))?;
+    let updated = parsed
+        .checked_add(time::Duration::days(i64::from(days)))
+        .ok_or_else(|| {
+            LibraryError::InvalidInput("reminder due date is outside supported range".into())
+        })?;
+    let formatted = updated.format(&Rfc3339).map_err(|_| {
+        LibraryError::InvalidInput("reminder due date is outside supported range".into())
+    })?;
+    normalize_rfc3339_field(&formatted, "due_at")
+}
+
+fn validate_record_id(value: &str, field: &str) -> Result<String, LibraryError> {
+    let id = value.trim();
+    if id.is_empty()
+        || id.len() > 128
+        || id.chars().any(char::is_control)
+        || id.contains('/')
+        || id.contains('\\')
+    {
+        return Err(LibraryError::InvalidInput(format!("{field} is invalid")));
+    }
+    Ok(id.to_owned())
+}
+
+fn validate_import_external_ref(value: &str, field: &str) -> Result<String, LibraryError> {
+    let external_ref = validate_record_id(value, field)?;
+    if external_ref != value {
+        return Err(LibraryError::InvalidInput(format!(
+            "{field} must not have leading or trailing whitespace"
+        )));
+    }
+    Ok(external_ref)
+}
+
+fn validate_print_attempt_printer_snapshot(value: &str) -> Result<String, LibraryError> {
+    if value.trim().is_empty()
+        || value.chars().count() > MAX_PRINTER_TEXT_CHARS
+        || value.chars().any(char::is_control)
+    {
+        return Err(LibraryError::InvalidInput(
+            "print attempt printer nickname snapshot is invalid".into(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_import_snapshot_name(value: &str) -> Result<String, LibraryError> {
+    if value.trim().is_empty()
+        || value.chars().count() > MAX_PRINTER_TEXT_CHARS
+        || value.chars().any(char::is_control)
+    {
+        return Err(LibraryError::InvalidInput(
+            "maintenance printer nickname snapshot is invalid".into(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_optional_import_snapshot_name(
+    value: Option<&str>,
+) -> Result<Option<String>, LibraryError> {
+    value
+        .map(|name| {
+            if name.is_empty() {
+                Ok(String::new())
+            } else {
+                validate_import_snapshot_name(name)
+            }
+        })
+        .transpose()
+}
+
+/// Import timestamps are opaque catalog metadata in the existing schema.
+/// Preserve their exact representation while bounding the untrusted text.
+fn validate_import_timestamp(value: &str, field: &str) -> Result<String, LibraryError> {
+    if value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(LibraryError::InvalidInput(format!("{field} is invalid")));
+    }
+    Ok(value.to_owned())
+}
+
+fn ensure_record_version(kind: &str, expected: u64, actual: i64) -> Result<(), LibraryError> {
+    let actual = u64::try_from(actual)
+        .map_err(|_| LibraryError::InvalidInput(format!("{kind} version is invalid")))?;
+    if actual != expected {
+        return Err(LibraryError::InvalidInput(format!(
+            "{kind} changed since it was read; expected version {expected}, found {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_part_stock_version(
+    part_id: &str,
+    expected: u64,
+    actual: i64,
+) -> Result<(), LibraryError> {
+    let actual = u64::try_from(actual)
+        .map_err(|_| LibraryError::InvalidInput("part version is invalid".into()))?;
+    if actual != expected {
+        return Err(LibraryError::PartStockVersionConflict {
+            part_id: part_id.into(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_printer_maintenance_log_version(
+    conn: &Connection,
+    id: &str,
+    expected: u64,
+) -> Result<(), LibraryError> {
+    let actual = conn
+        .query_row(
+            "SELECT metadata_version FROM printer_maintenance_logs WHERE id=?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| LibraryError::InvalidInput("maintenance log not found".into()))?;
+    ensure_record_version("printer maintenance log", expected, actual)
+}
+
+fn clean_bounded_label(value: &str, field: &str) -> Result<String, LibraryError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > MAX_PRINTER_TEXT_CHARS
+        || value.chars().any(char::is_control)
+    {
+        return Err(LibraryError::InvalidInput(format!(
+            "{field} must be non-empty, at most {MAX_PRINTER_TEXT_CHARS} characters, and contain no control characters"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn clean_optional_printer_field(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, LibraryError> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| clean_bounded_label(value, field))
+        .transpose()
+}
+
+fn clean_bounded_notes(value: &str, field: &str) -> Result<String, LibraryError> {
+    if value.len() > MAX_PRINTER_NOTES_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(LibraryError::InvalidInput(format!(
+            "{field} exceeds its byte limit or contains invalid control characters"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_part_stock_input(input: &PartStockInput) -> Result<PartStockInput, LibraryError> {
+    if input.quantity > MAX_PART_STOCK_QUANTITY || input.low_stock > MAX_PART_STOCK_QUANTITY {
+        return Err(LibraryError::InvalidInput(
+            "part stock quantities must be between 0 and 1000000".into(),
+        ));
+    }
+    let name = clean_bounded_label(&input.name, "part name")?;
+    let category = clean_optional_printer_field(input.category.as_deref(), "part category")?;
+    let unit = if input.unit.trim().is_empty() {
+        "pcs"
+    } else {
+        input.unit.trim()
+    };
+    let unit = clean_bounded_label(unit, "part unit")?;
+    let notes = clean_bounded_notes(input.notes.trim(), "part notes")?;
+    Ok(PartStockInput {
+        name,
+        category,
+        quantity: input.quantity,
+        unit,
+        notes,
+        low_stock: input.low_stock,
+    })
+}
+
+fn normalize_part_usage_snapshot(
+    snapshot: &PartUsageSnapshot,
+) -> Result<PartUsageSnapshot, LibraryError> {
+    let normalized = normalize_part_stock_input(&PartStockInput {
+        name: snapshot.name.clone(),
+        category: snapshot.category.clone(),
+        quantity: 0,
+        unit: snapshot.unit.clone(),
+        notes: String::new(),
+        low_stock: 0,
+    })?;
+    Ok(PartUsageSnapshot {
+        name: normalized.name,
+        category: normalized.category,
+        unit: normalized.unit,
+    })
+}
+
+fn normalize_printer_input(input: &PrinterInput) -> Result<PrinterInput, LibraryError> {
+    let nickname = clean_bounded_label(&input.nickname, "printer nickname")?;
+    let make = clean_optional_printer_field(input.make.as_deref(), "printer make")?;
+    let model = clean_optional_printer_field(input.model.as_deref(), "printer model")?;
+    let printer_type = clean_optional_printer_field(input.printer_type.as_deref(), "printer type")?;
+    let firmware = clean_optional_printer_field(input.firmware.as_deref(), "printer firmware")?;
+    let host = validate_printer_host(input.host.as_deref())?;
+    let web_url = normalize_printer_web_url(input.web_url.as_deref())?;
+    let notes = clean_bounded_notes(&input.notes, "printer notes")?;
+    if let Some(bed) = input.bed_mm {
+        if bed
+            .iter()
+            .any(|dimension| !dimension.is_finite() || !(0.1..=10_000.0).contains(dimension))
+        {
+            return Err(LibraryError::InvalidInput(
+                "printer bed dimensions must be finite and between 0.1 and 10000 mm".into(),
+            ));
+        }
+    }
+    Ok(PrinterInput {
+        nickname,
+        make,
+        model,
+        printer_type,
+        firmware,
+        host,
+        web_url,
+        bed_mm: input.bed_mm,
+        notes,
+    })
+}
+
+fn validate_printer_host(value: Option<&str>) -> Result<Option<String>, LibraryError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > 255
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || value
+            .chars()
+            .any(|character| matches!(character, '@' | '/' | '\\' | '?' | '#'))
+    {
+        return Err(LibraryError::InvalidInput(
+            "printer host must be a hostname or IP address without credentials or a URL path"
+                .into(),
+        ));
+    }
+    let parsed = url::Url::parse(&format!("http://{value}/"))
+        .map_err(|_| LibraryError::InvalidInput("printer host is invalid".into()))?;
+    if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LibraryError::InvalidInput("printer host is invalid".into()));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// Validates a printer's HTTP(S) endpoint and keeps only its origin. Path,
+/// query, and fragment values are dropped because imported URLs are inert
+/// endpoint hints and may contain tokens or other sensitive values.
+pub fn normalize_printer_web_url(value: Option<&str>) -> Result<Option<String>, LibraryError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > 2048 || value.chars().any(char::is_control) {
+        return Err(LibraryError::InvalidInput(
+            "printer web URL is invalid".into(),
+        ));
+    }
+    let parsed = url::Url::parse(value)
+        .map_err(|_| LibraryError::InvalidInput("printer web URL is invalid".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(LibraryError::InvalidInput(
+            "printer web URL must be HTTP(S) without credentials".into(),
+        ));
+    }
+    Ok(Some(parsed.origin().ascii_serialization()))
+}
+
+fn checked_export_count(count: i64, label: &str, maximum: usize) -> Result<usize, LibraryError> {
+    let count = usize::try_from(count)
+        .map_err(|_| LibraryError::InvalidInput(format!("JSON export {label} count is invalid")))?;
+    if count > maximum {
+        return Err(LibraryError::InvalidInput(format!(
+            "JSON export has {count} {label}, exceeding the supported maximum of {maximum}"
+        )));
+    }
+    Ok(count)
+}
+
+fn checked_history_list_count(
+    count: i64,
+    label: &str,
+    maximum: usize,
+) -> Result<usize, LibraryError> {
+    let count = usize::try_from(count).map_err(|_| {
+        LibraryError::InvalidInput(format!("printer {label} list count is invalid"))
+    })?;
+    if count > maximum {
+        return Err(LibraryError::InvalidInput(format!(
+            "printer {label} list has {count} records, exceeding the supported maximum of {maximum}"
+        )));
+    }
+    Ok(count)
+}
+
+fn ensure_printer_history_capacity(
+    current_count: i64,
+    incoming_count: usize,
+    label: &str,
+    maximum: usize,
+) -> Result<(), LibraryError> {
+    let current_count = usize::try_from(current_count)
+        .map_err(|_| LibraryError::InvalidInput(format!("printer {label} count is invalid")))?;
+    let total = current_count
+        .checked_add(incoming_count)
+        .ok_or_else(|| LibraryError::InvalidInput(format!("printer {label} count overflowed")))?;
+    if total > maximum {
+        return Err(LibraryError::InvalidInput(format!(
+            "printer {label} limit of {maximum} records would be exceeded"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_endpoint_approval(input: &PrinterInput, approved: bool) -> Result<(), LibraryError> {
+    if approved && input.host.is_none() && input.web_url.is_none() {
+        return Err(LibraryError::InvalidInput(
+            "an endpoint must be saved before it can be approved".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_printer_status(
+    connection: PrinterConnectionStatus,
+    job: PrinterJobStatus,
+    error_code: Option<&str>,
+) -> Result<(), LibraryError> {
+    if connection != PrinterConnectionStatus::Online && job != PrinterJobStatus::Unknown {
+        return Err(LibraryError::InvalidInput(
+            "job status must be unknown unless the printer is online".into(),
+        ));
+    }
+    if let Some(code) = error_code {
+        if code.is_empty()
+            || code.len() > 64
+            || !code.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+            || matches!(
+                connection,
+                PrinterConnectionStatus::Online | PrinterConnectionStatus::Unknown
+            )
+        {
+            return Err(LibraryError::InvalidInput(
+                "printer connection error code is invalid or not applicable".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_maintenance_input(
+    input: &PrinterMaintenanceInput,
+) -> Result<PrinterMaintenanceInput, LibraryError> {
+    Ok(PrinterMaintenanceInput {
+        title: clean_bounded_label(&input.title, "maintenance title")?,
+        performed_at: normalize_rfc3339_field(&input.performed_at, "performed_at")?,
+        notes: clean_bounded_notes(&input.notes, "maintenance notes")?,
+    })
+}
+
+fn normalize_printer_reminder_input(
+    input: &PrinterReminderInput,
+) -> Result<PrinterReminderInput, LibraryError> {
+    if input
+        .interval_days
+        .is_some_and(|days| !(1..=36_500).contains(&days))
+    {
+        return Err(LibraryError::InvalidInput(
+            "printer reminder interval must be between 1 and 36500 days".into(),
+        ));
+    }
+    Ok(PrinterReminderInput {
+        title: clean_bounded_label(&input.title, "reminder title")?,
+        notes: clean_bounded_notes(&input.notes, "reminder notes")?,
+        due_at: normalize_rfc3339_field(&input.due_at, "due_at")?,
+        interval_days: input.interval_days,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{
+        PrinterDataImportMaintenanceLog, PrinterDataImportPrinter, PrinterDataImportReminder,
+    };
     use std::fs;
 
     const TEST_SCHEMA_V1: &str = r#"
@@ -5993,6 +10027,83 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         root
+    }
+
+    /// Rebuilds only the v6 print-attempt shape so migration fixtures created
+    /// from the current base schema exercise the real v6→v7 DDL path.
+    fn downgrade_printer_schema_to_v6(conn: &Connection) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE IF EXISTS print_attempt_parts;
+             DROP TABLE IF EXISTS parts_stock;
+             DROP INDEX IF EXISTS print_attempt_printer_idx;
+             DROP INDEX IF EXISTS printer_reminders_due_idx;
+             DROP INDEX IF EXISTS printer_reminders_printer_idx;
+             DROP INDEX IF EXISTS printer_maintenance_printer_idx;
+             DROP INDEX IF EXISTS printers_name_idx;
+             DROP TABLE IF EXISTS printer_reminders;
+             DROP TABLE IF EXISTS printer_maintenance_logs;
+             DROP TABLE IF EXISTS printers;
+             ALTER TABLE print_attempts RENAME TO print_attempts_v7;
+             DROP TABLE print_attempt_filaments;
+             CREATE TABLE print_attempts (
+                id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+                printed_at TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                notes TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO print_attempts
+                (id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at)
+                SELECT id,model_id,printed_at,quantity,notes,outcome,created_at,updated_at
+                FROM print_attempts_v7;
+             DROP TABLE print_attempts_v7;
+             CREATE TABLE print_attempt_filaments (
+                attempt_id TEXT NOT NULL REFERENCES print_attempts(id) ON DELETE CASCADE,
+                filament_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                PRIMARY KEY(attempt_id,filament_id)
+             );
+             PRAGMA user_version=6;",
+        )
+        .unwrap();
+    }
+
+    /// Rebuilds the v7 maintenance table shape so the v7→v8 migration is tested
+    /// against a populated database rather than only against a fresh schema.
+    fn downgrade_printer_maintenance_logs_to_v7(conn: &Connection) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             DROP TABLE IF EXISTS print_attempt_parts;
+             DROP TABLE IF EXISTS parts_stock;
+             DROP INDEX IF EXISTS printer_maintenance_printer_idx;
+             ALTER TABLE printer_maintenance_logs RENAME TO printer_maintenance_logs_v8;
+             ALTER TABLE print_attempts DROP COLUMN stock_adjusted;
+             CREATE TABLE printer_maintenance_logs (
+                id TEXT PRIMARY KEY,
+                printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL,
+                printer_nickname TEXT NOT NULL CHECK(length(printer_nickname) BETWEEN 1 AND 128),
+                title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 128),
+                performed_at TEXT NOT NULL,
+                notes TEXT NOT NULL CHECK(length(notes) <= 20000),
+                created_at TEXT NOT NULL
+             );
+             INSERT INTO printer_maintenance_logs
+                (id,printer_id,printer_nickname,title,performed_at,notes,created_at)
+             SELECT id,printer_id,printer_nickname,title,performed_at,notes,created_at
+             FROM printer_maintenance_logs_v8;
+             DROP TABLE printer_maintenance_logs_v8;
+             CREATE INDEX printer_maintenance_printer_idx
+                ON printer_maintenance_logs(printer_id,performed_at DESC,id);
+             PRAGMA user_version=7;
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
     }
 
     fn hash(byte: u8) -> String {
@@ -6192,6 +10303,7 @@ mod tests {
                     notes: "good".into(),
                     filament_ids: vec!["pla-red".into()],
                     outcome: PrintOutcome::Printed,
+                    parts: None,
                 },
             )
             .unwrap();
@@ -6212,6 +10324,7 @@ mod tests {
                     notes: "failed".into(),
                     filament_ids: vec![],
                     outcome: PrintOutcome::Failed,
+                    parts: None,
                 },
             )
             .unwrap();
@@ -6223,6 +10336,7 @@ mod tests {
                 notes: "failed edited".into(),
                 filament_ids: vec![],
                 outcome: PrintOutcome::Failed,
+                parts: None,
             },
         )
         .unwrap();
@@ -6261,6 +10375,149 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.metadata.notes, None);
         assert_eq!(cleared.description, "");
+    }
+
+    #[test]
+    fn source_metadata_accepts_http_urls_and_safe_origin_labels_only() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut model = db.create_model("Source metadata", None).unwrap();
+
+        for source in [
+            "https://example.test/models/42",
+            "http://example.test/models/42",
+            "HTTPS://example.test/models/42",
+            "Thingiverse",
+            "my-mini-factory.com",
+        ] {
+            model = db
+                .update_model_metadata(
+                    &model.id,
+                    model.metadata_version,
+                    &MetadataPatch {
+                        source_url: Some(source.into()),
+                        ..MetadataPatch::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(model.metadata.source_url.as_deref(), Some(source));
+        }
+
+        for invalid in [
+            "https://",
+            "https://user:password@example.test/model",
+            "https://@example.test/model",
+            "https://example.test/model\nInjected",
+            "javascript:alert(1)",
+            "file:///tmp/model.stl",
+            "//example.test/model",
+            "Thingiverse/path",
+            "Thingiverse?download=1",
+            "Thingiverse#model",
+            "Thingiverse\\model",
+            "Thingiverse:archive",
+            "Thingiverse\n",
+            "Thingiverse\u{0001}",
+        ] {
+            let version = model.metadata_version;
+            assert!(
+                db.update_model_metadata(
+                    &model.id,
+                    version,
+                    &MetadataPatch {
+                        source_url: Some(invalid.into()),
+                        ..MetadataPatch::default()
+                    },
+                )
+                .is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+            assert_eq!(
+                db.get_model(&model.id).unwrap().unwrap().metadata_version,
+                version
+            );
+        }
+    }
+
+    #[test]
+    fn print_attempt_creation_time_import_is_validated_and_does_not_replace_update_time() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Print history", None).unwrap();
+        let imported_value = serde_json::json!({
+            "printed_at": "2026-10-10T12:00:00Z",
+            "quantity": 1,
+            "notes": "Imported history",
+            "filament_ids": [],
+            "outcome": "printed"
+        });
+        let imported_input: PrintAttemptInput = serde_json::from_value(imported_value).unwrap();
+        let imported = db
+            .import_print_attempt(
+                &model.id,
+                &imported_input,
+                "2020-01-02T03:04:05.123456+05:30",
+            )
+            .unwrap();
+
+        assert_eq!(imported.created_at, "2020-01-01T21:34:05.123Z");
+        assert_ne!(imported.updated_at, imported.created_at);
+
+        let invalid_value = serde_json::json!({
+            "printed_at": "2026-10-10T12:00:00Z",
+            "quantity": 1,
+            "notes": "Invalid imported history",
+            "filament_ids": [],
+            "outcome": "printed"
+        });
+        let invalid_input: PrintAttemptInput = serde_json::from_value(invalid_value).unwrap();
+        assert!(db
+            .import_print_attempt(&model.id, &invalid_input, "2020-02-30T00:00:00Z")
+            .is_err());
+        assert_eq!(db.list_print_attempts(&model.id).unwrap().len(), 1);
+
+        let omitted_input: PrintAttemptInput = serde_json::from_value(serde_json::json!({
+            "printed_at": "2026-10-11T12:00:00Z",
+            "quantity": 1,
+            "notes": "No imported creation time",
+            "filament_ids": [],
+            "outcome": "failed"
+        }))
+        .unwrap();
+        let omitted = db.create_print_attempt(&model.id, &omitted_input).unwrap();
+        assert_eq!(omitted.created_at, omitted.updated_at);
+        assert_ne!(omitted.created_at, imported.created_at);
+    }
+
+    #[test]
+    fn ordinary_print_attempt_creation_does_not_accept_imported_creation_time() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Ordinary print", None).unwrap();
+        let requested = "2020-01-01T00:00:00Z";
+        let mut value = serde_json::json!({
+            "printed_at": "2026-10-10T12:00:00Z",
+            "quantity": 1,
+            "notes": "Normal user-created event",
+            "filament_ids": [],
+            "outcome": "printed"
+        });
+        value["created_at"] = serde_json::Value::String(requested.into());
+        let input: PrintAttemptInput = serde_json::from_value(value).unwrap();
+
+        let attempt = db.create_print_attempt(&model.id, &input).unwrap();
+
+        assert_ne!(attempt.created_at, requested);
+        assert_eq!(attempt.created_at, attempt.updated_at);
+
+        let mut update_value = serde_json::json!({
+            "printed_at": "2026-10-11T12:00:00Z",
+            "quantity": 1,
+            "notes": "Updated user-created event",
+            "filament_ids": [],
+            "outcome": "failed"
+        });
+        update_value["created_at"] = serde_json::Value::String(requested.into());
+        let update_input: PrintAttemptInput = serde_json::from_value(update_value).unwrap();
+        let updated = db.update_print_attempt(&attempt.id, &update_input).unwrap();
+        assert_eq!(updated.created_at, attempt.created_at);
     }
 
     #[test]
@@ -6749,6 +11006,7 @@ mod tests {
                 notes: String::new(),
                 filament_ids: vec![filament.id.clone()],
                 outcome: PrintOutcome::Printed,
+                parts: None,
             },
         )
         .unwrap();
@@ -7604,6 +11862,7 @@ mod tests {
                 notes: String::new(),
                 filament_ids: ids,
                 outcome: PrintOutcome::Printed,
+                parts: None,
             };
             assert!(db.create_print_attempt(&model.id, &input).is_err());
             assert!(db.list_print_attempts(&model.id).unwrap().is_empty());
@@ -7632,6 +11891,7 @@ mod tests {
                     notes: "persist".into(),
                     filament_ids: vec!["f1".into(), "f2".into()],
                     outcome: PrintOutcome::Printed,
+                    parts: None,
                 },
             )
             .unwrap();
@@ -7657,12 +11917,27 @@ mod tests {
         let db = LibraryDb::open_in_memory().unwrap();
         let first = db.create_model("First", None).unwrap();
         let second = db.create_model("Second", None).unwrap();
+        let part = db
+            .create_part_stock(&PartStockInput {
+                name: "M3 screw".into(),
+                category: Some("Screws".into()),
+                quantity: 20,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
         let input = PrintAttemptInput {
             printed_at: "2026-10-11T12:00:00Z".into(),
             quantity: 2,
             notes: "private batch note".into(),
             filament_ids: vec![],
             outcome: PrintOutcome::Printed,
+            parts: Some(vec![PartUsageInput {
+                id: part.id.clone(),
+                quantity: 2,
+                snapshot: None,
+            }]),
         };
         let invalid = vec![
             PrintAttemptBatchItem {
@@ -7696,13 +11971,15 @@ mod tests {
             .create_print_attempts_idempotent("batch-1", &items)
             .unwrap();
         assert_eq!(created, replayed);
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 12);
         assert_eq!(db.list_print_attempts(&first.id).unwrap().len(), 1);
         assert_eq!(db.list_print_attempts(&second.id).unwrap().len(), 1);
         let mut changed = items;
-        changed[0].input.quantity = 3;
+        changed[0].input.parts.as_mut().unwrap()[0].quantity = 3;
         assert!(db
             .create_print_attempts_idempotent("batch-1", &changed)
             .is_err());
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 12);
         let receipt: String = db
             .conn
             .query_row(
@@ -7712,6 +11989,183 @@ mod tests {
             )
             .unwrap();
         assert!(!receipt.contains("private batch note"));
+    }
+
+    #[test]
+    fn concurrent_idempotent_print_batches_charge_parts_only_once() {
+        let root = temp_root("concurrent-idempotent-parts");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("Concurrent inventory", None).unwrap();
+        let part = db
+            .create_part_stock(&PartStockInput {
+                name: "Bearing".into(),
+                category: Some("Bearings".into()),
+                quantity: 20,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
+        drop(db);
+
+        let mut input = print_attempt_input();
+        input.quantity = 2;
+        input.parts = Some(vec![PartUsageInput {
+            id: part.id.clone(),
+            quantity: 2,
+            snapshot: None,
+        }]);
+        let items = vec![PrintAttemptBatchItem {
+            model_id: model.id.clone(),
+            input,
+        }];
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                let items = items.clone();
+                std::thread::spawn(move || {
+                    let db = LibraryDb::open(&root).unwrap();
+                    barrier.wait();
+                    db.create_print_attempts_idempotent("same-batch", &items)
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let left = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(left[0], left[1]);
+
+        let db = LibraryDb::open(&root).unwrap();
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 16);
+        assert_eq!(db.list_print_attempts(&model.id).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_print_history_imports_preserve_batch_multiplicity_without_duplicates() {
+        let root = temp_root("concurrent-print-history-import");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("Concurrent history", None).unwrap();
+        let part = db
+            .create_part_stock(&PartStockInput {
+                name: "M3 screw".into(),
+                category: Some("Screws".into()),
+                quantity: 20,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
+        drop(db);
+
+        let item = PrintAttemptImportItem {
+            input: PrintAttemptInput {
+                printed_at: "2026-10-11T12:00:00Z".into(),
+                quantity: 2,
+                notes: "same event twice".into(),
+                filament_ids: vec!["filament-a".into()],
+                outcome: PrintOutcome::Printed,
+                parts: Some(vec![PartUsageInput {
+                    id: part.id.clone(),
+                    quantity: 2,
+                    snapshot: None,
+                }]),
+            },
+            created_at: Some("2026-10-11T12:05:00Z".into()),
+            printer_id: None,
+            printer_name: Some("Workshop printer".into()),
+        };
+        let attempts = vec![item.clone(), item];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let left_path = root.clone();
+        let left_model = model.id.clone();
+        let left_attempts = attempts.clone();
+        let left_barrier = std::sync::Arc::clone(&barrier);
+        let left = std::thread::spawn(move || {
+            let db = LibraryDb::open(&left_path).unwrap();
+            left_barrier.wait();
+            db.import_print_attempts_deduplicated(&left_model, &left_attempts)
+                .unwrap()
+        });
+
+        let right_path = root.clone();
+        let right_model = model.id.clone();
+        let right_barrier = std::sync::Arc::clone(&barrier);
+        let right = std::thread::spawn(move || {
+            let db = LibraryDb::open(&right_path).unwrap();
+            right_barrier.wait();
+            db.import_print_attempts_deduplicated(&right_model, &attempts)
+                .unwrap()
+        });
+
+        barrier.wait();
+        let left_result = left.join().unwrap();
+        let right_result = right.join().unwrap();
+        assert_eq!(left_result.added_count + right_result.added_count, 2);
+        assert_eq!(left_result.skipped_count + right_result.skipped_count, 2);
+
+        let db = LibraryDb::open(&root).unwrap();
+        let stored = db.list_print_attempts(&model.id).unwrap();
+        assert_eq!(stored.len(), 2);
+        // Historical JSON already carries the current on-hand quantity, so
+        // importing event links must not deduct their past usage again.
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 20);
+        assert!(stored.iter().all(|attempt| {
+            attempt.notes == "same event twice"
+                && attempt.printer_name.as_deref() == Some("Workshop printer")
+        }));
+        assert_eq!(
+            db.get_model(&model.id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .print_count,
+            4
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn print_history_import_rolls_back_when_a_later_row_is_invalid() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Atomic history", None).unwrap();
+        let input = PrintAttemptInput {
+            printed_at: "2026-10-11T12:00:00Z".into(),
+            quantity: 1,
+            notes: "must roll back".into(),
+            filament_ids: vec![],
+            outcome: PrintOutcome::Printed,
+            parts: None,
+        };
+        let attempts = vec![
+            PrintAttemptImportItem {
+                input: input.clone(),
+                created_at: None,
+                printer_id: None,
+                printer_name: None,
+            },
+            PrintAttemptImportItem {
+                input,
+                created_at: None,
+                printer_id: Some("missing-printer".into()),
+                printer_name: Some("Missing printer".into()),
+            },
+        ];
+
+        assert!(db
+            .import_print_attempts_deduplicated(&model.id, &attempts)
+            .is_err());
+        assert!(db.list_print_attempts(&model.id).unwrap().is_empty());
+        let unchanged = db.get_model(&model.id).unwrap().unwrap();
+        assert_eq!(unchanged.metadata.print_count, 0);
+        assert_eq!(unchanged.metadata.print_status, model.metadata.print_status);
+        assert_eq!(unchanged.metadata_version, model.metadata_version);
     }
 
     #[test]
@@ -8125,8 +12579,65 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), bytes);
         assert!(!first.reused_blob);
         assert!(second.reused_blob);
+        let staged_entries: Vec<_> = fs::read_dir(root.join("staging"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(staged_entries.len(), 1);
+        assert_eq!(fs::read(&staged_entries[0]).unwrap(), bytes);
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[test]
+    fn import_staging_error_reports_and_preserves_same_user_replacement() {
+        let temp = temp_root("import-staging-replacement");
+        fs::create_dir_all(&temp).unwrap();
+        let staging = temp.join("replacement.part");
+        let marker = temp.join(".import-staging-race-test");
+        fs::write(&marker, b"test-owned temporary directory").unwrap();
+        fs::write(&staging, b"staged model bytes").unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::tests::import_staging_replacement_child_process",
+                "--nocapture",
+            ])
+            .env("GOGGLELAB_CORE_STAGING_REPLACEMENT_PATH", &staging)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "replacement child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        retain_import_staging(&staging).unwrap();
+
+        assert_eq!(fs::read(&staging).unwrap(), b"replacement bytes");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn import_staging_replacement_child_process() {
+        let Ok(staging) = std::env::var("GOGGLELAB_CORE_STAGING_REPLACEMENT_PATH") else {
+            return;
+        };
+        let staging = PathBuf::from(staging);
+        let parent = staging.parent().unwrap();
+        assert!(parent
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("gogglelab-library-import-staging-replacement-"));
+        assert_eq!(
+            fs::read(parent.join(".import-staging-race-test")).unwrap(),
+            b"test-owned temporary directory"
+        );
+        fs::remove_file(&staging).unwrap();
+        fs::write(&staging, b"replacement bytes").unwrap();
     }
 
     #[test]
@@ -8182,6 +12693,164 @@ mod tests {
         assert!(LibraryDb::open(&root).is_err());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_open_rejects_sqlite_connection_opened_during_catalog_path_swap() {
+        let root = temp_root("db-open-race-library");
+        let decoy_root = temp_root("db-open-race-decoy");
+        let original = LibraryDb::open(&root).unwrap();
+        let original_model = original.create_model("Original", None).unwrap();
+        drop(original);
+        let decoy = LibraryDb::open(&decoy_root).unwrap();
+        decoy.create_model("Decoy", None).unwrap();
+        drop(decoy);
+
+        let catalog = root.join("library.sqlite3");
+        let replacement = root.join("library.sqlite3.replacement");
+        let displaced = root.join("library.sqlite3.displaced");
+        fs::copy(decoy_root.join("library.sqlite3"), &replacement).unwrap();
+        let result = LibraryDb::open_with_hooks(
+            &root,
+            || {
+                fs::rename(&catalog, &displaced).unwrap();
+                fs::rename(&replacement, &catalog).unwrap();
+            },
+            || {
+                fs::rename(&catalog, &replacement).unwrap();
+                fs::rename(&displaced, &catalog).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        let reopened = LibraryDb::open(&root).unwrap();
+        assert!(reopened.get_model(&original_model.id).unwrap().is_some());
+        assert!(reopened
+            .list_models(None, None)
+            .unwrap()
+            .iter()
+            .all(|model| model.display_name != "Decoy"));
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(decoy_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_commit_aborts_when_the_visible_database_is_replaced() {
+        let root = temp_root("db-commit-race-library");
+        let decoy_root = temp_root("db-commit-race-decoy");
+        let db = LibraryDb::open(&root).unwrap();
+        db.create_model("Original", None).unwrap();
+        let decoy = LibraryDb::open(&decoy_root).unwrap();
+        decoy.create_model("Decoy", None).unwrap();
+        drop(decoy);
+
+        let catalog = root.join("library.sqlite3");
+        let replacement = root.join("library.sqlite3.replacement");
+        let displaced = root.join("library.sqlite3.displaced");
+        fs::copy(decoy_root.join("library.sqlite3"), &replacement).unwrap();
+        db.catalog_file
+            .as_ref()
+            .unwrap()
+            .install_before_commit_hook(move || {
+                fs::rename(&catalog, &displaced).unwrap();
+                fs::rename(&replacement, &catalog).unwrap();
+            });
+
+        assert!(db.create_model("Must not commit", None).is_err());
+        let visible = LibraryDb::open(&root).unwrap();
+        let visible_models = visible.list_models(None, None).unwrap();
+        assert!(visible_models
+            .iter()
+            .any(|model| model.display_name == "Decoy"));
+        assert!(visible_models
+            .iter()
+            .all(|model| model.display_name != "Must not commit"));
+        drop(visible);
+        drop(db);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(decoy_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_commit_fails_if_the_visible_database_changes_after_identity_check() {
+        let root = temp_root("db-commit-after-check-library");
+        let decoy_root = temp_root("db-commit-after-check-decoy");
+        let db = LibraryDb::open(&root).unwrap();
+        db.create_model("Original", None).unwrap();
+        let decoy = LibraryDb::open(&decoy_root).unwrap();
+        decoy.create_model("Decoy", None).unwrap();
+        drop(decoy);
+
+        let catalog = root.join("library.sqlite3");
+        let replacement = root.join("library.sqlite3.replacement");
+        let displaced = root.join("library.sqlite3.displaced");
+        let decoy_database = decoy_root.join("library.sqlite3");
+        fs::copy(&decoy_database, &replacement).unwrap();
+        let replacement_connection = Connection::open(&replacement).unwrap();
+        let replacement_model: String = replacement_connection
+            .query_row(
+                "SELECT display_name FROM models WHERE deleted_at IS NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replacement_model, "Decoy");
+        drop(replacement_connection);
+        let hook_catalog = catalog.clone();
+        let hook_replacement = replacement.clone();
+        let hook_displaced = displaced.clone();
+        db.catalog_file
+            .as_ref()
+            .unwrap()
+            .install_after_commit_identity_check_hook(move || {
+                fs::rename(&hook_catalog, &hook_displaced).unwrap();
+                fs::rename(&hook_replacement, &hook_catalog).unwrap();
+            });
+
+        let result = db.create_model("Must not commit", None);
+        assert!(
+            result.is_err(),
+            "a catalog replacement after the commit identity check must fail closed"
+        );
+        assert!(
+            displaced.exists(),
+            "the after-check replacement hook did not run"
+        );
+        let raw_visible = Connection::open(&catalog).unwrap();
+        let raw_visible_model: String = raw_visible
+            .query_row(
+                "SELECT display_name FROM models WHERE deleted_at IS NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let journal_path = PathBuf::from(format!("{}-journal", catalog.display()));
+        assert_eq!(
+            raw_visible_model,
+            "Decoy",
+            "the visible replacement bytes changed; rollback_journal_exists={}",
+            journal_path.exists()
+        );
+        drop(raw_visible);
+        let visible = LibraryDb::open(&root).unwrap();
+        let visible_models = visible.list_models(None, None).unwrap();
+        assert!(
+            visible_models
+                .iter()
+                .any(|model| model.display_name == "Decoy"),
+            "visible replacement catalog lost its decoy record: {visible_models:?}"
+        );
+        assert!(visible_models
+            .iter()
+            .all(|model| model.display_name != "Must not commit"));
+        drop(visible);
+        drop(db);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(decoy_root);
     }
 
     #[test]
@@ -8420,6 +13089,8 @@ mod tests {
              PRAGMA user_version=3;",
         )
         .unwrap();
+        downgrade_printer_schema_to_v6(&conn);
+        conn.pragma_update(None, "user_version", 3).unwrap();
         drop(conn);
         let db = LibraryDb::open(&root).unwrap();
         assert_eq!(db.list_filaments(true).unwrap(), Vec::<Filament>::new());
@@ -8427,7 +13098,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         let backup = root.join("library.sqlite3.schema-v3.backup");
         assert!(backup.is_file());
         let backup_conn = Connection::open(backup).unwrap();
@@ -8460,6 +13131,8 @@ mod tests {
              PRAGMA user_version=4;",
         )
         .unwrap();
+        downgrade_printer_schema_to_v6(&conn);
+        conn.pragma_update(None, "user_version", 4).unwrap();
         drop(conn);
         let db = LibraryDb::open(&root).unwrap();
         let gallery = db.list_thumbnail_gallery("gallery-model").unwrap();
@@ -8482,7 +13155,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         let version: i64 = Connection::open(backup)
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -8505,6 +13178,8 @@ mod tests {
              PRAGMA user_version=5;",
         )
         .unwrap();
+        downgrade_printer_schema_to_v6(&conn);
+        conn.pragma_update(None, "user_version", 5).unwrap();
         drop(conn);
 
         let db = LibraryDb::open(&root).unwrap();
@@ -8522,7 +13197,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         drop(db);
 
         let db = LibraryDb::open(&root).unwrap();
@@ -8732,6 +13407,7 @@ mod tests {
                     notes: String::new(),
                     filament_ids: vec!["legacy-unknown".into()],
                     outcome: PrintOutcome::Printed,
+                    parts: None,
                 },
             )
             .unwrap();
@@ -9595,5 +14271,2315 @@ mod tests {
                 .as_deref(),
             Some(ROOT_FOLDER_ID)
         );
+    }
+
+    fn printer_input(name: &str) -> PrinterInput {
+        PrinterInput {
+            nickname: name.into(),
+            make: Some("Example Works".into()),
+            model: Some("P-1".into()),
+            printer_type: Some("FDM".into()),
+            firmware: Some("1.0".into()),
+            host: None,
+            web_url: None,
+            bed_mm: Some([220.0, 220.0, 250.0]),
+            notes: "Workshop printer".into(),
+        }
+    }
+
+    fn printer_reminder_input(due_at: &str, interval_days: Option<u32>) -> PrinterReminderInput {
+        PrinterReminderInput {
+            title: "Clean nozzle".into(),
+            notes: "Check for buildup".into(),
+            due_at: due_at.into(),
+            interval_days,
+        }
+    }
+
+    fn print_attempt_input() -> PrintAttemptInput {
+        PrintAttemptInput {
+            printed_at: "2026-10-14T12:00:00Z".into(),
+            quantity: 1,
+            notes: "Test print".into(),
+            filament_ids: Vec::new(),
+            outcome: PrintOutcome::Printed,
+            parts: None,
+        }
+    }
+
+    fn printer_data_import_printer(
+        external_ref: &str,
+        input: PrinterInput,
+    ) -> PrinterDataImportPrinter {
+        PrinterDataImportPrinter {
+            external_ref: external_ref.into(),
+            map_to_local_printer_id: None,
+            created_at: None,
+            updated_at: None,
+            input,
+        }
+    }
+
+    #[test]
+    fn printer_data_import_generates_local_ids_and_forces_new_printers_unapproved() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut input = printer_input("Imported P-1");
+        input.host = Some("192.0.2.21".into());
+        let mut batch = PrinterDataImport::default();
+        batch
+            .printers
+            .push(printer_data_import_printer("source-printer-1", input));
+
+        let result = db.import_printer_data(&batch).unwrap();
+        assert_eq!(result.imported_printer_count, 1);
+        assert_eq!(result.mapped_printer_count, 0);
+        let mapped = &result.printer_ref_map[0];
+        assert_eq!(mapped.external_ref, "source-printer-1");
+        assert_ne!(mapped.local_printer_id, mapped.external_ref);
+        let printer = db.get_printer(&mapped.local_printer_id).unwrap().unwrap();
+        assert_eq!(printer.source_kind, PrinterSourceKind::Imported);
+        assert!(!printer.endpoint_approved);
+        assert_eq!(printer.host.as_deref(), Some("192.0.2.21"));
+        assert_eq!(printer.connection_status, PrinterConnectionStatus::Unknown);
+        assert_eq!(printer.job_status, PrinterJobStatus::Unknown);
+    }
+
+    #[test]
+    fn printer_data_import_preserves_new_printer_timestamps_and_resets_trust_state() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let batch: PrinterDataImport = serde_json::from_value(serde_json::json!({
+            "printers": [{
+                "externalRef": "source-printer",
+                "createdAt": "1700000000",
+                "updatedAt": "1700000001",
+                "sourceKind": "native",
+                "endpointApproved": true,
+                "connectionStatus": "connected",
+                "jobStatus": "printing",
+                "input": printer_input("Imported with history")
+            }]
+        }))
+        .unwrap();
+
+        let imported = db.import_printer_data(&batch).unwrap();
+        let printer = db
+            .get_printer(&imported.printer_ref_map[0].local_printer_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(printer.created_at, "1700000000");
+        assert_eq!(printer.updated_at, "1700000001");
+        assert_eq!(printer.source_kind, PrinterSourceKind::Imported);
+        assert!(!printer.endpoint_approved);
+        assert_eq!(printer.connection_status, PrinterConnectionStatus::Unknown);
+        assert_eq!(printer.job_status, PrinterJobStatus::Unknown);
+    }
+
+    #[test]
+    fn printer_data_import_defaults_missing_printer_timestamps_to_import_time() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let batch: PrinterDataImport = serde_json::from_value(serde_json::json!({
+            "printers": [{
+                "externalRef": "source-printer",
+                "input": printer_input("Imported without history")
+            }]
+        }))
+        .unwrap();
+
+        let imported = db.import_printer_data(&batch).unwrap();
+        let printer = db
+            .get_printer(&imported.printer_ref_map[0].local_printer_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(printer.created_at, printer.updated_at);
+        assert!(printer
+            .created_at
+            .chars()
+            .any(|character| character.is_ascii_digit()));
+    }
+
+    #[test]
+    fn printer_data_import_rejects_unbounded_or_invalid_printer_timestamps() {
+        for (field, value) in [
+            ("createdAt", " ".into()),
+            ("updatedAt", "x".repeat(129)),
+            ("createdAt", "bad\u{0007}timestamp".into()),
+        ] {
+            let db = LibraryDb::open_in_memory().unwrap();
+            let mut printer = serde_json::json!({
+                "externalRef": "source-printer",
+                "input": printer_input("Invalid timestamp")
+            });
+            printer[field] = serde_json::Value::String(value);
+            let batch: PrinterDataImport = serde_json::from_value(serde_json::json!({
+                "printers": [printer]
+            }))
+            .unwrap();
+
+            assert!(
+                db.import_printer_data(&batch).is_err(),
+                "{field} should be rejected"
+            );
+            assert!(db.list_printers().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn printer_json_profile_import_and_export_support_the_5000_record_limit() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        assert_eq!(MAX_PRINTER_DATA_IMPORT_RECORDS, 65_000);
+        let mut batch = PrinterDataImport::default();
+        for index in 0..5_000 {
+            batch.printers.push(printer_data_import_printer(
+                &format!("profile-{index}"),
+                printer_input(&format!("Printer {index}")),
+            ));
+        }
+        for index in 0..50_000 {
+            batch
+                .maintenance_logs
+                .push(PrinterDataImportMaintenanceLog {
+                    external_ref: format!("full-cap-log-{index}"),
+                    printer_external_ref: Some("profile-0".into()),
+                    printer_nickname: Some("Printer 0".into()),
+                    input: PrinterMaintenanceInput {
+                        title: "Service printer".into(),
+                        performed_at: "2026-10-14T12:00:00Z".into(),
+                        notes: String::new(),
+                    },
+                    created_at: None,
+                });
+        }
+        for index in 0..10_000 {
+            batch.reminders.push(PrinterDataImportReminder {
+                external_ref: format!("full-cap-reminder-{index}"),
+                printer_external_ref: Some("profile-0".into()),
+                printer_nickname: Some("Printer 0".into()),
+                input: printer_reminder_input("2026-11-01T00:00:00Z", None),
+                status: PrinterReminderStatus::Active,
+                last_completed_at: None,
+                created_at: "1700000000".into(),
+                updated_at: "1700000000".into(),
+            });
+        }
+
+        let imported = db.import_printer_data(&batch).unwrap();
+        assert_eq!(imported.imported_printer_count, 5_000);
+        assert_eq!(imported.imported_maintenance_log_count, 50_000);
+        assert_eq!(imported.imported_reminder_count, 10_000);
+        let snapshot = db.export_printer_data_snapshot().unwrap();
+        assert_eq!(snapshot.printers.len(), 5_000);
+        assert_eq!(snapshot.maintenance_logs.len(), 50_000);
+        assert_eq!(snapshot.reminders.len(), 10_000);
+
+        let mut oversized_batch = PrinterDataImport::default();
+        for index in 0..5_001 {
+            oversized_batch.printers.push(printer_data_import_printer(
+                &format!("over-profile-{index}"),
+                printer_input(&format!("Over profile {index}")),
+            ));
+        }
+        assert!(db.import_printer_data(&oversized_batch).is_err());
+        assert_eq!(db.list_printers().unwrap().len(), 5_000);
+
+        db.conn
+            .execute(
+                "INSERT INTO printers(id,nickname,created_at,updated_at)
+                 VALUES('over-cap-printer','Over cap','1700000000','1700000000')",
+                [],
+            )
+            .unwrap();
+        let error = db.export_printer_data_snapshot().unwrap_err();
+        assert!(matches!(
+            error,
+            LibraryError::InvalidInput(message)
+                if message.contains("printers")
+                    && message.contains("supported maximum of 5000")
+        ));
+    }
+
+    #[test]
+    fn model_json_export_snapshot_accepts_5000_and_rejects_5001_before_listing() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        tx.execute(
+            "WITH RECURSIVE sequence(id) AS (
+                 SELECT 1 UNION ALL SELECT id+1 FROM sequence WHERE id<?1
+             )
+             INSERT INTO models(id,display_name,folder_id,created_at,updated_at)
+             SELECT 'export-model-'||id,'Export model '||id,'root','1700000000','1700000000'
+             FROM sequence",
+            params![MAX_LIBRARY_JSON_EXPORT_MODELS as i64],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(db.list_models_for_json_export().unwrap().len(), 5_000);
+
+        db.conn
+            .execute(
+                "INSERT INTO models(id,display_name,folder_id,created_at,updated_at)
+                 VALUES('export-model-over-cap','Export model over cap','root','1700000000','1700000000')",
+                [],
+            )
+            .unwrap();
+        let error = db.list_models_for_json_export().unwrap_err();
+        assert!(matches!(
+            error,
+            LibraryError::InvalidInput(message)
+                if message.contains("models")
+                    && message.contains("supported maximum of 5000")
+        ));
+    }
+
+    #[test]
+    fn printer_data_export_snapshot_and_ui_list_read_maintenance_beyond_ten_thousand() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut batch = PrinterDataImport::default();
+        batch.printers.push(printer_data_import_printer(
+            "export-printer",
+            printer_input("Export P-1"),
+        ));
+        for index in 0..10_001 {
+            batch
+                .maintenance_logs
+                .push(PrinterDataImportMaintenanceLog {
+                    external_ref: format!("maintenance-{index}"),
+                    printer_external_ref: Some("export-printer".into()),
+                    printer_nickname: Some("Export P-1".into()),
+                    input: PrinterMaintenanceInput {
+                        title: "Service printer".into(),
+                        performed_at: "2026-10-14T12:00:00Z".into(),
+                        notes: String::new(),
+                    },
+                    created_at: None,
+                });
+            if index < 10_000 {
+                batch.reminders.push(PrinterDataImportReminder {
+                    external_ref: format!("reminder-{index}"),
+                    printer_external_ref: Some("export-printer".into()),
+                    printer_nickname: Some("Export P-1".into()),
+                    input: printer_reminder_input("2026-11-01T00:00:00Z", None),
+                    status: PrinterReminderStatus::Active,
+                    last_completed_at: None,
+                    created_at: "1700000000".into(),
+                    updated_at: "1700000000".into(),
+                });
+            }
+        }
+
+        let imported = db.import_printer_data(&batch).unwrap();
+        assert_eq!(imported.imported_maintenance_log_count, 10_001);
+        assert_eq!(imported.imported_reminder_count, 10_000);
+        assert_eq!(
+            db.list_printer_maintenance_logs(None).unwrap().len(),
+            10_001
+        );
+        assert_eq!(db.list_printer_reminders(None, true).unwrap().len(), 10_000);
+
+        let snapshot = db.export_printer_data_snapshot().unwrap();
+
+        assert_eq!(snapshot.printers.len(), 1);
+        assert_eq!(snapshot.maintenance_logs.len(), 10_001);
+        assert_eq!(snapshot.reminders.len(), 10_000);
+        assert!(snapshot
+            .maintenance_logs
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id));
+        assert!(snapshot
+            .reminders
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id));
+    }
+
+    #[test]
+    fn native_and_imported_printer_web_urls_persist_only_the_origin() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut native_input = printer_input("Native URL P-1");
+        native_input.web_url = Some(
+            "https://printer.local:8443/ui/secret-token-value?token=query-secret#fragment-secret"
+                .into(),
+        );
+
+        let native = db.create_printer(&native_input, false).unwrap();
+
+        assert_eq!(
+            native.web_url.as_deref(),
+            Some("https://printer.local:8443")
+        );
+        let mut update = native_input.clone();
+        update.nickname = "Native URL P-1 Updated".into();
+        let updated = db
+            .update_printer(&native.id, native.metadata_version, &update, None)
+            .unwrap();
+        assert_eq!(
+            updated.web_url.as_deref(),
+            Some("https://printer.local:8443")
+        );
+
+        let mut imported_input = printer_input("Imported URL P-1");
+        imported_input.web_url = Some(
+            "http://printer.local/maintenance/api-token-value?token=query-secret#fragment-secret"
+                .into(),
+        );
+        let mut batch = PrinterDataImport::default();
+        batch.printers.push(printer_data_import_printer(
+            "source-web-printer",
+            imported_input,
+        ));
+        let imported = db.import_printer_data(&batch).unwrap();
+        let persisted = db
+            .get_printer(&imported.printer_ref_map[0].local_printer_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(persisted.web_url.as_deref(), Some("http://printer.local"));
+        assert!(!persisted.web_url.as_deref().unwrap().contains("token"));
+    }
+
+    #[test]
+    fn printer_history_writes_stop_at_global_limits_without_partial_changes() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut batch = PrinterDataImport::default();
+        batch.printers.push(printer_data_import_printer(
+            "capacity-printer",
+            printer_input("Capacity P-1"),
+        ));
+        for index in 0..49_998 {
+            batch
+                .maintenance_logs
+                .push(PrinterDataImportMaintenanceLog {
+                    external_ref: format!("capacity-log-{index}"),
+                    printer_external_ref: Some("capacity-printer".into()),
+                    printer_nickname: Some("Capacity P-1".into()),
+                    input: PrinterMaintenanceInput {
+                        title: "Initial maintenance".into(),
+                        performed_at: "2026-10-14T12:00:00Z".into(),
+                        notes: String::new(),
+                    },
+                    created_at: None,
+                });
+        }
+        for index in 0..9_998 {
+            batch.reminders.push(PrinterDataImportReminder {
+                external_ref: format!("capacity-reminder-{index}"),
+                printer_external_ref: Some("capacity-printer".into()),
+                printer_nickname: Some("Capacity P-1".into()),
+                input: printer_reminder_input("2026-11-01T00:00:00Z", None),
+                status: PrinterReminderStatus::Active,
+                last_completed_at: None,
+                created_at: "1700000000".into(),
+                updated_at: "1700000000".into(),
+            });
+        }
+        let imported = db.import_printer_data(&batch).unwrap();
+        let printer_id = imported.printer_ref_map[0].local_printer_id.clone();
+
+        db.create_printer_maintenance_log(
+            &printer_id,
+            &PrinterMaintenanceInput {
+                title: "Last normal log slot".into(),
+                performed_at: "2026-10-14T12:00:00Z".into(),
+                notes: String::new(),
+            },
+        )
+        .unwrap();
+        let first_reminder = db
+            .create_printer_reminder(
+                &printer_id,
+                &printer_reminder_input("2026-11-02T00:00:00Z", None),
+            )
+            .unwrap();
+        let second_reminder = db
+            .create_printer_reminder(
+                &printer_id,
+                &printer_reminder_input("2026-11-03T00:00:00Z", None),
+            )
+            .unwrap();
+        let reminder_error = db
+            .create_printer_reminder(
+                &printer_id,
+                &printer_reminder_input("2026-11-04T00:00:00Z", None),
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(
+            reminder_error,
+            LibraryError::InvalidInput(message) if message.contains("reminder limit of 10000")
+        ));
+
+        let completion_input = PrinterReminderCompletionInput {
+            completed_at: "2026-10-15T12:00:00Z".into(),
+            notes: "Final log slot".into(),
+        };
+        db.complete_printer_reminder(
+            &first_reminder.id,
+            first_reminder.metadata_version,
+            &completion_input,
+        )
+        .unwrap();
+        let log_error = db
+            .create_printer_maintenance_log(
+                &printer_id,
+                &PrinterMaintenanceInput {
+                    title: "Over-cap normal log".into(),
+                    performed_at: "2026-10-15T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(
+            log_error,
+            LibraryError::InvalidInput(message) if message.contains("maintenance log limit of 50000")
+        ));
+        let completion_error = db
+            .complete_printer_reminder(
+                &second_reminder.id,
+                second_reminder.metadata_version,
+                &completion_input,
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(
+            completion_error,
+            LibraryError::InvalidInput(message) if message.contains("maintenance log limit of 50000")
+        ));
+
+        let unchanged_reminder = db
+            .get_printer_reminder(&second_reminder.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged_reminder.metadata_version,
+            second_reminder.metadata_version
+        );
+        assert_eq!(unchanged_reminder.status, PrinterReminderStatus::Active);
+        assert_eq!(
+            db.list_printer_maintenance_logs(None).unwrap().len(),
+            50_000
+        );
+        assert_eq!(db.list_printer_reminders(None, true).unwrap().len(), 10_000);
+
+        let mut over_cap_log_import = PrinterDataImport::default();
+        over_cap_log_import.printers.push(PrinterDataImportPrinter {
+            external_ref: "mapped-capacity-printer".into(),
+            map_to_local_printer_id: Some(printer_id.clone()),
+            created_at: None,
+            updated_at: None,
+            input: printer_input("Ignored mapped name"),
+        });
+        over_cap_log_import
+            .maintenance_logs
+            .push(PrinterDataImportMaintenanceLog {
+                external_ref: "over-cap-log".into(),
+                printer_external_ref: Some("mapped-capacity-printer".into()),
+                printer_nickname: Some("Capacity P-1".into()),
+                input: PrinterMaintenanceInput {
+                    title: "Over-cap imported log".into(),
+                    performed_at: "2026-10-15T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+                created_at: None,
+            });
+        let log_import_error = db.import_printer_data(&over_cap_log_import).err().unwrap();
+        assert!(matches!(
+            log_import_error,
+            LibraryError::InvalidInput(message) if message.contains("maintenance log limit of 50000")
+        ));
+
+        let mut over_cap_reminder_import = PrinterDataImport::default();
+        over_cap_reminder_import
+            .printers
+            .push(PrinterDataImportPrinter {
+                external_ref: "mapped-capacity-printer".into(),
+                map_to_local_printer_id: Some(printer_id),
+                created_at: None,
+                updated_at: None,
+                input: printer_input("Ignored mapped name"),
+            });
+        over_cap_reminder_import
+            .reminders
+            .push(PrinterDataImportReminder {
+                external_ref: "over-cap-reminder".into(),
+                printer_external_ref: Some("mapped-capacity-printer".into()),
+                printer_nickname: Some("Capacity P-1".into()),
+                input: printer_reminder_input("2026-11-05T00:00:00Z", None),
+                status: PrinterReminderStatus::Active,
+                last_completed_at: None,
+                created_at: "1700000000".into(),
+                updated_at: "1700000000".into(),
+            });
+        let reminder_import_error = db
+            .import_printer_data(&over_cap_reminder_import)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            reminder_import_error,
+            LibraryError::InvalidInput(message) if message.contains("reminder limit of 10000")
+        ));
+        assert_eq!(
+            db.list_printer_maintenance_logs(None).unwrap().len(),
+            50_000
+        );
+        assert_eq!(db.list_printer_reminders(None, true).unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn printer_data_export_snapshot_rejects_history_over_its_cap() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let printer = db
+            .create_printer(&printer_input("Export P-1"), false)
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        for index in 0..=MAX_PRINTER_JSON_EXPORT_REMINDERS {
+            tx.execute(
+                "INSERT INTO printer_reminders
+                 (id,metadata_version,printer_id,printer_nickname,title,notes,due_at,
+                  interval_days,status,last_completed_at,created_at,updated_at)
+                 VALUES(?1,1,?2,?3,'Check printer','',?4,NULL,'active',NULL,?5,?5)",
+                params![
+                    format!("over-cap-reminder-{index}"),
+                    printer.id.as_str(),
+                    printer.nickname.as_str(),
+                    "2026-11-01T00:00:00Z",
+                    "1700000000",
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let list_error = db.list_printer_reminders(None, true).unwrap_err();
+        assert!(matches!(
+            list_error,
+            LibraryError::InvalidInput(message)
+                if message.contains("supported maximum of 10000")
+        ));
+
+        let error = db.export_printer_data_snapshot().unwrap_err();
+
+        assert!(matches!(
+            error,
+            LibraryError::InvalidInput(message)
+                if message.contains("maintenance reminders")
+                    && message.contains("supported maximum of 10000")
+        ));
+    }
+
+    #[test]
+    fn printer_data_import_rejects_invalid_and_duplicate_profile_refs_but_preserves_orphan_history()
+    {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut invalid_ref = PrinterDataImport::default();
+        invalid_ref.printers.push(printer_data_import_printer(
+            "bad/ref",
+            printer_input("Invalid ref"),
+        ));
+        assert!(db.import_printer_data(&invalid_ref).is_err());
+        assert!(db.list_printers().unwrap().is_empty());
+
+        let mut duplicate_ref = PrinterDataImport::default();
+        duplicate_ref.printers.extend([
+            printer_data_import_printer("same-ref", printer_input("First")),
+            printer_data_import_printer("same-ref", printer_input("Second")),
+        ]);
+        assert!(db.import_printer_data(&duplicate_ref).is_err());
+        assert!(db.list_printers().unwrap().is_empty());
+
+        let mut invalid_history_refs = PrinterDataImport::default();
+        invalid_history_refs
+            .maintenance_logs
+            .push(PrinterDataImportMaintenanceLog {
+                external_ref: "invalid-log-ref".into(),
+                printer_external_ref: Some("bad/ref".into()),
+                printer_nickname: Some("Historical Name".into()),
+                input: PrinterMaintenanceInput {
+                    title: "Clean nozzle".into(),
+                    performed_at: "2026-10-01T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+                created_at: None,
+            });
+        invalid_history_refs
+            .reminders
+            .push(PrinterDataImportReminder {
+                external_ref: "invalid-reminder-ref".into(),
+                printer_external_ref: Some("bad/ref".into()),
+                printer_nickname: Some("Historical Name".into()),
+                input: printer_reminder_input("2026-11-01T12:00:00Z", None),
+                status: PrinterReminderStatus::Active,
+                last_completed_at: None,
+                created_at: "2026-10-01T12:00:00Z".into(),
+                updated_at: "2026-10-01T12:00:00Z".into(),
+            });
+        assert!(db.import_printer_data(&invalid_history_refs).is_err());
+        assert!(db.list_printer_maintenance_logs(None).unwrap().is_empty());
+        assert!(db.list_printer_reminders(None, true).unwrap().is_empty());
+
+        let mut orphan_history = PrinterDataImport::default();
+        orphan_history
+            .maintenance_logs
+            .push(PrinterDataImportMaintenanceLog {
+                external_ref: "log-1".into(),
+                printer_external_ref: Some("missing-printer".into()),
+                printer_nickname: Some("Historical Name".into()),
+                input: PrinterMaintenanceInput {
+                    title: "Clean nozzle".into(),
+                    performed_at: "2026-10-01T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+                created_at: None,
+            });
+        orphan_history.reminders.push(PrinterDataImportReminder {
+            external_ref: "reminder-1".into(),
+            printer_external_ref: Some("missing-printer".into()),
+            printer_nickname: None,
+            input: printer_reminder_input("2026-11-01T12:00:00Z", None),
+            status: PrinterReminderStatus::Active,
+            last_completed_at: None,
+            created_at: "2026-10-01T12:00:00Z".into(),
+            updated_at: "2026-10-01T12:00:00Z".into(),
+        });
+
+        let imported = db.import_printer_data(&orphan_history).unwrap();
+        assert_eq!(imported.imported_printer_count, 0);
+        assert_eq!(imported.imported_maintenance_log_count, 1);
+        assert_eq!(imported.imported_reminder_count, 1);
+        assert!(db.list_printers().unwrap().is_empty());
+        let logs = db.list_printer_maintenance_logs(None).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].printer_id, None);
+        assert_eq!(logs[0].printer_nickname, "Historical Name");
+        let reminders = db.list_printer_reminders(None, true).unwrap();
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].printer_id, None);
+        assert_eq!(reminders[0].printer_nickname, "");
+    }
+
+    #[test]
+    fn printer_data_import_accepts_null_history_profile_references() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let batch: PrinterDataImport = serde_json::from_value(serde_json::json!({
+            "maintenanceLogs": [{
+                "externalRef": "null-log",
+                "printerExternalRef": null,
+                "input": {
+                    "title": "Clean nozzle",
+                    "performedAt": "2026-10-01T12:00:00Z",
+                    "notes": ""
+                },
+                "createdAt": "2026-10-01T12:00:00Z"
+            }],
+            "reminders": [{
+                "externalRef": "null-reminder",
+                "printerExternalRef": null,
+                "printerNickname": "",
+                "input": {
+                    "title": "Inspect belts",
+                    "notes": "",
+                    "dueAt": "2026-11-01T12:00:00Z",
+                    "intervalDays": null
+                },
+                "status": "active",
+                "lastCompletedAt": null,
+                "createdAt": "2026-10-01T12:00:00Z",
+                "updatedAt": "2026-10-01T12:00:00Z"
+            }]
+        }))
+        .unwrap();
+
+        let imported = db.import_printer_data(&batch).unwrap();
+        assert_eq!(imported.imported_printer_count, 0);
+        let logs = db.list_printer_maintenance_logs(None).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].printer_id, None);
+        assert_eq!(logs[0].printer_nickname, "");
+        let reminders = db.list_printer_reminders(None, true).unwrap();
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].printer_id, None);
+        assert_eq!(reminders[0].printer_nickname, "");
+        assert!(db.list_printers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_v10_history_migration_preserves_rows_indexes_foreign_keys_and_backup() {
+        let root = temp_root("schema-v10-history-names");
+        let db = LibraryDb::open(&root).unwrap();
+        let printer = db
+            .create_printer(&printer_input("Migration history printer"), false)
+            .unwrap();
+        let log = db
+            .create_printer_maintenance_log(
+                &printer.id,
+                &PrinterMaintenanceInput {
+                    title: "Replace nozzle".into(),
+                    performed_at: "2026-10-01T12:00:00Z".into(),
+                    notes: "Preserve this log".into(),
+                },
+            )
+            .unwrap();
+        let reminder = db
+            .create_printer_reminder(
+                &printer.id,
+                &PrinterReminderInput {
+                    title: "Inspect belts".into(),
+                    notes: "Preserve this reminder".into(),
+                    due_at: "2026-11-01T12:00:00Z".into(),
+                    interval_days: Some(30),
+                },
+            )
+            .unwrap();
+        drop(db);
+
+        let connection = Connection::open(root.join("library.sqlite3")).unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
+        drop(connection);
+
+        let migrated = LibraryDb::open(&root).unwrap();
+        assert_eq!(
+            migrated.get_printer_maintenance_log(&log.id).unwrap(),
+            Some(log)
+        );
+        assert_eq!(
+            migrated.get_printer_reminder(&reminder.id).unwrap(),
+            Some(reminder)
+        );
+        assert_eq!(
+            migrated
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            11
+        );
+        let mut empty_orphans = PrinterDataImport::default();
+        empty_orphans
+            .maintenance_logs
+            .push(PrinterDataImportMaintenanceLog {
+                external_ref: "empty-unlinked-log".into(),
+                printer_external_ref: None,
+                printer_nickname: None,
+                input: PrinterMaintenanceInput {
+                    title: "Preserve empty history name".into(),
+                    performed_at: "2026-10-02T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+                created_at: None,
+            });
+        empty_orphans.reminders.push(PrinterDataImportReminder {
+            external_ref: "empty-unlinked-reminder".into(),
+            printer_external_ref: None,
+            printer_nickname: None,
+            input: PrinterReminderInput {
+                title: "Preserve empty reminder name".into(),
+                notes: String::new(),
+                due_at: "2026-11-02T12:00:00Z".into(),
+                interval_days: None,
+            },
+            status: PrinterReminderStatus::Active,
+            last_completed_at: None,
+            created_at: "2026-10-02T12:00:00Z".into(),
+            updated_at: "2026-10-02T12:00:00Z".into(),
+        });
+        let imported = migrated.import_printer_data(&empty_orphans).unwrap();
+        assert_eq!(imported.imported_printer_count, 0);
+        assert_eq!(migrated.list_printers().unwrap().len(), 1);
+        let logs = migrated.list_printer_maintenance_logs(None).unwrap();
+        let empty_log = logs
+            .iter()
+            .find(|record| record.title == "Preserve empty history name")
+            .unwrap();
+        assert_eq!(empty_log.printer_id, None);
+        assert_eq!(empty_log.printer_nickname, "");
+        let reminders = migrated.list_printer_reminders(None, true).unwrap();
+        let empty_reminder = reminders
+            .iter()
+            .find(|record| record.title == "Preserve empty reminder name")
+            .unwrap();
+        assert_eq!(empty_reminder.printer_id, None);
+        assert_eq!(empty_reminder.printer_nickname, "");
+        drop(migrated);
+
+        let connection = Connection::open(root.join("library.sqlite3")).unwrap();
+        for index in [
+            "printer_maintenance_printer_idx",
+            "printer_reminders_due_idx",
+            "printer_reminders_printer_idx",
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "migration dropped index {index}");
+        }
+        for table in ["printer_maintenance_logs", "printer_reminders"] {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA foreign_key_list({table})"))
+                .unwrap();
+            let foreign_keys = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(foreign_keys.contains(&(
+                "printers".into(),
+                "printer_id".into(),
+                "SET NULL".into()
+            )));
+        }
+        drop(connection);
+
+        let backup = Connection::open(root.join("library.sqlite3.schema-v10.backup")).unwrap();
+        assert_eq!(
+            backup
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn printer_data_import_keeps_mapped_printers_unchanged_and_preserves_log_name() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut existing_input = printer_input("Local P-1");
+        existing_input.host = Some("192.0.2.10".into());
+        let existing = db.create_printer(&existing_input, true).unwrap();
+        let mut imported_input = printer_input("Source Name Must Not Replace Local Name");
+        imported_input.host = Some("192.0.2.12".into());
+        let mut batch = PrinterDataImport::default();
+        batch.printers.push(PrinterDataImportPrinter {
+            external_ref: "source-printer".into(),
+            map_to_local_printer_id: Some(existing.id.clone()),
+            created_at: Some("1700000000".into()),
+            updated_at: Some("1700000001".into()),
+            input: imported_input,
+        });
+        batch
+            .maintenance_logs
+            .push(PrinterDataImportMaintenanceLog {
+                external_ref: "source-log".into(),
+                printer_external_ref: Some("source-printer".into()),
+                printer_nickname: Some("Retired Historical Nickname".into()),
+                input: PrinterMaintenanceInput {
+                    title: "Replace nozzle".into(),
+                    performed_at: "2026-10-02T12:00:00Z".into(),
+                    notes: "Source history".into(),
+                },
+                created_at: Some("1700000000".into()),
+            });
+
+        let result = db.import_printer_data(&batch).unwrap();
+        assert_eq!(result.imported_printer_count, 0);
+        assert_eq!(result.mapped_printer_count, 1);
+        assert_eq!(
+            db.get_printer(&existing.id).unwrap().unwrap(),
+            existing,
+            "mapping an imported printer must not modify the local profile or approval"
+        );
+        let logs = db
+            .list_printer_maintenance_logs(Some(&existing.id))
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].printer_id.as_deref(), Some(existing.id.as_str()));
+        assert_ne!(logs[0].id, "source-log");
+        assert_eq!(logs[0].printer_nickname, "Retired Historical Nickname");
+        assert_eq!(logs[0].created_at, "1700000000");
+    }
+
+    #[test]
+    fn printer_data_import_round_trips_paused_and_completed_reminders() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut batch = PrinterDataImport::default();
+        batch.printers.push(printer_data_import_printer(
+            "source-printer",
+            printer_input("Imported Reminder P-1"),
+        ));
+        batch.reminders.extend([
+            PrinterDataImportReminder {
+                external_ref: "paused-reminder".into(),
+                printer_external_ref: Some("source-printer".into()),
+                printer_nickname: Some("Historical paused printer name".into()),
+                input: printer_reminder_input("2026-11-01T00:00:00Z", Some(14)),
+                status: PrinterReminderStatus::Paused,
+                last_completed_at: None,
+                created_at: "1700000000".into(),
+                updated_at: "1700000001".into(),
+            },
+            PrinterDataImportReminder {
+                external_ref: "completed-reminder".into(),
+                printer_external_ref: Some("source-printer".into()),
+                printer_nickname: None,
+                input: printer_reminder_input("2026-11-02T00:00:00Z", None),
+                status: PrinterReminderStatus::Completed,
+                last_completed_at: Some("2026-10-10T12:30:00Z".into()),
+                created_at: "1700000002".into(),
+                updated_at: "1700000003".into(),
+            },
+        ]);
+
+        let result = db.import_printer_data(&batch).unwrap();
+        assert_eq!(result.imported_reminder_count, 2);
+        let printer_id = &result.printer_ref_map[0].local_printer_id;
+        let reminders = db.list_printer_reminders(Some(printer_id), true).unwrap();
+        let paused = reminders
+            .iter()
+            .find(|reminder| reminder.due_at.starts_with("2026-11-01"))
+            .unwrap();
+        assert_eq!(paused.status, PrinterReminderStatus::Paused);
+        assert_eq!(paused.printer_nickname, "Historical paused printer name");
+        assert_eq!(paused.last_completed_at, None);
+        assert_eq!(paused.created_at, "1700000000");
+        assert_eq!(paused.updated_at, "1700000001");
+
+        let completed = reminders
+            .iter()
+            .find(|reminder| reminder.due_at.starts_with("2026-11-02"))
+            .unwrap();
+        assert_ne!(paused.id, "paused-reminder");
+        assert_ne!(completed.id, "completed-reminder");
+        assert_eq!(completed.status, PrinterReminderStatus::Completed);
+        assert_eq!(completed.printer_id.as_deref(), Some(printer_id.as_str()));
+        assert_eq!(completed.printer_nickname, "Imported Reminder P-1");
+        assert_eq!(
+            completed.last_completed_at.as_deref(),
+            Some("2026-10-10T12:30:00.000Z")
+        );
+        assert_eq!(completed.created_at, "1700000002");
+        assert_eq!(completed.updated_at, "1700000003");
+    }
+
+    #[test]
+    fn printer_data_import_rolls_back_when_a_later_row_fails() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_imported_reminder
+                 BEFORE INSERT ON printer_reminders
+                 WHEN NEW.title='Reject this import row'
+                 BEGIN SELECT RAISE(ABORT, 'test import row rejected'); END;",
+            )
+            .unwrap();
+        let mut batch = PrinterDataImport::default();
+        batch.printers.push(printer_data_import_printer(
+            "source-printer",
+            printer_input("Atomic import P-1"),
+        ));
+        batch
+            .maintenance_logs
+            .push(PrinterDataImportMaintenanceLog {
+                external_ref: "source-log".into(),
+                printer_external_ref: Some("source-printer".into()),
+                printer_nickname: Some("Atomic import P-1".into()),
+                input: PrinterMaintenanceInput {
+                    title: "Valid earlier row".into(),
+                    performed_at: "2026-10-02T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+                created_at: None,
+            });
+        batch.reminders.push(PrinterDataImportReminder {
+            external_ref: "source-reminder".into(),
+            printer_external_ref: Some("source-printer".into()),
+            printer_nickname: None,
+            input: PrinterReminderInput {
+                title: "Reject this import row".into(),
+                notes: String::new(),
+                due_at: "2026-11-02T00:00:00Z".into(),
+                interval_days: None,
+            },
+            status: PrinterReminderStatus::Active,
+            last_completed_at: None,
+            created_at: "1700000000".into(),
+            updated_at: "1700000001".into(),
+        });
+
+        assert!(db.import_printer_data(&batch).is_err());
+        assert!(db.list_printers().unwrap().is_empty());
+        assert!(db.list_printer_maintenance_logs(None).unwrap().is_empty());
+        assert!(db.list_printer_reminders(None, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_v6_migration_adds_printer_catalog_without_changing_existing_history() {
+        let root = temp_root("schema-v6-printers");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("Legacy print", None).unwrap();
+        let attempt = db
+            .create_print_attempt(&model.id, &print_attempt_input())
+            .unwrap();
+        downgrade_printer_schema_to_v6(&db.conn);
+        drop(db);
+
+        let migrated = LibraryDb::open(&root).unwrap();
+        assert_eq!(
+            migrated
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        let loaded = migrated.get_print_attempt(&attempt.id).unwrap().unwrap();
+        assert_eq!(loaded.printer_id, None);
+        assert_eq!(loaded.printer_name, None);
+        assert_eq!(loaded.printed_at, "2026-10-14T12:00:00.000Z");
+        assert!(migrated
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='printers')",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        let backup = root.join("library.sqlite3.schema-v6.backup");
+        assert!(backup.is_file());
+        assert_eq!(
+            Connection::open(backup)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v7_migration_adds_maintenance_versions_and_preserves_rows() {
+        let root = temp_root("schema-v7-maintenance-version");
+        let db = LibraryDb::open(&root).unwrap();
+        let printer = db
+            .create_printer(&printer_input("Versioned maintenance P-1"), false)
+            .unwrap();
+        let log = db
+            .create_printer_maintenance_log(
+                &printer.id,
+                &PrinterMaintenanceInput {
+                    title: "Clean nozzle".into(),
+                    performed_at: "2026-10-14T12:00:00Z".into(),
+                    notes: "Before migration".into(),
+                },
+            )
+            .unwrap();
+        downgrade_printer_maintenance_logs_to_v7(&db.conn);
+        drop(db);
+
+        let migrated = LibraryDb::open(&root).unwrap();
+        assert_eq!(
+            migrated
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        let recovered = migrated
+            .get_printer_maintenance_log(&log.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.metadata_version, 1);
+        assert_eq!(recovered.title, "Clean nozzle");
+        assert_eq!(recovered.notes, "Before migration");
+        let backup = root.join("library.sqlite3.schema-v7.backup");
+        assert!(backup.is_file());
+        let backup_db = Connection::open(backup).unwrap();
+        assert_eq!(
+            backup_db
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            backup_db
+                .query_row(
+                    "SELECT COUNT(*) FROM printer_maintenance_logs WHERE id=?1",
+                    params![log.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(migrated);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn printer_crud_checks_versions_and_bounded_fields() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let printer = db
+            .create_printer(&printer_input("Workshop P-1"), false)
+            .unwrap();
+        assert_eq!(printer.metadata_version, 1);
+        assert_eq!(printer.connection_status, PrinterConnectionStatus::Unknown);
+        assert_eq!(printer.job_status, PrinterJobStatus::Unknown);
+        assert_eq!(printer.source_kind, PrinterSourceKind::Manual);
+
+        let updated = db
+            .update_printer(
+                &printer.id,
+                printer.metadata_version,
+                &printer_input("Workshop P-1 v2"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated.metadata_version, 2);
+        assert_eq!(updated.nickname, "Workshop P-1 v2");
+        assert!(db
+            .update_printer(
+                &printer.id,
+                printer.metadata_version,
+                &printer_input("stale write"),
+                None,
+            )
+            .is_err());
+
+        let mut invalid = printer_input("bad dimensions");
+        invalid.bed_mm = Some([220.0, f32::NAN, 250.0]);
+        assert!(db.create_printer(&invalid, false).is_err());
+        let invalid = printer_input("\u{0000}bad");
+        assert!(db.create_printer(&invalid, false).is_err());
+        let mut invalid = printer_input("bad notes");
+        invalid.notes = "x".repeat(20_001);
+        assert!(db.create_printer(&invalid, false).is_err());
+        let mut credentials = printer_input("credentialed endpoint");
+        credentials.web_url = Some("http://user:password@printer.local/".into());
+        assert!(db.create_printer(&credentials, false).is_err());
+        let mut unapproved = printer_input("unapproved endpoint");
+        unapproved.host = Some("192.0.2.1".into());
+        let unapproved = db.create_printer(&unapproved, false).unwrap();
+        assert!(!unapproved.endpoint_approved);
+
+        let mut approved_input = printer_input("approved endpoint");
+        approved_input.host = Some("192.0.2.10".into());
+        let approved = db.create_printer(&approved_input, true).unwrap();
+        let mut changed_endpoint = approved_input.clone();
+        changed_endpoint.host = Some("192.0.2.11".into());
+        let changed = db
+            .update_printer(
+                &approved.id,
+                approved.metadata_version,
+                &changed_endpoint,
+                None,
+            )
+            .unwrap();
+        assert!(!changed.endpoint_approved);
+        assert!(db
+            .record_printer_status(
+                &changed.id,
+                PrinterConnectionStatus::Offline,
+                PrinterJobStatus::Unknown,
+                "2026-10-14T12:02:00Z",
+                None,
+            )
+            .is_err());
+        let reapproved = db
+            .update_printer(
+                &changed.id,
+                changed.metadata_version,
+                &changed_endpoint,
+                Some(true),
+            )
+            .unwrap();
+        assert!(reapproved.endpoint_approved);
+
+        assert!(db.list_printers().unwrap().contains(&updated));
+        assert_eq!(db.list_printers().unwrap().len(), 3);
+        assert!(db
+            .delete_printer(&printer.id, printer.metadata_version)
+            .is_err());
+        db.delete_printer(&unapproved.id, unapproved.metadata_version)
+            .unwrap();
+        db.delete_printer(&reapproved.id, reapproved.metadata_version)
+            .unwrap();
+        db.delete_printer(&updated.id, updated.metadata_version)
+            .unwrap();
+        assert!(db.get_printer(&printer.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn part_stock_crud_uses_versions_and_matches_printventory_fields() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let input = PartStockInput {
+            name: "M3x8 screw".into(),
+            category: Some("Screws".into()),
+            quantity: 20,
+            unit: "pcs".into(),
+            notes: "Black oxide".into(),
+            low_stock: 4,
+        };
+
+        let created = db.create_part_stock(&input).unwrap();
+        assert_eq!(created.metadata_version, 1);
+        assert_eq!(created.name, "M3x8 screw");
+        assert_eq!(created.category.as_deref(), Some("Screws"));
+        assert_eq!(created.quantity, 20);
+        assert_eq!(created.unit, "pcs");
+        assert_eq!(created.notes, "Black oxide");
+        assert_eq!(created.low_stock, 4);
+
+        let updated_input = PartStockInput {
+            quantity: 16,
+            low_stock: 6,
+            ..input.clone()
+        };
+        let updated = db
+            .update_part_stock(&created.id, created.metadata_version, &updated_input)
+            .unwrap();
+        assert_eq!(updated.metadata_version, 2);
+        assert_eq!(updated.quantity, 16);
+        assert_eq!(updated.low_stock, 6);
+        assert!(matches!(
+            db.update_part_stock(&created.id, created.metadata_version, &input),
+            Err(LibraryError::PartStockVersionConflict {
+                part_id,
+                expected: 1,
+                actual: 2,
+            }) if part_id == created.id
+        ));
+        assert_eq!(db.list_part_stock().unwrap(), vec![updated.clone()]);
+
+        let invalid = PartStockInput {
+            quantity: 1_000_001,
+            ..updated_input
+        };
+        assert!(db
+            .update_part_stock(&updated.id, updated.metadata_version, &invalid)
+            .is_err());
+        assert!(matches!(
+            db.delete_part_stock(&updated.id, created.metadata_version),
+            Err(LibraryError::PartStockVersionConflict {
+                part_id,
+                expected: 1,
+                actual: 2,
+            }) if part_id == updated.id
+        ));
+        db.delete_part_stock(&updated.id, updated.metadata_version)
+            .unwrap();
+        assert!(db.get_part_stock(&updated.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn print_attempt_parts_consume_per_copy_for_failed_events_and_restore_on_delete() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Failed print with hardware", None).unwrap();
+        let part = db
+            .create_part_stock(&PartStockInput {
+                name: "M3 nut".into(),
+                category: Some("Nuts".into()),
+                quantity: 20,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 3,
+            })
+            .unwrap();
+        let mut input = print_attempt_input();
+        input.outcome = PrintOutcome::Failed;
+        input.quantity = 2;
+        input.parts = Some(vec![PartUsageInput {
+            id: part.id.clone(),
+            quantity: 4,
+            snapshot: None,
+        }]);
+
+        let event = db.create_print_attempt(&model.id, &input).unwrap();
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 12);
+        assert_eq!(event.parts.len(), 1);
+        assert_eq!(event.parts[0].quantity_per_copy, 4);
+        assert_eq!(event.parts[0].quantity, 8);
+        assert_eq!(event.parts[0].name, "M3 nut");
+
+        db.delete_print_attempt(&event.id).unwrap();
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 20);
+        assert!(db.get_print_attempt(&event.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_imported_history_does_not_refund_a_current_stock_snapshot() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Imported stock snapshot", None).unwrap();
+        let part = db
+            .create_part_stock(&PartStockInput {
+                name: "M4 nut".into(),
+                category: Some("Hardware".into()),
+                quantity: 10,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 2,
+            })
+            .unwrap();
+        let mut input = print_attempt_input();
+        input.quantity = 2;
+        input.parts = Some(vec![PartUsageInput {
+            id: part.id.clone(),
+            quantity: 3,
+            snapshot: None,
+        }]);
+
+        let imported = db
+            .import_print_attempt_with_printer(&model.id, &input, None, None, None)
+            .unwrap();
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 10);
+        assert_eq!(imported.parts[0].quantity, 6);
+
+        let mut edited = print_attempt_input();
+        edited.notes = "reviewed historical note".into();
+        let updated = db.update_print_attempt(&imported.id, &edited).unwrap();
+        assert_eq!(updated.parts[0].quantity, 3);
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 10);
+
+        db.delete_print_attempt(&imported.id).unwrap();
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 10);
+    }
+
+    #[test]
+    fn imported_orphan_part_snapshot_never_links_or_refunds_replacement_stock() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Orphaned imported part", None).unwrap();
+        let replacement = db
+            .create_part_stock(&PartStockInput {
+                name: "M5 bolt".into(),
+                category: Some("Hardware".into()),
+                quantity: 12,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 2,
+            })
+            .unwrap();
+        let orphan_id = format!("{PRINTVENTORY_ORPHAN_PART_ID_PREFIX}abcdef0123456789");
+        let mut input = print_attempt_input();
+        input.parts = Some(vec![PartUsageInput {
+            id: orphan_id.clone(),
+            quantity: 2,
+            snapshot: Some(PartUsageSnapshot {
+                name: "M5 bolt".into(),
+                category: Some("Hardware".into()),
+                unit: "pcs".into(),
+            }),
+        }]);
+
+        assert!(db.create_print_attempt(&model.id, &input).is_err());
+        let imported = db
+            .import_print_attempt_with_printer(&model.id, &input, None, None, None)
+            .unwrap();
+        assert_eq!(imported.parts.len(), 1);
+        assert_eq!(imported.parts[0].id.as_deref(), Some(orphan_id.as_str()));
+        assert_eq!(imported.parts[0].name, "M5 bolt");
+        assert_eq!(imported.parts[0].quantity, 2);
+        assert_eq!(
+            db.get_part_stock(&replacement.id)
+                .unwrap()
+                .unwrap()
+                .quantity,
+            12
+        );
+
+        db.delete_print_attempt(&imported.id).unwrap();
+        assert_eq!(
+            db.get_part_stock(&replacement.id)
+                .unwrap()
+                .unwrap()
+                .quantity,
+            12
+        );
+    }
+
+    #[test]
+    fn cancelled_print_attempt_is_queued_not_counted_but_still_consumes_parts() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Cancelled print", None).unwrap();
+        let part = db
+            .create_part_stock(&PartStockInput {
+                name: "Bearing".into(),
+                category: Some("Bearings".into()),
+                quantity: 5,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
+        let mut input = print_attempt_input();
+        input.outcome = PrintOutcome::Cancelled;
+        input.quantity = 2;
+        input.parts = Some(vec![PartUsageInput {
+            id: part.id.clone(),
+            quantity: 1,
+            snapshot: None,
+        }]);
+
+        let event = db.create_print_attempt(&model.id, &input).unwrap();
+        let updated_model = db.get_model(&model.id).unwrap().unwrap();
+        assert_eq!(event.outcome, PrintOutcome::Cancelled);
+        assert_eq!(updated_model.metadata.print_status, PrintStatus::Queued);
+        assert_eq!(updated_model.metadata.print_count, 0);
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 3);
+    }
+
+    #[test]
+    fn print_attempt_edit_applies_only_part_stock_delta_and_rolls_back_short_stock() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Edited hardware event", None).unwrap();
+        let screw = db
+            .create_part_stock(&PartStockInput {
+                name: "M3 screw".into(),
+                category: Some("Screws".into()),
+                quantity: 20,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
+        let bearing = db
+            .create_part_stock(&PartStockInput {
+                name: "608 bearing".into(),
+                category: Some("Bearings".into()),
+                quantity: 10,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
+        let mut input = print_attempt_input();
+        input.quantity = 3;
+        input.parts = Some(vec![PartUsageInput {
+            id: screw.id.clone(),
+            quantity: 2,
+            snapshot: None,
+        }]);
+        let event = db.create_print_attempt(&model.id, &input).unwrap();
+        assert_eq!(db.get_part_stock(&screw.id).unwrap().unwrap().quantity, 14);
+
+        let mut note_only = print_attempt_input();
+        note_only.notes = "edit notes, keep inventory links".into();
+        let preserved = db.update_print_attempt(&event.id, &note_only).unwrap();
+        assert_eq!(db.get_part_stock(&screw.id).unwrap().unwrap().quantity, 18);
+        assert_eq!(preserved.parts.len(), 1);
+        assert_eq!(preserved.parts[0].quantity_per_copy, 2);
+        assert_eq!(preserved.parts[0].quantity, 2);
+
+        let mut edited = input.clone();
+        edited.quantity = 1;
+        edited.parts = Some(vec![
+            PartUsageInput {
+                id: screw.id.clone(),
+                quantity: 1,
+                snapshot: None,
+            },
+            PartUsageInput {
+                id: bearing.id.clone(),
+                quantity: 3,
+                snapshot: None,
+            },
+        ]);
+        let updated = db.update_print_attempt(&event.id, &edited).unwrap();
+        assert_eq!(db.get_part_stock(&screw.id).unwrap().unwrap().quantity, 19);
+        assert_eq!(db.get_part_stock(&bearing.id).unwrap().unwrap().quantity, 7);
+        assert_eq!(updated.parts.len(), 2);
+
+        let mut insufficient = edited.clone();
+        insufficient.parts.as_mut().unwrap()[1].quantity = 20;
+        assert!(db.update_print_attempt(&event.id, &insufficient).is_err());
+        assert_eq!(db.get_part_stock(&screw.id).unwrap().unwrap().quantity, 19);
+        assert_eq!(db.get_part_stock(&bearing.id).unwrap().unwrap().quantity, 7);
+        assert_eq!(db.get_print_attempt(&event.id).unwrap().unwrap(), updated);
+
+        let mut cleared = edited.clone();
+        cleared.parts = Some(Vec::new());
+        let cleared = db.update_print_attempt(&event.id, &cleared).unwrap();
+        assert!(cleared.parts.is_empty());
+        assert_eq!(db.get_part_stock(&screw.id).unwrap().unwrap().quantity, 20);
+        assert_eq!(
+            db.get_part_stock(&bearing.id).unwrap().unwrap().quantity,
+            10
+        );
+        db.delete_print_attempt(&event.id).unwrap();
+        assert_eq!(db.get_part_stock(&screw.id).unwrap().unwrap().quantity, 20);
+        assert_eq!(
+            db.get_part_stock(&bearing.id).unwrap().unwrap().quantity,
+            10
+        );
+    }
+
+    #[test]
+    fn deleting_part_preserves_event_snapshot_without_restoring_replacement_stock() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Deleted hardware", None).unwrap();
+        let original = db
+            .create_part_stock(&PartStockInput {
+                name: "Heat-set insert".into(),
+                category: Some("Inserts".into()),
+                quantity: 10,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
+        let mut input = print_attempt_input();
+        input.outcome = PrintOutcome::Failed;
+        input.parts = Some(vec![PartUsageInput {
+            id: original.id.clone(),
+            quantity: 2,
+            snapshot: None,
+        }]);
+        let event = db.create_print_attempt(&model.id, &input).unwrap();
+        let after_consume = db.get_part_stock(&original.id).unwrap().unwrap();
+        db.delete_part_stock(&original.id, after_consume.metadata_version)
+            .unwrap();
+        let replacement = db
+            .create_part_stock(&PartStockInput {
+                name: "Heat-set insert".into(),
+                category: Some("Inserts".into()),
+                quantity: 5,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 0,
+            })
+            .unwrap();
+        let historical = db.get_print_attempt(&event.id).unwrap().unwrap();
+        assert_eq!(historical.parts[0].name, "Heat-set insert");
+        assert_eq!(
+            historical.parts[0].id.as_deref(),
+            Some(original.id.as_str())
+        );
+        db.delete_print_attempt(&event.id).unwrap();
+        assert_eq!(
+            db.get_part_stock(&replacement.id)
+                .unwrap()
+                .unwrap()
+                .quantity,
+            5
+        );
+    }
+
+    #[test]
+    fn schema_v8_migration_preserves_catalog_history_and_creates_backup() {
+        let root = temp_root("schema-v8-parts-stock");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("Parts migration", None).unwrap();
+        let printer = db
+            .create_printer(&printer_input("Migration printer"), false)
+            .unwrap();
+        let event = db
+            .create_print_attempt_with_printer(
+                &model.id,
+                &PrintAttemptInputWithPrinter {
+                    input: print_attempt_input(),
+                    printer_id: Some(Some(printer.id.clone())),
+                },
+            )
+            .unwrap();
+        let model_after_event = db.get_model(&model.id).unwrap().unwrap();
+        let printer_after_event = db.get_printer(&printer.id).unwrap().unwrap();
+        drop(db);
+
+        let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE print_attempt_parts;
+             DROP TABLE parts_stock;
+             ALTER TABLE print_attempts DROP COLUMN stock_adjusted;
+             PRAGMA user_version=8;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = LibraryDb::open(&root).unwrap();
+        assert_eq!(
+            migrated.get_model(&model.id).unwrap().unwrap(),
+            model_after_event
+        );
+        assert_eq!(
+            migrated.get_printer(&printer.id).unwrap().unwrap(),
+            printer_after_event
+        );
+        let mut expected_event = event.clone();
+        expected_event.stock_adjusted = None;
+        assert_eq!(
+            migrated.get_print_attempt(&event.id).unwrap().unwrap(),
+            expected_event
+        );
+        assert!(migrated.list_part_stock().unwrap().is_empty());
+        assert_eq!(
+            migrated
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        drop(migrated);
+
+        let backup = Connection::open(root.join("library.sqlite3.schema-v8.backup")).unwrap();
+        assert_eq!(
+            backup
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            backup
+                .query_row("SELECT COUNT(*) FROM print_attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v9_migration_marks_every_event_unknown_without_guessing_stock_history() {
+        let root = temp_root("schema-v9-stock-adjustment-marker");
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.create_model("Schema v9 stock marker", None).unwrap();
+        let part = db
+            .create_part_stock(&PartStockInput {
+                name: "M2 spacer".into(),
+                category: Some("Hardware".into()),
+                quantity: 10,
+                unit: "pcs".into(),
+                notes: String::new(),
+                low_stock: 2,
+            })
+            .unwrap();
+        let mut input = print_attempt_input();
+        input.parts = Some(vec![PartUsageInput {
+            id: part.id.clone(),
+            quantity: 2,
+            snapshot: None,
+        }]);
+        let event = db.create_print_attempt(&model.id, &input).unwrap();
+        assert_eq!(db.get_part_stock(&part.id).unwrap().unwrap().quantity, 8);
+        let historical = db
+            .import_print_attempt(&model.id, &print_attempt_input(), "2026-10-16T12:00:00Z")
+            .unwrap();
+        drop(db);
+
+        let conn = Connection::open(root.join("library.sqlite3")).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE print_attempts DROP COLUMN stock_adjusted;
+             PRAGMA user_version=9;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = LibraryDb::open(&root).unwrap();
+        let mut expected_event = event.clone();
+        expected_event.stock_adjusted = None;
+        assert_eq!(
+            migrated.get_print_attempt(&event.id).unwrap().unwrap(),
+            expected_event
+        );
+        assert_eq!(
+            migrated
+                .conn
+                .query_row(
+                    "SELECT stock_adjusted FROM print_attempts WHERE id=?1",
+                    params![event.id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            migrated
+                .get_print_attempt(&historical.id)
+                .unwrap()
+                .unwrap()
+                .stock_adjusted,
+            None
+        );
+        let mut historical_edit = print_attempt_input();
+        historical_edit.parts = Some(vec![PartUsageInput {
+            id: part.id.clone(),
+            quantity: 1,
+            snapshot: None,
+        }]);
+        let updated_historical = migrated
+            .update_print_attempt(&historical.id, &historical_edit)
+            .unwrap();
+        assert_eq!(updated_historical.stock_adjusted, None);
+        assert_eq!(
+            migrated.get_part_stock(&part.id).unwrap().unwrap().quantity,
+            8
+        );
+        migrated.delete_print_attempt(&historical.id).unwrap();
+        migrated.delete_print_attempt(&event.id).unwrap();
+        assert_eq!(
+            migrated.get_part_stock(&part.id).unwrap().unwrap().quantity,
+            8
+        );
+        assert!(root.join("library.sqlite3.schema-v9.backup").is_file());
+        drop(migrated);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovered_printer_batch_is_atomic_and_keeps_per_item_approval() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut approved_input = printer_input("Discovered approved");
+        approved_input.host = Some("192.168.50.20".into());
+        let unapproved_input = printer_input("Discovered unapproved");
+
+        let created = db
+            .create_discovered_printers(&[(approved_input, true), (unapproved_input, false)])
+            .unwrap();
+
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0].source_kind, PrinterSourceKind::Discovered);
+        assert!(created[0].endpoint_approved);
+        assert!(!created[1].endpoint_approved);
+        assert_eq!(db.list_printers().unwrap().len(), 2);
+
+        let mut invalid_input = printer_input("Invalid discovered");
+        invalid_input.bed_mm = Some([220.0, 0.0, 250.0]);
+        assert!(db
+            .create_discovered_printers(&[
+                (printer_input("Would roll back"), false),
+                (invalid_input, false),
+            ])
+            .is_err());
+        assert_eq!(db.list_printers().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn discovered_printer_batch_has_a_small_explicit_limit() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let items = (0..=MAX_DISCOVERED_PRINTER_BATCH)
+            .map(|index| (printer_input(&format!("Discovered {index}")), false))
+            .collect::<Vec<_>>();
+
+        assert!(db.create_discovered_printers(&items).is_err());
+        assert!(db.list_printers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_settings_printer_import_is_idempotent_by_id_and_preserves_edits() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let legacy = vec![
+            LegacyPrinter {
+                id: "legacy-a".into(),
+                name: "Old printer".into(),
+                bed_mm: [256.0, 256.0, 300.0],
+            },
+            LegacyPrinter {
+                id: "legacy-b".into(),
+                name: "Second printer".into(),
+                bed_mm: [200.0, 200.0, 200.0],
+            },
+        ];
+        let first = db.import_legacy_printers(&legacy).unwrap();
+        assert_eq!(first.inserted, 2);
+        assert_eq!(first.already_present, 0);
+        let edited = db
+            .update_printer("legacy-a", 1, &printer_input("Renamed by user"), None)
+            .unwrap();
+
+        let second = db.import_legacy_printers(&legacy).unwrap();
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.already_present, 2);
+        assert_eq!(db.get_printer("legacy-a").unwrap().unwrap(), edited);
+
+        let mut invalid = legacy.clone();
+        invalid[1].id = "legacy-a".into();
+        assert!(db.import_legacy_printers(&invalid).is_err());
+        assert_eq!(db.list_printers().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn legacy_settings_printer_import_accepts_5000_and_rejects_5001_atomically() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let legacy = (0..MAX_PRINTER_IMPORT_COUNT)
+            .map(|index| LegacyPrinter {
+                id: format!("legacy-boundary-{index}"),
+                name: format!("Legacy boundary printer {index}"),
+                bed_mm: [220.0, 220.0, 250.0],
+            })
+            .collect::<Vec<_>>();
+
+        let imported = db.import_legacy_printers(&legacy).unwrap();
+        assert_eq!(imported.inserted, MAX_PRINTER_IMPORT_COUNT);
+        assert_eq!(imported.already_present, 0);
+
+        let retried = db.import_legacy_printers(&legacy).unwrap();
+        assert_eq!(retried.inserted, 0);
+        assert_eq!(retried.already_present, MAX_PRINTER_IMPORT_COUNT);
+        assert_eq!(db.list_printers().unwrap().len(), MAX_PRINTER_IMPORT_COUNT);
+
+        let mut over_cap = legacy;
+        over_cap.push(LegacyPrinter {
+            id: "legacy-boundary-over-cap".into(),
+            name: "Over-cap printer".into(),
+            bed_mm: [220.0, 220.0, 250.0],
+        });
+        let error = db.import_legacy_printers(&over_cap).unwrap_err();
+        assert!(matches!(
+            error,
+            LibraryError::InvalidInput(message)
+                if message.contains("legacy printer import exceeds")
+        ));
+        assert_eq!(db.list_printers().unwrap().len(), MAX_PRINTER_IMPORT_COUNT);
+    }
+
+    #[test]
+    fn printer_status_separates_connectivity_from_job_state_and_bounds_codes() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut status_input = printer_input("Status P-1");
+        status_input.host = Some("192.0.2.20".into());
+        let printer = db.create_printer(&status_input, true).unwrap();
+        assert!(printer.endpoint_approved);
+        let checked = db
+            .record_printer_status(
+                &printer.id,
+                PrinterConnectionStatus::Online,
+                PrinterJobStatus::Printing,
+                "2026-10-14T12:00:00Z",
+                None,
+            )
+            .unwrap();
+        assert_eq!(checked.connection_status, PrinterConnectionStatus::Online);
+        assert_eq!(checked.job_status, PrinterJobStatus::Printing);
+        assert_eq!(
+            checked.last_checked_at.as_deref(),
+            Some("2026-10-14T12:00:00.000Z")
+        );
+
+        assert!(db
+            .record_printer_status(
+                &printer.id,
+                PrinterConnectionStatus::Offline,
+                PrinterJobStatus::Unknown,
+                "2026-10-14T12:01:00Z",
+                Some(&"x".repeat(65)),
+            )
+            .is_err());
+        let unchanged = db.get_printer(&printer.id).unwrap().unwrap();
+        assert_eq!(unchanged.connection_status, PrinterConnectionStatus::Online);
+        assert_eq!(unchanged.job_status, PrinterJobStatus::Printing);
+
+        let mut changed_endpoint = status_input;
+        changed_endpoint.host = Some("192.0.2.21".into());
+        let changed = db
+            .update_printer(
+                &printer.id,
+                unchanged.metadata_version,
+                &changed_endpoint,
+                None,
+            )
+            .unwrap();
+        assert!(!changed.endpoint_approved);
+        assert_eq!(changed.connection_status, PrinterConnectionStatus::Unknown);
+        assert_eq!(changed.job_status, PrinterJobStatus::Unknown);
+        assert_eq!(changed.last_checked_at, None);
+        assert!(db
+            .record_printer_status(
+                &changed.id,
+                PrinterConnectionStatus::Online,
+                PrinterJobStatus::Idle,
+                "2026-10-14T12:03:00Z",
+                None,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn printer_status_commit_rejects_an_endpoint_changed_during_the_check() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut input = printer_input("Concurrent status P-1");
+        input.host = Some("192.0.2.30".into());
+        let before_check = db.create_printer(&input, true).unwrap();
+
+        let mut replacement = input;
+        replacement.host = Some("192.0.2.31".into());
+        let changed = db
+            .update_printer(
+                &before_check.id,
+                before_check.metadata_version,
+                &replacement,
+                None,
+            )
+            .unwrap();
+        assert!(!changed.endpoint_approved);
+
+        assert!(db
+            .record_printer_status_if_current(
+                &before_check,
+                PrinterConnectionStatus::Online,
+                PrinterJobStatus::Idle,
+                "2026-10-14T12:02:00Z",
+                None,
+            )
+            .is_err());
+        let persisted = db.get_printer(&before_check.id).unwrap().unwrap();
+        assert_eq!(persisted.host.as_deref(), Some("192.0.2.31"));
+        assert_eq!(
+            persisted.connection_status,
+            PrinterConnectionStatus::Unknown
+        );
+        assert_eq!(persisted.job_status, PrinterJobStatus::Unknown);
+        assert_eq!(persisted.last_checked_at, None);
+    }
+
+    #[test]
+    fn reminder_completion_and_reschedule_are_atomic_and_write_a_maintenance_log() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let printer = db
+            .create_printer(&printer_input("Reminder P-1"), false)
+            .unwrap();
+        let reminder = db
+            .create_printer_reminder(
+                &printer.id,
+                &printer_reminder_input("2026-10-14T00:00:00Z", Some(7)),
+            )
+            .unwrap();
+
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_phase8_maintenance_log
+                 BEFORE INSERT ON printer_maintenance_logs
+                 BEGIN SELECT RAISE(ABORT,'synthetic log failure'); END;",
+            )
+            .unwrap();
+        let completion_input = PrinterReminderCompletionInput {
+            completed_at: "2026-10-14T12:00:00Z".into(),
+            notes: "Nozzle cleaned".into(),
+        };
+        assert!(db
+            .complete_printer_reminder(&reminder.id, reminder.metadata_version, &completion_input)
+            .is_err());
+        let rolled_back = db.get_printer_reminder(&reminder.id).unwrap().unwrap();
+        assert_eq!(rolled_back.metadata_version, reminder.metadata_version);
+        assert_eq!(rolled_back.due_at, reminder.due_at);
+        assert!(db
+            .list_printer_maintenance_logs(Some(&printer.id))
+            .unwrap()
+            .is_empty());
+        db.conn
+            .execute_batch("DROP TRIGGER fail_phase8_maintenance_log")
+            .unwrap();
+
+        let completion = db
+            .complete_printer_reminder(&reminder.id, reminder.metadata_version, &completion_input)
+            .unwrap();
+        assert_eq!(completion.reminder.due_at, "2026-10-21T12:00:00.000Z");
+        assert_eq!(completion.reminder.metadata_version, 2);
+        assert_eq!(
+            completion.maintenance_log.printer_nickname,
+            printer.nickname
+        );
+        assert_eq!(completion.maintenance_log.title, reminder.title);
+        assert_eq!(
+            db.list_printer_maintenance_logs(Some(&printer.id))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .complete_printer_reminder(
+                &reminder.id,
+                reminder.metadata_version,
+                &PrinterReminderCompletionInput {
+                    completed_at: "not-a-date".into(),
+                    notes: "Must roll back".into(),
+                },
+            )
+            .is_err());
+        assert_eq!(
+            db.list_printer_maintenance_logs(Some(&printer.id))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let rescheduled = db
+            .reschedule_printer_reminder(
+                &reminder.id,
+                completion.reminder.metadata_version,
+                "2026-11-01T00:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(rescheduled.due_at, "2026-11-01T00:00:00.000Z");
+        assert_eq!(rescheduled.metadata_version, 3);
+        assert!(db
+            .reschedule_printer_reminder(
+                &reminder.id,
+                completion.reminder.metadata_version,
+                "invalid"
+            )
+            .is_err());
+        assert_eq!(
+            db.list_printer_maintenance_logs(Some(&printer.id))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let edited = db
+            .update_printer_reminder(
+                &reminder.id,
+                rescheduled.metadata_version,
+                &PrinterReminderInput {
+                    title: "Nozzle inspection".into(),
+                    notes: "Updated note".into(),
+                    due_at: "2026-11-02T00:00:00Z".into(),
+                    interval_days: Some(14),
+                },
+            )
+            .unwrap();
+        assert_eq!(edited.metadata_version, 4);
+        assert_eq!(edited.title, "Nozzle inspection");
+        let paused = db
+            .set_printer_reminder_paused(&reminder.id, edited.metadata_version, true)
+            .unwrap();
+        assert_eq!(paused.status, PrinterReminderStatus::Paused);
+        let resumed = db
+            .set_printer_reminder_paused(&reminder.id, paused.metadata_version, false)
+            .unwrap();
+        assert_eq!(resumed.status, PrinterReminderStatus::Active);
+        db.delete_printer_reminder(&reminder.id, resumed.metadata_version)
+            .unwrap();
+        assert!(db.get_printer_reminder(&reminder.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn printer_maintenance_log_crud_preserves_historical_printer_snapshot() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let printer = db
+            .create_printer(&printer_input("Maintenance P-1"), false)
+            .unwrap();
+        let log = db
+            .create_printer_maintenance_log(
+                &printer.id,
+                &PrinterMaintenanceInput {
+                    title: "Replace nozzle".into(),
+                    performed_at: "2026-10-14T12:00:00Z".into(),
+                    notes: "Old nozzle removed".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(log.metadata_version, 1);
+        let updated = db
+            .update_printer_maintenance_log(
+                &log.id,
+                log.metadata_version,
+                &PrinterMaintenanceInput {
+                    title: "Replace nozzle and clean".into(),
+                    performed_at: "2026-10-15T12:00:00Z".into(),
+                    notes: "Completed".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.metadata_version, 2);
+        assert!(matches!(
+            db.update_printer_maintenance_log(
+                &log.id,
+                log.metadata_version,
+                &PrinterMaintenanceInput {
+                    title: "Stale edit".into(),
+                    performed_at: "2026-10-16T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+            ),
+            Err(LibraryError::InvalidInput(message))
+                if message.contains("changed since it was read")
+        ));
+        assert!(matches!(
+            db.delete_printer_maintenance_log(&updated.id, log.metadata_version),
+            Err(LibraryError::InvalidInput(message))
+                if message.contains("changed since it was read")
+        ));
+        db.delete_printer(&printer.id, printer.metadata_version)
+            .unwrap();
+        assert!(matches!(
+            db.update_printer_maintenance_log(
+                &updated.id,
+                updated.metadata_version,
+                &PrinterMaintenanceInput {
+                    title: "Stale after printer deletion".into(),
+                    performed_at: "2026-10-16T12:00:00Z".into(),
+                    notes: String::new(),
+                },
+            ),
+            Err(LibraryError::InvalidInput(message))
+                if message.contains("changed since it was read")
+        ));
+        assert!(matches!(
+            db.delete_printer_maintenance_log(&updated.id, updated.metadata_version),
+            Err(LibraryError::InvalidInput(message))
+                if message.contains("changed since it was read")
+        ));
+        let historical = db
+            .get_printer_maintenance_log(&updated.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.printer_id, None);
+        assert_eq!(historical.metadata_version, updated.metadata_version + 1);
+        assert_eq!(historical.printer_nickname, "Maintenance P-1");
+        assert_eq!(historical.title, "Replace nozzle and clean");
+        db.delete_printer_maintenance_log(&historical.id, historical.metadata_version)
+            .unwrap();
+        assert!(db
+            .get_printer_maintenance_log(&historical.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn printer_reminder_interval_enforces_inclusive_backend_boundaries() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let printer = db
+            .create_printer(&printer_input("Reminder boundaries P-1"), false)
+            .unwrap();
+
+        for interval_days in [1, 36_500] {
+            let reminder = db
+                .create_printer_reminder(
+                    &printer.id,
+                    &printer_reminder_input("2026-11-01T00:00:00Z", Some(interval_days)),
+                )
+                .unwrap();
+            assert_eq!(reminder.interval_days, Some(interval_days));
+        }
+        for interval_days in [0, 36_501] {
+            assert!(matches!(
+                db.create_printer_reminder(
+                    &printer.id,
+                    &printer_reminder_input("2026-11-01T00:00:00Z", Some(interval_days)),
+                ),
+                Err(LibraryError::InvalidInput(message))
+                    if message.contains("between 1 and 36500 days")
+            ));
+        }
+        assert_eq!(db.list_printer_reminders(None, true).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn imported_print_attempt_preserves_linked_historical_printer_name() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Imported linked print", None).unwrap();
+        let printer = db
+            .create_printer(&printer_input("Legacy P-1"), false)
+            .unwrap();
+        let renamed = db
+            .update_printer(
+                &printer.id,
+                printer.metadata_version,
+                &printer_input("Current P-1"),
+                None,
+            )
+            .unwrap();
+
+        let imported = db
+            .import_print_attempt_with_printer(
+                &model.id,
+                &print_attempt_input(),
+                Some("1700000000"),
+                Some(&renamed.id),
+                Some("Legacy P-1"),
+            )
+            .unwrap();
+        assert_eq!(imported.printer_id.as_deref(), Some(renamed.id.as_str()));
+        assert_eq!(imported.printer_name.as_deref(), Some("Legacy P-1"));
+        assert_eq!(imported.created_at, "1700000000");
+    }
+
+    #[test]
+    fn imported_print_attempt_allows_an_unlinked_printer_name_snapshot() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Imported unlinked print", None).unwrap();
+        let imported = db
+            .import_print_attempt_with_printer(
+                &model.id,
+                &print_attempt_input(),
+                None,
+                None,
+                Some("Unmapped legacy printer"),
+            )
+            .unwrap();
+        assert_eq!(imported.printer_id, None);
+        assert_eq!(
+            imported.printer_name.as_deref(),
+            Some("Unmapped legacy printer")
+        );
+        assert!(!imported.created_at.is_empty());
+    }
+
+    #[test]
+    fn imported_print_attempt_rejects_an_unmapped_local_printer_id() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Imported invalid link", None).unwrap();
+        assert!(db
+            .import_print_attempt_with_printer(
+                &model.id,
+                &print_attempt_input(),
+                None,
+                Some("external-printer-ref"),
+                Some("Source nickname"),
+            )
+            .is_err());
+        assert!(db.list_print_attempts(&model.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn print_attempt_printer_patch_preserves_clears_and_snapshots_attribution() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Printer attribution", None).unwrap();
+        let printer = db
+            .create_printer(&printer_input("Snapshot P-1"), false)
+            .unwrap();
+        let create: PrintAttemptInputWithPrinter = serde_json::from_value(serde_json::json!({
+            "printed_at": "2026-10-14T12:00:00Z",
+            "quantity": 1,
+            "notes": "Initial",
+            "filament_ids": [],
+            "outcome": "printed",
+            "printer_id": printer.id
+        }))
+        .unwrap();
+        let attempt = db
+            .create_print_attempt_with_printer(&model.id, &create)
+            .unwrap();
+        assert_eq!(attempt.printer_id.as_deref(), Some(printer.id.as_str()));
+        assert_eq!(attempt.printer_name.as_deref(), Some("Snapshot P-1"));
+
+        let omitted: PrintAttemptInputWithPrinter = serde_json::from_value(serde_json::json!({
+            "printed_at": "2026-10-14T12:00:00Z",
+            "quantity": 2,
+            "notes": "Updated without attribution key",
+            "filament_ids": [],
+            "outcome": "printed"
+        }))
+        .unwrap();
+        let preserved = db
+            .update_print_attempt_with_printer(&attempt.id, &omitted)
+            .unwrap();
+        assert_eq!(preserved.printer_id.as_deref(), Some(printer.id.as_str()));
+        assert_eq!(preserved.printer_name.as_deref(), Some("Snapshot P-1"));
+
+        let cleared: PrintAttemptInputWithPrinter = serde_json::from_value(serde_json::json!({
+            "printed_at": "2026-10-14T12:00:00Z",
+            "quantity": 2,
+            "notes": "Explicit null clears",
+            "filament_ids": [],
+            "outcome": "printed",
+            "printer_id": null
+        }))
+        .unwrap();
+        let cleared = db
+            .update_print_attempt_with_printer(&attempt.id, &cleared)
+            .unwrap();
+        assert_eq!(cleared.printer_id, None);
+        assert_eq!(cleared.printer_name, None);
+
+        let linked_again = db
+            .update_print_attempt_with_printer(&attempt.id, &create)
+            .unwrap();
+        db.delete_printer(&printer.id, printer.metadata_version)
+            .unwrap();
+        let after_delete = db.get_print_attempt(&attempt.id).unwrap().unwrap();
+        assert_eq!(after_delete.printer_id, None);
+        assert_eq!(after_delete.printer_name.as_deref(), Some("Snapshot P-1"));
+        assert_eq!(linked_again.printer_name.as_deref(), Some("Snapshot P-1"));
     }
 }

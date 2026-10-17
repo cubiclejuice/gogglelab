@@ -6,6 +6,8 @@ export interface HostCapabilities {
   features: {
     revealSource: boolean;
     trashSource: boolean;
+    purgeCatalog: boolean;
+    cleanupOrphans: boolean;
     launchSlicer: boolean;
     downloadSource: boolean;
     downloadBundle: boolean;
@@ -207,16 +209,50 @@ export interface BrowserFilament extends BrowserFilamentInput {
   archived: boolean;
   sourceMissing: boolean;
 }
+export interface BrowserPartStockInput {
+  name: string;
+  category: string | null;
+  quantity: number;
+  unit: string;
+  notes: string;
+  lowStock: number;
+}
+export interface BrowserPartStock extends Omit<BrowserPartStockInput, "quantity" | "lowStock"> {
+  id: string;
+  /** Decimal wire integers avoid precision loss for Rust u64 inventory. */
+  quantity: string;
+  lowStock: string;
+  metadataVersion: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+export interface BrowserPrintAttemptPartInput {
+  id: string;
+  quantity: number;
+}
+export interface BrowserPrintAttemptPart {
+  id: string | null;
+  name: string;
+  category: string | null;
+  unit: string;
+  quantityPerCopy: number;
+  quantity: number;
+}
 export interface BrowserPrintAttemptInput {
   printedAt: string;
   quantity: number;
   notes: string;
   filamentIds: string[];
-  outcome: "printed" | "failed";
+  outcome: "printed" | "failed" | "cancelled";
+  /** Optional for older clients and payloads. */
+  parts?: BrowserPrintAttemptPartInput[];
 }
-export interface BrowserPrintAttempt extends BrowserPrintAttemptInput {
+export interface BrowserPrintAttempt extends Omit<BrowserPrintAttemptInput, "parts"> {
   id: string;
   modelId: string;
+  parts?: BrowserPrintAttemptPart[];
+  /** Null marks legacy part usage whose effect on stock cannot be reconstructed. */
+  stockAdjusted?: boolean | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -266,6 +302,20 @@ export interface BrowserRootHandle {
   catalogRootId: string | null;
   label: string;
   access: "readOnly" | "writable" | "backupOnly" | "inbox";
+}
+export function managementActionAvailability(
+  features:
+    | Pick<HostCapabilities["features"], "trashSource" | "purgeCatalog" | "cleanupOrphans">
+    | null
+    | undefined,
+  roots: readonly BrowserRootHandle[],
+): { physicalSource: boolean; purgeCatalog: boolean; cleanupOrphans: boolean } {
+  return {
+    physicalSource: features?.trashSource === true,
+    purgeCatalog:
+      features?.purgeCatalog === true && roots.some((root) => root.access === "backupOnly"),
+    cleanupOrphans: features?.cleanupOrphans === true,
+  };
 }
 export interface BrowserScanStatus {
   running: boolean;
@@ -363,8 +413,13 @@ export type ManagementAction =
       destinationHandleId: string;
       fileName: string;
     }
-  | { kind: "purgeCatalog"; backupDestinationHandleId: string; backupFileName: string }
-  | { kind: "cleanupOrphans" };
+  | {
+      kind: "purgeCatalog";
+      backupDestinationHandleId: string;
+      backupFileName: string;
+      confirm: true;
+    }
+  | { kind: "cleanupOrphans"; confirm: true };
 export interface ActionPlan {
   token: string;
   actionKind: string;
@@ -373,6 +428,15 @@ export interface ActionPlan {
   catalogRevision: string;
   targets: Array<{ modelId: string; metadataVersion: string; contentHash: string | null }>;
   impact: string[];
+}
+export interface SourceHoldReceipt {
+  modelId: string;
+  rootHandleId: string;
+  relativePath: string;
+  holdName: string;
+  journalName: string;
+  bytes: string;
+  sha256: string;
 }
 export type ManagementResult =
   | { kind: "removed"; snapshotId: string; removedIds: string[] }
@@ -393,9 +457,22 @@ export type ManagementResult =
       models: number;
       bytes: string;
     }
-  | { kind: "quarantined"; snapshotId: string; modelId: string }
+  | {
+      kind: "quarantined";
+      snapshotId: string;
+      modelId: string;
+      sourceHolds: SourceHoldReceipt[];
+    }
+  | {
+      kind: "quarantinedMany";
+      snapshotId: string;
+      models: string[];
+      sourceHolds: SourceHoldReceipt[];
+    }
   | { kind: "quarantineUndone"; model: MutationVersion }
-  | { kind: "moved"; model: MutationVersion }
+  | { kind: "quarantineUndoneMany"; models: MutationVersion[] }
+  | { kind: "moved"; model: MutationVersion; sourceHolds: SourceHoldReceipt[] }
+  | { kind: "movedMany"; models: MutationVersion[]; sourceHolds: SourceHoldReceipt[] }
   | {
       kind: "purged";
       backupDestinationHandleId: string;
@@ -465,6 +542,7 @@ export class LibraryHttpError extends Error {
     readonly requestId: string,
     readonly retryable: boolean,
     readonly currentVersion?: string,
+    readonly sourceHolds: SourceHoldReceipt[] = [],
   ) {
     super(message);
   }
@@ -646,6 +724,15 @@ export interface LibraryClient {
     expectedVersion: string,
     signal?: AbortSignal,
   ): Promise<BrowserFilament | null>;
+  listPartStock(signal?: AbortSignal): Promise<BrowserPartStock[]>;
+  createPartStock(input: BrowserPartStockInput, signal?: AbortSignal): Promise<BrowserPartStock>;
+  updatePartStock(
+    id: string,
+    expectedVersion: string,
+    input: BrowserPartStockInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserPartStock>;
+  deletePartStock(id: string, expectedVersion: string, signal?: AbortSignal): Promise<void>;
   assignFilaments(
     assignments: Array<{ target: VersionedTarget; filamentIds: string[] }>,
     signal?: AbortSignal,
@@ -1165,6 +1252,38 @@ export class HttpLibraryClient implements LibraryClient {
       signal,
     });
   }
+  listPartStock(signal?: AbortSignal): Promise<BrowserPartStock[]> {
+    return this.json("/api/v1/parts", { signal });
+  }
+  createPartStock(input: BrowserPartStockInput, signal?: AbortSignal): Promise<BrowserPartStock> {
+    return this.json("/api/v1/parts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+  }
+  updatePartStock(
+    id: string,
+    expectedVersion: string,
+    input: BrowserPartStockInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserPartStock> {
+    return this.json(`/api/v1/parts/${segment(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, input }),
+      signal,
+    });
+  }
+  deletePartStock(id: string, expectedVersion: string, signal?: AbortSignal): Promise<void> {
+    return this.json(`/api/v1/parts/${segment(id)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion }),
+      signal,
+    });
+  }
   listHistory(modelId: string, signal?: AbortSignal): Promise<BrowserPrintAttempt[]> {
     return this.json(`/api/v1/models/${segment(modelId)}/history`, { signal });
   }
@@ -1398,6 +1517,7 @@ export class HttpLibraryClient implements LibraryClient {
         requestId?: string;
         retryable?: boolean;
         currentVersion?: string;
+        sourceHolds?: SourceHoldReceipt[];
       };
     } | null;
     throw new LibraryHttpError(
@@ -1406,6 +1526,7 @@ export class HttpLibraryClient implements LibraryClient {
       body?.error?.requestId ?? response.headers.get("x-request-id") ?? "unknown",
       body?.error?.retryable ?? false,
       body?.error?.currentVersion,
+      body?.error?.sourceHolds ?? [],
     );
   }
 }

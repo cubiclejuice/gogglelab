@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -7,6 +8,8 @@ use std::sync::Mutex;
 use image::{ImageDecoder, ImageFormat, ImageReader, Limits};
 use quick_xml::{events::Event, Reader};
 use sha2::{Digest, Sha256};
+
+use crate::secure_fs::Directory;
 
 const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 4096;
@@ -100,35 +103,40 @@ pub fn import_custom_image_file(root: &Path, path: &Path) -> Result<(PathBuf, St
 }
 
 pub fn store_png(root: &Path, relative: &Path, png: &[u8], hash: &str) -> Result<(), String> {
+    store_png_with_publish_hook(root, relative, png, hash, || {})
+}
+
+fn store_png_with_publish_hook<F>(
+    root: &Path,
+    relative: &Path,
+    png: &[u8],
+    hash: &str,
+    after_staging: F,
+) -> Result<(), String>
+where
+    F: FnOnce(),
+{
     if root.canonicalize().map_err(|error| error.to_string())? != root {
         return Err("Library root identity changed".into());
     }
-    let parent = root.join("thumbnails");
-    let directory = fs::symlink_metadata(&parent).map_err(|error| error.to_string())?;
-    if !directory.is_dir()
-        || directory.file_type().is_symlink()
-        || parent.canonicalize().map_err(|error| error.to_string())? != parent
-    {
-        return Err("Preview directory is not an owned ordinary directory".into());
+    if format!("{:x}", Sha256::digest(png)) != hash {
+        return Err("Custom preview bytes do not match their content hash".into());
     }
+    let expected_relative = PathBuf::from("thumbnails").join(format!("custom-{hash}.png"));
+    if relative != expected_relative {
+        return Err("Custom preview path does not match its content hash".into());
+    }
+    let root_directory = Directory::open(root).map_err(|error| error.to_string())?;
+    let directory = root_directory
+        .open_child(OsStr::new("thumbnails"))
+        .map_err(|_| "Preview directory is not an owned ordinary directory")?;
     let output = root.join(relative);
-    match fs::symlink_metadata(&output) {
-        Ok(metadata) => {
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() > MAX_OUTPUT_BYTES as u64
-            {
-                return Err("Custom preview cache entry is unsafe".into());
-            }
-            let mut bytes = Vec::new();
-            fs::File::open(&output)
-                .map_err(|error| error.to_string())?
-                .take(MAX_OUTPUT_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|error| error.to_string())?;
-            if bytes.len() > MAX_OUTPUT_BYTES {
-                return Err("Custom preview cache grew beyond its limit".into());
-            }
+    let output_name = output
+        .file_name()
+        .ok_or_else(|| "Custom preview filename is invalid".to_string())?;
+    match directory.open_file(output_name) {
+        Ok(file) => {
+            let bytes = read_bounded_file(file, MAX_OUTPUT_BYTES as u64)?;
             if format!("{:x}", Sha256::digest(&bytes)) != hash {
                 return Err("Custom preview cache entry failed its hash check".into());
             }
@@ -137,26 +145,65 @@ pub fn store_png(root: &Path, relative: &Path, png: &[u8], hash: &str) -> Result
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let staging = parent.join(format!(
+    let staging_name = OsString::from(format!(
         ".custom-{}-{}.part",
         std::process::id(),
         FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-            .map_err(|error| error.to_string())?;
-        file.write_all(png).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        drop(file);
-        // A hard link publishes without replacing any existing cache entry.
-        fs::hard_link(&staging, &output).map_err(|error| error.to_string())?;
-        Ok(())
-    })();
-    let _ = fs::remove_file(&staging);
-    result
+    let mut file = directory
+        .create_new_file(&staging_name)
+        .map_err(|error| error.to_string())?;
+    let write_result = file.write_all(png).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = directory.hold_entry(&staging_name);
+        return Err(error.to_string());
+    }
+    after_staging();
+    if let Err(error) = directory.rename_child_exclusive(&staging_name, output_name) {
+        let _ = directory.hold_entry(&staging_name);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            let file = directory
+                .open_file(output_name)
+                .map_err(|open_error| open_error.to_string())?;
+            let existing = read_bounded_file(file, MAX_OUTPUT_BYTES as u64)?;
+            if format!("{:x}", Sha256::digest(&existing)) == hash {
+                return Ok(());
+            }
+            return Err("Custom preview cache entry failed its hash check".into());
+        }
+        return Err(error.to_string());
+    }
+    let published = match directory.open_file(output_name) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = directory.hold_entry(output_name);
+            return Err(error.to_string());
+        }
+    };
+    let published_bytes = match read_bounded_file(published, MAX_OUTPUT_BYTES as u64) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = directory.hold_entry(output_name);
+            return Err(error);
+        }
+    };
+    if format!("{:x}", Sha256::digest(&published_bytes)) != hash {
+        let _ = directory.hold_entry(output_name);
+        return Err("Published custom preview failed its content hash check".into());
+    }
+    Ok(())
+}
+
+fn read_bounded_file(file: fs::File, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err("Custom preview cache grew beyond its limit".into());
+    }
+    Ok(bytes)
 }
 
 /// Package thumbnails stay inside the ZIP. No external relationships or paths
@@ -212,12 +259,12 @@ pub fn embedded_3mf_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
                         b"1.0" => quick_xml::XmlVersion::Explicit1_0,
                         b"1.1" => quick_xml::XmlVersion::Explicit1_1,
                         _ => {
-                            return Err("Unsupported XML version in thumbnail relationships".into())
+                            return Err("Unsupported XML version in thumbnail relationships".into());
                         }
                     };
                 }
                 Event::DocType(_) => {
-                    return Err("3MF thumbnail relationships cannot contain a DTD".into())
+                    return Err("3MF thumbnail relationships cannot contain a DTD".into());
                 }
                 Event::Eof => break,
                 _ => {}
@@ -333,6 +380,60 @@ mod tests {
         assert!(normalize_image(&vec![0; 16 * 1024 * 1024 + 1]).is_err());
         assert!(normalize_image(&png(4097, 1)).is_err());
         assert!(normalize_image(&png(2049, 2049)).is_err());
+    }
+
+    #[test]
+    fn custom_cache_rejects_a_hash_that_does_not_match_the_published_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("thumbnails")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let bytes = png(8, 8);
+        let relative = PathBuf::from(format!("thumbnails/custom-{}.png", "0".repeat(64)));
+
+        assert!(store_png(&root, &relative, &bytes, &"0".repeat(64)).is_err());
+        assert_eq!(fs::read_dir(root.join("thumbnails")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn custom_cache_verifies_and_holds_bytes_replaced_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("thumbnails")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let bytes = png(8, 8);
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let relative = PathBuf::from(format!("thumbnails/custom-{hash}.png"));
+        let replacement = b"concurrent replacement bytes";
+        let staging_directory = root.join("thumbnails");
+
+        let result = store_png_with_publish_hook(&root, &relative, &bytes, &hash, || {
+            let staging = fs::read_dir(&staging_directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .unwrap()
+                .path();
+            fs::remove_file(&staging).unwrap();
+            fs::write(staging, replacement).unwrap();
+        });
+
+        assert!(result.is_err());
+        assert!(!root.join(&relative).exists());
+        let held = fs::read_dir(staging_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gogglelab-held-")
+                    && entry.file_name().to_string_lossy().ends_with(".data")
+            })
+            .find(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == replacement));
+        assert!(held.is_some(), "the raced bytes must remain recoverable");
     }
 
     fn jpeg(width: u32, height: u32) -> Vec<u8> {

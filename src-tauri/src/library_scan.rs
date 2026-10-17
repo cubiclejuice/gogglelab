@@ -16,8 +16,16 @@ use library_runtime::scanner::{is_model_path, modified_nanos, root_should_scan, 
 pub use library_runtime::scanner::{LibraryScanStatus, ScanControl};
 
 pub fn start_background_scanner(app: tauri::AppHandle) {
-    let runtime = app.state::<LibraryState>().runtime().clone();
-    library_runtime::scanner::start_background_scanner(&runtime);
+    start_background_scanner_if_allowed(crate::visual_qa::active(), || {
+        let runtime = app.state::<LibraryState>().runtime().clone();
+        library_runtime::scanner::start_background_scanner(&runtime);
+    });
+}
+
+fn start_background_scanner_if_allowed(visual_qa: bool, start: impl FnOnce()) {
+    if !visual_qa {
+        start();
+    }
 }
 
 pub(crate) fn start_manual_scan(
@@ -50,6 +58,14 @@ mod tests {
     use std::time::Duration;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn visual_qa_skips_background_scanner_before_runtime_access() {
+        start_background_scanner_if_allowed(true, || panic!("QA must not start the scanner"));
+        let mut started = false;
+        start_background_scanner_if_allowed(false, || started = true);
+        assert!(started);
+    }
 
     fn temp_root(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
