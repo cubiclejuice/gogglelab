@@ -1,8 +1,12 @@
-import type { DesktopLibraryServerStatus } from "./ipc";
+import type { DesktopLibraryServerStatus, DesktopPrinterNetworkPolicy } from "./ipc";
+import { DesktopPrinterNetworkSettings } from "./desktop-printer-network-settings";
 
 export interface LibraryServerSettingsCallbacks {
   status(): Promise<DesktopLibraryServerStatus>;
-  start(allowExternalIntegrations: boolean): Promise<DesktopLibraryServerStatus>;
+  start(
+    allowExternalIntegrations: boolean,
+    printerNetwork: DesktopPrinterNetworkPolicy | null,
+  ): Promise<DesktopLibraryServerStatus>;
   stop(): Promise<DesktopLibraryServerStatus>;
   revealAccessKey(): Promise<{ accessKey: string }>;
 }
@@ -66,8 +70,13 @@ export class LibraryServerSettingsSection {
   private allowExternalIntegrations = false;
   private hasPendingExternalIntegrationChoice = false;
   private request = 0;
+  private mutationPending = false;
+  private readonly printerNetwork: DesktopPrinterNetworkSettings;
 
   constructor(private readonly callbacks: LibraryServerSettingsCallbacks) {
+    this.printerNetwork = new DesktopPrinterNetworkSettings((policy) =>
+      this.applyPrinterNetwork(policy),
+    );
     this.element = document.createElement("fieldset");
     this.element.className = "settings-section library-server-settings";
     const legend = document.createElement("legend");
@@ -130,6 +139,7 @@ export class LibraryServerSettingsSection {
       this.integrationStatus,
       networkLabel,
       networkHint,
+      this.printerNetwork.element,
       this.action,
       this.reveal,
       this.key,
@@ -142,11 +152,14 @@ export class LibraryServerSettingsSection {
   }
 
   async refresh(): Promise<void> {
+    // A read cannot supersede the authoritative result of an in-flight policy write.
+    if (this.mutationPending) return;
     const request = ++this.request;
     try {
       const status = await this.callbacks.status();
       if (request !== this.request) return;
       this.status = status;
+      this.printerNetwork.sync(status);
       this.allowExternalIntegrations = libraryServerExternalIntegrationChoice(
         status,
         this.allowExternalIntegrations,
@@ -162,22 +175,32 @@ export class LibraryServerSettingsSection {
   }
 
   private async toggle(): Promise<void> {
-    const request = ++this.request;
+    if (this.mutationPending) return;
+    this.mutationPending = true;
+    this.request += 1;
     this.action.disabled = true;
+    this.allowExternalInput.disabled = true;
+    this.printerNetwork.setBusy(true);
     this.error.textContent = "";
     try {
       const status = this.status.running
         ? await this.callbacks.stop()
-        : await this.callbacks.start(this.allowExternalIntegrations);
-      if (request !== this.request) return;
+        : await this.callbacks.start(
+            this.allowExternalIntegrations,
+            this.printerNetwork.draftPolicy(),
+          );
       this.status = status;
+      this.printerNetwork.sync(status, true);
       this.allowExternalIntegrations = status.running && status.allowExternalIntegrations;
       this.hasPendingExternalIntegrationChoice = false;
       this.render();
     } catch (error) {
-      if (request === this.request) this.showError(error);
+      this.showError(error);
     } finally {
-      if (request === this.request) this.action.disabled = false;
+      this.mutationPending = false;
+      this.action.disabled = false;
+      this.allowExternalInput.disabled = false;
+      this.printerNetwork.setBusy(false);
     }
   }
 
@@ -196,8 +219,9 @@ export class LibraryServerSettingsSection {
   }
 
   private async updateExternalIntegrations(): Promise<void> {
+    if (this.mutationPending) return;
     const allowExternalIntegrations = this.allowExternalInput.checked;
-    const request = ++this.request;
+    this.request += 1;
     this.error.textContent = "";
     if (!this.status.running) {
       this.allowExternalIntegrations = allowExternalIntegrations;
@@ -205,22 +229,53 @@ export class LibraryServerSettingsSection {
       this.render();
       return;
     }
+    this.mutationPending = true;
     this.allowExternalInput.disabled = true;
+    this.action.disabled = true;
+    this.printerNetwork.setBusy(true);
     try {
-      const status = await this.callbacks.start(allowExternalIntegrations);
-      if (request !== this.request) return;
+      // Preserve only the currently applied printer permission, never an unapplied draft.
+      const status = await this.callbacks.start(
+        allowExternalIntegrations,
+        this.status.printerNetwork ?? null,
+      );
       this.status = status;
+      this.printerNetwork.sync(status);
       this.allowExternalIntegrations = status.running && status.allowExternalIntegrations;
       this.hasPendingExternalIntegrationChoice = false;
       this.render();
     } catch (error) {
-      if (request === this.request) {
-        this.allowExternalIntegrations = this.status.allowExternalIntegrations;
-        this.render();
-        this.showError(error);
-      }
+      this.allowExternalIntegrations = this.status.allowExternalIntegrations;
+      this.render();
+      this.showError(error);
     } finally {
-      if (request === this.request) this.allowExternalInput.disabled = false;
+      this.mutationPending = false;
+      this.allowExternalInput.disabled = false;
+      this.action.disabled = false;
+      this.printerNetwork.setBusy(false);
+    }
+  }
+
+  private async applyPrinterNetwork(policy: DesktopPrinterNetworkPolicy | null): Promise<void> {
+    if (!this.status.running || this.mutationPending) return;
+    this.mutationPending = true;
+    this.request += 1;
+    this.action.disabled = true;
+    this.allowExternalInput.disabled = true;
+    this.error.textContent = "";
+    try {
+      const status = await this.callbacks.start(this.status.allowExternalIntegrations, policy);
+      this.status = status;
+      this.printerNetwork.sync(status, true);
+      this.allowExternalIntegrations = status.running && status.allowExternalIntegrations;
+      this.render();
+    } catch (error) {
+      this.showError(error);
+      throw error;
+    } finally {
+      this.mutationPending = false;
+      this.action.disabled = false;
+      this.allowExternalInput.disabled = false;
     }
   }
 

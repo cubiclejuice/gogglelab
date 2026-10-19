@@ -191,6 +191,27 @@ While that synthetic listener is running, connect the browser client with its te
 
 LAN/Docker networking, live printers, MCP source-mutation clients, and provider calls need separate exact authorization and are otherwise `NOT-RUN`. Loopback success does not prove them.
 
+With the matching approved source-build lane, optional printer-network browser QA
+can use the deliberately fake example below. Its output directory must not exist.
+It binds only `127.0.0.1:3847`, installs a static synthetic backend before admitting
+policy, and cannot contact printers. The printed fixture key is public test data.
+
+```powershell
+$fixture = Join-Path $env:TEMP ('GoggleLab-Fake-Network-' + [guid]::NewGuid().ToString('N'))
+cargo run -p library-server --example printer_network_fixture --locked -- $fixture
+```
+
+Open the printed localhost URL and use its fixture-only key. Review scope
+`10.250.0.10/32`, then separately Start. Save the returned Synthetic Moonraker as an
+unapproved profile; approve its displayed endpoint, then explicitly check status.
+For the fake Carbon consent flow, create make `Elegoo`, model `Centauri Carbon`,
+host `10.250.0.11`; approve it, verify status stays disabled until its separate
+broadcast checkbox is selected, then confirm one fake check. Expect synthetic
+online/printing. Test a second discovery cancellation and browser disconnect/key
+clearing. Stop with Ctrl+C and retain the printed synthetic operation counts.
+These results prove guarded UI/API behavior only, never Windows printer hardware
+compatibility. A fixture failure is `BLOCKED`; do not remove a guard to proceed.
+
 ## 9. Uninstall, second installer, and cleanup
 
 With approval, uninstall through Windows' supported interface. Verify application/shortcuts are removed and synthetic source files remain unchanged. Record whether synthetic app data persists; do not manually erase it. Test reinstall/data retention within that lane if desired, then use a separate clean snapshot/account for the other installer.

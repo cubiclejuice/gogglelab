@@ -10,7 +10,7 @@ use library_server::{
     AllowedAuthority, AllowedOrigin, EngineError, HostMode, HostSlicerAdapter, HostSlicerSummary,
     ProtocolEngineAdapter, SecurityConfig, ServerHandle,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -314,6 +314,34 @@ struct RunningServer {
     address: SocketAddr,
     allow_external_integrations: bool,
     integration_transport: Arc<library_runtime::integrations::RuntimeIntegrationTransport>,
+    printer_network: Option<DesktopPrinterNetworkPolicy>,
+    printer_runtime: Arc<library_runtime::LibraryRuntime>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopPrinterNetworkPolicy {
+    allowed_scopes: Vec<String>,
+    #[serde(default)]
+    allow_multicast_discovery: bool,
+    #[serde(default)]
+    allow_carbon_broadcast: bool,
+}
+
+pub(crate) fn prepare_printer_network(
+    policy: Option<&DesktopPrinterNetworkPolicy>,
+) -> Result<Option<library_runtime::printer_network_api::PrinterNetworkPolicy>, AppError> {
+    policy
+        .map(|policy| {
+            crate::visual_qa::require_printer_network()?;
+            library_runtime::printer_network_api::PrinterNetworkPolicy::new(
+                policy.allowed_scopes.clone(),
+                policy.allow_multicast_discovery,
+                policy.allow_carbon_broadcast,
+            )
+            .map_err(|error| server_error(error.to_string()))
+        })
+        .transpose()
 }
 
 impl DesktopServerState {
@@ -334,6 +362,7 @@ pub struct DesktopServerStatus {
     pub base_url: Option<String>,
     pub mcp_url: Option<String>,
     pub allow_external_integrations: bool,
+    pub printer_network: Option<DesktopPrinterNetworkPolicy>,
 }
 
 #[tauri::command]
@@ -342,12 +371,14 @@ pub async fn library_server_start(
     server: State<'_, DesktopServerState>,
     port: Option<u16>,
     allow_external_integrations: Option<bool>,
+    printer_network: Option<DesktopPrinterNetworkPolicy>,
 ) -> Result<DesktopServerStatus, AppError> {
     start_impl(
         &library,
         &server,
         port,
         allow_external_integrations.unwrap_or(false),
+        printer_network,
     )
     .await
 }
@@ -357,16 +388,25 @@ async fn start_impl(
     server: &DesktopServerState,
     port: Option<u16>,
     allow_external_integrations: bool,
+    printer_network: Option<DesktopPrinterNetworkPolicy>,
 ) -> Result<DesktopServerStatus, AppError> {
+    // This operator setting validates without I/O. Isolated QA cannot install it.
+    let prepared_printer_network = prepare_printer_network(printer_network.as_ref())?;
     let mut running = server.running.lock().await;
     if let Some(current) = running.as_mut() {
+        current
+            .printer_runtime
+            .configure_printer_network(prepared_printer_network)
+            .map_err(|error| server_error(error.to_string()))?;
         current
             .integration_transport
             .set_allow_network(allow_external_integrations);
         current.allow_external_integrations = allow_external_integrations;
-        return Ok(status_for(
+        current.printer_network = printer_network;
+        return Ok(status_with_printer_policy(
             Some(current.address),
             current.allow_external_integrations,
+            current.printer_network.clone(),
         ));
     }
     let port = port.unwrap_or(DEFAULT_DESKTOP_SERVER_PORT);
@@ -450,13 +490,28 @@ async fn start_impl(
             return Err(server_error(error));
         }
     };
+    if let Err(error) = library
+        .runtime()
+        .configure_printer_network(prepared_printer_network)
+    {
+        integration_transport.set_allow_network(false);
+        let _ = handle.stop().await;
+        return Err(server_error(error.to_string()));
+    }
+    let status = status_with_printer_policy(
+        Some(address),
+        allow_external_integrations,
+        printer_network.clone(),
+    );
     *running = Some(RunningServer {
         handle,
         address,
         allow_external_integrations,
         integration_transport,
+        printer_network,
+        printer_runtime: Arc::clone(library.runtime()),
     });
-    Ok(status_for(Some(address), allow_external_integrations))
+    Ok(status)
 }
 
 #[tauri::command]
@@ -467,10 +522,15 @@ pub async fn library_server_stop(
 }
 
 async fn stop_impl(server: &DesktopServerState) -> Result<DesktopServerStatus, AppError> {
-    let current = server.running.lock().await.take();
+    // Serialize stop with a new start, including revocation and listener shutdown.
+    let mut running = server.running.lock().await;
+    let current = running.take();
     if let Some(current) = current {
         current.integration_transport.set_allow_network(false);
-        current.handle.stop().await.map_err(server_error)?;
+        let revoked = current.printer_runtime.configure_printer_network(None);
+        let stopped = current.handle.stop().await;
+        revoked.map_err(|error| server_error(error.to_string()))?;
+        stopped.map_err(server_error)?;
     }
     Ok(status_for(None, false))
 }
@@ -481,7 +541,11 @@ pub async fn library_server_status(
 ) -> Result<DesktopServerStatus, AppError> {
     let running = server.running.lock().await;
     Ok(match running.as_ref() {
-        Some(value) => status_for(Some(value.address), value.allow_external_integrations),
+        Some(value) => status_with_printer_policy(
+            Some(value.address),
+            value.allow_external_integrations,
+            value.printer_network.clone(),
+        ),
         None => status_for(None, false),
     })
 }
@@ -513,6 +577,7 @@ fn desktop_capabilities() -> BTreeSet<Capability> {
         Capability::Maintenance,
         Capability::HostPaths,
         Capability::HostSlicer,
+        Capability::PrinterNetwork,
     ])
 }
 
@@ -520,12 +585,21 @@ fn status_for(
     address: Option<SocketAddr>,
     allow_external_integrations: bool,
 ) -> DesktopServerStatus {
+    status_with_printer_policy(address, allow_external_integrations, None)
+}
+
+fn status_with_printer_policy(
+    address: Option<SocketAddr>,
+    allow_external_integrations: bool,
+    printer_network: Option<DesktopPrinterNetworkPolicy>,
+) -> DesktopServerStatus {
     let running = address.is_some();
     DesktopServerStatus {
         running,
         base_url: address.map(|address| format!("http://{address}")),
         mcp_url: address.map(|address| format!("http://{address}/mcp")),
         allow_external_integrations: running && allow_external_integrations,
+        printer_network: if running { printer_network } else { None },
     }
 }
 
@@ -555,6 +629,36 @@ mod tests {
         let address: SocketAddr = "127.0.0.1:3745".parse().unwrap();
         assert!(status_for(Some(address), true).allow_external_integrations);
         assert!(!status_for(None, true).allow_external_integrations);
+    }
+
+    #[test]
+    fn stopped_server_explicitly_reports_printer_network_access_off() {
+        let json = serde_json::to_value(status_for(None, false)).unwrap();
+        assert_eq!(json.get("printerNetwork"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn printer_policy_datagram_defaults_are_independent_and_stop_discards_policy() {
+        let mut value = serde_json::json!({"allowedScopes":["10.250.0.1/32"]});
+        let policy: DesktopPrinterNetworkPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert!(!policy.allow_multicast_discovery);
+        assert!(!policy.allow_carbon_broadcast);
+        assert!(prepare_printer_network(None).unwrap().is_none());
+        let address: SocketAddr = "127.0.0.1:3745".parse().unwrap();
+        assert!(
+            status_with_printer_policy(Some(address), false, Some(policy.clone()))
+                .printer_network
+                .is_some()
+        );
+        assert!(status_with_printer_policy(None, true, Some(policy))
+            .printer_network
+            .is_none());
+        value["allowMulticastDiscovery"] = serde_json::json!(true);
+        let policy: DesktopPrinterNetworkPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert!(policy.allow_multicast_discovery);
+        assert!(!policy.allow_carbon_broadcast);
+        value["allowBroadcast"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DesktopPrinterNetworkPolicy>(value).is_err());
     }
 
     #[test]

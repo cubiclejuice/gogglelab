@@ -2257,6 +2257,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http",
  "image",
+ "library-core",
  "library-protocol",
  "library-runtime",
  "rmcp",

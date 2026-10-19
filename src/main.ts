@@ -462,7 +462,8 @@ export function startApp(extensions: AppExtensions): void {
   settingsPanel.addExtensionSection(extensions.createSettingsSection?.() ?? null);
   const libraryServerSettings = new LibraryServerSettingsSection({
     status: libraryServerStatus,
-    start: (allowExternalIntegrations) => libraryServerStart(undefined, allowExternalIntegrations),
+    start: (allowExternalIntegrations, printerNetwork) =>
+      libraryServerStart(undefined, allowExternalIntegrations, printerNetwork),
     stop: libraryServerStop,
     revealAccessKey: libraryServerRevealAccessKey,
   });

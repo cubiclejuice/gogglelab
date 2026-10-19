@@ -845,3 +845,50 @@ test("history printer assignment supports explicit clear and omitted preservatio
     globalThis.fetch = original;
   }
 });
+
+test("printer network client keeps explicit review confirmation and version precision", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  await expect(client.getPrinterNetworkPolicy()).rejects.toBeInstanceOf(LibraryHttpError);
+  client.setToken("token");
+  const original = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({
+      url: String(url),
+      method: init.method ?? "GET",
+      body: init.body ? JSON.parse(init.body) : null,
+    });
+    return Response.json({});
+  };
+  try {
+    await client.getPrinterNetworkPolicy();
+    await client.planPrinterDiscovery("10.7.8.1-10.7.8.2", true);
+    await client.startPrinterDiscovery("plan-secret", true);
+    await client.getPrinterDiscovery("job/id");
+    await client.cancelPrinterDiscovery("job/id");
+    await client.setPrinterEndpointApproval("printer/id", "18446744073709551614", true);
+    await client.testPrinterConnection("printer/id", "18446744073709551614", true, true);
+    expect(requests.map((item) => item.method)).toEqual([
+      "GET",
+      "POST",
+      "POST",
+      "GET",
+      "DELETE",
+      "PUT",
+      "POST",
+    ]);
+    expect(requests[0].url).toEndWith("/api/v1/printer-network/policy");
+    expect(requests[1].body).toEqual({ range: "10.7.8.1-10.7.8.2", includeBambuDiscovery: true });
+    expect(requests[2].body).toEqual({ planToken: "plan-secret", confirm: true });
+    expect(requests[3].url).toEndWith("/api/v1/printer-network/discovery-jobs/job%2Fid");
+    expect(requests[5].body).toEqual({ expectedVersion: "18446744073709551614", approved: true });
+    expect(requests[6].body).toEqual({
+      expectedVersion: "18446744073709551614",
+      discoverMainboardId: true,
+      confirm: true,
+    });
+    expect(requests.every((item) => !item.url.includes("plan-secret"))).toBe(true);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

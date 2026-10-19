@@ -22,6 +22,8 @@ struct OperatorConfig {
     #[serde(default)]
     allow_external_integrations: bool,
     #[serde(default)]
+    printer_network: Option<ConfiguredPrinterNetwork>,
+    #[serde(default)]
     allowed_roots: Vec<ConfiguredRoot>,
     #[serde(default)]
     allowed_hosts: Vec<String>,
@@ -56,6 +58,36 @@ struct ConfiguredRoot {
     catalog_root_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfiguredPrinterNetwork {
+    allowed_scopes: Vec<String>,
+    #[serde(default)]
+    allow_multicast_discovery: bool,
+    #[serde(default)]
+    allow_carbon_broadcast: bool,
+}
+
+fn prepare_printer_network(
+    config: &OperatorConfig,
+) -> Result<Option<library_runtime::printer_network_api::PrinterNetworkPolicy>, String> {
+    let Some(policy) = &config.printer_network else {
+        return Ok(None);
+    };
+    if !config.capabilities.contains(&Capability::PrinterNetwork) {
+        return Err(
+            "Printer network policy requires the explicit printerNetwork capability".into(),
+        );
+    }
+    library_runtime::printer_network_api::PrinterNetworkPolicy::new(
+        policy.allowed_scopes.clone(),
+        policy.allow_multicast_discovery,
+        policy.allow_carbon_broadcast,
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let arguments = Arguments::parse()?;
@@ -69,6 +101,8 @@ async fn main() -> Result<(), String> {
     if let Some(token_file) = arguments.token_file {
         config.token_file = token_file;
     }
+    // Validate outbound printer authority before opening or mutating a catalog.
+    let printer_network = prepare_printer_network(&config)?;
     let listen = arguments
         .listen
         .unwrap_or_else(|| "127.0.0.1:3745".parse().expect("constant address"));
@@ -146,6 +180,9 @@ async fn main() -> Result<(), String> {
         capabilities: config.capabilities.clone(),
     })
     .map_err(|error| error.to_string())?;
+    runtime
+        .configure_printer_network(printer_network)
+        .map_err(|error| error.to_string())?;
     runtime
         .install_shared_state(Arc::new(
             library_runtime::integration_state::IntegrationState::load(integration_settings_path)?,
@@ -231,7 +268,10 @@ async fn main() -> Result<(), String> {
     tokio::signal::ctrl_c()
         .await
         .map_err(|_| "Shutdown signal failed")?;
-    server.stop().await
+    let revoked = runtime.configure_printer_network(None);
+    let stopped = server.stop().await;
+    revoked.map_err(|error| error.to_string())?;
+    stopped
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -411,5 +451,59 @@ mod tests {
         }))
         .unwrap();
         assert!(opted_in.allow_external_integrations);
+    }
+
+    #[test]
+    fn printer_network_policy_has_a_separate_explicit_operator_setting() {
+        let config = serde_json::json!({
+            "library":"/srv/library",
+            "web":"/srv/web",
+            "tokenFile":"/srv/server-token",
+            "integrationSettings":"/srv/integrations.json",
+            "printerNetwork": {
+                "allowedScopes":["10.250.0.1/32"],
+                "allowMulticastDiscovery":false,
+                "allowCarbonBroadcast":false
+            },
+            "capabilities":["catalogRead","catalogWrite","printerNetwork"]
+        });
+        let parsed = serde_json::from_value::<OperatorConfig>(config);
+        assert!(
+            parsed.is_ok(),
+            "Explicit printer policy must parse: {parsed:?}"
+        );
+        assert!(!parsed.unwrap().allow_external_integrations);
+    }
+
+    #[test]
+    fn printer_network_defaults_off_and_requires_both_scope_and_capability() {
+        let mut value = serde_json::json!({
+            "library":"/srv/library", "web":"/srv/web",
+            "tokenFile":"/srv/server-token", "integrationSettings":"/srv/integrations.json",
+            "allowExternalIntegrations":true
+        });
+        let legacy: OperatorConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.printer_network.is_none());
+        assert!(prepare_printer_network(&legacy).unwrap().is_none());
+        assert!(!legacy.capabilities.contains(&Capability::PrinterNetwork));
+
+        value["printerNetwork"] = serde_json::json!({"allowedScopes":["10.250.0.1/32"]});
+        let missing_cap: OperatorConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(prepare_printer_network(&missing_cap).is_err());
+        value["capabilities"] =
+            serde_json::json!(["catalogRead", "catalogWrite", "printerNetwork"]);
+        let selected: OperatorConfig = serde_json::from_value(value.clone()).unwrap();
+        let policy = selected.printer_network.as_ref().unwrap();
+        assert!(!policy.allow_multicast_discovery);
+        assert!(!policy.allow_carbon_broadcast);
+        assert!(prepare_printer_network(&selected).unwrap().is_some());
+
+        for scopes in [serde_json::json!([]), serde_json::json!(["8.8.8.8/32"])] {
+            value["printerNetwork"]["allowedScopes"] = scopes;
+            let rejected: OperatorConfig = serde_json::from_value(value.clone()).unwrap();
+            assert!(prepare_printer_network(&rejected).is_err());
+        }
+        value["printerNetwork"]["allowBroadcast"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<OperatorConfig>(value).is_err());
     }
 }

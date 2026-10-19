@@ -94,6 +94,17 @@ mod tests {
                 assert!(crate::slicers::slicer_support_directory(definition).is_none());
             }
             assert!(require_printer_network().is_err());
+            let remote_policy: crate::server_commands::DesktopPrinterNetworkPolicy =
+                serde_json::from_value(serde_json::json!({
+                    "allowedScopes":["10.250.0.1/32"],
+                    "allowMulticastDiscovery":true,
+                    "allowCarbonBroadcast":true
+                }))
+                .unwrap();
+            assert!(crate::server_commands::prepare_printer_network(Some(&remote_policy)).is_err());
+            assert!(crate::server_commands::prepare_printer_network(None)
+                .unwrap()
+                .is_none());
             // Exercise the native adapter's actual guard through both shared
             // Carbon paths. Transport construction must fail before route
             // selection or a socket. Loopback remains safe on regressions.

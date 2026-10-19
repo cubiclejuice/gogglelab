@@ -67,6 +67,7 @@ pub mod images;
 pub mod integration_state;
 pub mod integrations;
 pub mod printer_network;
+pub mod printer_network_api;
 pub mod scanner;
 mod secure_fs;
 pub use secure_fs::{HeldEntry, MovedEntry};
@@ -750,6 +751,7 @@ impl RuntimeConfig {
             Capability::Maintenance,
             Capability::HostPaths,
             Capability::HostSlicer,
+            Capability::PrinterNetwork,
         ]);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         capabilities.insert(Capability::PhysicalSourceWrite);
@@ -2451,6 +2453,9 @@ impl RuntimeInfoEngine for LibraryRuntime {
             capabilities: self
                 .capabilities
                 .intersection(&context.capabilities)
+                .filter(|capability| {
+                    **capability != Capability::PrinterNetwork || self.printer_network_enabled()
+                })
                 .cloned()
                 .collect(),
             roots: self.roots.iter().map(|root| root.handle.clone()).collect(),

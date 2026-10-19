@@ -2756,6 +2756,7 @@ login.addEventListener("submit", (event) => {
         "/api/v1/printer-reminders" in openApi.paths &&
         "/api/v1/printer-maintenance-logs" in openApi.paths;
       printerFleetButton.hidden = !printerFleetRoutesAvailable;
+      printerFleetDialog.setNetworkAvailable("/api/v1/printer-network/policy" in openApi.paths);
       filamentRoutesAvailable =
         "/api/v1/models/filaments/bulk" in openApi.paths && "/api/v1/filaments" in openApi.paths;
       scanRoutesAvailable = "/api/v1/scan" in openApi.paths && "/api/v1/roots" in openApi.paths;
@@ -2826,6 +2827,7 @@ disconnect.addEventListener("click", () => {
   modelController?.abort();
   modelLoadRevision += 1;
   eventController = null;
+  printerFleetDialog.dismiss();
   client.clearToken();
   capabilities = null;
   captureRoutesAvailable = false;
@@ -2838,7 +2840,7 @@ disconnect.addEventListener("click", () => {
   partStockButton.hidden = true;
   printerFleetRoutesAvailable = false;
   printerFleetButton.hidden = true;
-  printerFleetDialog.dismiss();
+  printerFleetDialog.setNetworkAvailable(false);
   filamentRoutesAvailable = false;
   scanRoutesAvailable = false;
   captureSummaryRoutesAvailable = false;

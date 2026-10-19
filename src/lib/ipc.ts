@@ -1472,18 +1472,26 @@ export function aiDiscardTagReview(reviewToken: string): Promise<void> {
   return invoke("ai_discard_tag_review", { reviewToken });
 }
 
+export interface DesktopPrinterNetworkPolicy {
+  allowedScopes: string[];
+  allowMulticastDiscovery: boolean;
+  allowCarbonBroadcast: boolean;
+}
+
 export interface DesktopLibraryServerStatus {
   running: boolean;
   baseUrl: string | null;
   mcpUrl: string | null;
   allowExternalIntegrations: boolean;
+  printerNetwork?: DesktopPrinterNetworkPolicy | null;
 }
 
 export function libraryServerStart(
   port?: number,
   allowExternalIntegrations = false,
+  printerNetwork: DesktopPrinterNetworkPolicy | null = null,
 ): Promise<DesktopLibraryServerStatus> {
-  return invoke("library_server_start", { port, allowExternalIntegrations });
+  return invoke("library_server_start", { port, allowExternalIntegrations, printerNetwork });
 }
 
 export function libraryServerStop(): Promise<DesktopLibraryServerStatus> {

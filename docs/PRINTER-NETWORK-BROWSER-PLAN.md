@@ -1,6 +1,6 @@
 # Guarded browser and MCP printer networking
 
-Status: next implementation slice after the shared-transport build gate. This is
+Status: local implementation, package, and synthetic visual acceptance passed. This is
 required by the browser parity promise in the Free parity plan. Everything remains
 Community/Free. Bambu MQTT and real-device validation remain deferred in issue #3.
 
@@ -17,13 +17,13 @@ Community/Free. Bambu MQTT and real-device validation remain deferred in issue #
   response, suggestion, and total-deadline bounds; report actual limits to the UI.
 - No live LAN, hardware, or provider call is authorized for implementation testing.
   Use synthetic transports and loopback fixtures. Existing one-shot approvals are
-  consumed. Never use the real printer address as a test fixture target.
+  consumed. Never send a new request to a real printer under consumed approvals.
 
-## Proposed interface
+## Interface and acceptance requirements
 
 Use existing authenticated API/MCP conventions, strict unknown-field rejection,
-sanitized errors, and decimal strings for versions. Names below are proposed until
-implemented together with protocol, OpenAPI, client, and contract tests.
+sanitized errors, and decimal strings for versions. Protocol, OpenAPI, client, and
+contract tests must agree on the operations below.
 
 1. Read policy availability and limits without networking. Disabled hosts explain
    that the operator must configure access; clients cannot turn it on.
@@ -103,3 +103,31 @@ authorization. Operator policy disable automatically cancels affected work.
 The unified app's production core-pin update also requires publication on public
 `main` under its supported update script. Preserve unrelated private-repo work;
 test composition separately and do not bypass that release integration gate.
+
+## Verification checkpoint, 2026-10-19
+
+The complete serial Rust workspace suite, workspace Clippy, formatting/diff checks,
+and 326 frontend tests / 1,287 assertions pass. Runtime coverage includes ten API
+tests and 73 shared transport tests; the server library suite passes 62 tests.
+The isolated debug app and standalone Community production app both build. The
+Community identifier and deep/strict ad-hoc signature are verified.
+
+Independent review found and fixed scope-narrowing blocking endpoint revocation,
+and a native settings refresh racing revocation and later AI-setting updates.
+Both have regressions that failed before the fix. Browser inspection also caught
+hidden buttons being displayed by CSS and cramped checkbox/consent layout; scoped
+styles now keep inactive controls hidden and consent on its own full-width row.
+
+The fake-only loopback example in
+`crates/library-server/examples/printer_network_fixture.rs` proved interactive
+review/start, suggestion review/unapproved save, separate approval/check, fake
+Moonraker and Carbon online/printing results, cancellation, and disconnect/key
+clearing. The owner completed native browser confirmations that automation could
+not reach. Fixture operation counts were discovery=2/status=2. A separate initial
+connect-only fixture recorded zero/zero. A fresh post-layout fixture was seeded
+through guarded APIs for visual inspection (zero discoveries/one fake status).
+The runtime asserts that the fake backend is installed before policy admission;
+none of these fixtures can send printer traffic. All fixtures were stopped and
+their evidence retained. Native isolated Settings separately shows the listener,
+AI access, printer LAN access, multicast, and Carbon broadcast off; no permission
+was enabled during that native inspection. Hardware acceptance remains open.

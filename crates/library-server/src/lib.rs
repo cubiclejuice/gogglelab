@@ -1,8 +1,9 @@
 #![recursion_limit = "256"]
 use library_protocol::{
-    Printer, PrinterFleetEngine, PrinterInput, PrinterMaintenanceInput, PrinterMaintenanceLog,
-    PrinterReminder, PrinterReminderCompletion, PrinterReminderCompletionInput,
-    PrinterReminderInput,
+    Printer, PrinterConnectionResponse, PrinterDiscoveryJob, PrinterDiscoveryPlan,
+    PrinterFleetEngine, PrinterInput, PrinterMaintenanceInput, PrinterMaintenanceLog,
+    PrinterNetworkEngine, PrinterNetworkPolicySummary, PrinterReminder, PrinterReminderCompletion,
+    PrinterReminderCompletionInput, PrinterReminderInput,
 };
 
 mod bootstrap;
@@ -1242,6 +1243,62 @@ pub trait LibraryEngine: Send + Sync + 'static {
 
     fn supports_tool(&self, context: &RequestContext, name: &str) -> bool;
 
+    fn get_printer_network_policy(
+        &self,
+        _: &RequestContext,
+    ) -> Result<PrinterNetworkPolicySummary, EngineError> {
+        Err(network_unsupported())
+    }
+    fn plan_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: bool,
+    ) -> Result<PrinterDiscoveryPlan, EngineError> {
+        Err(network_unsupported())
+    }
+    fn start_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: bool,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Err(network_unsupported())
+    }
+    fn get_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Err(network_unsupported())
+    }
+    fn cancel_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Err(network_unsupported())
+    }
+    fn set_printer_endpoint_approval(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: u64,
+        _: bool,
+    ) -> Result<Printer, EngineError> {
+        Err(network_unsupported())
+    }
+    fn test_printer_connection(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: u64,
+        _: bool,
+        _: bool,
+    ) -> Result<PrinterConnectionResponse, EngineError> {
+        Err(network_unsupported())
+    }
+
     fn list_thumbnails(
         &self,
         context: &RequestContext,
@@ -1881,6 +1938,7 @@ pub struct ProtocolEngineAdapter<
         + FilamentEngine
         + PartStockEngine
         + PrinterFleetEngine
+        + PrinterNetworkEngine
         + PrintHistoryEngine
         + CaptureEngine
         + BundleEngine
@@ -1905,6 +1963,7 @@ impl<
             + FilamentEngine
             + PartStockEngine
             + PrinterFleetEngine
+            + PrinterNetworkEngine
             + PrintHistoryEngine
             + CaptureEngine
             + BundleEngine
@@ -2045,6 +2104,7 @@ impl<
             + FilamentEngine
             + PartStockEngine
             + PrinterFleetEngine
+            + PrinterNetworkEngine
             + PrintHistoryEngine
             + CaptureEngine
             + BundleEngine
@@ -2357,6 +2417,9 @@ impl<
             };
         }
         validate_tool_shape(name, &arguments)?;
+        if network_tool_schema(name).is_some() {
+            return call_network_tool(self, context, name, arguments);
+        }
 
         if fleet_tool_schema(name).is_some() {
             let string = |key: &str| {
@@ -3806,6 +3869,29 @@ impl<
     }
 
     fn supports_tool(&self, context: &RequestContext, name: &str) -> bool {
+        if network_tool_schema(name).is_some() {
+            if !context.capabilities.contains(&Capability::CatalogRead) {
+                return false;
+            }
+            let Ok(policy) = self.inner.get_printer_network_policy(context) else {
+                return false;
+            };
+            if name == "get_printer_network_policy" {
+                return true;
+            }
+            if !context.capabilities.contains(&Capability::PrinterNetwork) || !policy.enabled {
+                return false;
+            }
+            return if matches!(
+                name,
+                "set_printer_endpoint_approval" | "test_printer_connection"
+            ) {
+                policy.status_checks_available
+                    && context.capabilities.contains(&Capability::CatalogWrite)
+            } else {
+                policy.discovery_available
+            };
+        }
         let connected = matches!(
             name,
             "search_models"
@@ -4491,6 +4577,75 @@ impl<
     ) -> Result<PrinterReminder, EngineError> {
         self.inner
             .reschedule_printer_reminder(context, id, expected_version, due_at)
+            .map_err(map_runtime_error)
+    }
+    fn get_printer_network_policy(
+        &self,
+        c: &RequestContext,
+    ) -> Result<PrinterNetworkPolicySummary, EngineError> {
+        self.inner
+            .get_printer_network_policy(c)
+            .map_err(map_runtime_error)
+    }
+    fn plan_printer_discovery(
+        &self,
+        c: &RequestContext,
+        range: &str,
+        bambu: bool,
+    ) -> Result<PrinterDiscoveryPlan, EngineError> {
+        self.inner
+            .plan_printer_discovery(c, range, bambu)
+            .map_err(map_runtime_error)
+    }
+    fn start_printer_discovery(
+        &self,
+        c: &RequestContext,
+        token: &str,
+        confirm: bool,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        self.inner
+            .start_printer_discovery(c, token, confirm)
+            .map_err(map_runtime_error)
+    }
+    fn get_printer_discovery(
+        &self,
+        c: &RequestContext,
+        id: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        self.inner
+            .get_printer_discovery(c, id)
+            .map_err(map_runtime_error)
+    }
+    fn cancel_printer_discovery(
+        &self,
+        c: &RequestContext,
+        id: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        self.inner
+            .cancel_printer_discovery(c, id)
+            .map_err(map_runtime_error)
+    }
+    fn set_printer_endpoint_approval(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+        approved: bool,
+    ) -> Result<Printer, EngineError> {
+        self.inner
+            .set_printer_endpoint_approval(c, id, v, approved)
+            .map_err(map_runtime_error)
+    }
+    fn test_printer_connection(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+        discover: bool,
+        confirm: bool,
+    ) -> Result<PrinterConnectionResponse, EngineError> {
+        self.inner
+            .test_printer_connection(c, id, v, discover, confirm)
             .map_err(map_runtime_error)
     }
     fn list_part_stock(&self, c: &RequestContext) -> Result<Vec<PartStock>, EngineError> {
@@ -5235,6 +5390,9 @@ fn validate_source_file_action_shape(
 
 fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
     let object = value.as_object().ok_or_else(invalid_tool)?;
+    if network_tool_schema(name).is_some() {
+        return validate_network_tool(name, value);
+    }
     if matches!(name, "trash_file" | "move_files") {
         return validate_source_file_action_shape(name, object);
     }
@@ -6509,8 +6667,29 @@ fn build_router<E: LibraryEngine>(
             "/api/v1/printer-reminders/{id}/reschedule",
             axum::routing::post(fleet_reschedule_reminder::<E>),
         )
+        .route("/api/v1/printer-network/policy", get(network_policy::<E>))
+        .route(
+            "/api/v1/printer-network/discovery-plans",
+            axum::routing::post(network_plan::<E>),
+        )
+        .route(
+            "/api/v1/printer-network/discovery-jobs",
+            axum::routing::post(network_start::<E>),
+        )
+        .route(
+            "/api/v1/printer-network/discovery-jobs/{jobId}",
+            get(network_get::<E>).delete(network_cancel::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}/endpoint-approval",
+            axum::routing::put(network_approve::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}/status-checks",
+            axum::routing::post(network_test::<E>),
+        )
         .route("/api/v1/health", get(health))
-        .route("/api/v1/openapi.json", get(openapi))
+        .route("/api/v1/openapi.json", get(openapi::<E>))
         .route("/api/v1/capabilities", get(capabilities::<E>))
         .route("/api/v1/status", get(status::<E>))
         .route("/api/v1/models", get(models::<E>))
@@ -6734,8 +6913,29 @@ async fn health() -> Json<Value> {
     Json(serde_json::json!({"status":"ok","apiVersion":API_VERSION}))
 }
 
-async fn openapi() -> Json<Value> {
-    Json(openapi_document())
+async fn openapi<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Value>, ApiError> {
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        let mut document = openapi_document();
+        for (path, mut operations) in network_openapi_paths().as_object().unwrap().clone() {
+            operations.as_object_mut().unwrap().retain(|_, operation| {
+                operation["operationId"]
+                    .as_str()
+                    .is_some_and(|name| engine.supports_tool(&c, name))
+            });
+            if operations.as_object().unwrap().is_empty() {
+                document["paths"].as_object_mut().unwrap().remove(&path);
+            } else {
+                document["paths"][&path] = operations;
+            }
+        }
+        Ok(document)
+    })
+    .await
+    .map(Json)
 }
 
 pub fn openapi_document() -> Value {
@@ -6869,10 +7069,18 @@ pub fn openapi_document() -> Value {
         .as_object_mut()
         .unwrap()
         .extend(fleet_output_schemas().as_object().unwrap().clone());
+    document["components"]["schemas"]
+        .as_object_mut()
+        .unwrap()
+        .extend(network_output_schemas().as_object().unwrap().clone());
     document["paths"]
         .as_object_mut()
         .unwrap()
         .extend(fleet_openapi_paths().as_object().unwrap().clone());
+    document["paths"]
+        .as_object_mut()
+        .unwrap()
+        .extend(network_openapi_paths().as_object().unwrap().clone());
     document
 }
 
@@ -8591,6 +8799,13 @@ pub fn tool_names() -> &'static [&'static str] {
         "save_filament",
         "delete_filament",
         "set_model_filaments",
+        "get_printer_network_policy",
+        "plan_printer_discovery",
+        "start_printer_discovery",
+        "get_printer_discovery",
+        "cancel_printer_discovery",
+        "set_printer_endpoint_approval",
+        "test_printer_connection",
         "list_printers",
         "get_printer",
         "create_printer",
@@ -8672,7 +8887,7 @@ pub fn tool_definitions() -> Vec<Value> {
     tool_names()
         .iter()
         .map(|name| {
-            let input_schema = if let Some(schema) = fleet_tool_schema(name) { schema } else { match *name {
+            let input_schema = if let Some(schema) = network_tool_schema(name).or_else(|| fleet_tool_schema(name)) { schema } else { match *name {
                 "search_models" => serde_json::json!({
                     "type":"object","additionalProperties":false,
                     "properties":{
@@ -8862,6 +9077,12 @@ pub fn tool_definitions() -> Vec<Value> {
             serde_json::json!({
                 "name": name,
                 "description": match *name {
+                    "get_printer_network_policy" => "Read host-configured printer LAN availability and bounds without network I/O. Clients cannot enable or expand this policy.".to_owned(),
+                    "plan_printer_discovery" => "Review an admitted private IPv4 range and implemented protocol choices without networking. Returns an expiring principal-bound one-use plan and multicast disclosure. Requires PrinterNetwork and CatalogRead.".to_owned(),
+                    "start_printer_discovery" => "Start the exact reviewed discovery plan with confirm:true. Returns an owner-bound bounded job; poll or cancel it explicitly. No automatic save or endpoint approval.".to_owned(),
+                    "get_printer_discovery" | "cancel_printer_discovery" => "Read or cancel only this principal's bounded discovery job. Current PrinterNetwork/CatalogRead permission and host policy are rechecked; opaque job IDs grant no authority.".to_owned(),
+                    "set_printer_endpoint_approval" => "Approve or revoke an exact saved printer endpoint using its decimal expectedVersion. Requires current PrinterNetwork, CatalogRead, CatalogWrite, and operator-admitted scope; performs no network I/O.".to_owned(),
+                    "test_printer_connection" => "Explicit one-shot read-only check of an approved saved printer, with decimal expectedVersion and confirm:true. Saving its snapshot requires PrinterNetwork/CatalogRead/CatalogWrite. Carbon discoverMainboardId broadcasts to 255.255.255.255:3000 on the routed interface only when independently permitted; other LAN devices may receive it. MainboardID stays transient. No credentials or control commands are accepted.".to_owned(),
                     "search_models" => "Search the catalog with either search or the legacy query field, plus designer, all supplied tag names, file type, print-state, rating, favorite, thumbnail, and admitted-root filters. Use offset only on the first page; follow the returned cursor for stable continuation.".to_owned(),
                     "find_duplicates" => "Find duplicate models by stored SHA-256, either for up to 1,000 explicit modelIds or a catalog filter set limited to 1,000 matches. Filtered scans require an admitted root when directory is supplied, exclude ZIP members by default, and return at most 200 groups. Hashes are the catalog's import/scan fingerprints; use source-status checks before making file decisions.".to_owned(),
                     "get_hash_status" => "Return global hash counts, or counts for a bounded catalog filter set. Directory filters require an admitted root. Stored hashes are computed during import and scans; this count does not claim that current source bytes still match.".to_owned(),
@@ -9489,4 +9710,389 @@ fn fleet_output_schemas() -> Value {
     }
     schemas.insert("PrinterReminderCompletion".into(),serde_json::json!({"type":"object","additionalProperties":false,"required":["reminder","maintenanceLog"],"properties":{"reminder":{"$ref":"#/components/schemas/PrinterReminder"},"maintenanceLog":{"$ref":"#/components/schemas/PrinterMaintenanceLog"}}}));
     Value::Object(schemas)
+}
+
+fn network_unsupported() -> EngineError {
+    EngineError {
+        code: "unsupported",
+        message: "Printer networking is unavailable in this engine".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    }
+}
+fn network_permissions(
+    c: &RequestContext,
+    write: bool,
+    policy_only: bool,
+) -> Result<(), EngineError> {
+    if !c.capabilities.contains(&Capability::CatalogRead)
+        || (!policy_only && !c.capabilities.contains(&Capability::PrinterNetwork))
+        || (write && !c.capabilities.contains(&Capability::CatalogWrite))
+    {
+        return Err(EngineError {
+            code: "forbidden",
+            message: "Printer networking permission is required".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    Ok(())
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkPlanBody {
+    range: String,
+    include_bambu_discovery: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkStartBody {
+    plan_token: String,
+    confirm: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkApprovalBody {
+    expected_version: String,
+    approved: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkCheckBody {
+    expected_version: String,
+    discover_mainboard_id: bool,
+    confirm: bool,
+}
+
+async fn network_policy<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<PrinterNetworkPolicySummary>, ApiError> {
+    network_permissions(&c, false, true).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.get_printer_network_policy(&c)
+    })
+    .await
+    .map(Json)
+}
+async fn network_plan<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<NetworkPlanBody>,
+) -> Result<Json<PrinterDiscoveryPlan>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if b.range.is_empty() || b.range.len() > 4096 {
+        return Err(api_bad("invalidInput", "Discovery range is invalid"));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.plan_printer_discovery(&c, &b.range, b.include_bambu_discovery)
+    })
+    .await
+    .map(Json)
+}
+async fn network_start<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<NetworkStartBody>,
+) -> Result<Json<PrinterDiscoveryJob>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if b.plan_token.is_empty() || b.plan_token.len() > 256 || !b.confirm {
+        return Err(api_bad(
+            "invalidInput",
+            "A reviewed plan and confirm:true are required",
+        ));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.start_printer_discovery(&c, &b.plan_token, b.confirm)
+    })
+    .await
+    .map(Json)
+}
+async fn network_get<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PrinterDiscoveryJob>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 {
+        return Err(api_bad("invalidInput", "Job ID is invalid"));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.get_printer_discovery(&c, &id)
+    })
+    .await
+    .map(Json)
+}
+async fn network_cancel<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PrinterDiscoveryJob>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 {
+        return Err(api_bad("invalidInput", "Job ID is invalid"));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.cancel_printer_discovery(&c, &id)
+    })
+    .await
+    .map(Json)
+}
+async fn network_approve<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<NetworkApprovalBody>,
+) -> Result<Json<Printer>, ApiError> {
+    network_permissions(&c, true, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 {
+        return Err(api_bad("invalidInput", "Printer ID is invalid"));
+    }
+    let version = parse_version(&b.expected_version)?;
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.set_printer_endpoint_approval(&c, &id, version, b.approved)
+    })
+    .await
+    .map(Json)
+}
+async fn network_test<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<NetworkCheckBody>,
+) -> Result<Json<PrinterConnectionResponse>, ApiError> {
+    network_permissions(&c, true, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 || !b.confirm {
+        return Err(api_bad(
+            "invalidInput",
+            "A printer ID and confirm:true are required",
+        ));
+    }
+    let version = parse_version(&b.expected_version)?;
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.test_printer_connection(&c, &id, version, b.discover_mainboard_id, b.confirm)
+    })
+    .await
+    .map(Json)
+}
+
+fn network_tool_schema(name: &str) -> Option<Value> {
+    let text = |max| serde_json::json!({"type":"string","minLength":1,"maxLength":max});
+    let version = serde_json::json!({"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"});
+    let confirm = serde_json::json!({"type":"boolean","const":true});
+    let properties = match name {
+        "get_printer_network_policy" => serde_json::json!({}),
+        "plan_printer_discovery" => {
+            serde_json::json!({"range":text(4096),"includeBambuDiscovery":{"type":"boolean"}})
+        }
+        "start_printer_discovery" => serde_json::json!({"planToken":text(256),"confirm":confirm}),
+        "get_printer_discovery" | "cancel_printer_discovery" => {
+            serde_json::json!({"jobId":text(128)})
+        }
+        "set_printer_endpoint_approval" => {
+            serde_json::json!({"printerId":text(128),"expectedVersion":version,"approved":{"type":"boolean"}})
+        }
+        "test_printer_connection" => {
+            serde_json::json!({"printerId":text(128),"expectedVersion":version,"discoverMainboardId":{"type":"boolean"},"confirm":confirm})
+        }
+        _ => return None,
+    };
+    let required = properties
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(
+        serde_json::json!({"type":"object","additionalProperties":false,"properties":properties,"required":required}),
+    )
+}
+fn validate_network_tool(name: &str, value: &Value) -> Result<(), EngineError> {
+    let schema = network_tool_schema(name).ok_or_else(invalid_tool)?;
+    let object = value.as_object().ok_or_else(invalid_tool)?;
+    let fields = schema["properties"].as_object().unwrap();
+    if object.len() != fields.len() || object.keys().any(|key| !fields.contains_key(key)) {
+        return Err(invalid_tool());
+    }
+    for (key, field) in fields {
+        let value = &object[key];
+        if field["type"] == "boolean" {
+            if !value.is_boolean() || (key == "confirm" && value != true) {
+                return Err(invalid_tool());
+            }
+        } else {
+            let text = value.as_str().ok_or_else(invalid_tool)?;
+            if text.is_empty() || text.len() > field["maxLength"].as_u64().unwrap_or(128) as usize {
+                return Err(invalid_tool());
+            }
+            if key == "expectedVersion" && parse_decimal(text).is_err() {
+                return Err(invalid_tool());
+            }
+        }
+    }
+    Ok(())
+}
+fn call_network_tool<E: LibraryEngine + ?Sized>(
+    engine: &E,
+    c: &RequestContext,
+    name: &str,
+    args: Value,
+) -> Result<Value, EngineError> {
+    let write = matches!(
+        name,
+        "set_printer_endpoint_approval" | "test_printer_connection"
+    );
+    network_permissions(c, write, name == "get_printer_network_policy")?;
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_tool)
+    };
+    let boolean = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_bool)
+            .ok_or_else(invalid_tool)
+    };
+    let encode = |value: Value| Ok(value);
+    match name {
+        "get_printer_network_policy" => encode(
+            serde_json::to_value(engine.get_printer_network_policy(c)?)
+                .map_err(|_| invalid_tool())?,
+        ),
+        "plan_printer_discovery" => encode(
+            serde_json::to_value(engine.plan_printer_discovery(
+                c,
+                text("range")?,
+                boolean("includeBambuDiscovery")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        "start_printer_discovery" => encode(
+            serde_json::to_value(engine.start_printer_discovery(
+                c,
+                text("planToken")?,
+                boolean("confirm")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        "get_printer_discovery" => encode(
+            serde_json::to_value(engine.get_printer_discovery(c, text("jobId")?)?)
+                .map_err(|_| invalid_tool())?,
+        ),
+        "cancel_printer_discovery" => encode(
+            serde_json::to_value(engine.cancel_printer_discovery(c, text("jobId")?)?)
+                .map_err(|_| invalid_tool())?,
+        ),
+        "set_printer_endpoint_approval" => encode(
+            serde_json::to_value(engine.set_printer_endpoint_approval(
+                c,
+                text("printerId")?,
+                tool_version(&args)?,
+                boolean("approved")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        "test_printer_connection" => encode(
+            serde_json::to_value(engine.test_printer_connection(
+                c,
+                text("printerId")?,
+                tool_version(&args)?,
+                boolean("discoverMainboardId")?,
+                boolean("confirm")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        _ => Err(invalid_tool()),
+    }
+}
+fn network_openapi_paths() -> Value {
+    let mut paths = serde_json::Map::new();
+    for (path, operations) in [
+        (
+            "/api/v1/printer-network/policy",
+            vec![("get", "get_printer_network_policy")],
+        ),
+        (
+            "/api/v1/printer-network/discovery-plans",
+            vec![("post", "plan_printer_discovery")],
+        ),
+        (
+            "/api/v1/printer-network/discovery-jobs",
+            vec![("post", "start_printer_discovery")],
+        ),
+        (
+            "/api/v1/printer-network/discovery-jobs/{jobId}",
+            vec![
+                ("get", "get_printer_discovery"),
+                ("delete", "cancel_printer_discovery"),
+            ],
+        ),
+        (
+            "/api/v1/printers/{id}/endpoint-approval",
+            vec![("put", "set_printer_endpoint_approval")],
+        ),
+        (
+            "/api/v1/printers/{id}/status-checks",
+            vec![("post", "test_printer_connection")],
+        ),
+    ] {
+        let mut methods = serde_json::Map::new();
+        for (method, tool) in operations {
+            let mut schema = network_tool_schema(tool).unwrap();
+            let mut operation = serde_json::json!({"operationId":tool,"description":"Explicit read-only printer LAN operation. Host policy and current printerNetwork/catalogRead permission are mandatory; endpoint approval and saved status also require catalogWrite. No credentials, raw identifiers, arbitrary URL, or control commands.","responses":{"200":{"description":"Sanitized bounded result; versions are decimal strings"},"400":{"description":"Invalid request or missing explicit confirmation"},"401":{"description":"Authentication required"},"403":{"description":"Current permission or operator policy missing"},"404":{"description":"Plan or job is missing, expired, already consumed, or not owned by this principal"},"409":{"description":"Stale printer version, changed policy generation, or cancelled work"},"422":{"description":"Malformed JSON shape or unsupported fields"},"503":{"description":"Maintenance or capacity limit"}}});
+            if tool == "get_printer_network_policy" {
+                operation["description"] = serde_json::json!("Read host-configured printer LAN availability and bounds with catalogRead permission. This performs no network I/O and remains available when printerNetwork permission or host policy is absent; clients cannot enable or expand policy.");
+            }
+            if path.contains('{') {
+                let (parameter, key) = if path.contains("{jobId}") {
+                    ("jobId", "jobId")
+                } else {
+                    ("id", "printerId")
+                };
+                operation["parameters"] = serde_json::json!([{"name":parameter,"in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":128}}]);
+                schema["properties"].as_object_mut().unwrap().remove(key);
+                schema["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|value| value != key);
+            }
+            if !matches!(method, "get" | "delete") {
+                operation["requestBody"] = serde_json::json!({"required":true,"content":{"application/json":{"schema":schema}}});
+            }
+            let response = match tool {
+                "get_printer_network_policy" => "PrinterNetworkPolicySummary",
+                "plan_printer_discovery" => "PrinterDiscoveryPlan",
+                "set_printer_endpoint_approval" => "Printer",
+                "test_printer_connection" => "PrinterConnectionResponse",
+                _ => "PrinterDiscoveryJob",
+            };
+            operation["responses"]["200"]["content"] = serde_json::json!({"application/json":{"schema":{"$ref":format!("#/components/schemas/{response}")}}});
+            methods.insert(method.into(), operation);
+        }
+        paths.insert(path.into(), Value::Object(methods));
+    }
+    Value::Object(paths)
+}
+
+fn network_output_schemas() -> Value {
+    let boolean = serde_json::json!({"type":"boolean"});
+    let text = serde_json::json!({"type":"string"});
+    let optional_text = serde_json::json!({"type":["string","null"]});
+    let count = serde_json::json!({"type":"integer","minimum":0,"maximum":4294967295_u64});
+    serde_json::json!({
+      "PrinterNetworkPolicySummary":{"type":"object","additionalProperties":false,"required":["enabled","discoveryAvailable","statusChecksAvailable","multicastDiscoveryAllowed","carbonBroadcastAllowed","maxDiscoveryAddresses","maxSuggestions","maximumDurationMs"],"properties":{"enabled":boolean,"discoveryAvailable":boolean,"statusChecksAvailable":boolean,"multicastDiscoveryAllowed":boolean,"carbonBroadcastAllowed":boolean,"maxDiscoveryAddresses":count,"maxSuggestions":count,"maximumDurationMs":count}},
+      "PrinterDiscoveryPlan":{"type":"object","additionalProperties":false,"required":["planToken","normalizedRange","addressCount","includeBambuDiscovery","multicastDisclosure","expiresAt"],"properties":{"planToken":text,"normalizedRange":text,"addressCount":count,"includeBambuDiscovery":boolean,"multicastDisclosure":optional_text,"expiresAt":{"type":"string","format":"date-time"}}},
+      "PrinterNetworkSuggestion":{"type":"object","additionalProperties":false,"required":["key","name","model","bedMm","connection","source","printerType"],"properties":{"key":text,"name":text,"model":optional_text,"bedMm":{"oneOf":[{"type":"null"},{"type":"array","minItems":3,"maxItems":3,"items":count}]},"connection":{"type":"object","additionalProperties":false,"required":["kind","address"],"properties":{"kind":{"type":"string","const":"network"},"address":text}},"source":{"type":"string","enum":["moonraker","prusalink","bambu_mqtt_tls"]},"printerType":text}},
+      "PrinterDiscoveryJob":{"type":"object","additionalProperties":false,"required":["jobId","status","suggestions","normalizedRange","errorCode"],"properties":{"jobId":text,"status":{"type":"string","enum":["running","completed","cancelled","failed"]},"suggestions":{"type":"array","maxItems":33,"items":{"$ref":"#/components/schemas/PrinterNetworkSuggestion"}},"normalizedRange":text,"errorCode":optional_text}},
+      "PrinterConnectionResponse":{"type":"object","additionalProperties":false,"required":["result","printer","statusEventObserved"],"properties":{"result":{"type":"string","enum":["connected","unreachable","unsupported","authRequired","failed","cancelled"]},"printer":{"$ref":"#/components/schemas/Printer"},"statusEventObserved":boolean}}
+    })
 }

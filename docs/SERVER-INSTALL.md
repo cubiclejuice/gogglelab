@@ -69,6 +69,61 @@ Start with an absolute config path:
 
 The server creates a random access key in the configured secret file if absent. It requires an ordinary file, outside the catalog, with Unix permissions `0600`; keep it separate from exports and backups. Open `http://127.0.0.1:3745/` and enter the key through the login form. Browser credentials remain in memory and are cleared on disconnect. Do not put keys in URLs, scripts committed to Git, model notes, or screenshots. Health at `/api/v1/health` reports liveness only; API, media, events and MCP data require authentication.
 
+### Optional printer LAN requests
+
+Printer fleet records, maintenance, and reminders are Free metadata operations.
+Outbound discovery and connection checks require a separate host-controlled opt-in.
+Neither starting the browser listener nor enabling AI/Spoolman access enables them.
+The default Docker configuration also leaves printer networking disabled.
+
+For the standalone server, deliberately add `printerNetwork` to the capability list
+and add an operator policy to the existing config. Replace the synthetic example
+address with the private IPv4 scope you intend to admit:
+
+```json
+{
+  "capabilities": ["catalogRead", "catalogWrite", "mediaRead", "mediaWrite", "printerNetwork"],
+  "printerNetwork": {
+    "allowedScopes": ["10.250.0.10/32"],
+    "allowMulticastDiscovery": false,
+    "allowCarbonBroadcast": false
+  }
+}
+```
+
+Retain the rest of the full config and any other deliberately selected capabilities.
+The policy requires one to 32 private scope entries; each discovery request is
+limited to 1,022 addresses and must stay within that policy. Invalid or public
+scopes fail validation before the catalog is opened. Omitted policy means Off,
+even if a capability name is present. Changing a standalone policy requires an
+operator-controlled restart. Browser and MCP clients cannot expand it.
+
+In desktop Settings, the separate Printer LAN access fieldset accepts the same
+scopes and independent datagram choices. Draft changes make no request. Start the
+server or explicitly apply the printer setting to admit it for that session.
+Stopping the listener clears permission and cancels work. AI setting changes use
+the applied printer policy, never an unapplied printer draft.
+
+Unicast discovery works without either datagram flag. Bambu SSDP requires explicit
+multicast permission; packets may reach devices outside selected scopes, while
+only in-scope replies can produce candidates or connections. Original Centauri
+Carbon MainboardID discovery separately requires `allowCarbonBroadcast`: it sends
+one UDP broadcast to `255.255.255.255:3000` on the routed interface. Multicast
+permission does not grant broadcast permission. The browser shows these reaches
+before the corresponding explicit action. Container/interface routing may prevent
+discovery; do not switch to host networking or expand firewall permissions
+automatically to work around it.
+
+Clients first review a normalized scope, then separately start the expiring,
+one-use, principal-bound plan. Jobs have bounded lifetime and owner-only polling
+and cancellation. Suggestions require review before saving and remain unapproved.
+Review the exact saved endpoint before its selected-printer check. Stale versions,
+policy changes, and cancellation prevent stale results from being published or
+saved. Withdrawing approval still works after a scope is narrowed. No credential,
+printer control, arbitrary URL, raw MainboardID, or raw status payload is accepted
+by these interfaces. Bambu MQTT remains deferred in issue #3; synthetic tests do
+not establish hardware compatibility.
+
 ## HTTPS on a LAN
 
 A LAN browser connection requires HTTPS. Use a reverse proxy and keep the backend loopback-only wherever possible. With Caddy running on the same host, set:

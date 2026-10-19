@@ -1,3 +1,4 @@
+import { BrowserPrinterNetwork } from "./browser-printer-network";
 import {
   formatWireInteger,
   LibraryHttpError,
@@ -95,12 +96,18 @@ function localDateTime(value: string): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-/** Data-only fleet management. Network discovery and connection checks stay on the host. */
+/** Fleet management and explicit host-authorized network actions. */
 export class BrowserPrinterFleetDialog {
   private dialog: HTMLDialogElement | null = null;
   private editors = new Set<HTMLDialogElement>();
+  private network: BrowserPrinterNetwork | null = null;
+  private networkAvailable = false;
+  setNetworkAvailable(available: boolean): void {
+    this.networkAvailable = available;
+  }
   constructor(private readonly client: LibraryClient) {}
   dismiss(): void {
+    this.network?.dismiss();
     for (const editor of this.editors) editor.close();
     this.dialog?.close();
   }
@@ -137,6 +144,16 @@ export class BrowserPrinterFleetDialog {
     let logLimit = DISPLAY_LIMIT;
     let reminderLimit = DISPLAY_LIMIT;
     const current = () => dialog.open && dialog.isConnected;
+    const network = new BrowserPrinterNetwork(
+      this.client,
+      async (notice) => {
+        if (current()) await refresh(notice);
+      },
+      () => {
+        if (current()) render();
+      },
+    );
+    this.network = network;
     const addPrinter = button("Add printer", () => {
       void this.editPrinter(null, async (input) => {
         await this.client.createPrinter(input);
@@ -173,6 +190,7 @@ export class BrowserPrinterFleetDialog {
       notice,
       controls,
       message,
+      network.element,
       printerList,
       logHeading,
       logsList,
@@ -249,6 +267,7 @@ export class BrowserPrinterFleetDialog {
               );
           }),
         );
+        row.append(network.printerActions(printer));
         printerList.append(row);
       }
       if (!shownPrinters.length)
@@ -416,6 +435,8 @@ export class BrowserPrinterFleetDialog {
       "close",
       () => {
         revision += 1;
+        network.dismiss();
+        if (this.network === network) this.network = null;
         dialog.remove();
         if (this.dialog === dialog) this.dialog = null;
         if (invoker?.isConnected) invoker.focus();
@@ -423,6 +444,7 @@ export class BrowserPrinterFleetDialog {
       { once: true },
     );
     await refresh();
+    if (current()) await network.loadPolicy(this.networkAvailable);
   }
   private async editor(
     titleText: string,

@@ -253,6 +253,45 @@ export interface BrowserPrinter extends Omit<LibraryPrinter, "metadataVersion" |
   metadataVersion: string;
   printCount: string;
 }
+export interface BrowserPrinterNetworkPolicy {
+  enabled: boolean;
+  discoveryAvailable: boolean;
+  statusChecksAvailable: boolean;
+  multicastDiscoveryAllowed: boolean;
+  carbonBroadcastAllowed: boolean;
+  maxDiscoveryAddresses: number;
+  maxSuggestions: number;
+  maximumDurationMs: number;
+}
+export interface BrowserPrinterDiscoveryPlan {
+  planToken: string;
+  normalizedRange: string;
+  addressCount: number;
+  includeBambuDiscovery: boolean;
+  multicastDisclosure: string | null;
+  expiresAt: string;
+}
+export interface BrowserPrinterSuggestion {
+  key: string;
+  name: string;
+  model: string | null;
+  bedMm: [number, number, number] | null;
+  connection: { kind: string; address: string };
+  source: "moonraker" | "prusalink" | "bambu_mqtt_tls";
+  printerType: string;
+}
+export interface BrowserPrinterDiscoveryJob {
+  jobId: string;
+  status: "running" | "completed" | "cancelled" | "failed";
+  suggestions: BrowserPrinterSuggestion[];
+  normalizedRange: string;
+  errorCode: string | null;
+}
+export interface BrowserPrinterConnectionResult {
+  result: "connected" | "unreachable" | "unsupported" | "authRequired" | "failed" | "cancelled";
+  printer: BrowserPrinter;
+  statusEventObserved: boolean;
+}
 export type BrowserPrinterInput = PrinterInput;
 export type BrowserMaintenanceInput = PrinterMaintenanceInput;
 export interface BrowserMaintenanceLog extends Omit<PrinterMaintenanceLog, "metadataVersion"> {
@@ -757,6 +796,32 @@ export interface LibraryClient {
     expectedVersion: string,
     signal?: AbortSignal,
   ): Promise<BrowserFilament | null>;
+  getPrinterNetworkPolicy(signal?: AbortSignal): Promise<BrowserPrinterNetworkPolicy>;
+  planPrinterDiscovery(
+    range: string,
+    includeBambuDiscovery: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinterDiscoveryPlan>;
+  startPrinterDiscovery(
+    planToken: string,
+    confirm: true,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinterDiscoveryJob>;
+  getPrinterDiscovery(jobId: string, signal?: AbortSignal): Promise<BrowserPrinterDiscoveryJob>;
+  cancelPrinterDiscovery(jobId: string, signal?: AbortSignal): Promise<BrowserPrinterDiscoveryJob>;
+  setPrinterEndpointApproval(
+    id: string,
+    expectedVersion: string,
+    approved: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinter>;
+  testPrinterConnection(
+    id: string,
+    expectedVersion: string,
+    discoverMainboardId: boolean,
+    confirm: true,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinterConnectionResult>;
   listPrinters(signal?: AbortSignal): Promise<BrowserPrinter[]>;
   createPrinter(input: BrowserPrinterInput, signal?: AbortSignal): Promise<BrowserPrinter>;
   updatePrinter(
@@ -1336,6 +1401,69 @@ export class HttpLibraryClient implements LibraryClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ assignments }),
+      signal,
+    });
+  }
+  getPrinterNetworkPolicy(signal?: AbortSignal): Promise<BrowserPrinterNetworkPolicy> {
+    return this.json("/api/v1/printer-network/policy", { signal });
+  }
+  planPrinterDiscovery(
+    range: string,
+    includeBambuDiscovery: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinterDiscoveryPlan> {
+    return this.json("/api/v1/printer-network/discovery-plans", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ range, includeBambuDiscovery }),
+      signal,
+    });
+  }
+  startPrinterDiscovery(
+    planToken: string,
+    confirm: true,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinterDiscoveryJob> {
+    return this.json("/api/v1/printer-network/discovery-jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planToken, confirm }),
+      signal,
+    });
+  }
+  getPrinterDiscovery(jobId: string, signal?: AbortSignal): Promise<BrowserPrinterDiscoveryJob> {
+    return this.json(`/api/v1/printer-network/discovery-jobs/${segment(jobId)}`, { signal });
+  }
+  cancelPrinterDiscovery(jobId: string, signal?: AbortSignal): Promise<BrowserPrinterDiscoveryJob> {
+    return this.json(`/api/v1/printer-network/discovery-jobs/${segment(jobId)}`, {
+      method: "DELETE",
+      signal,
+    });
+  }
+  setPrinterEndpointApproval(
+    id: string,
+    expectedVersion: string,
+    approved: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinter> {
+    return this.json(`/api/v1/printers/${segment(id)}/endpoint-approval`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, approved }),
+      signal,
+    });
+  }
+  testPrinterConnection(
+    id: string,
+    expectedVersion: string,
+    discoverMainboardId: boolean,
+    confirm: true,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinterConnectionResult> {
+    return this.json(`/api/v1/printers/${segment(id)}/status-checks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, discoverMainboardId, confirm }),
       signal,
     });
   }

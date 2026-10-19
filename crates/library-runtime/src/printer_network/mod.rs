@@ -44,6 +44,7 @@ mod tests {
         mode: Option<FakeMode>,
         requests: Mutex<Vec<ProbeRequest>>,
         bambu_hosts: Mutex<Vec<Ipv4Addr>>,
+        ssdp_requests: AtomicUsize,
         elegoo_discoveries: Mutex<Vec<(Ipv4Addr, Duration)>>,
         elegoo_requests: Mutex<Vec<(Ipv4Addr, String, Duration)>>,
         active_requests: AtomicUsize,
@@ -206,6 +207,7 @@ mod tests {
             _cancelled: &AtomicBool,
         ) -> Vec<(Ipv4Addr, Vec<u8>)> {
             let response = b"HTTP/1.1 200 OK\r\nST: urn:bambulab-com:device:3dprinter:1\r\nUSN: uuid:AB12CD34EF56::urn:bambulab-com:device:3dprinter:1\r\n\r\n".to_vec();
+            self.ssdp_requests.fetch_add(1, Ordering::AcqRel);
             match self.mode.as_ref().unwrap() {
                 FakeMode::Bambu => scope
                     .addresses()
@@ -1048,6 +1050,29 @@ mod tests {
         certificate.extend(der(0x03, &[0]));
         der(0x30, &certificate)
     }
+    #[test]
+    fn unicast_only_discovery_never_calls_the_ssdp_transport() {
+        let transport = Arc::new(FakeTransport::new(FakeMode::Moonraker));
+        let scope = parse_scan_scope("192.168.200.10").unwrap();
+        let suggestions = discover_with_transport_options(
+            &scope,
+            transport.clone(),
+            Arc::new(AtomicBool::new(false)),
+            ScanLimits::default(),
+            false,
+        );
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(transport.ssdp_requests.load(Ordering::Acquire), 0);
+        assert!(transport.bambu_hosts.lock().unwrap().is_empty());
+        let _ = discover_with_transport_options(
+            &scope,
+            transport.clone(),
+            Arc::new(AtomicBool::new(false)),
+            ScanLimits::default(),
+            true,
+        );
+        assert_eq!(transport.ssdp_requests.load(Ordering::Acquire), 1);
+    }
 }
 use std::collections::BTreeSet;
 use std::fmt;
@@ -1820,15 +1845,28 @@ fn discover_with_transport(
     cancelled: Arc<AtomicBool>,
     limits: ScanLimits,
 ) -> Vec<Suggestion> {
+    discover_with_transport_options(scope, transport, cancelled, limits, true)
+}
+fn discover_with_transport_options(
+    scope: &ScanScope,
+    transport: Arc<dyn ProbeTransport>,
+    cancelled: Arc<AtomicBool>,
+    limits: ScanLimits,
+    include_bambu: bool,
+) -> Vec<Suggestion> {
     let limits = limits.bounded();
     let deadline = Instant::now() + limits.total;
     let addresses = scope.addresses().to_vec();
-    let bambu_candidates = self::bambu_discovery::validated_candidates(
-        scope,
-        transport.bambu_ssdp_responses(scope, deadline, limits.request, &cancelled),
-    )
-    .into_iter()
-    .collect::<BTreeSet<_>>();
+    let bambu_candidates = if include_bambu {
+        self::bambu_discovery::validated_candidates(
+            scope,
+            transport.bambu_ssdp_responses(scope, deadline, limits.request, &cancelled),
+        )
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let next = AtomicUsize::new(0);
     let suggestions = Mutex::new(Vec::new());
     let workers = limits.workers.min(addresses.len()).max(1);
@@ -2680,5 +2718,24 @@ mod guard_tests {
                 &AtomicBool::new(false)
             )
             .is_empty());
+    }
+}
+
+/// Browser callers must explicitly choose multicast; native legacy calls retain their original choice.
+pub fn discover_with_options(
+    scope: &ScanScope,
+    cancelled: Arc<AtomicBool>,
+    guard: NetworkGuard,
+    include_bambu: bool,
+) -> Vec<Suggestion> {
+    match NativeTransport::new(guard) {
+        Ok(transport) => discover_with_transport_options(
+            scope,
+            Arc::new(transport),
+            cancelled,
+            ScanLimits::default(),
+            include_bambu,
+        ),
+        Err(_) => Vec::new(),
     }
 }

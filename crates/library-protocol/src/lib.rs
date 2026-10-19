@@ -12,6 +12,7 @@ pub const MAX_PAGE_LIMIT: u16 = 500;
 pub enum Capability {
     CatalogRead,
     CatalogWrite,
+    PrinterNetwork,
     MediaRead,
     MediaWrite,
     Scan,
@@ -2466,4 +2467,129 @@ pub trait PrinterFleetEngine: Send + Sync {
         expected_version: u64,
         due_at: &str,
     ) -> Result<PrinterReminder, RuntimeError>;
+}
+
+/// Host-configured availability only; clients cannot expand network permission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterNetworkPolicySummary {
+    pub enabled: bool,
+    pub discovery_available: bool,
+    pub status_checks_available: bool,
+    pub multicast_discovery_allowed: bool,
+    pub carbon_broadcast_allowed: bool,
+    pub max_discovery_addresses: u32,
+    pub max_suggestions: u32,
+    pub maximum_duration_ms: u32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterDiscoveryPlan {
+    pub plan_token: String,
+    pub normalized_range: String,
+    pub address_count: u32,
+    pub include_bambu_discovery: bool,
+    pub multicast_disclosure: Option<String>,
+    pub expires_at: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterDiscoveryJobStatus {
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterNetworkConnection {
+    pub kind: String,
+    pub address: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterSuggestionSource {
+    Moonraker,
+    Prusalink,
+    BambuMqttTls,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterNetworkSuggestion {
+    pub key: String,
+    pub name: String,
+    pub model: Option<String>,
+    pub bed_mm: Option<[u32; 3]>,
+    pub connection: PrinterNetworkConnection,
+    pub source: PrinterSuggestionSource,
+    pub printer_type: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterDiscoveryJob {
+    pub job_id: String,
+    pub status: PrinterDiscoveryJobStatus,
+    pub suggestions: Vec<PrinterNetworkSuggestion>,
+    pub normalized_range: String,
+    pub error_code: Option<String>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PrinterConnectionResult {
+    Connected,
+    Unreachable,
+    Unsupported,
+    AuthRequired,
+    Failed,
+    Cancelled,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterConnectionResponse {
+    pub result: PrinterConnectionResult,
+    pub printer: Printer,
+    pub status_event_observed: bool,
+}
+pub trait PrinterNetworkEngine: Send + Sync {
+    fn get_printer_network_policy(
+        &self,
+        context: &RequestContext,
+    ) -> Result<PrinterNetworkPolicySummary, RuntimeError>;
+    fn plan_printer_discovery(
+        &self,
+        context: &RequestContext,
+        range: &str,
+        include_bambu_discovery: bool,
+    ) -> Result<PrinterDiscoveryPlan, RuntimeError>;
+    fn start_printer_discovery(
+        &self,
+        context: &RequestContext,
+        plan_token: &str,
+        confirm: bool,
+    ) -> Result<PrinterDiscoveryJob, RuntimeError>;
+    fn get_printer_discovery(
+        &self,
+        context: &RequestContext,
+        job_id: &str,
+    ) -> Result<PrinterDiscoveryJob, RuntimeError>;
+    fn cancel_printer_discovery(
+        &self,
+        context: &RequestContext,
+        job_id: &str,
+    ) -> Result<PrinterDiscoveryJob, RuntimeError>;
+    fn set_printer_endpoint_approval(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        approved: bool,
+    ) -> Result<Printer, RuntimeError>;
+    fn test_printer_connection(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        discover_mainboard_id: bool,
+        confirm: bool,
+    ) -> Result<PrinterConnectionResponse, RuntimeError>;
 }

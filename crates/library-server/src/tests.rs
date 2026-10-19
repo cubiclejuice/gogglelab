@@ -14,6 +14,25 @@ use super::*;
 
 struct FakeEngine;
 
+#[test]
+fn printer_network_openapi_exposes_the_reviewed_interface() {
+    let document = openapi_document();
+    for (path, method) in [
+        ("/api/v1/printer-network/policy", "get"),
+        ("/api/v1/printer-network/discovery-plans", "post"),
+        ("/api/v1/printer-network/discovery-jobs", "post"),
+        ("/api/v1/printer-network/discovery-jobs/{jobId}", "get"),
+        ("/api/v1/printer-network/discovery-jobs/{jobId}", "delete"),
+        ("/api/v1/printers/{id}/endpoint-approval", "put"),
+        ("/api/v1/printers/{id}/status-checks", "post"),
+    ] {
+        assert!(
+            document["paths"][path][method].is_object(),
+            "{method} {path}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct FakeHostSlicerAdapter {
     opened: Mutex<Vec<(String, u64, String)>>,
@@ -496,6 +515,67 @@ macro_rules! fake_extended_engine {
 }
 
 impl LibraryEngine for FakeEngine {
+    fn get_printer_network_policy(
+        &self,
+        _: &RequestContext,
+    ) -> Result<PrinterNetworkPolicySummary, EngineError> {
+        Ok(PrinterNetworkPolicySummary {
+            enabled: true,
+            discovery_available: true,
+            status_checks_available: true,
+            multicast_discovery_allowed: false,
+            carbon_broadcast_allowed: false,
+            max_discovery_addresses: 1022,
+            max_suggestions: 33,
+            maximum_duration_ms: 30000,
+        })
+    }
+    fn plan_printer_discovery(
+        &self,
+        _: &RequestContext,
+        range: &str,
+        include_bambu: bool,
+    ) -> Result<PrinterDiscoveryPlan, EngineError> {
+        Ok(PrinterDiscoveryPlan {
+            plan_token: "synthetic-plan".into(),
+            normalized_range: range.into(),
+            address_count: 1,
+            include_bambu_discovery: include_bambu,
+            multicast_disclosure: None,
+            expires_at: "2026-10-19T12:00:00Z".into(),
+        })
+    }
+    fn start_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: bool,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Ok(fake_network_job(
+            "synthetic-job",
+            library_protocol::PrinterDiscoveryJobStatus::Running,
+        ))
+    }
+    fn get_printer_discovery(
+        &self,
+        _: &RequestContext,
+        id: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Ok(fake_network_job(
+            id,
+            library_protocol::PrinterDiscoveryJobStatus::Completed,
+        ))
+    }
+    fn cancel_printer_discovery(
+        &self,
+        _: &RequestContext,
+        id: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Ok(fake_network_job(
+            id,
+            library_protocol::PrinterDiscoveryJobStatus::Cancelled,
+        ))
+    }
     fake_extended_engine!();
     fn capabilities(&self, _: &RequestContext) -> Result<HostCapabilities, EngineError> {
         Ok(HostCapabilities {
@@ -6517,4 +6597,284 @@ fn fleet_mcp_shapes_and_u64_wire_contracts_are_strict() {
     assert_eq!(restored.metadata_version, u64::MAX);
     wire["metadataVersion"] = json!(9007199254740993_u64);
     assert!(serde_json::from_value::<library_protocol::PrinterMaintenanceLog>(wire).is_err());
+}
+
+#[test]
+fn printer_network_tool_shapes_require_exact_review_and_versions() {
+    for (name, valid) in [
+        ("get_printer_network_policy", json!({})),
+        (
+            "plan_printer_discovery",
+            json!({"range":"192.0.2.10","includeBambuDiscovery":false}),
+        ),
+        (
+            "start_printer_discovery",
+            json!({"planToken":"opaque-plan","confirm":true}),
+        ),
+        ("get_printer_discovery", json!({"jobId":"opaque-job"})),
+        ("cancel_printer_discovery", json!({"jobId":"opaque-job"})),
+        (
+            "set_printer_endpoint_approval",
+            json!({"printerId":"printer-1","expectedVersion":"18446744073709551615","approved":false}),
+        ),
+        (
+            "test_printer_connection",
+            json!({"printerId":"printer-1","expectedVersion":"9007199254740993","discoverMainboardId":false,"confirm":true}),
+        ),
+    ] {
+        assert!(validate_tool_shape(name, &valid).is_ok(), "{name}");
+        let mut extra = valid.clone();
+        extra["mainboardId"] = json!("must-never-be-accepted");
+        assert!(validate_tool_shape(name, &extra).is_err(), "{name}");
+        for key in valid.as_object().unwrap().keys() {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(validate_tool_shape(name, &missing).is_err(), "{name}:{key}");
+        }
+    }
+    for invalid in [
+        json!("01"),
+        json!(9007199254740993_u64),
+        json!("18446744073709551616"),
+        json!("-1"),
+    ] {
+        assert!(validate_tool_shape(
+            "set_printer_endpoint_approval",
+            &json!({"printerId":"p","expectedVersion":invalid,"approved":true})
+        )
+        .is_err());
+    }
+    assert!(validate_tool_shape(
+        "start_printer_discovery",
+        &json!({"planToken":"p","confirm":false})
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn printer_network_routes_require_permission_and_disabled_policy_never_networks() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let adapter = Arc::new(ProtocolEngineAdapter::new(runtime, HostMode::Headless));
+    let app = router(adapter.clone(), security(8));
+    let unauth = app
+        .clone()
+        .oneshot(
+            request("GET", "/api/v1/printer-network/policy", false)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    let policy = app
+        .clone()
+        .oneshot(
+            request("GET", "/api/v1/printer-network/policy", true)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(policy.status(), StatusCode::OK);
+    let value: Value =
+        serde_json::from_slice(&to_bytes(policy.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(value["enabled"], false);
+    let denied = app
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/printer-network/discovery-plans", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"range":"192.0.2.10","includeBambuDiscovery":false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let mut net_security = security(8);
+    net_security
+        .principal_capabilities
+        .insert(Capability::PrinterNetwork);
+    let app = router(adapter.clone(), net_security);
+    let hidden = app
+        .clone()
+        .oneshot(
+            request("GET", "/api/v1/openapi.json", true)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let document: Value =
+        serde_json::from_slice(&to_bytes(hidden.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert!(document["paths"]["/api/v1/printer-network/policy"].is_object());
+    assert!(document["paths"]
+        .get("/api/v1/printer-network/discovery-plans")
+        .is_none());
+    for (uri, body) in [
+        (
+            "/api/v1/printer-network/discovery-plans",
+            json!({"range":"192.0.2.10","includeBambuDiscovery":false,"credentials":"no"}),
+        ),
+        (
+            "/api/v1/printers/p/status-checks",
+            json!({"expectedVersion":"1","discoverMainboardId":false,"confirm":true,"mainboardId":"never"}),
+        ),
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                request("POST", uri, true)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let reader = RequestContext {
+        principal_id: "reader".into(),
+        request_id: "test".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead]),
+    };
+    assert!(adapter.supports_tool(&reader, "get_printer_network_policy"));
+    assert!(!adapter.supports_tool(&reader, "plan_printer_discovery"));
+    assert!(!adapter.supports_tool(&reader, "test_printer_connection"));
+}
+
+#[test]
+fn printer_network_permission_matrix_never_uses_an_id_as_authority() {
+    for (capabilities, policy_ok, network_ok, write_ok) in [
+        (BTreeSet::new(), false, false, false),
+        (
+            BTreeSet::from([Capability::CatalogRead]),
+            true,
+            false,
+            false,
+        ),
+        (
+            BTreeSet::from([Capability::CatalogRead, Capability::PrinterNetwork]),
+            true,
+            true,
+            false,
+        ),
+        (
+            BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+            true,
+            false,
+            false,
+        ),
+        (
+            BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::CatalogWrite,
+                Capability::PrinterNetwork,
+            ]),
+            true,
+            true,
+            true,
+        ),
+    ] {
+        let context = RequestContext {
+            principal_id: "same-owner".into(),
+            request_id: "test".into(),
+            capabilities,
+        };
+        assert_eq!(
+            network_permissions(&context, false, true).is_ok(),
+            policy_ok
+        );
+        assert_eq!(
+            network_permissions(&context, false, false).is_ok(),
+            network_ok
+        );
+        assert_eq!(network_permissions(&context, true, false).is_ok(), write_ok);
+    }
+}
+
+fn fake_network_job(
+    id: &str,
+    status: library_protocol::PrinterDiscoveryJobStatus,
+) -> PrinterDiscoveryJob {
+    PrinterDiscoveryJob {
+        job_id: id.into(),
+        status,
+        suggestions: Vec::new(),
+        normalized_range: "192.0.2.10".into(),
+        error_code: None,
+    }
+}
+#[tokio::test]
+async fn printer_network_synthetic_discovery_routes_preserve_review_and_job_shapes() {
+    let mut config = security(8);
+    config
+        .principal_capabilities
+        .insert(Capability::PrinterNetwork);
+    let app = router(Arc::new(FakeEngine), config);
+    for (method, path, body, expected) in [
+        (
+            "POST",
+            "/api/v1/printer-network/discovery-plans",
+            Some(json!({"range":"192.0.2.10","includeBambuDiscovery":false})),
+            json!({"planToken":"synthetic-plan"}),
+        ),
+        (
+            "POST",
+            "/api/v1/printer-network/discovery-jobs",
+            Some(json!({"planToken":"synthetic-plan","confirm":true})),
+            json!({"status":"running"}),
+        ),
+        (
+            "GET",
+            "/api/v1/printer-network/discovery-jobs/synthetic-job",
+            None,
+            json!({"status":"completed"}),
+        ),
+        (
+            "DELETE",
+            "/api/v1/printer-network/discovery-jobs/synthetic-job",
+            None,
+            json!({"status":"cancelled"}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                request(method, path, true)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(
+                        body.map(|body| Body::from(body.to_string()))
+                            .unwrap_or_else(Body::empty),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        for (field, expected) in expected.as_object().unwrap() {
+            assert_eq!(&value[field], expected);
+        }
+    }
+    let rejected = app
+        .oneshot(
+            request("POST", "/api/v1/printer-network/discovery-jobs", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"planToken":"synthetic-plan","confirm":false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 }

@@ -2491,6 +2491,86 @@ input[type="radio"] {
 .library-server-settings [hidden] {
   display: none;
 }
+.browser-printer-network [hidden] {
+  display: none;
+}
+/* Printer permission fields stay readable as a single full-width settings flow. */
+.browser-metadata-dialog .browser-printer-network,
+.library-server-settings .desktop-printer-network-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+  min-width: 0;
+}
+.library-server-settings .desktop-printer-network-settings {
+  grid-column: 1 / -1;
+}
+.browser-printer-network > *,
+.desktop-printer-network-settings > * {
+  min-width: 0;
+}
+.browser-printer-network > div {
+  display: grid;
+  gap: var(--space-2);
+}
+.browser-printer-network p,
+.browser-printer-network-actions p,
+.desktop-printer-network-settings p {
+  margin: 0;
+}
+.browser-printer-network .printer-network-scope,
+.desktop-printer-network-settings .printer-network-scope {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+}
+.printer-network-scope > input,
+.printer-network-scope > textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--button);
+  border: 1px solid var(--button-border);
+  border-radius: var(--space-1);
+  padding: var(--space-2);
+}
+.browser-metadata-dialog .printer-network-checkbox,
+.desktop-printer-network-settings .printer-network-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  max-width: none;
+  overflow-wrap: anywhere;
+}
+.printer-network-checkbox > input[type="checkbox"] {
+  flex: none;
+  width: auto;
+  margin: 0;
+}
+.browser-printer-network > button,
+.desktop-printer-network-settings > button {
+  justify-self: start;
+  max-width: 100%;
+  white-space: normal;
+}
+.browser-printer-network-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, max-content));
+  align-items: start;
+  gap: var(--space-2);
+  margin-block: var(--space-2);
+}
+.browser-printer-network-actions > .browser-printer-carbon-consent,
+.browser-printer-network-actions > p {
+  grid-column: 1 / -1;
+}
+.browser-printer-network-actions > button {
+  justify-self: start;
+  max-width: 100%;
+  white-space: normal;
+}
 .library-server-settings input[readonly] {
   min-width: 0;
   grid-column: 1 / 3;

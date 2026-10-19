@@ -17,8 +17,13 @@ The authenticated headless server, browser library, MCP integration and reviewed
 capture inbox are implemented. Localhost and read-only server defaults remain; remote
 access and write capabilities require explicit configuration. Native source operations
 use configured roots, version/hash checks and recoverable holds for original files.
-Browser printer fleet/maintenance coverage and current Linux/container delivery are
-undergoing completion and acceptance; they are not established by desktop-only tests.
+Browser printer fleet, maintenance, and reminders now share the versioned runtime.
+Optional printer LAN access requires a separate host policy and stays off by default.
+Discovery requires scope review plus a separate Start; suggestions save unapproved.
+Selected-printer checks require approval and current versions. Bambu multicast and
+Carbon broadcast are independent choices. Clients cannot expand host permission.
+Revocation/cancellation prevent stale results from being saved. Synthetic browser
+acceptance is separate from hardware and current Linux/container delivery checks.
 
 Free adds a local filament catalog and model/history assignments. Spoolman pulls retain
 stable filament/spool IDs and referenced missing/archived records. AI tagging supports
