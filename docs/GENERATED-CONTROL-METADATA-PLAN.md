@@ -1,6 +1,6 @@
 # Verified generated transaction metadata
 
-Status: primitive and shared native/runtime caller implementation passed independent review; final serial workspace, Clippy, formatting, and Community production build/signature checks pass; isolated launch and refreshed Linux image acceptance remain pending. This closes the remaining normal
+Status: primitive and shared native/runtime caller implementation passed independent review; local implementation, review, final serial workspace, Clippy, formatting, Community production signature, isolated launch, and Linux container acceptance complete at code commit `8ea0a4e`. This closes the remaining normal
 purge/restore journal growth under the original-sources-only hold policy. It is
 not a sweep of historical holds or build output and performs no manual cleanup.
 
@@ -117,8 +117,19 @@ including 201 native, 120 catalog-core, 254 runtime, and 62 server tests. Worksp
 Clippy (existing warnings), formatting, and diff checks pass. The optimized
 Community app builds and passes deep strict signature verification; executable
 SHA-256 `202eecf5079d48cbc3d330f1f631251caffb079f12191b386a4b4acbb8454d31`.
-Isolated launch and updated Linux container acceptance are the remaining package
-checks for this slice.
+The isolated debug app built through the supported Tauri CLI, launched under
+`com.sonicparke.gogglelab.phase8-qa` with the exact isolation flag, opened its
+Library successfully, and exited. The normal build wrapper's postprocessor assumed
+the release bundle name for the custom debug invocation; the direct Tauri command
+completed successfully without changing source or guards.
+
+The immutable `8ea0a4ed3fb7a4d415d4927dd7efa60bf97c57a7` Linux ARM64 image passes
+synthetic REST/MCP, indexing/no staging holds, version conflicts, fleet/reminders,
+purge/restore, and restart checks. Generated parent journals retire, both previous
+Libraries and restore's previous-catalog ZIP remain, and original model hashes
+are unchanged. The container is stopped; dedicated synthetic volumes, images, and
+evidence remain preserved. Native Linux desktop, Windows, hardware, unified core
+integration, and generated-media provenance follow-ups are separate gates.
 
 ### Bounded parent scan and test isolation
 

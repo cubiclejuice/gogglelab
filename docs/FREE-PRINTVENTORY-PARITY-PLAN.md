@@ -2,7 +2,7 @@
 
 Date: 2026-10-15 (updated 2026-10-19)
 Open Phase 6 release gates: friend-run native Windows runtime/DACL/junction/replacement checks and final release review. Ordinary concurrent changes are guarded by pinned file/directory identities; hostile same-UID swap-and-restore windows are documented residuals outside the requested threat model. At the owner's direction, Phase 7 and subsequent phases proceed in order while native validation remains pending; no cross-platform parity claim is made until those checks pass.
-Status (2026-10-19): local phases 1–10 include reviewed printer/parts/slicer JSON in Free and schema v11. Delivery audit exposed missing native stock IPC and browser fleet coverage; those backfills are pushed at `2a6847fa605422e122c5f370041a4baa99457579`. Complete isolated native slicer import/export/restart acceptance now passes. Browser/MCP discovery and selected-printer checks are implemented with separately admitted host policy, default-off multicast/broadcast permissions, one-use review, version checks, and cancellation/revocation guards. The latest full serial Rust workspace suite, Clippy, and 326-test frontend gate pass; the network slice also passes isolated native default-off inspection, synthetic browser acceptance, and a Community production build/signature check. Synthetic browser acceptance covers discovery, unapproved profile saving, approval, fake Moonraker/Carbon printing status, cancellation, and disconnect; no real printer request was made. Remaining gates include the official unified core pin/composition, remaining Linux desktop delivery, friend-run Windows checks, hardware acceptance, final generated-metadata package checks, provenance-aware generated-media follow-ups, and final release review. Bambu MQTT remains deferred in issue #3. The [Windows handoff](WINDOWS-FRIEND-ACCEPTANCE.md) is embedded in issue #2 with exact source provenance. Verified prior candidates and active builds are preserved; no cleanup or installed-app replacement occurred. No full parity or Windows/hardware acceptance claim is made.
+Status (2026-10-19): local phases 1–10 include reviewed printer/parts/slicer JSON in Free and schema v11. Delivery audit exposed missing native stock IPC and browser fleet coverage; those backfills are pushed at `2a6847fa605422e122c5f370041a4baa99457579`. Complete isolated native slicer import/export/restart acceptance now passes. Browser/MCP discovery and selected-printer checks are implemented with separately admitted host policy, default-off multicast/broadcast permissions, one-use review, version checks, and cancellation/revocation guards. The latest full serial Rust workspace suite, Clippy, and 326-test frontend gate pass; the network slice also passes isolated native default-off inspection, synthetic browser acceptance, and a Community production build/signature check. Synthetic browser acceptance covers discovery, unapproved profile saving, approval, fake Moonraker/Carbon printing status, cancellation, and disconnect; no real printer request was made. Remaining gates include the official unified core pin/composition, remaining Linux desktop delivery, friend-run Windows checks, hardware acceptance, provenance-aware generated-media follow-ups, and final release review. Bambu MQTT remains deferred in issue #3. The [Windows handoff](WINDOWS-FRIEND-ACCEPTANCE.md) is embedded in issue #2 with exact source provenance. Verified prior candidates and active builds are preserved; no cleanup or installed-app replacement occurred. No full parity or Windows/hardware acceptance claim is made.
 
 ## Decision
 
@@ -495,3 +495,37 @@ See the generated-control metadata plan for concurrency residuals, the 4,096-ent
 parent bound, and preserved logs from the two environment-dependent test attempts.
 The updated isolated app launch and Linux image checks remain pending at this
 checkpoint. Existing Linux container evidence is for the earlier `444e3ae` source.
+
+### Verified metadata delivery and approved cleanup (2026-10-19)
+
+Code checkpoint `8ea0a4ed3fb7a4d415d4927dd7efa60bf97c57a7` is pushed. Its production
+Community app passes strict signature verification, and the rebuilt isolated debug
+app opens its Library and exits under the dedicated QA identifier/guard. Screenshot:
+`output/generated-metadata-isolated-library.png`. The updated immutable Linux
+ARM64 image passes the synthetic authenticated REST/MCP, read-only source indexing,
+no staging holds, fleet/conflict/reminder, purge/restore, and restart checks. Parent
+journals are retired; both previous Library directories and restore's previous
+catalog ZIP are preserved. Source hashes remain unchanged. Evidence:
+`output/container-acceptance-8ea0a4e/checks.json` and source archive provenance.
+The fixture container and isolated app are stopped. Windows issue #2 contains the
+complete current handoff and exact `8ea0a4e` source identity, verified by read-back.
+
+PID 44771 exited. A fresh full target open-file scan and process inspection found
+no build/app activity; the exact approved dry-run still reported 16,264 files /
+11.7 GiB, all selected paths inside repository `target/debug`, with no app bundles
+or tracked source. The owner's one-time conditional command then ran successfully:
+`cargo clean --manifest-path /Users/bradmcalister/Documents/DEV/gogglelab/Cargo.toml --target-dir /Users/bradmcalister/Documents/DEV/gogglelab/target --profile dev --package gogglelab`.
+Cargo removed that exact logical scope. Data-volume free space increased from
+23,154,774,016 to 28,407,513,088 bytes: **5,252,739,072 bytes (4.892 GiB)** measured
+recovery. Logical output size differs from physical APFS space. Repository debug is
+now 14 GiB; repository release remains 2.6 GiB, the reused working target 40 GiB,
+and preserved app candidates 118 MiB. Working/known-good executable hashes and deep
+strict signatures, plus the repository release signature, still verify. No source,
+Git state, configuration, user data, Docker data, or historical source holds were
+cleaned. This exact cleanup approval is consumed; future scopes need fresh approval.
+
+Remaining delivery gates: official unified core integration/pin and composition,
+native Linux desktop and friend-run Windows acceptance, deferred Bambu MQTT/real
+hardware checks, provenance-aware different generated-thumbnail/geometry retirement,
+and final release review. The last Carbon discovery timed out; synthetic printing
+status does not establish real hardware acceptance. Full parity is not claimed.
