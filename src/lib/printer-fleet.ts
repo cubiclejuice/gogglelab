@@ -779,9 +779,11 @@ export class PrinterFleetState {
         );
       }
       this.connectionTests.set(id, result);
+      const reportedJobState =
+        response?.printer?.id === id ? jobStatusLabel(response.printer.jobStatus) : "unknown";
       this.status =
         result === "connected" && response?.statusEventObserved === true
-          ? "An SDCP status event was observed during this test; job state is not mapped yet."
+          ? `SDCP event observed during this test; reported job state: ${reportedJobState}.`
           : connectionTestCopy(result);
       return result === "connected";
     } catch {

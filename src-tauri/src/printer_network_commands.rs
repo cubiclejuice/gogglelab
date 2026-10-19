@@ -9,6 +9,8 @@ mod tests {
         Bambu,
         BambuOutOfScope,
         Elegoo,
+        ElegooUnknown,
+        ElegooNoEvent,
         Moonraker,
         MoonrakerAuth(&'static str),
         PrusaAuth,
@@ -117,7 +119,7 @@ mod tests {
                 FakeMode::Bambu | FakeMode::BambuOutOfScope => {
                     Ok(ProbeResponse::new(404, Vec::new()))
                 }
-                FakeMode::Elegoo => Ok(ProbeResponse::new(404, Vec::new())),
+                FakeMode::Elegoo | FakeMode::ElegooUnknown | FakeMode::ElegooNoEvent => Ok(ProbeResponse::new(404, Vec::new())),
             }
         }
 
@@ -142,13 +144,22 @@ mod tests {
             address: Ipv4Addr,
             mainboard_id: &str,
             timeout: Duration,
-        ) -> Result<bool, ProbeError> {
+        ) -> Result<crate::elegoo_sdcp::SdcpStatusObservation, ProbeError> {
             self.elegoo_requests
                 .lock()
                 .unwrap()
                 .push((address, mainboard_id.to_owned(), timeout));
             match self.mode.as_ref().unwrap() {
-                FakeMode::Elegoo => Ok(true),
+                FakeMode::Elegoo => Ok(crate::elegoo_sdcp::SdcpStatusObservation {
+                    event_observed: true,
+                    job_status: PrinterJobStatus::Printing,
+                }),
+                FakeMode::ElegooUnknown | FakeMode::ElegooNoEvent => {
+                    Ok(crate::elegoo_sdcp::SdcpStatusObservation {
+                        event_observed: matches!(self.mode, Some(FakeMode::ElegooUnknown)),
+                        job_status: PrinterJobStatus::Unknown,
+                    })
+                }
                 _ => Err(ProbeError::Failed),
             }
         }
@@ -770,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn original_centauri_carbon_uses_fixed_sdcp_refresh_and_keeps_job_unknown() {
+    fn original_centauri_carbon_uses_fixed_sdcp_refresh_and_maps_observed_printing() {
         let mut printer = fixture_printer(Some("Elegoo"), "192.168.0.108", true);
         printer.model = Some("Centauri Carbon".into());
         let transport = FakeTransport::new(FakeMode::Elegoo);
@@ -786,7 +797,7 @@ mod tests {
 
         assert_eq!(outcome.result, PrinterConnectionTestResult::Connected);
         assert_eq!(outcome.connection_status, PrinterConnectionStatus::Online);
-        assert_eq!(outcome.job_status, PrinterJobStatus::Unknown);
+        assert_eq!(outcome.job_status, PrinterJobStatus::Printing);
         assert!(outcome.status_event_observed);
         let requests = transport.elegoo_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -796,6 +807,30 @@ mod tests {
         assert!(transport.requests.lock().unwrap().is_empty());
         assert!(transport.bambu_hosts.lock().unwrap().is_empty());
         assert!(transport.elegoo_discoveries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn original_centauri_carbon_keeps_unknown_for_unmapped_or_absent_status() {
+        for (mode, event_observed) in [
+            (FakeMode::ElegooUnknown, true),
+            (FakeMode::ElegooNoEvent, false),
+        ] {
+            let mut printer = fixture_printer(Some("Elegoo"), "192.168.0.108", true);
+            printer.model = Some("Centauri Carbon".into());
+            let transport = FakeTransport::new(mode);
+            let outcome = check_printer_with_transport_and_sdcp(
+                &printer,
+                &transport,
+                Instant::now() + Duration::from_secs(2),
+                Duration::from_secs(2),
+                Some("AB12CD34EF56"),
+                false,
+            )
+            .unwrap();
+            assert_eq!(outcome.result, PrinterConnectionTestResult::Connected);
+            assert_eq!(outcome.job_status, PrinterJobStatus::Unknown);
+            assert_eq!(outcome.status_event_observed, event_observed);
+        }
     }
 
     #[test]
@@ -814,7 +849,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.result, PrinterConnectionTestResult::Connected);
-        assert_eq!(outcome.job_status, PrinterJobStatus::Unknown);
+        assert_eq!(outcome.job_status, PrinterJobStatus::Printing);
         assert!(outcome.status_event_observed);
         assert_eq!(
             transport
@@ -1493,7 +1528,7 @@ trait ProbeTransport: Send + Sync {
         _address: Ipv4Addr,
         _mainboard_id: &str,
         _timeout: Duration,
-    ) -> Result<bool, ProbeError> {
+    ) -> Result<crate::elegoo_sdcp::SdcpStatusObservation, ProbeError> {
         Err(ProbeError::Failed)
     }
     fn elegoo_sdcp_mainboard_id(
@@ -1589,7 +1624,7 @@ impl ProbeTransport for NativeTransport {
         address: Ipv4Addr,
         mainboard_id: &str,
         timeout: Duration,
-    ) -> Result<bool, ProbeError> {
+    ) -> Result<crate::elegoo_sdcp::SdcpStatusObservation, ProbeError> {
         crate::elegoo_sdcp::send_status_refresh(
             address,
             mainboard_id,
@@ -2322,9 +2357,9 @@ fn check_printer_with_transport_and_sdcp(
         let timeout = bounded_timeout(deadline, request_limit)?;
         return Ok(
             match transport.elegoo_sdcp_status_refresh(address, mainboard_id, timeout) {
-                Ok(status_event_observed) => connection_succeeded_with_status_event(
-                    PrinterJobStatus::Unknown,
-                    status_event_observed,
+                Ok(observation) => connection_succeeded_with_status_event(
+                    observation.job_status,
+                    observation.event_observed,
                 ),
                 Err(ProbeError::Timeout | ProbeError::Unreachable) => NetworkOutcome::new(
                     PrinterConnectionTestResult::Unreachable,

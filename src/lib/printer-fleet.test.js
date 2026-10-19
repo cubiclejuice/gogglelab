@@ -585,7 +585,7 @@ test("connection test forwards explicit MainboardID discovery without persisting
   expect(state.model.managedPrinters[0]).not.toHaveProperty("mainboardId");
 });
 
-test("connection test reports a received status event without implying a job state", async () => {
+test("connection test reports an unknown SDCP event without inventing a job state", async () => {
   const state = new PrinterFleetState(
     baseModel,
     callbacks({
@@ -598,11 +598,44 @@ test("connection test reports a received status event without implying a job sta
   );
 
   expect(await state.testConnection(printer.id)).toBe(true);
-  expect(state.status).toBe(
-    "An SDCP status event was observed during this test; job state is not mapped yet.",
-  );
+  expect(state.status).toBe("SDCP event observed during this test; reported job state: unknown.");
   expect(state.model.managedPrinters[0].jobStatus).toBe("unknown");
   expect(state.model.managedPrinters[0]).not.toHaveProperty("mainboardId");
+});
+
+test("Community connection check shows only the matching printer's reported job snapshot", async () => {
+  for (const jobStatus of ["idle", "printing", "paused", "complete"]) {
+    const state = new PrinterFleetState(
+      baseModel,
+      callbacks({
+        testConnection: async () => ({
+          result: "connected",
+          printer: { ...printer, jobStatus },
+          statusEventObserved: true,
+        }),
+      }),
+    );
+    expect(await state.testConnection(printer.id)).toBe(true);
+    expect(state.status).toBe(
+      `SDCP event observed during this test; reported job state: ${jobStatus}.`,
+    );
+    expect(state.model.managedPrinters[0].jobStatus).toBe(jobStatus);
+  }
+  const wrongPrinter = new PrinterFleetState(
+    baseModel,
+    callbacks({
+      testConnection: async () => ({
+        result: "connected",
+        printer: { ...printer, id: "different-printer", jobStatus: "printing" },
+        statusEventObserved: true,
+      }),
+    }),
+  );
+  await wrongPrinter.testConnection(printer.id);
+  expect(wrongPrinter.model.managedPrinters[0].jobStatus).toBe("unknown");
+  expect(wrongPrinter.status).toBe(
+    "SDCP event observed during this test; reported job state: unknown.",
+  );
 });
 
 test("connection acknowledgement without a status event keeps the generic connected copy", async () => {

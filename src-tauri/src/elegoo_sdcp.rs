@@ -1,4 +1,5 @@
 use base64::Engine as _;
+use library_core::models::PrinterJobStatus;
 use ring::rand::SecureRandom as _;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
@@ -13,6 +14,21 @@ pub(crate) enum SdcpRequestError {
     InvalidHandshake,
     AcknowledgementMissing,
     Io,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SdcpStatusObservation {
+    pub event_observed: bool,
+    pub job_status: PrinterJobStatus,
+}
+
+impl SdcpStatusObservation {
+    fn no_event() -> Self {
+        Self {
+            event_observed: false,
+            job_status: PrinterJobStatus::Unknown,
+        }
+    }
 }
 
 const SDCP_PORT: u16 = 3030;
@@ -121,12 +137,13 @@ fn validate_websocket_upgrade_response(
 
 /// Performs only the fixed, unauthenticated SDCP status-refresh exchange.
 /// A successful return confirms a WebSocket upgrade and a correlated Cmd 0
-/// acknowledgement; it does not parse or claim the printer's status payload.
+/// acknowledgement. Any mapped job state comes from a matching status event
+/// observed during this exchange; the event itself is not request-correlated.
 pub(crate) fn send_status_refresh(
     address: Ipv4Addr,
     mainboard_id: &str,
     timeout: Duration,
-) -> Result<bool, SdcpRequestError> {
+) -> Result<SdcpStatusObservation, SdcpRequestError> {
     crate::visual_qa::require_printer_network().map_err(|_| SdcpRequestError::Io)?;
     if timeout.is_zero() {
         return Err(SdcpRequestError::Timeout);
@@ -146,7 +163,7 @@ fn perform_status_refresh(
     address: Ipv4Addr,
     mainboard_id: &str,
     deadline: Instant,
-) -> Result<bool, SdcpRequestError> {
+) -> Result<SdcpStatusObservation, SdcpRequestError> {
     validate_mainboard_id(mainboard_id)?;
     let client_key =
         base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
@@ -211,16 +228,16 @@ fn wait_for_status_ack(
     mainboard_id: &str,
     request_id: uuid::Uuid,
     deadline: Instant,
-) -> Result<bool, SdcpRequestError> {
+) -> Result<SdcpStatusObservation, SdcpRequestError> {
     let mut total_bytes = 0_usize;
     let mut acknowledgement_received = false;
-    let mut status_event_observed = false;
+    let mut observation = SdcpStatusObservation::no_event();
     let mut response_deadline = deadline;
     for _ in 0..MAX_SERVER_FRAMES {
         let frame = match read_server_frame(socket, response_deadline) {
             Err(SdcpRequestError::Timeout | SdcpRequestError::Unreachable) => {
                 return if acknowledgement_received {
-                    Ok(status_event_observed)
+                    Ok(observation)
                 } else {
                     Err(SdcpRequestError::AcknowledgementMissing)
                 };
@@ -243,13 +260,16 @@ fn wait_for_status_ack(
                         acknowledgement_received = true;
                         response_deadline = deadline.min(Instant::now() + STATUS_EVENT_GRACE);
                     }
-                    if status_event_observed {
-                        return Ok(true);
+                    if observation.event_observed {
+                        return Ok(observation);
                     }
-                } else if is_status_event(&payload, mainboard_id) {
-                    status_event_observed = true;
+                } else if let Some(job_status) = parse_status_event(&payload, mainboard_id) {
+                    observation = SdcpStatusObservation {
+                        event_observed: true,
+                        job_status,
+                    };
                     if acknowledgement_received {
-                        return Ok(true);
+                        return Ok(observation);
                     }
                 }
             }
@@ -267,7 +287,7 @@ fn wait_for_status_ack(
                 let write_timeout = match remaining(pong_deadline) {
                     Ok(timeout) => timeout,
                     Err(SdcpRequestError::Timeout) if acknowledgement_received => {
-                        return Ok(status_event_observed);
+                        return Ok(observation);
                     }
                     Err(error) => return Err(error),
                 };
@@ -281,7 +301,7 @@ fn wait_for_status_ack(
                             SdcpRequestError::Timeout | SdcpRequestError::Unreachable
                         )
                     {
-                        return Ok(status_event_observed);
+                        return Ok(observation);
                     }
                     return Err(error);
                 }
@@ -289,7 +309,7 @@ fn wait_for_status_ack(
             ServerFrame::Pong => {}
             ServerFrame::Close => {
                 return if acknowledgement_received {
-                    Ok(status_event_observed)
+                    Ok(observation)
                 } else {
                     Err(SdcpRequestError::AcknowledgementMissing)
                 };
@@ -297,7 +317,7 @@ fn wait_for_status_ack(
         }
     }
     if acknowledgement_received {
-        Ok(status_event_observed)
+        Ok(observation)
     } else {
         Err(SdcpRequestError::AcknowledgementMissing)
     }
@@ -399,24 +419,33 @@ fn is_correlated_status_ack(payload: &[u8], mainboard_id: &str, request_id: uuid
             == Some(0)
 }
 
-fn is_status_event(payload: &[u8], mainboard_id: &str) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return false;
-    };
-    value.get("Topic").and_then(serde_json::Value::as_str)
-        == Some(format!("sdcp/status/{mainboard_id}").as_str())
-        && value
-            .pointer("/Data/Cmd")
+// Original CC1 status envelope and print states are defined by Elegoo's FDM CC adapter:
+// https://github.com/elegooofficial/elegoo-link/blob/46c7b814e055cf9675d58482d79f43d0bd2280da/src/lan/adapters/elegoo_fdm_cc/elegoo_fdm_cc_message_adapter.cpp#L33-L62
+// The same adapter parses the top-level Status object (handlePrinterStatus).
+// Only directly represented job states are mapped; transitional and unknown values stay Unknown.
+fn parse_status_event(payload: &[u8], mainboard_id: &str) -> Option<PrinterJobStatus> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    if value.get("Topic").and_then(serde_json::Value::as_str)
+        != Some(format!("sdcp/status/{mainboard_id}").as_str())
+        || value.get("MainboardID").and_then(serde_json::Value::as_str) != Some(mainboard_id)
+        || !value
+            .get("Status")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return None;
+    }
+    Some(
+        match value
+            .pointer("/Status/PrintInfo/Status")
             .and_then(serde_json::Value::as_u64)
-            == Some(0)
-        && value
-            .pointer("/Data/MainboardID")
-            .and_then(serde_json::Value::as_str)
-            == Some(mainboard_id)
-        && value
-            .pointer("/Data/Data")
-            .and_then(serde_json::Value::as_object)
-            .is_some()
+        {
+            Some(0) => PrinterJobStatus::Idle,
+            Some(6) => PrinterJobStatus::Paused,
+            Some(9) => PrinterJobStatus::Complete,
+            Some(13) => PrinterJobStatus::Printing,
+            _ => PrinterJobStatus::Unknown,
+        },
+    )
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, SdcpRequestError> {
@@ -598,38 +627,192 @@ mod tests {
     }
 
     #[test]
-    fn status_event_requires_matching_topic_command_mainboard_and_data_object() {
+    fn status_event_requires_matching_topic_and_top_level_mainboard_and_status_object() {
         let valid = json!({
             "Topic": "sdcp/status/AB12CD34EF56",
-            "Data": {
-                "Cmd": 0,
-                "Data": {"Filename": "example.gcode"},
-                "MainboardID": "AB12CD34EF56"
-            }
+            "MainboardID": "AB12CD34EF56",
+            "Status": {"PrintInfo": {"Status": 13}}
         });
-        assert!(is_status_event(
-            &serde_json::to_vec(&valid).unwrap(),
-            "AB12CD34EF56"
-        ));
+        assert_eq!(
+            parse_status_event(&serde_json::to_vec(&valid).unwrap(), "AB12CD34EF56"),
+            Some(PrinterJobStatus::Printing)
+        );
 
         let mut wrong_topic = valid.clone();
         wrong_topic["Topic"] = json!("sdcp/status/OTHER");
-        assert!(!is_status_event(
-            &serde_json::to_vec(&wrong_topic).unwrap(),
-            "AB12CD34EF56"
-        ));
+        assert!(
+            parse_status_event(&serde_json::to_vec(&wrong_topic).unwrap(), "AB12CD34EF56")
+                .is_none()
+        );
         let mut wrong_command = valid.clone();
-        wrong_command["Data"]["Cmd"] = json!(1);
-        assert!(!is_status_event(
-            &serde_json::to_vec(&wrong_command).unwrap(),
-            "AB12CD34EF56"
-        ));
+        wrong_command["Status"] = json!(null);
+        assert!(
+            parse_status_event(&serde_json::to_vec(&wrong_command).unwrap(), "AB12CD34EF56")
+                .is_none()
+        );
         let mut wrong_board = valid.clone();
-        wrong_board["Data"]["MainboardID"] = json!("OTHER");
-        assert!(!is_status_event(
-            &serde_json::to_vec(&wrong_board).unwrap(),
-            "AB12CD34EF56"
-        ));
+        wrong_board["MainboardID"] = json!("OTHER");
+        assert!(
+            parse_status_event(&serde_json::to_vec(&wrong_board).unwrap(), "AB12CD34EF56")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn original_cc1_job_states_map_only_directly_represented_states() {
+        for (code, expected) in [
+            (0, PrinterJobStatus::Idle),
+            (6, PrinterJobStatus::Paused),
+            (9, PrinterJobStatus::Complete),
+            (13, PrinterJobStatus::Printing),
+        ] {
+            let event = status_fixture(json!(code));
+            assert_eq!(
+                parse_status_event(&serde_json::to_vec(&event).unwrap(), "AB12CD34EF56"),
+                Some(expected)
+            );
+        }
+        for code in [
+            1, 5, 7, 8, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 255,
+        ] {
+            let event = status_fixture(json!(code));
+            assert_eq!(
+                parse_status_event(&serde_json::to_vec(&event).unwrap(), "AB12CD34EF56"),
+                Some(PrinterJobStatus::Unknown)
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_or_missing_print_info_is_an_observed_event_with_unknown_job() {
+        for status in [
+            json!("13"),
+            json!(13.0),
+            json!(-1),
+            json!(null),
+            json!(true),
+            json!({}),
+            json!([]),
+        ] {
+            let event = status_fixture(status);
+            assert_eq!(
+                parse_status_event(&serde_json::to_vec(&event).unwrap(), "AB12CD34EF56"),
+                Some(PrinterJobStatus::Unknown)
+            );
+        }
+        for status in [
+            json!({}),
+            json!({"PrintInfo": {}}),
+            json!({"PrintInfo": null}),
+        ] {
+            let mut event = status_fixture(json!(13));
+            event["Status"] = status;
+            assert_eq!(
+                parse_status_event(&serde_json::to_vec(&event).unwrap(), "AB12CD34EF56"),
+                Some(PrinterJobStatus::Unknown)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_command_envelope_does_not_count_as_a_status_event() {
+        let event = json!({
+            "Topic": "sdcp/status/AB12CD34EF56",
+            "Data": {"Cmd": 0, "MainboardID": "AB12CD34EF56", "Data": {"PrintInfo": {"Status": 13}}}
+        });
+        assert_eq!(
+            parse_status_event(&serde_json::to_vec(&event).unwrap(), "AB12CD34EF56"),
+            None
+        );
+        assert_eq!(parse_status_event(b"not json", "AB12CD34EF56"), None);
+    }
+
+    fn status_fixture(status: Value) -> Value {
+        json!({
+            "Topic": "sdcp/status/AB12CD34EF56",
+            "MainboardID": "AB12CD34EF56",
+            "Status": {"PrintInfo": {"Status": status}}
+        })
+    }
+
+    fn ack_fixture(request_id: uuid::Uuid) -> Value {
+        json!({
+            "Topic": "sdcp/response/AB12CD34EF56",
+            "Data": {
+                "Cmd": 0,
+                "Data": {"Ack": 0},
+                "RequestID": request_id.to_string(),
+                "MainboardID": "AB12CD34EF56"
+            }
+        })
+    }
+
+    fn receive_fixture_frames(
+        frames: Vec<Value>,
+    ) -> Result<SdcpStatusObservation, SdcpRequestError> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let socket_address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            for frame in frames {
+                socket
+                    .write_all(&encode_server_text_frame(
+                        &serde_json::to_vec(&frame).unwrap(),
+                    ))
+                    .unwrap();
+            }
+            // Explicit WebSocket close avoids depending on TCP EOF classification.
+            socket.write_all(&[0x88, 0]).unwrap();
+        });
+        let mut socket = TcpStream::connect(socket_address).unwrap();
+        let result = wait_for_status_ack(
+            &mut socket,
+            "AB12CD34EF56",
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn mapped_status_requires_ack_and_supports_both_frame_orders() {
+        let request_id = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        for frames in [
+            vec![status_fixture(json!(6)), ack_fixture(request_id)],
+            vec![ack_fixture(request_id), status_fixture(json!(6))],
+        ] {
+            assert_eq!(
+                receive_fixture_frames(frames),
+                Ok(SdcpStatusObservation {
+                    event_observed: true,
+                    job_status: PrinterJobStatus::Paused,
+                })
+            );
+        }
+        assert_eq!(
+            receive_fixture_frames(vec![status_fixture(json!(13))]),
+            Err(SdcpRequestError::AcknowledgementMissing)
+        );
+        let mut wrong_ack = ack_fixture(request_id);
+        wrong_ack["Data"]["Data"]["Ack"] = json!(1);
+        assert_eq!(
+            receive_fixture_frames(vec![status_fixture(json!(13)), wrong_ack]),
+            Err(SdcpRequestError::AcknowledgementMissing)
+        );
+    }
+
+    #[test]
+    fn wrong_identity_events_never_supply_a_job_state_even_with_a_valid_ack() {
+        let request_id = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let mut wrong_board = status_fixture(json!(13));
+        wrong_board["MainboardID"] = json!("OTHER");
+        let mut wrong_topic = status_fixture(json!(13));
+        wrong_topic["Topic"] = json!("sdcp/status/OTHER");
+        assert_eq!(
+            receive_fixture_frames(vec![wrong_board, wrong_topic, ack_fixture(request_id)]),
+            Ok(SdcpStatusObservation::no_event())
+        );
     }
 
     #[test]
@@ -774,12 +957,9 @@ mod tests {
             let request_id = request["Data"]["RequestID"].as_str().unwrap();
             let status = json!({
                 "Id": request["Id"],
-                "Data": {
-                    "Cmd": 0,
-                    "Data": {"Filename": "example.gcode"},
-                    "MainboardID": "AB12CD34EF56",
-                    "TimeStamp": 1_792_101_000_u64
-                },
+                "Status": {"PrintInfo": {"Status": 13}},
+                "MainboardID": "AB12CD34EF56",
+                "TimeStamp": 1_792_101_000_u64,
                 "Topic": "sdcp/status/AB12CD34EF56"
             });
             socket
@@ -813,7 +993,8 @@ mod tests {
             Instant::now() + Duration::from_secs(2),
         )
         .unwrap();
-        assert!(status_received);
+        assert!(status_received.event_observed);
+        assert_eq!(status_received.job_status, PrinterJobStatus::Printing);
         server.join().unwrap();
     }
 
@@ -849,7 +1030,7 @@ mod tests {
                 request_id,
                 Instant::now() + Duration::from_secs(1),
             ),
-            Ok(false)
+            Ok(SdcpStatusObservation::no_event())
         );
         server.join().unwrap();
     }
