@@ -1,3 +1,13 @@
+import type {
+  LibraryPrinter,
+  PrinterInput,
+  PrinterMaintenanceInput,
+  PrinterMaintenanceLog,
+  PrinterReminderInput,
+  PrinterReminder,
+  PrinterReminderCompletionInput,
+} from "./ipc";
+
 export interface HostCapabilities {
   apiVersion: "1";
   hostMode: "desktop" | "headless";
@@ -238,18 +248,41 @@ export interface BrowserPrintAttemptPart {
   quantityPerCopy: number;
   quantity: number;
 }
+/** Versions and cumulative counts remain decimal strings across HTTP. */
+export interface BrowserPrinter extends Omit<LibraryPrinter, "metadataVersion" | "printCount"> {
+  metadataVersion: string;
+  printCount: string;
+}
+export type BrowserPrinterInput = PrinterInput;
+export type BrowserMaintenanceInput = PrinterMaintenanceInput;
+export interface BrowserMaintenanceLog extends Omit<PrinterMaintenanceLog, "metadataVersion"> {
+  metadataVersion: string;
+}
+export type BrowserReminderInput = PrinterReminderInput;
+export interface BrowserReminder extends Omit<PrinterReminder, "metadataVersion"> {
+  metadataVersion: string;
+}
+export type BrowserReminderCompletionInput = PrinterReminderCompletionInput;
+export interface BrowserReminderCompletion {
+  reminder: BrowserReminder;
+  maintenanceLog: BrowserMaintenanceLog;
+}
+
 export interface BrowserPrintAttemptInput {
   printedAt: string;
   quantity: number;
   notes: string;
   filamentIds: string[];
   outcome: "printed" | "failed" | "cancelled";
+  /** Undefined preserves the existing printer; null clears it. */
+  printerId?: string | null;
   /** Optional for older clients and payloads. */
   parts?: BrowserPrintAttemptPartInput[];
 }
 export interface BrowserPrintAttempt extends Omit<BrowserPrintAttemptInput, "parts"> {
   id: string;
   modelId: string;
+  printerNicknameSnapshot?: string | null;
   parts?: BrowserPrintAttemptPart[];
   /** Null marks legacy part usage whose effect on stock cannot be reconstructed. */
   stockAdjusted?: boolean | null;
@@ -724,6 +757,60 @@ export interface LibraryClient {
     expectedVersion: string,
     signal?: AbortSignal,
   ): Promise<BrowserFilament | null>;
+  listPrinters(signal?: AbortSignal): Promise<BrowserPrinter[]>;
+  createPrinter(input: BrowserPrinterInput, signal?: AbortSignal): Promise<BrowserPrinter>;
+  updatePrinter(
+    id: string,
+    expectedVersion: string,
+    input: BrowserPrinterInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinter>;
+  deletePrinter(id: string, expectedVersion: string, signal?: AbortSignal): Promise<void>;
+  listPrinterMaintenance(
+    printerId?: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserMaintenanceLog[]>;
+  createPrinterMaintenance(
+    printerId: string,
+    input: BrowserMaintenanceInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserMaintenanceLog>;
+  updatePrinterMaintenance(
+    id: string,
+    expectedVersion: string,
+    input: BrowserMaintenanceInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserMaintenanceLog>;
+  deletePrinterMaintenance(
+    id: string,
+    expectedVersion: string,
+    signal?: AbortSignal,
+  ): Promise<void>;
+  listPrinterReminders(printerId?: string, signal?: AbortSignal): Promise<BrowserReminder[]>;
+  createPrinterReminder(
+    printerId: string,
+    input: BrowserReminderInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminder>;
+  updatePrinterReminder(
+    id: string,
+    expectedVersion: string,
+    input: BrowserReminderInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminder>;
+  deletePrinterReminder(id: string, expectedVersion: string, signal?: AbortSignal): Promise<void>;
+  pausePrinterReminder(
+    id: string,
+    expectedVersion: string,
+    paused: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminder>;
+  completePrinterReminder(
+    id: string,
+    expectedVersion: string,
+    input: BrowserReminderCompletionInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminderCompletion>;
   listPartStock(signal?: AbortSignal): Promise<BrowserPartStock[]>;
   createPartStock(input: BrowserPartStockInput, signal?: AbortSignal): Promise<BrowserPartStock>;
   updatePartStock(
@@ -1249,6 +1336,150 @@ export class HttpLibraryClient implements LibraryClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ assignments }),
+      signal,
+    });
+  }
+  listPrinters(signal?: AbortSignal): Promise<BrowserPrinter[]> {
+    return this.json("/api/v1/printers", { signal });
+  }
+  createPrinter(input: BrowserPrinterInput, signal?: AbortSignal): Promise<BrowserPrinter> {
+    return this.json("/api/v1/printers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+  }
+  updatePrinter(
+    id: string,
+    expectedVersion: string,
+    input: BrowserPrinterInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserPrinter> {
+    return this.json(`/api/v1/printers/${segment(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, input }),
+      signal,
+    });
+  }
+  deletePrinter(id: string, expectedVersion: string, signal?: AbortSignal): Promise<void> {
+    return this.json(`/api/v1/printers/${segment(id)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion }),
+      signal,
+    });
+  }
+  listPrinterMaintenance(
+    printerId?: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserMaintenanceLog[]> {
+    return this.json(
+      printerId
+        ? `/api/v1/printers/${segment(printerId)}/maintenance-logs`
+        : "/api/v1/printer-maintenance-logs",
+      { signal },
+    );
+  }
+  createPrinterMaintenance(
+    printerId: string,
+    input: BrowserMaintenanceInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserMaintenanceLog> {
+    return this.json(`/api/v1/printers/${segment(printerId)}/maintenance-logs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+  }
+  updatePrinterMaintenance(
+    id: string,
+    expectedVersion: string,
+    input: BrowserMaintenanceInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserMaintenanceLog> {
+    return this.json(`/api/v1/printer-maintenance-logs/${segment(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, input }),
+      signal,
+    });
+  }
+  deletePrinterMaintenance(
+    id: string,
+    expectedVersion: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.json(`/api/v1/printer-maintenance-logs/${segment(id)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion }),
+      signal,
+    });
+  }
+  listPrinterReminders(printerId?: string, signal?: AbortSignal): Promise<BrowserReminder[]> {
+    const query = new URLSearchParams({ includeCompleted: "true" });
+    if (printerId) query.set("printerId", printerId);
+    return this.json(`/api/v1/printer-reminders?${query}`, { signal });
+  }
+  createPrinterReminder(
+    printerId: string,
+    input: BrowserReminderInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminder> {
+    return this.json("/api/v1/printer-reminders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ printerId, input }),
+      signal,
+    });
+  }
+  updatePrinterReminder(
+    id: string,
+    expectedVersion: string,
+    input: BrowserReminderInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminder> {
+    return this.json(`/api/v1/printer-reminders/${segment(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, input }),
+      signal,
+    });
+  }
+  deletePrinterReminder(id: string, expectedVersion: string, signal?: AbortSignal): Promise<void> {
+    return this.json(`/api/v1/printer-reminders/${segment(id)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion }),
+      signal,
+    });
+  }
+  pausePrinterReminder(
+    id: string,
+    expectedVersion: string,
+    paused: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminder> {
+    return this.json(`/api/v1/printer-reminders/${segment(id)}/pause`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, paused }),
+      signal,
+    });
+  }
+  completePrinterReminder(
+    id: string,
+    expectedVersion: string,
+    input: BrowserReminderCompletionInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserReminderCompletion> {
+    return this.json(`/api/v1/printer-reminders/${segment(id)}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, ...input }),
       signal,
     });
   }

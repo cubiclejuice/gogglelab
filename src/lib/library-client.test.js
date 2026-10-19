@@ -690,3 +690,158 @@ test("integration credential is request-only and never enters the provider URL",
     globalThis.fetch = original;
   }
 });
+
+test("browser printer fleet requires authentication and preserves decimal wire versions", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  await expect(client.listPrinters()).rejects.toBeInstanceOf(LibraryHttpError);
+  client.setToken("fleet-token");
+  const original = globalThis.fetch;
+  const requests = [];
+  const version = "18446744073709551614";
+  const printer = { id: "printer/a", metadataVersion: version, printCount: version };
+  globalThis.fetch = async (url, init) => {
+    requests.push({
+      url: String(url),
+      headers: new Headers(init.headers),
+      body: init.body,
+      method: init.method ?? "GET",
+    });
+    return Response.json(printer);
+  };
+  try {
+    const input = {
+      nickname: "Workshop",
+      make: null,
+      model: null,
+      printerType: "FDM",
+      firmware: null,
+      host: null,
+      webUrl: null,
+      bedMm: null,
+      notes: "",
+    };
+    expect((await client.updatePrinter("printer/a", version, input)).metadataVersion).toBe(version);
+    await client.deletePrinter("printer/a", version);
+    expect(requests[0].url).toBe("https://library.test/api/v1/printers/printer%2Fa");
+    expect(requests[0].headers.get("Authorization")).toBe("Bearer fleet-token");
+    expect(JSON.parse(requests[0].body)).toEqual({ expectedVersion: version, input });
+    expect(JSON.parse(requests[1].body)).toEqual({ expectedVersion: version });
+    expect(requests[0].url).not.toContain("fleet-token");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("printer fleet conflicts expose current decimal version without retrying a write", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  client.setToken("token");
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json(
+      {
+        error: {
+          code: "versionConflict",
+          message: "Printer changed",
+          requestId: "fleet-conflict",
+          retryable: false,
+          currentVersion: "9007199254740999",
+        },
+      },
+      { status: 409 },
+    );
+  };
+  try {
+    await expect(client.deletePrinter("printer", "9007199254740998")).rejects.toMatchObject({
+      code: "versionConflict",
+      currentVersion: "9007199254740999",
+    });
+    expect(calls).toBe(1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("browser fleet maintenance and reminder writes bind exact IDs and decimal versions", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  client.setToken("fleet-token");
+  const original = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({
+      url: String(url),
+      method: init.method ?? "GET",
+      body: init.body ? JSON.parse(init.body) : null,
+    });
+    return Response.json({ metadataVersion: "9007199254740999" });
+  };
+  try {
+    const log = { title: "Lubricate", performedAt: "2026-10-19T12:00:00Z", notes: "" };
+    const reminder = { title: "Clean", dueAt: "2026-10-20T12:00:00Z", intervalDays: 7, notes: "" };
+    await client.listPrinterMaintenance();
+    await client.listPrinterMaintenance("a/b");
+    await client.createPrinterMaintenance("a/b", log);
+    await client.updatePrinterMaintenance("log/id", "9007199254740998", log);
+    await client.deletePrinterMaintenance("log/id", "9007199254740998");
+    await client.listPrinterReminders("a/b");
+    await client.createPrinterReminder("a/b", reminder);
+    await client.updatePrinterReminder("rem/id", "9007199254740998", reminder);
+    await client.pausePrinterReminder("rem/id", "9007199254740998", true);
+    await client.completePrinterReminder("rem/id", "9007199254740998", {
+      completedAt: "2026-10-21T12:00:00Z",
+      notes: "Done",
+    });
+    await client.deletePrinterReminder("rem/id", "9007199254740998");
+    expect(requests[0].url).toEndWith("/api/v1/printer-maintenance-logs");
+    expect(requests[1].url).toEndWith("/api/v1/printers/a%2Fb/maintenance-logs");
+    expect(requests[2].body).toEqual(log);
+    expect(requests[3].body).toEqual({ expectedVersion: "9007199254740998", input: log });
+    expect(requests[4].body).toEqual({ expectedVersion: "9007199254740998" });
+    expect(requests[5].url).toEndWith(
+      "/api/v1/printer-reminders?includeCompleted=true&printerId=a%2Fb",
+    );
+    expect(requests[6].body).toEqual({ printerId: "a/b", input: reminder });
+    expect(requests[7].body).toEqual({ expectedVersion: "9007199254740998", input: reminder });
+    expect(requests[8].body).toEqual({ expectedVersion: "9007199254740998", paused: true });
+    expect(requests[9].body).toEqual({
+      expectedVersion: "9007199254740998",
+      completedAt: "2026-10-21T12:00:00Z",
+      notes: "Done",
+    });
+    expect(requests[10].method).toBe("DELETE");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("history printer assignment supports explicit clear and omitted preservation", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  client.setToken("token");
+  const original = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return Response.json({ printerId: "printer", printerNicknameSnapshot: "Workshop" });
+  };
+  const input = {
+    printedAt: "2026-10-19T12:00:00Z",
+    quantity: 1,
+    outcome: "printed",
+    notes: "",
+    filamentIds: [],
+  };
+  try {
+    expect(
+      (await client.createHistory("model", { ...input, printerId: "printer" }))
+        .printerNicknameSnapshot,
+    ).toBe("Workshop");
+    await client.updateHistory("event", input);
+    await client.updateHistory("event", { ...input, printerId: null });
+    expect(bodies[0].printerId).toBe("printer");
+    expect(Object.hasOwn(bodies[1], "printerId")).toBe(false);
+    expect(bodies[2].printerId).toBe(null);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

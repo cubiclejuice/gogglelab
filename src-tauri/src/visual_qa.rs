@@ -94,18 +94,43 @@ mod tests {
                 assert!(crate::slicers::slicer_support_directory(definition).is_none());
             }
             assert!(require_printer_network().is_err());
-            // The real socket entry points reject before route selection or
-            // connection. Loopback inputs also make this safe on regressions.
-            let address = std::net::Ipv4Addr::LOCALHOST;
-            let timeout = std::time::Duration::from_millis(1);
-            assert_eq!(
-                crate::elegoo_discovery::discover_mainboard_id(address, timeout),
-                Err(crate::elegoo_discovery::DiscoveryError::Failed)
-            );
-            assert_eq!(
-                crate::elegoo_sdcp::send_status_refresh(address, "0123456789abcdef", timeout),
-                Err(crate::elegoo_sdcp::SdcpRequestError::Io)
-            );
+            // Exercise the native adapter's actual guard through both shared
+            // Carbon paths. Transport construction must fail before route
+            // selection or a socket. Loopback remains safe on regressions.
+            let temp = tempfile::tempdir().unwrap();
+            let db = library_core::LibraryDb::open(temp.path()).unwrap();
+            let printer = db
+                .create_printer(
+                    &library_core::PrinterInput {
+                        nickname: "Isolated QA fixture".into(),
+                        make: Some("Elegoo".into()),
+                        model: Some("Centauri Carbon".into()),
+                        printer_type: None,
+                        firmware: None,
+                        host: Some("127.0.0.1".into()),
+                        web_url: None,
+                        bed_mm: None,
+                        notes: String::new(),
+                    },
+                    true,
+                )
+                .unwrap();
+            for (mainboard_id, discover_mainboard_id) in
+                [(Some("0123456789abcdef"), false), (None, true)]
+            {
+                let outcome = library_runtime::printer_network::check_connection(
+                    &printer,
+                    mainboard_id,
+                    discover_mainboard_id,
+                    crate::printer_network_commands::native_network_guard(),
+                );
+                assert_eq!(outcome.error_code, Some("transport_unavailable"));
+                assert_eq!(
+                    outcome.result,
+                    library_runtime::printer_network::PrinterConnectionTestResult::Failed
+                );
+                assert!(!outcome.status_event_observed);
+            }
             return;
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())

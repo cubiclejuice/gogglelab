@@ -1,9 +1,6 @@
 mod archive;
-mod bambu_discovery;
 mod cad_engine;
 mod commands;
-mod elegoo_discovery;
-mod elegoo_sdcp;
 mod error;
 pub mod extension_api;
 mod filetree;
@@ -23,7 +20,6 @@ mod library_scan;
 mod library_thumbnail;
 mod opened_urls;
 mod printer_commands;
-mod printer_network;
 mod printer_network_commands;
 mod printers;
 mod recovery;
@@ -156,6 +152,10 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             library_commands::library_delete_tag,
             library_commands::library_update_model_metadata,
             library_commands::library_update_models_metadata,
+            library_commands::library_list_part_stock,
+            library_commands::library_create_part_stock,
+            library_commands::library_update_part_stock,
+            library_commands::library_delete_part_stock,
             library_commands::library_create_print_attempt,
             library_commands::library_create_print_attempt_with_printer,
             library_commands::library_import_print_attempt,

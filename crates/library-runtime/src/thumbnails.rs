@@ -150,12 +150,30 @@ pub(crate) fn ensure_thumbnail_from_bytes(
     if png.len() as u64 > MAX_CACHED_PNG_BYTES {
         return Err("Generated thumbnail exceeds its cache size limit".into());
     }
+    let png_hash = hex_digest(&png);
+    // Regeneration can reproduce the exact cache entry. Reuse those verified
+    // bytes rather than displacing them into a permanent recovery hold.
+    if let Some(existing) = open_thumbnail_file(&directory, output_name)? {
+        if existing
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len()
+            == png.len() as u64
+        {
+            let existing_bytes = read_bounded_file(existing, MAX_CACHED_PNG_BYTES)?;
+            if existing_bytes == png {
+                return Ok(ThumbnailArtifact {
+                    relative_path: relative,
+                    png_hash,
+                });
+            }
+        }
+    }
     let staging_name = OsString::from(format!(
         ".thumbnail-{}-{}.part",
         std::process::id(),
         STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let png_hash = hex_digest(&png);
     let mut file = directory
         .create_new_file(&staging_name)
         .map_err(|error| error.to_string())?;
@@ -676,6 +694,41 @@ mod tests {
         )
         .unwrap();
         assert!(png_data_uri(&root.join(regenerated.relative_path)).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_identical_regeneration_does_not_grow_thumbnail_storage() {
+        let root = temp_root("identical-regeneration");
+        let source_bytes = binary_triangle();
+        let source_hash = hex_digest(&source_bytes);
+        let generate = || {
+            ensure_thumbnail_from_bytes(
+                &root,
+                &source_bytes,
+                &source_hash,
+                source_bytes.len() as u64,
+                &settings(),
+                true,
+            )
+            .unwrap()
+        };
+        let first = generate();
+        let expected_bytes = fs::read(root.join(&first.relative_path)).unwrap();
+        for _ in 0..3 {
+            let regenerated = generate();
+            assert_eq!(regenerated.relative_path, first.relative_path);
+            assert_eq!(regenerated.png_hash, first.png_hash);
+            assert_eq!(
+                fs::read(root.join(&regenerated.relative_path)).unwrap(),
+                expected_bytes
+            );
+            let entries = fs::read_dir(root.join("thumbnails"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(entries, vec![first.relative_path.file_name().unwrap()]);
+        }
         let _ = fs::remove_dir_all(root);
     }
 

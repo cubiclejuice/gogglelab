@@ -143,8 +143,11 @@ pub(crate) fn send_status_refresh(
     address: Ipv4Addr,
     mainboard_id: &str,
     timeout: Duration,
+    guard: &super::NetworkGuard,
 ) -> Result<SdcpStatusObservation, SdcpRequestError> {
-    crate::visual_qa::require_printer_network().map_err(|_| SdcpRequestError::Io)?;
+    if !guard.permitted() {
+        return Err(SdcpRequestError::Io);
+    }
     if timeout.is_zero() {
         return Err(SdcpRequestError::Timeout);
     }

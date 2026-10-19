@@ -46,6 +46,12 @@ pub enum LibraryError {
         expected: u64,
         actual: u64,
     },
+    #[error("{kind} changed since it was read; expected version {expected}, found {actual}")]
+    PrinterRecordVersionConflict {
+        kind: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("idempotency key conflicts with another payload: {0}")]
     IdempotencyConflict(String),
     #[error("unsupported library format: {0}")]

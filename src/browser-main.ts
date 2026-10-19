@@ -12,6 +12,7 @@ import {
   type HostCapabilities,
 } from "./lib/library-client";
 import { partStockValidationError, printAttemptStockWarning } from "./lib/library-history";
+import { BrowserPrinterFleetDialog, printerHistoryOptions } from "./lib/browser-printer-fleet";
 import { isBrowserDialogCurrent } from "./lib/browser-dialog";
 import {
   BoundedTaskQueue,
@@ -29,6 +30,7 @@ import "./styles.css";
 
 const root = document.querySelector<HTMLElement>("#browser-app")!;
 const client = new HttpLibraryClient();
+const printerFleetDialog = new BrowserPrinterFleetDialog(client);
 const integrationDialog = new LibraryAiDialog(document.body);
 let bundleDialog: import("./lib/library-bundle-dialog").LibraryBundleDialog | null = null;
 async function getBundleDialog(): Promise<
@@ -110,6 +112,7 @@ let metadataRoutesAvailable = false;
 let historyRoutesAvailable = false;
 let historyBatchRoutesAvailable = false;
 let partStockRoutesAvailable = false;
+let printerFleetRoutesAvailable = false;
 let filamentRoutesAvailable = false;
 let scanRoutesAvailable = false;
 let captureSummaryRoutesAvailable = false;
@@ -205,6 +208,9 @@ manageCatalog.disabled = true;
 const partStockButton = actionButton("Parts stock", () => void showPartStockManager());
 partStockButton.disabled = true;
 partStockButton.hidden = true;
+const printerFleetButton = actionButton("Printer fleet", () => void printerFleetDialog.show());
+printerFleetButton.disabled = true;
+printerFleetButton.hidden = true;
 const reviewDuplicates = actionButton("Duplicates in loaded", () => void showDuplicates());
 reviewDuplicates.disabled = true;
 const browserSettings = actionButton("Catalog settings", () => void showBrowserSettings());
@@ -384,6 +390,7 @@ toolbar.append(
   refresh,
   manageCatalog,
   partStockButton,
+  printerFleetButton,
   reviewDuplicates,
   browserSettings,
   browserManagement,
@@ -421,6 +428,7 @@ const catalogControls = [
   refresh,
   manageCatalog,
   partStockButton,
+  printerFleetButton,
   reviewDuplicates,
   browserSettings,
   browserManagement,
@@ -2060,8 +2068,30 @@ async function showHistory(model: BrowserModel): Promise<void> {
   const partQuantityInputs = new Map<string, HTMLInputElement>();
   let partStock: BrowserPartStock[] = [];
   let partSelectionChanged = false;
+  const printer = document.createElement("select");
+  printer.setAttribute("aria-label", "Printer for this print");
+  printer.hidden = !printerFleetRoutesAvailable;
+  let printerChoices: import("./lib/library-client").BrowserPrinter[] = [];
+  let printerSelectionChanged = false;
+  let printerChoicesAvailable = false;
+  const setPrinterChoices = (
+    attempt: import("./lib/library-client").BrowserPrintAttempt | null,
+  ) => {
+    printer.replaceChildren();
+    for (const choice of printerHistoryOptions(printerChoices, attempt)) {
+      const option = document.createElement("option");
+      option.value = choice.value;
+      option.textContent = choice.label;
+      printer.append(option);
+    }
+    printer.value = attempt?.printerId ?? "";
+    printerSelectionChanged = false;
+  };
+  printer.addEventListener("change", () => {
+    printerSelectionChanged = true;
+  });
   const close = actionButton("Close", () => dialog.close());
-  form.append(date, quantity, outcome, notes, partFieldset, save);
+  form.append(date, quantity, outcome, printer, notes, partFieldset, save);
   dialog.append(title, list, form, message, close);
   document.body.append(dialog);
   dialog.showModal();
@@ -2174,12 +2204,25 @@ async function showHistory(model: BrowserModel): Promise<void> {
   const render = async () => {
     const request = ++revision;
     try {
-      const [attempts, availableParts] = await Promise.all([
+      const [attempts, availableParts, availablePrinters] = await Promise.all([
         client.listHistory(model.id),
         partStockRoutesAvailable ? client.listPartStock() : Promise.resolve([]),
+        printerFleetRoutesAvailable
+          ? client
+              .listPrinters()
+              .then((items) => ({ items, failed: false }))
+              .catch(() => ({ items: [], failed: true }))
+          : Promise.resolve({ items: [], failed: false }),
       ]);
       if (!isBrowserDialogCurrent(request, revision, dialog.open, dialog.isConnected)) return;
       partStock = availableParts;
+      printerChoices = availablePrinters.items;
+      printerChoicesAvailable = printerFleetRoutesAvailable && !availablePrinters.failed;
+      printer.disabled = !printerChoicesAvailable;
+      if (availablePrinters.failed)
+        message.textContent =
+          "Printer choices could not load. Existing printer history is preserved; reopen this dialog to retry.";
+      setPrinterChoices(editingAttempt);
       renderPartControls(editingAttempt);
       list.replaceChildren();
       for (const attempt of attempts) {
@@ -2191,7 +2234,7 @@ async function showHistory(model: BrowserModel): Promise<void> {
           attempt.stockAdjusted,
           (attempt.parts?.length ?? 0) > 0,
         );
-        row.textContent = `${attempt.printedAt.slice(0, 10)} · ${attempt.quantity} · ${attempt.outcome}${attempt.notes ? ` · ${attempt.notes}` : ""}${partSummaryText}${stockWarning ? ` · ${stockWarning}` : ""}`;
+        row.textContent = `${attempt.printedAt.slice(0, 10)} · ${attempt.quantity} · ${attempt.outcome}${attempt.printerNicknameSnapshot ? ` · Printer: ${attempt.printerNicknameSnapshot}` : ""}${attempt.notes ? ` · ${attempt.notes}` : ""}${partSummaryText}${stockWarning ? ` · ${stockWarning}` : ""}`;
         row.append(
           actionButton("Edit", () => {
             editingAttempt = attempt;
@@ -2200,6 +2243,7 @@ async function showHistory(model: BrowserModel): Promise<void> {
             quantity.value = String(attempt.quantity);
             notes.value = attempt.notes;
             outcome.value = attempt.outcome;
+            setPrinterChoices(attempt);
             renderPartControls(attempt);
             save.textContent = "Save print";
             date.focus();
@@ -2237,6 +2281,8 @@ async function showHistory(model: BrowserModel): Promise<void> {
       filamentIds: model.filamentIds.slice(0, 5),
       outcome: outcome.value as "printed" | "failed" | "cancelled",
     };
+    if (printerChoicesAvailable && (!editingAttempt || printerSelectionChanged))
+      input.printerId = printer.value === "__clear" ? null : printer.value || null;
     if (!editingAttempt || partSelectionChanged) {
       input.parts = partStock.flatMap((part) => {
         const use = partUseInputs.get(part.id);
@@ -2705,6 +2751,11 @@ login.addEventListener("submit", (event) => {
       historyBatchRoutesAvailable = "/api/v1/history/bulk" in openApi.paths;
       partStockRoutesAvailable = "/api/v1/parts" in openApi.paths;
       partStockButton.hidden = !partStockRoutesAvailable;
+      printerFleetRoutesAvailable =
+        "/api/v1/printers" in openApi.paths &&
+        "/api/v1/printer-reminders" in openApi.paths &&
+        "/api/v1/printer-maintenance-logs" in openApi.paths;
+      printerFleetButton.hidden = !printerFleetRoutesAvailable;
       filamentRoutesAvailable =
         "/api/v1/models/filaments/bulk" in openApi.paths && "/api/v1/filaments" in openApi.paths;
       scanRoutesAvailable = "/api/v1/scan" in openApi.paths && "/api/v1/roots" in openApi.paths;
@@ -2785,6 +2836,9 @@ disconnect.addEventListener("click", () => {
   historyBatchRoutesAvailable = false;
   partStockRoutesAvailable = false;
   partStockButton.hidden = true;
+  printerFleetRoutesAvailable = false;
+  printerFleetButton.hidden = true;
+  printerFleetDialog.dismiss();
   filamentRoutesAvailable = false;
   scanRoutesAvailable = false;
   captureSummaryRoutesAvailable = false;

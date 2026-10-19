@@ -185,7 +185,9 @@ Use synthetic data only. No discovery, printer connections, credentials, or prov
 
 ## 8. Optional loopback server
 
-Deliberately enable the supported listener only in the disposable profile and retain loopback binding. Record actual address/port, verify protected unauthenticated requests fail and an authorized local read works, then disable it and verify the socket closes. Do not record tokens in logs/screenshots.
+Deliberately enable the supported listener only in the disposable profile and retain loopback binding. Record actual address/port, verify protected unauthenticated requests fail and an authorized local read works, and perform the browser checks below before stopping the listener. Do not record tokens in logs/screenshots.
+
+While that synthetic listener is running, connect the browser client with its temporary key. Confirm Printer fleet is advertised and available without a license. Create/edit a synthetic profile, select it, add maintenance and a reminder, and check persistence after a controlled fixture-server restart. A notes-only maintenance edit must preserve the exact saved timestamp, including seconds/milliseconds. Pause the reminder: Complete must be absent until Resume; completing it afterward must create one maintenance record and update the reminder atomically. Record the observed values. Keep printer network policy disabled and do not click discovery/status actions. Disconnect and verify the browser reports its key cleared from memory, then disable the listener and verify the socket closes. A missing fleet route/control is a failure, not a skipped success.
 
 LAN/Docker networking, live printers, MCP source-mutation clients, and provider calls need separate exact authorization and are otherwise `NOT-RUN`. Loopback success does not prove them.
 
@@ -225,6 +227,7 @@ Synthetic root (redacted in shared copy):
 | JSON round-trip including slicers | | | |
 | Schema 11 / backup / recovery | | | |
 | Optional loopback authentication | | | |
+| Browser fleet / exact dates / pause / completion / persistence | | | |
 | Uninstall / source preservation | | | |
 
 ## Commands and exit codes

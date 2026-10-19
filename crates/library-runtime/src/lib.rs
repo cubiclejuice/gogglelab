@@ -1,3 +1,8 @@
+use library_protocol::{
+    Printer, PrinterConnectionStatus, PrinterFleetEngine, PrinterInput, PrinterJobStatus,
+    PrinterMaintenanceInput, PrinterMaintenanceLog, PrinterReminder, PrinterReminderCompletion,
+    PrinterReminderCompletionInput, PrinterReminderInput, PrinterReminderStatus, PrinterSourceKind,
+};
 use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -61,6 +66,7 @@ pub mod geometry;
 pub mod images;
 pub mod integration_state;
 pub mod integrations;
+pub mod printer_network;
 pub mod scanner;
 mod secure_fs;
 pub use secure_fs::{HeldEntry, MovedEntry};
@@ -11429,6 +11435,11 @@ fn runtime_library_error(error: LibraryError) -> RuntimeError {
             expected: _,
             filament_id: _,
         }
+        | LibraryError::PrinterRecordVersionConflict {
+            actual,
+            expected: _,
+            kind: _,
+        }
         | LibraryError::PartStockVersionConflict {
             actual,
             expected: _,
@@ -17351,5 +17362,328 @@ mod tests {
             require_durable_source_mutations().unwrap_err().code,
             RuntimeErrorCode::Unsupported
         );
+    }
+}
+
+fn fleet_printersourcekind(value: library_core::models::PrinterSourceKind) -> PrinterSourceKind {
+    match value {
+        library_core::models::PrinterSourceKind::Manual => PrinterSourceKind::Manual,
+        library_core::models::PrinterSourceKind::Discovered => PrinterSourceKind::Discovered,
+        library_core::models::PrinterSourceKind::Imported => PrinterSourceKind::Imported,
+    }
+}
+
+fn fleet_printerconnectionstatus(
+    value: library_core::models::PrinterConnectionStatus,
+) -> PrinterConnectionStatus {
+    match value {
+        library_core::models::PrinterConnectionStatus::Unknown => PrinterConnectionStatus::Unknown,
+        library_core::models::PrinterConnectionStatus::Online => PrinterConnectionStatus::Online,
+        library_core::models::PrinterConnectionStatus::Offline => PrinterConnectionStatus::Offline,
+        library_core::models::PrinterConnectionStatus::AuthRequired => {
+            PrinterConnectionStatus::AuthRequired
+        }
+        library_core::models::PrinterConnectionStatus::Error => PrinterConnectionStatus::Error,
+    }
+}
+
+fn fleet_printerjobstatus(value: library_core::models::PrinterJobStatus) -> PrinterJobStatus {
+    match value {
+        library_core::models::PrinterJobStatus::Unknown => PrinterJobStatus::Unknown,
+        library_core::models::PrinterJobStatus::Idle => PrinterJobStatus::Idle,
+        library_core::models::PrinterJobStatus::Printing => PrinterJobStatus::Printing,
+        library_core::models::PrinterJobStatus::Paused => PrinterJobStatus::Paused,
+        library_core::models::PrinterJobStatus::Complete => PrinterJobStatus::Complete,
+    }
+}
+
+fn fleet_printer(value: library_core::models::Printer) -> Printer {
+    Printer {
+        id: value.id,
+        metadata_version: value.metadata_version,
+        nickname: value.nickname,
+        make: value.make,
+        model: value.model,
+        printer_type: value.printer_type,
+        firmware: value.firmware,
+        host: value.host,
+        web_url: value.web_url,
+        endpoint_approved: value.endpoint_approved,
+        bed_mm: value.bed_mm,
+        notes: value.notes,
+        source_kind: fleet_printersourcekind(value.source_kind),
+        connection_status: fleet_printerconnectionstatus(value.connection_status),
+        job_status: fleet_printerjobstatus(value.job_status),
+        last_checked_at: value.last_checked_at,
+        connection_error_code: value.connection_error_code,
+        print_count: value.print_count,
+        last_printed_at: value.last_printed_at,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+    }
+}
+
+fn fleet_core_printerinput(value: PrinterInput) -> library_core::models::PrinterInput {
+    library_core::models::PrinterInput {
+        nickname: value.nickname,
+        make: value.make,
+        model: value.model,
+        printer_type: value.printer_type,
+        firmware: value.firmware,
+        host: value.host,
+        web_url: value.web_url,
+        bed_mm: value.bed_mm,
+        notes: value.notes,
+    }
+}
+
+fn fleet_core_printermaintenanceinput(
+    value: PrinterMaintenanceInput,
+) -> library_core::models::PrinterMaintenanceInput {
+    library_core::models::PrinterMaintenanceInput {
+        title: value.title,
+        performed_at: value.performed_at,
+        notes: value.notes,
+    }
+}
+
+fn fleet_printermaintenancelog(
+    value: library_core::models::PrinterMaintenanceLog,
+) -> PrinterMaintenanceLog {
+    PrinterMaintenanceLog {
+        id: value.id,
+        metadata_version: value.metadata_version,
+        printer_id: value.printer_id,
+        printer_nickname: value.printer_nickname,
+        title: value.title,
+        performed_at: value.performed_at,
+        notes: value.notes,
+        created_at: value.created_at,
+    }
+}
+
+fn fleet_printerreminderstatus(
+    value: library_core::models::PrinterReminderStatus,
+) -> PrinterReminderStatus {
+    match value {
+        library_core::models::PrinterReminderStatus::Active => PrinterReminderStatus::Active,
+        library_core::models::PrinterReminderStatus::Paused => PrinterReminderStatus::Paused,
+        library_core::models::PrinterReminderStatus::Completed => PrinterReminderStatus::Completed,
+    }
+}
+
+fn fleet_core_printerreminderinput(
+    value: PrinterReminderInput,
+) -> library_core::models::PrinterReminderInput {
+    library_core::models::PrinterReminderInput {
+        title: value.title,
+        notes: value.notes,
+        due_at: value.due_at,
+        interval_days: value.interval_days,
+    }
+}
+
+fn fleet_printerreminder(value: library_core::models::PrinterReminder) -> PrinterReminder {
+    PrinterReminder {
+        id: value.id,
+        metadata_version: value.metadata_version,
+        printer_id: value.printer_id,
+        printer_nickname: value.printer_nickname,
+        title: value.title,
+        notes: value.notes,
+        due_at: value.due_at,
+        interval_days: value.interval_days,
+        status: fleet_printerreminderstatus(value.status),
+        last_completed_at: value.last_completed_at,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+    }
+}
+
+fn fleet_core_printerremindercompletioninput(
+    value: PrinterReminderCompletionInput,
+) -> library_core::models::PrinterReminderCompletionInput {
+    library_core::models::PrinterReminderCompletionInput {
+        completed_at: value.completed_at,
+        notes: value.notes,
+    }
+}
+
+fn fleet_printerremindercompletion(
+    value: library_core::models::PrinterReminderCompletion,
+) -> PrinterReminderCompletion {
+    PrinterReminderCompletion {
+        reminder: fleet_printerreminder(value.reminder),
+        maintenance_log: fleet_printermaintenancelog(value.maintenance_log),
+    }
+}
+
+impl PrinterFleetEngine for LibraryRuntime {
+    fn list_printers(&self, context: &RequestContext) -> Result<Vec<Printer>, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.list_printers())
+            .map(|values| values.into_iter().map(fleet_printer).collect())
+    }
+    fn get_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+    ) -> Result<Option<Printer>, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.get_printer(id))
+            .map(|value| value.map(fleet_printer))
+    }
+    fn create_printer(
+        &self,
+        context: &RequestContext,
+        input: PrinterInput,
+    ) -> Result<Printer, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = fleet_core_printerinput(input);
+        self.mutate_db(|db| db.create_printer(&input, false))
+            .map(fleet_printer)
+    }
+    fn update_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterInput,
+    ) -> Result<Printer, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = fleet_core_printerinput(input);
+        self.mutate_db(|db| db.update_printer(id, expected_version, &input, None))
+            .map(fleet_printer)
+    }
+    fn delete_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| db.delete_printer(id, expected_version))
+    }
+    fn list_printer_maintenance_logs(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+    ) -> Result<Vec<PrinterMaintenanceLog>, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.list_printer_maintenance_logs(printer_id))
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(fleet_printermaintenancelog)
+                    .collect()
+            })
+    }
+    fn create_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = fleet_core_printermaintenanceinput(input);
+        self.mutate_db(|db| db.create_printer_maintenance_log(printer_id, &input))
+            .map(fleet_printermaintenancelog)
+    }
+    fn update_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = fleet_core_printermaintenanceinput(input);
+        self.mutate_db(|db| db.update_printer_maintenance_log(id, expected_version, &input))
+            .map(fleet_printermaintenancelog)
+    }
+    fn delete_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| db.delete_printer_maintenance_log(id, expected_version))
+    }
+    fn list_printer_reminders(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<PrinterReminder>, RuntimeError> {
+        self.require(context, Capability::CatalogRead)?;
+        self.read_db(|db| db.list_printer_reminders(printer_id, include_completed))
+            .map(|values| values.into_iter().map(fleet_printerreminder).collect())
+    }
+    fn create_printer_reminder(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = fleet_core_printerreminderinput(input);
+        self.mutate_db(|db| db.create_printer_reminder(printer_id, &input))
+            .map(fleet_printerreminder)
+    }
+    fn update_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = fleet_core_printerreminderinput(input);
+        self.mutate_db(|db| db.update_printer_reminder(id, expected_version, &input))
+            .map(fleet_printerreminder)
+    }
+    fn delete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| db.delete_printer_reminder(id, expected_version))
+    }
+    fn complete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderCompletionInput,
+    ) -> Result<PrinterReminderCompletion, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        let input = fleet_core_printerremindercompletioninput(input);
+        self.mutate_db(|db| db.complete_printer_reminder(id, expected_version, &input))
+            .map(fleet_printerremindercompletion)
+    }
+    fn set_printer_reminder_paused(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        paused: bool,
+    ) -> Result<PrinterReminder, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| db.set_printer_reminder_paused(id, expected_version, paused))
+            .map(fleet_printerreminder)
+    }
+    fn reschedule_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        due_at: &str,
+    ) -> Result<PrinterReminder, RuntimeError> {
+        self.require(context, Capability::CatalogWrite)?;
+        self.mutate_db(|db| db.reschedule_printer_reminder(id, expected_version, due_at))
+            .map(fleet_printerreminder)
     }
 }

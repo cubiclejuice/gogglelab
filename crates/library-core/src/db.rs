@@ -9680,9 +9680,11 @@ fn ensure_record_version(kind: &str, expected: u64, actual: i64) -> Result<(), L
     let actual = u64::try_from(actual)
         .map_err(|_| LibraryError::InvalidInput(format!("{kind} version is invalid")))?;
     if actual != expected {
-        return Err(LibraryError::InvalidInput(format!(
-            "{kind} changed since it was read; expected version {expected}, found {actual}"
-        )));
+        return Err(LibraryError::PrinterRecordVersionConflict {
+            kind: kind.to_owned(),
+            expected,
+            actual,
+        });
     }
     Ok(())
 }
@@ -16381,13 +16383,19 @@ mod tests {
                     notes: String::new(),
                 },
             ),
-            Err(LibraryError::InvalidInput(message))
-                if message.contains("changed since it was read")
+            Err(LibraryError::PrinterRecordVersionConflict {
+                actual: 2,
+                expected: 1,
+                ..
+            })
         ));
         assert!(matches!(
             db.delete_printer_maintenance_log(&updated.id, log.metadata_version),
-            Err(LibraryError::InvalidInput(message))
-                if message.contains("changed since it was read")
+            Err(LibraryError::PrinterRecordVersionConflict {
+                actual: 2,
+                expected: 1,
+                ..
+            })
         ));
         db.delete_printer(&printer.id, printer.metadata_version)
             .unwrap();
@@ -16401,13 +16409,19 @@ mod tests {
                     notes: String::new(),
                 },
             ),
-            Err(LibraryError::InvalidInput(message))
-                if message.contains("changed since it was read")
+            Err(LibraryError::PrinterRecordVersionConflict {
+                actual: 3,
+                expected: 2,
+                ..
+            })
         ));
         assert!(matches!(
             db.delete_printer_maintenance_log(&updated.id, updated.metadata_version),
-            Err(LibraryError::InvalidInput(message))
-                if message.contains("changed since it was read")
+            Err(LibraryError::PrinterRecordVersionConflict {
+                actual: 3,
+                expected: 2,
+                ..
+            })
         ));
         let historical = db
             .get_printer_maintenance_log(&updated.id)

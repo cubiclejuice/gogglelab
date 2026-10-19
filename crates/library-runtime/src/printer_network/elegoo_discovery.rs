@@ -35,24 +35,27 @@ fn parse_discovery_response(source: Ipv4Addr, target: Ipv4Addr, packet: &[u8]) -
         return None;
     }
     let mainboard_id = data.get("MainboardID")?.as_str()?;
-    crate::elegoo_sdcp::validate_mainboard_id(mainboard_id).ok()?;
+    super::elegoo_sdcp::validate_mainboard_id(mainboard_id).ok()?;
     Some(mainboard_id.to_owned())
 }
 
 pub(crate) fn discover_mainboard_id(
     target: Ipv4Addr,
     timeout: Duration,
+    guard: &super::NetworkGuard,
 ) -> Result<String, DiscoveryError> {
-    crate::visual_qa::require_printer_network().map_err(|_| DiscoveryError::Failed)?;
+    if !guard.permitted() {
+        return Err(DiscoveryError::Failed);
+    }
     if timeout.is_zero() {
         return Err(DiscoveryError::Timeout);
     }
     let deadline = Instant::now() + timeout;
     let route_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
         .map_err(|_| DiscoveryError::Failed)?;
-    let interface = crate::printer_network::route_interface(&route_socket, target)
-        .ok_or(DiscoveryError::Unreachable)?;
-    if !crate::printer_network::is_private_unicast(interface) {
+    let interface =
+        super::scope::route_interface(&route_socket, target).ok_or(DiscoveryError::Unreachable)?;
+    if !super::scope::is_private_unicast(interface) {
         return Err(DiscoveryError::Unreachable);
     }
     let socket =

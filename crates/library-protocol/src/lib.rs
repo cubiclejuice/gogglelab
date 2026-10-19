@@ -2204,3 +2204,266 @@ pub trait CatalogJobEngine: Send + Sync {
         force: bool,
     ) -> Result<ScanStatus, RuntimeError>;
 }
+
+// Browser/MCP printer metadata uses exact decimal strings for 64-bit counters.
+mod printer_decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(serde::de::Error::custom(
+                "expected a canonical decimal u64 string",
+            ));
+        }
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterSourceKind {
+    Manual,
+    Discovered,
+    Imported,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterConnectionStatus {
+    #[default]
+    Unknown,
+    Online,
+    Offline,
+    AuthRequired,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterJobStatus {
+    #[default]
+    Unknown,
+    Idle,
+    Printing,
+    Paused,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Printer {
+    pub id: String,
+    #[serde(with = "printer_decimal_u64")]
+    pub metadata_version: u64,
+    pub nickname: String,
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub printer_type: Option<String>,
+    pub firmware: Option<String>,
+    pub host: Option<String>,
+    pub web_url: Option<String>,
+    pub endpoint_approved: bool,
+    pub bed_mm: Option<[f32; 3]>,
+    pub notes: String,
+    pub source_kind: PrinterSourceKind,
+    pub connection_status: PrinterConnectionStatus,
+    pub job_status: PrinterJobStatus,
+    /// Connection and job state are a snapshot from the last explicit check.
+    /// Consumers should treat old timestamps as stale until a user checks again.
+    pub last_checked_at: Option<String>,
+    pub connection_error_code: Option<String>,
+    #[serde(with = "printer_decimal_u64")]
+    pub print_count: u64,
+    pub last_printed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrinterInput {
+    pub nickname: String,
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub printer_type: Option<String>,
+    pub firmware: Option<String>,
+    pub host: Option<String>,
+    pub web_url: Option<String>,
+    pub bed_mm: Option<[f32; 3]>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrinterMaintenanceInput {
+    pub title: String,
+    pub performed_at: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterMaintenanceLog {
+    pub id: String,
+    #[serde(with = "printer_decimal_u64")]
+    pub metadata_version: u64,
+    pub printer_id: Option<String>,
+    pub printer_nickname: String,
+    pub title: String,
+    pub performed_at: String,
+    pub notes: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrinterReminderStatus {
+    #[default]
+    Active,
+    Paused,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrinterReminderInput {
+    pub title: String,
+    pub notes: String,
+    pub due_at: String,
+    pub interval_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterReminder {
+    pub id: String,
+    #[serde(with = "printer_decimal_u64")]
+    pub metadata_version: u64,
+    pub printer_id: Option<String>,
+    pub printer_nickname: String,
+    pub title: String,
+    pub notes: String,
+    pub due_at: String,
+    pub interval_days: Option<u32>,
+    pub status: PrinterReminderStatus,
+    pub last_completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrinterReminderCompletionInput {
+    pub completed_at: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrinterReminderCompletion {
+    pub reminder: PrinterReminder,
+    pub maintenance_log: PrinterMaintenanceLog,
+}
+
+/// Data-only fleet management. Network and credential operations are deliberately absent.
+pub trait PrinterFleetEngine: Send + Sync {
+    fn list_printers(&self, context: &RequestContext) -> Result<Vec<Printer>, RuntimeError>;
+    fn get_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+    ) -> Result<Option<Printer>, RuntimeError>;
+    fn create_printer(
+        &self,
+        context: &RequestContext,
+        input: PrinterInput,
+    ) -> Result<Printer, RuntimeError>;
+    fn update_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterInput,
+    ) -> Result<Printer, RuntimeError>;
+    fn delete_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError>;
+    fn list_printer_maintenance_logs(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+    ) -> Result<Vec<PrinterMaintenanceLog>, RuntimeError>;
+    fn create_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, RuntimeError>;
+    fn update_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, RuntimeError>;
+    fn delete_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError>;
+    fn list_printer_reminders(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<PrinterReminder>, RuntimeError>;
+    fn create_printer_reminder(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, RuntimeError>;
+    fn update_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, RuntimeError>;
+    fn delete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), RuntimeError>;
+    fn complete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderCompletionInput,
+    ) -> Result<PrinterReminderCompletion, RuntimeError>;
+    fn set_printer_reminder_paused(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        paused: bool,
+    ) -> Result<PrinterReminder, RuntimeError>;
+    fn reschedule_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        due_at: &str,
+    ) -> Result<PrinterReminder, RuntimeError>;
+}

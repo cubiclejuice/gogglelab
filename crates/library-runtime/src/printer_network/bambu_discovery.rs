@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::printer_network::ScanScope;
+use super::scope::ScanScope;
 
 const MAX_SSDP_PACKET_BYTES: usize = 4 * 1024;
 const MAX_SSDP_RESPONSES: usize = 64;
@@ -45,8 +45,9 @@ pub(crate) fn search(
     deadline: Instant,
     request_timeout: Duration,
     cancelled: &AtomicBool,
+    guard: &super::NetworkGuard,
 ) -> Vec<(Ipv4Addr, Vec<u8>)> {
-    if crate::visual_qa::require_printer_network().is_err() {
+    if !guard.permitted() {
         return Vec::new();
     }
     let interfaces = routed_interfaces(scope, deadline, cancelled);
@@ -108,7 +109,7 @@ fn routed_interfaces(
         return Vec::new();
     };
     routed_interfaces_with(scope, deadline, cancelled, |target| {
-        crate::printer_network::route_interface(&route_socket, target)
+        super::scope::route_interface(&route_socket, target)
     })
 }
 
@@ -264,8 +265,8 @@ fn parse_search_response(source: Ipv4Addr, packet: &[u8]) -> Option<BambuSsdpRep
 
 #[cfg(test)]
 mod tests {
+    use super::super::scope::parse_scan_scope;
     use super::*;
-    use crate::printer_network::parse_scan_scope;
 
     #[test]
     fn parses_a_bambu_search_response() {

@@ -24,11 +24,11 @@ output/
 .perplexity-research/
 
 # Public test certificates only; corresponding private keys are not stored.
-!src-tauri/src/testdata/bambu-test-root.pem
-!src-tauri/src/testdata/bambu-test-leaf.pem
-!src-tauri/src/testdata/bambu-chain-root.pem
-!src-tauri/src/testdata/bambu-cross-intermediate.pem
-!src-tauri/src/testdata/bambu-cross-leaf.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-test-root.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-test-leaf.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-chain-root.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-cross-intermediate.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-cross-leaf.pem
 
 !docs/ARCHITECTURE.md
 !docs/F3D-PREVIEW.md
@@ -64,3 +64,4 @@ dist-browser/
 
 !docs/SERVER-INSTALL.md
 !docs/WINDOWS-FRIEND-ACCEPTANCE.md
+!docs/PRINTER-NETWORK-BROWSER-PLAN.md

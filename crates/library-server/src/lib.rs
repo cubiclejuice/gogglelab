@@ -1,4 +1,9 @@
 #![recursion_limit = "256"]
+use library_protocol::{
+    Printer, PrinterFleetEngine, PrinterInput, PrinterMaintenanceInput, PrinterMaintenanceLog,
+    PrinterReminder, PrinterReminderCompletion, PrinterReminderCompletionInput,
+    PrinterReminderInput,
+};
 
 mod bootstrap;
 mod confirmation;
@@ -1405,6 +1410,244 @@ pub trait LibraryEngine: Send + Sync + 'static {
         id: &str,
         v: u64,
     ) -> Result<Option<Filament>, EngineError>;
+    fn list_printers(&self, context: &RequestContext) -> Result<Vec<Printer>, EngineError> {
+        let _ = context;
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn get_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+    ) -> Result<Option<Printer>, EngineError> {
+        let _ = (context, id);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn create_printer(
+        &self,
+        context: &RequestContext,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        let _ = (context, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn update_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        let _ = (context, id, expected_version);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn list_printer_maintenance_logs(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+    ) -> Result<Vec<PrinterMaintenanceLog>, EngineError> {
+        let _ = (context, printer_id);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn create_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        let _ = (context, printer_id, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn update_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        let _ = (context, id, expected_version);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn list_printer_reminders(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<PrinterReminder>, EngineError> {
+        let _ = (context, printer_id, include_completed);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn create_printer_reminder(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, printer_id, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn update_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        let _ = (context, id, expected_version);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn complete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderCompletionInput,
+    ) -> Result<PrinterReminderCompletion, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn set_printer_reminder_paused(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        paused: bool,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, id, expected_version, paused);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn reschedule_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        due_at: &str,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, id, expected_version, due_at);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
     fn list_part_stock(&self, _c: &RequestContext) -> Result<Vec<PartStock>, EngineError> {
         Err(EngineError {
             code: "unsupported",
@@ -1637,6 +1880,7 @@ pub struct ProtocolEngineAdapter<
         + FolderEngine
         + FilamentEngine
         + PartStockEngine
+        + PrinterFleetEngine
         + PrintHistoryEngine
         + CaptureEngine
         + BundleEngine
@@ -1660,6 +1904,7 @@ impl<
             + FolderEngine
             + FilamentEngine
             + PartStockEngine
+            + PrinterFleetEngine
             + PrintHistoryEngine
             + CaptureEngine
             + BundleEngine
@@ -1799,6 +2044,7 @@ impl<
             + FolderEngine
             + FilamentEngine
             + PartStockEngine
+            + PrinterFleetEngine
             + PrintHistoryEngine
             + CaptureEngine
             + BundleEngine
@@ -2111,6 +2357,146 @@ impl<
             };
         }
         validate_tool_shape(name, &arguments)?;
+
+        if fleet_tool_schema(name).is_some() {
+            let string = |key: &str| {
+                arguments
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty() && v.len() <= 128)
+                    .ok_or_else(invalid_tool)
+            };
+            let filter = || -> Result<Option<&str>, EngineError> {
+                arguments
+                    .get("printerId")
+                    .map(|_| string("printerId"))
+                    .transpose()
+            };
+            let input = || arguments.get("input").cloned().ok_or_else(invalid_tool);
+            match name {
+                "list_printers" => return encoded!(self.list_printers(context)?),
+                "get_printer" => return encoded!(self.get_printer(context, string("printerId")?)?),
+                "create_printer" => {
+                    return encoded!(self.create_printer(
+                        context,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "update_printer" => {
+                    return encoded!(self.update_printer(
+                        context,
+                        string("printerId")?,
+                        tool_version(&arguments)?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "delete_printer" => {
+                    self.delete_printer(context, string("printerId")?, tool_version(&arguments)?)?;
+                    return Ok(serde_json::json!({"deleted":true}));
+                }
+                "list_printer_maintenance_logs" => {
+                    return encoded!(self.list_printer_maintenance_logs(context, filter()?)?)
+                }
+                "create_printer_maintenance_log" => {
+                    return encoded!(self.create_printer_maintenance_log(
+                        context,
+                        string("printerId")?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "update_printer_maintenance_log" => {
+                    return encoded!(self.update_printer_maintenance_log(
+                        context,
+                        string("logId")?,
+                        tool_version(&arguments)?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "delete_printer_maintenance_log" => {
+                    self.delete_printer_maintenance_log(
+                        context,
+                        string("logId")?,
+                        tool_version(&arguments)?,
+                    )?;
+                    return Ok(serde_json::json!({"deleted":true}));
+                }
+                "list_printer_reminders" => {
+                    let include = arguments
+                        .get("includeCompleted")
+                        .map(Value::as_bool)
+                        .unwrap_or(Some(false))
+                        .ok_or_else(invalid_tool)?;
+                    return encoded!(self.list_printer_reminders(context, filter()?, include)?);
+                }
+                "create_printer_reminder" => {
+                    return encoded!(self.create_printer_reminder(
+                        context,
+                        string("printerId")?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "update_printer_reminder" => {
+                    return encoded!(self.update_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "delete_printer_reminder" => {
+                    self.delete_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                    )?;
+                    return Ok(serde_json::json!({"deleted":true}));
+                }
+                "complete_printer_reminder" => {
+                    let completed_at = arguments
+                        .get("completedAt")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned();
+                    let notes = arguments
+                        .get("notes")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned();
+                    return encoded!(self.complete_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        PrinterReminderCompletionInput {
+                            completed_at,
+                            notes
+                        }
+                    )?);
+                }
+                "set_printer_reminder_paused" => {
+                    return encoded!(self.set_printer_reminder_paused(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        arguments
+                            .get("paused")
+                            .and_then(Value::as_bool)
+                            .ok_or_else(invalid_tool)?
+                    )?)
+                }
+                "reschedule_printer_reminder" => {
+                    return encoded!(self.reschedule_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        arguments
+                            .get("dueAt")
+                            .and_then(Value::as_str)
+                            .ok_or_else(invalid_tool)?
+                    )?)
+                }
+                _ => return Err(invalid_tool()),
+            }
+        }
         match name {
             "list_slicers" => {
                 if !self.supports_tool(context, name) {
@@ -3473,6 +3859,22 @@ impl<
                 | "save_filament"
                 | "delete_filament"
                 | "set_model_filaments"
+                | "list_printers"
+                | "get_printer"
+                | "create_printer"
+                | "update_printer"
+                | "delete_printer"
+                | "list_printer_maintenance_logs"
+                | "create_printer_maintenance_log"
+                | "update_printer_maintenance_log"
+                | "delete_printer_maintenance_log"
+                | "list_printer_reminders"
+                | "create_printer_reminder"
+                | "update_printer_reminder"
+                | "delete_printer_reminder"
+                | "complete_printer_reminder"
+                | "set_printer_reminder_paused"
+                | "reschedule_printer_reminder"
                 | "list_part_stock"
                 | "create_part_stock"
                 | "update_part_stock"
@@ -3561,6 +3963,18 @@ impl<
                 | "save_filament"
                 | "delete_filament"
                 | "set_model_filaments"
+                | "create_printer"
+                | "update_printer"
+                | "delete_printer"
+                | "create_printer_maintenance_log"
+                | "update_printer_maintenance_log"
+                | "delete_printer_maintenance_log"
+                | "create_printer_reminder"
+                | "update_printer_reminder"
+                | "delete_printer_reminder"
+                | "complete_printer_reminder"
+                | "set_printer_reminder_paused"
+                | "reschedule_printer_reminder"
                 | "create_part_stock"
                 | "update_part_stock"
                 | "delete_part_stock"
@@ -3921,6 +4335,162 @@ impl<
     ) -> Result<Option<Filament>, EngineError> {
         self.inner
             .delete_filament(c, id, v)
+            .map_err(map_runtime_error)
+    }
+    fn list_printers(&self, context: &RequestContext) -> Result<Vec<Printer>, EngineError> {
+        self.inner.list_printers(context).map_err(map_runtime_error)
+    }
+    fn get_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+    ) -> Result<Option<Printer>, EngineError> {
+        self.inner
+            .get_printer(context, id)
+            .map_err(map_runtime_error)
+    }
+    fn create_printer(
+        &self,
+        context: &RequestContext,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        self.inner
+            .create_printer(context, input)
+            .map_err(map_runtime_error)
+    }
+    fn update_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        self.inner
+            .update_printer(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn delete_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_printer(context, id, expected_version)
+            .map_err(map_runtime_error)
+    }
+    fn list_printer_maintenance_logs(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+    ) -> Result<Vec<PrinterMaintenanceLog>, EngineError> {
+        self.inner
+            .list_printer_maintenance_logs(context, printer_id)
+            .map_err(map_runtime_error)
+    }
+    fn create_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        self.inner
+            .create_printer_maintenance_log(context, printer_id, input)
+            .map_err(map_runtime_error)
+    }
+    fn update_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        self.inner
+            .update_printer_maintenance_log(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn delete_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_printer_maintenance_log(context, id, expected_version)
+            .map_err(map_runtime_error)
+    }
+    fn list_printer_reminders(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<PrinterReminder>, EngineError> {
+        self.inner
+            .list_printer_reminders(context, printer_id, include_completed)
+            .map_err(map_runtime_error)
+    }
+    fn create_printer_reminder(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .create_printer_reminder(context, printer_id, input)
+            .map_err(map_runtime_error)
+    }
+    fn update_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .update_printer_reminder(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn delete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_printer_reminder(context, id, expected_version)
+            .map_err(map_runtime_error)
+    }
+    fn complete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderCompletionInput,
+    ) -> Result<PrinterReminderCompletion, EngineError> {
+        self.inner
+            .complete_printer_reminder(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn set_printer_reminder_paused(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        paused: bool,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .set_printer_reminder_paused(context, id, expected_version, paused)
+            .map_err(map_runtime_error)
+    }
+    fn reschedule_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        due_at: &str,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .reschedule_printer_reminder(context, id, expected_version, due_at)
             .map_err(map_runtime_error)
     }
     fn list_part_stock(&self, c: &RequestContext) -> Result<Vec<PartStock>, EngineError> {
@@ -4794,6 +5364,62 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         ),
         "get_folder_tree" | "list_tags" => (&[], &[]),
         "list_filaments" => (&["includeUnavailable"], &[]),
+        name if fleet_tool_schema(name).is_some() => {
+            let schema = fleet_tool_schema(name).unwrap();
+            if object
+                .keys()
+                .any(|key| schema["properties"].get(key).is_none())
+                || schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| !object.contains_key(key.as_str().unwrap()))
+            {
+                return Err(invalid_tool());
+            }
+            for (key, value) in object {
+                match key.as_str() {
+                    "input" => {
+                        let valid = if name.ends_with("maintenance_log") {
+                            serde_json::from_value::<PrinterMaintenanceInput>(value.clone()).is_ok()
+                        } else if name.ends_with("reminder") {
+                            serde_json::from_value::<PrinterReminderInput>(value.clone()).is_ok()
+                        } else {
+                            serde_json::from_value::<PrinterInput>(value.clone()).is_ok()
+                        };
+                        if !valid {
+                            return Err(invalid_tool());
+                        }
+                    }
+                    "expectedVersion" => {
+                        let text = value.as_str().ok_or_else(invalid_tool)?;
+                        if text.is_empty()
+                            || text.len() > 20
+                            || (text.len() > 1 && text.starts_with('0'))
+                            || !text.bytes().all(|b| b.is_ascii_digit())
+                            || text.parse::<u64>().is_err()
+                        {
+                            return Err(invalid_tool());
+                        }
+                    }
+                    "includeCompleted" | "paused" => {
+                        if !value.is_boolean() {
+                            return Err(invalid_tool());
+                        }
+                    }
+                    _ => {
+                        let text = value.as_str().ok_or_else(invalid_tool)?;
+                        let maximum = schema["properties"][key]["maxLength"]
+                            .as_u64()
+                            .unwrap_or(128) as usize;
+                        if text.len() > maximum || (key.ends_with("Id") && text.is_empty()) {
+                            return Err(invalid_tool());
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         "list_part_stock" => (&[], &[]),
         "create_part_stock" => (&["input"], &["input"]),
         "update_part_stock" => (
@@ -5841,6 +6467,48 @@ fn build_router<E: LibraryEngine>(
         security: Arc::new(security),
     };
     let mut routes = Router::new()
+        .route(
+            "/api/v1/printers",
+            get(fleet_list_printers::<E>).post(fleet_create_printer::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}",
+            get(fleet_get_printer::<E>)
+                .put(fleet_update_printer::<E>)
+                .delete(fleet_delete_printer::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}/maintenance-logs",
+            get(fleet_printer_logs::<E>).post(fleet_create_log::<E>),
+        )
+        .route(
+            "/api/v1/printer-maintenance-logs",
+            get(fleet_list_logs::<E>),
+        )
+        .route(
+            "/api/v1/printer-maintenance-logs/{id}",
+            axum::routing::put(fleet_update_log::<E>).delete(fleet_delete_log::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders",
+            get(fleet_list_reminders::<E>).post(fleet_create_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}",
+            axum::routing::put(fleet_update_reminder::<E>).delete(fleet_delete_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}/complete",
+            axum::routing::post(fleet_complete_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}/pause",
+            axum::routing::post(fleet_pause_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}/reschedule",
+            axum::routing::post(fleet_reschedule_reminder::<E>),
+        )
         .route("/api/v1/health", get(health))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/capabilities", get(capabilities::<E>))
@@ -6071,7 +6739,7 @@ async fn openapi() -> Json<Value> {
 }
 
 pub fn openapi_document() -> Value {
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "openapi":"3.1.0",
         "info":{"title":"GoggleLab Library API","version":"1.0.0"},
         "servers":[{"url":"/"}],
@@ -6196,7 +6864,16 @@ pub fn openapi_document() -> Value {
             "/api/v1/events":{"get":{"responses":{"200":{"description":"Authenticated server-sent invalidation events","content":{"text/event-stream":{}}}}}},
             "/mcp":{"post":{"responses":{"200":{"description":"JSON-RPC response"},"202":{"description":"Notification accepted"}}},"get":{"responses":{"405":{"description":"Standalone SSE listener disabled in v1"}}},"delete":{"responses":{"204":{"description":"Session terminated"},"404":{"description":"Unknown session"}}}}
         }
-    })
+    });
+    document["components"]["schemas"]
+        .as_object_mut()
+        .unwrap()
+        .extend(fleet_output_schemas().as_object().unwrap().clone());
+    document["paths"]
+        .as_object_mut()
+        .unwrap()
+        .extend(fleet_openapi_paths().as_object().unwrap().clone());
+    document
 }
 
 async fn capabilities<E: LibraryEngine>(
@@ -7914,6 +8591,22 @@ pub fn tool_names() -> &'static [&'static str] {
         "save_filament",
         "delete_filament",
         "set_model_filaments",
+        "list_printers",
+        "get_printer",
+        "create_printer",
+        "update_printer",
+        "delete_printer",
+        "list_printer_maintenance_logs",
+        "create_printer_maintenance_log",
+        "update_printer_maintenance_log",
+        "delete_printer_maintenance_log",
+        "list_printer_reminders",
+        "create_printer_reminder",
+        "update_printer_reminder",
+        "delete_printer_reminder",
+        "complete_printer_reminder",
+        "set_printer_reminder_paused",
+        "reschedule_printer_reminder",
         "list_part_stock",
         "create_part_stock",
         "update_part_stock",
@@ -7979,7 +8672,7 @@ pub fn tool_definitions() -> Vec<Value> {
     tool_names()
         .iter()
         .map(|name| {
-            let input_schema = match *name {
+            let input_schema = if let Some(schema) = fleet_tool_schema(name) { schema } else { match *name {
                 "search_models" => serde_json::json!({
                     "type":"object","additionalProperties":false,
                     "properties":{
@@ -8165,7 +8858,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "required":["confirmationToken"]
                 }),
                 _ => serde_json::json!({"type":"object"}),
-            };
+            }};
             serde_json::json!({
                 "name": name,
                 "description": match *name {
@@ -8267,4 +8960,533 @@ mod print_history_contract_tests {
                 .is_none()
         );
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetUpdate<T> {
+    expected_version: String,
+    input: T,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetQuery {
+    printer_id: Option<String>,
+    #[serde(default)]
+    include_completed: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetReminderCreate {
+    printer_id: String,
+    input: PrinterReminderInput,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetComplete {
+    expected_version: String,
+    completed_at: String,
+    notes: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetPause {
+    expected_version: String,
+    paused: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetReschedule {
+    expected_version: String,
+    due_at: String,
+}
+
+async fn fleet_list_printers<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Vec<Printer>>, ApiError> {
+    s.engine
+        .list_printers(&c)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_get_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Option<Printer>>, ApiError> {
+    s.engine
+        .get_printer(&c, &id)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_create_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(input): Json<PrinterInput>,
+) -> Result<Json<Printer>, ApiError> {
+    s.engine
+        .create_printer(&c, input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_update_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetUpdate<PrinterInput>>,
+) -> Result<Json<Printer>, ApiError> {
+    s.engine
+        .update_printer(&c, &id, parse_version(&b.expected_version)?, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_delete_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<VersionBody>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_printer(&c, &id, parse_version(&b.expected_version)?)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_list_logs<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Query(q): Query<FleetQuery>,
+) -> Result<Json<Vec<PrinterMaintenanceLog>>, ApiError> {
+    s.engine
+        .list_printer_maintenance_logs(&c, q.printer_id.as_deref())
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_printer_logs<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<PrinterMaintenanceLog>>, ApiError> {
+    s.engine
+        .list_printer_maintenance_logs(&c, Some(&id))
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_create_log<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<PrinterMaintenanceInput>,
+) -> Result<Json<PrinterMaintenanceLog>, ApiError> {
+    s.engine
+        .create_printer_maintenance_log(&c, &id, input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_update_log<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetUpdate<PrinterMaintenanceInput>>,
+) -> Result<Json<PrinterMaintenanceLog>, ApiError> {
+    s.engine
+        .update_printer_maintenance_log(&c, &id, parse_version(&b.expected_version)?, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_delete_log<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<VersionBody>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_printer_maintenance_log(&c, &id, parse_version(&b.expected_version)?)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_list_reminders<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Query(q): Query<FleetQuery>,
+) -> Result<Json<Vec<PrinterReminder>>, ApiError> {
+    s.engine
+        .list_printer_reminders(&c, q.printer_id.as_deref(), q.include_completed)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_create_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<FleetReminderCreate>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .create_printer_reminder(&c, &b.printer_id, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_update_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetUpdate<PrinterReminderInput>>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .update_printer_reminder(&c, &id, parse_version(&b.expected_version)?, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_delete_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<VersionBody>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_printer_reminder(&c, &id, parse_version(&b.expected_version)?)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_complete_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetComplete>,
+) -> Result<Json<PrinterReminderCompletion>, ApiError> {
+    s.engine
+        .complete_printer_reminder(
+            &c,
+            &id,
+            parse_version(&b.expected_version)?,
+            PrinterReminderCompletionInput {
+                completed_at: b.completed_at,
+                notes: b.notes,
+            },
+        )
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_pause_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetPause>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .set_printer_reminder_paused(&c, &id, parse_version(&b.expected_version)?, b.paused)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_reschedule_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetReschedule>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .reschedule_printer_reminder(&c, &id, parse_version(&b.expected_version)?, &b.due_at)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+fn fleet_input_schema(kind: &str) -> Value {
+    let text = |maximum| serde_json::json!({"type":"string","maxLength":maximum});
+    let optional_text = |maximum| serde_json::json!({"type":["string","null"],"maxLength":maximum});
+    let (properties, required) = match kind {
+        "printer" => (
+            serde_json::json!({"nickname":{"type":"string","minLength":1,"maxLength":128},"make":optional_text(128),"model":optional_text(128),"printerType":optional_text(128),"firmware":optional_text(128),"host":optional_text(255),"webUrl":optional_text(2048),"bedMm":{"oneOf":[{"type":"null"},{"type":"array","minItems":3,"maxItems":3,"items":{"type":"number","minimum":0.1,"maximum":10000}}]},"notes":text(20000)}),
+            vec!["nickname", "notes"],
+        ),
+        "log" => (
+            serde_json::json!({"title":{"type":"string","minLength":1,"maxLength":128},"performedAt":{"type":"string","format":"date-time","maxLength":64},"notes":text(20000)}),
+            vec!["title", "performedAt", "notes"],
+        ),
+        _ => (
+            serde_json::json!({"title":{"type":"string","minLength":1,"maxLength":128},"notes":text(20000),"dueAt":{"type":"string","format":"date-time","maxLength":64},"intervalDays":{"type":["integer","null"],"minimum":1,"maximum":36500}}),
+            vec!["title", "notes", "dueAt"],
+        ),
+    };
+    serde_json::json!({"type":"object","additionalProperties":false,"properties":properties,"required":required})
+}
+fn fleet_tool_schema(name: &str) -> Option<Value> {
+    let id = serde_json::json!({"type":"string","minLength":1,"maxLength":128});
+    let version = serde_json::json!({"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"});
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    match name {
+        "list_printers" => {}
+        "get_printer"
+        | "create_printer_maintenance_log"
+        | "create_printer_reminder"
+        | "update_printer"
+        | "delete_printer" => {
+            properties.insert("printerId".into(), id.clone());
+            required.push("printerId");
+        }
+        "list_printer_maintenance_logs" | "list_printer_reminders" => {
+            properties.insert("printerId".into(), id.clone());
+        }
+        "update_printer_maintenance_log" | "delete_printer_maintenance_log" => {
+            properties.insert("logId".into(), id.clone());
+            required.push("logId");
+        }
+        "update_printer_reminder"
+        | "delete_printer_reminder"
+        | "complete_printer_reminder"
+        | "set_printer_reminder_paused"
+        | "reschedule_printer_reminder" => {
+            properties.insert("reminderId".into(), id.clone());
+            required.push("reminderId");
+        }
+        "create_printer" => {}
+        _ => return None,
+    }
+    if name.starts_with("update_")
+        || name.starts_with("delete_")
+        || matches!(
+            name,
+            "complete_printer_reminder"
+                | "set_printer_reminder_paused"
+                | "reschedule_printer_reminder"
+        )
+    {
+        properties.insert("expectedVersion".into(), version);
+        required.push("expectedVersion");
+    }
+    if name.starts_with("create_") || name.starts_with("update_") {
+        let kind = if name.ends_with("maintenance_log") {
+            "log"
+        } else if name.ends_with("reminder") {
+            "reminder"
+        } else {
+            "printer"
+        };
+        properties.insert("input".into(), fleet_input_schema(kind));
+        required.push("input");
+    }
+    if name == "list_printer_reminders" {
+        properties.insert(
+            "includeCompleted".into(),
+            serde_json::json!({"type":"boolean"}),
+        );
+    }
+    for (tool, field, schema) in [
+        (
+            "complete_printer_reminder",
+            "completedAt",
+            serde_json::json!({"type":"string","format":"date-time","maxLength":64}),
+        ),
+        (
+            "complete_printer_reminder",
+            "notes",
+            serde_json::json!({"type":"string","maxLength":20000}),
+        ),
+        (
+            "set_printer_reminder_paused",
+            "paused",
+            serde_json::json!({"type":"boolean"}),
+        ),
+        (
+            "reschedule_printer_reminder",
+            "dueAt",
+            serde_json::json!({"type":"string","format":"date-time","maxLength":64}),
+        ),
+    ] {
+        if name == tool {
+            properties.insert(field.into(), schema);
+            required.push(field);
+        }
+    }
+    Some(
+        serde_json::json!({"type":"object","additionalProperties":false,"properties":properties,"required":required}),
+    )
+}
+fn fleet_openapi_paths() -> Value {
+    let mut paths = serde_json::Map::new();
+    for (path, actions) in [
+        (
+            "/api/v1/printers",
+            vec![("get", "list_printers"), ("post", "create_printer")],
+        ),
+        (
+            "/api/v1/printers/{id}",
+            vec![
+                ("get", "get_printer"),
+                ("put", "update_printer"),
+                ("delete", "delete_printer"),
+            ],
+        ),
+        (
+            "/api/v1/printers/{id}/maintenance-logs",
+            vec![
+                ("get", "list_printer_maintenance_logs"),
+                ("post", "create_printer_maintenance_log"),
+            ],
+        ),
+        (
+            "/api/v1/printer-maintenance-logs",
+            vec![("get", "list_printer_maintenance_logs")],
+        ),
+        (
+            "/api/v1/printer-maintenance-logs/{id}",
+            vec![
+                ("put", "update_printer_maintenance_log"),
+                ("delete", "delete_printer_maintenance_log"),
+            ],
+        ),
+        (
+            "/api/v1/printer-reminders",
+            vec![
+                ("get", "list_printer_reminders"),
+                ("post", "create_printer_reminder"),
+            ],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}",
+            vec![
+                ("put", "update_printer_reminder"),
+                ("delete", "delete_printer_reminder"),
+            ],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}/complete",
+            vec![("post", "complete_printer_reminder")],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}/pause",
+            vec![("post", "set_printer_reminder_paused")],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}/reschedule",
+            vec![("post", "reschedule_printer_reminder")],
+        ),
+    ] {
+        let mut methods = serde_json::Map::new();
+        for (method, tool) in actions {
+            let mut operation = serde_json::json!({"operationId":tool,"description":"Data-only Community printer fleet metadata. CatalogRead permits reads; CatalogWrite permits mutations. No discovery, credentials, endpoint approval, network requests, or printer controls. Versions and printCount are decimal strings. Stale versions fail atomically.","responses":{"200":{"description":"Credential-free printer metadata; metadataVersion and printCount are decimal strings"},"204":{"description":"Deleted"},"401":{"description":"Authentication required"},"403":{"description":"Required catalog capability absent"},"409":{"description":"Stored version changed; no mutation"},"422":{"description":"Invalid metadata or unsupported input fields"},"503":{"description":"Library maintenance in progress"}}});
+            if path.contains("{id}") {
+                operation["parameters"] = serde_json::json!([{"name":"id","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":128}}]);
+            }
+            if method == "get" && !path.contains("{id}") && tool != "list_printers" {
+                operation["parameters"] = serde_json::json!([{"name":"printerId","in":"query","schema":{"type":"string","maxLength":128}},{"name":"includeCompleted","in":"query","schema":{"type":"boolean","default":false}}]);
+            }
+            if method != "get" {
+                let mut schema = fleet_tool_schema(tool).expect("known fleet tool");
+                for key in ["printerId", "logId", "reminderId"] {
+                    if path.contains("{id}") {
+                        schema["properties"].as_object_mut().unwrap().remove(key);
+                        schema["required"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|value| value != key);
+                    }
+                }
+                if matches!(tool, "create_printer" | "create_printer_maintenance_log") {
+                    schema = schema["properties"]["input"].take();
+                }
+                operation["requestBody"] = serde_json::json!({"required":true,"content":{"application/json":{"schema":schema}}});
+            }
+            let response_kind =
+                if tool.ends_with("maintenance_log") || tool == "list_printer_maintenance_logs" {
+                    "PrinterMaintenanceLog"
+                } else if tool == "complete_printer_reminder" {
+                    "PrinterReminderCompletion"
+                } else if tool.contains("reminder") {
+                    "PrinterReminder"
+                } else {
+                    "Printer"
+                };
+            let item = serde_json::json!({"$ref":format!("#/components/schemas/{response_kind}")});
+            let response_schema = if tool.starts_with("list_") {
+                serde_json::json!({"type":"array","items":item})
+            } else if tool == "get_printer" {
+                serde_json::json!({"oneOf":[item,{"type":"null"}]})
+            } else {
+                item
+            };
+            if method == "delete" {
+                operation["responses"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("200");
+            } else {
+                operation["responses"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("204");
+                operation["responses"]["200"]["content"] =
+                    serde_json::json!({"application/json":{"schema":response_schema}});
+            }
+            methods.insert(method.into(), operation);
+        }
+        paths.insert(path.into(), Value::Object(methods));
+    }
+    Value::Object(paths)
+}
+
+fn fleet_output_schemas() -> Value {
+    let decimal = serde_json::json!({"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"});
+    let text = serde_json::json!({"type":"string"});
+    let nullable = serde_json::json!({"type":["string","null"]});
+    let mut schemas = serde_json::Map::new();
+    for (kind, name) in [
+        ("printer", "Printer"),
+        ("log", "PrinterMaintenanceLog"),
+        ("reminder", "PrinterReminder"),
+    ] {
+        let mut schema = fleet_input_schema(kind);
+        let properties = schema["properties"].as_object_mut().unwrap();
+        properties.insert("id".into(), text.clone());
+        properties.insert("metadataVersion".into(), decimal.clone());
+        properties.insert("createdAt".into(), text.clone());
+        if kind == "printer" {
+            for field in ["lastCheckedAt", "connectionErrorCode", "lastPrintedAt"] {
+                properties.insert(field.into(), nullable.clone());
+            }
+            properties.insert("updatedAt".into(), text.clone());
+            properties.insert("printCount".into(), decimal.clone());
+            properties.insert(
+                "endpointApproved".into(),
+                serde_json::json!({"type":"boolean"}),
+            );
+            properties.insert(
+                "sourceKind".into(),
+                serde_json::json!({"type":"string","enum":["manual","discovered","imported"]}),
+            );
+            properties.insert("connectionStatus".into(),serde_json::json!({"type":"string","enum":["unknown","online","offline","auth_required","error"]}));
+            properties.insert("jobStatus".into(),serde_json::json!({"type":"string","enum":["unknown","idle","printing","paused","complete"]}));
+        } else {
+            properties.insert("printerId".into(), nullable.clone());
+            properties.insert("printerNickname".into(), text.clone());
+            if kind == "reminder" {
+                properties.insert("updatedAt".into(), text.clone());
+                properties.insert("lastCompletedAt".into(), nullable.clone());
+                properties.insert(
+                    "status".into(),
+                    serde_json::json!({"type":"string","enum":["active","paused","completed"]}),
+                );
+            }
+        }
+        let required = properties.keys().cloned().collect::<Vec<_>>();
+        schema["required"] = serde_json::json!(required);
+        schemas.insert(name.into(), schema);
+    }
+    schemas.insert("PrinterReminderCompletion".into(),serde_json::json!({"type":"object","additionalProperties":false,"required":["reminder","maintenanceLog"],"properties":{"reminder":{"$ref":"#/components/schemas/PrinterReminder"},"maintenanceLog":{"$ref":"#/components/schemas/PrinterMaintenanceLog"}}}));
+    Value::Object(schemas)
 }

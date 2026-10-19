@@ -5,8 +5,9 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use crate::extension_api::{AppError, AppState, ModelSummary};
 use library_core::{
     CatalogSettings, Folder, ImportResult, IndexRoot, LibraryDb, LibraryError, MetadataPatch,
-    Model, PrintAttempt, PrintAttemptImportItem, PrintAttemptImportResult, PrintAttemptInput,
-    PrintAttemptInputWithPrinter, Tag, VersionedTarget,
+    Model, PartStock, PartStockInput, PrintAttempt, PrintAttemptImportItem,
+    PrintAttemptImportResult, PrintAttemptInput, PrintAttemptInputWithPrinter, Tag,
+    VersionedTarget,
 };
 use library_runtime::{LibraryRuntime, RuntimeConfig, RuntimeIoGuard, RuntimeMaintenanceGuard};
 
@@ -319,6 +320,48 @@ pub fn library_update_models_metadata(
 ) -> Result<Vec<Model>, AppError> {
     with_db(&state, |db| {
         db.bulk_update_metadata(&targets, &patch)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_list_part_stock(
+    state: tauri::State<'_, LibraryState>,
+) -> Result<Vec<PartStock>, AppError> {
+    with_db(&state, |db| db.list_part_stock().map_err(library_error))
+}
+
+#[tauri::command]
+pub fn library_create_part_stock(
+    state: tauri::State<'_, LibraryState>,
+    input: PartStockInput,
+) -> Result<PartStock, AppError> {
+    with_db(&state, |db| {
+        db.create_part_stock(&input).map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_update_part_stock(
+    state: tauri::State<'_, LibraryState>,
+    id: String,
+    expected_version: u64,
+    input: PartStockInput,
+) -> Result<PartStock, AppError> {
+    with_db(&state, |db| {
+        db.update_part_stock(&id, expected_version, &input)
+            .map_err(library_error)
+    })
+}
+
+#[tauri::command]
+pub fn library_delete_part_stock(
+    state: tauri::State<'_, LibraryState>,
+    id: String,
+    expected_version: u64,
+) -> Result<(), AppError> {
+    with_db(&state, |db| {
+        db.delete_part_stock(&id, expected_version)
             .map_err(library_error)
     })
 }

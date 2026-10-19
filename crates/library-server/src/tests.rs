@@ -6143,3 +6143,378 @@ async fn desktop_slicer_tools_are_advertised_and_invokable_over_authenticated_mc
         vec![("model-1".into(), 7, "com.bambulab.bambu-studio".into())]
     );
 }
+
+#[tokio::test]
+async fn browser_printer_fleet_auth_versions_and_completion_are_atomic() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let adapter = Arc::new(ProtocolEngineAdapter::new(
+        Arc::clone(&runtime),
+        HostMode::Headless,
+    ));
+    let app = router(adapter.clone(), security(8));
+    let input = json!({"nickname":"Bench printer","make":"Elegoo","model":"Centauri Carbon",
+        "printerType":"fdm","firmware":null,"host":"192.0.2.10","webUrl":null,
+        "bedMm":[256,256,256],"notes":"Synthetic metadata only"});
+    let denied = app
+        .clone()
+        .oneshot(
+            request("GET", "/api/v1/printers", false)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let mut read_security = security(8);
+    read_security.principal_capabilities = BTreeSet::from([Capability::CatalogRead]);
+    let reader = router(adapter.clone(), read_security);
+    let denied = reader
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/printers", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let injected = app
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/printers", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"nickname":"bad","notes":"", "endpointApproved":true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = app
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/printers", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let printer: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(printer["metadataVersion"], "1");
+    assert_eq!(printer["printCount"], "0");
+    assert_eq!(printer["endpointApproved"], false);
+    assert_eq!(printer["jobStatus"], "unknown");
+    let id = printer["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            request("PUT", &format!("/api/v1/printers/{id}"), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"expectedVersion":"1","input":input}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stale = app
+        .clone()
+        .oneshot(
+            request("DELETE", &format!("/api/v1/printers/{id}"), true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"expectedVersion":"1"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let response = app.clone().oneshot(request("POST","/api/v1/printer-reminders",true)
+        .header(header::CONTENT_TYPE,"application/json").body(Body::from(json!({"printerId":id,"input":{"title":"Lubricate","notes":"test","dueAt":"2026-10-19T00:00:00Z","intervalDays":7}}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let reminder: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    let reminder_id = reminder["id"].as_str().unwrap();
+    let complete =
+        json!({"expectedVersion":"1","completedAt":"2026-10-19T12:00:00Z","notes":"Done"});
+    let response = app
+        .clone()
+        .oneshot(
+            request(
+                "POST",
+                &format!("/api/v1/printer-reminders/{reminder_id}/complete"),
+                true,
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(complete.to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let completed: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(completed["reminder"]["metadataVersion"], "2");
+    assert_eq!(completed["maintenanceLog"]["metadataVersion"], "1");
+    let replay = app
+        .clone()
+        .oneshot(
+            request(
+                "POST",
+                &format!("/api/v1/printer-reminders/{reminder_id}/complete"),
+                true,
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(complete.to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let response = reader
+        .oneshot(
+            request(
+                "GET",
+                &format!("/api/v1/printers/{id}/maintenance-logs"),
+                true,
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let logs: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(logs.as_array().unwrap().len(), 1);
+    let maintenance_guard = runtime.begin_maintenance().unwrap();
+    let blocked = app
+        .oneshot(
+            request("POST", "/api/v1/printers", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(maintenance_guard);
+}
+
+#[tokio::test]
+async fn browser_fleet_openapi_mcp_and_endpoint_trust_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        temp.path().join("library"),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let adapter = Arc::new(ProtocolEngineAdapter::new(
+        Arc::clone(&runtime),
+        HostMode::Headless,
+    ));
+    let reader = RequestContext {
+        principal_id: "fleet-reader".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead]),
+        request_id: "reader".into(),
+    };
+    let writer = RequestContext {
+        principal_id: "fleet-writer".into(),
+        capabilities: BTreeSet::from([Capability::CatalogRead, Capability::CatalogWrite]),
+        request_id: "writer".into(),
+    };
+    for name in [
+        "list_printers",
+        "get_printer",
+        "list_printer_maintenance_logs",
+        "list_printer_reminders",
+    ] {
+        assert!(adapter.supports_tool(&reader, name), "{name}");
+    }
+    for name in [
+        "create_printer",
+        "update_printer",
+        "delete_printer",
+        "create_printer_maintenance_log",
+        "update_printer_maintenance_log",
+        "delete_printer_maintenance_log",
+        "create_printer_reminder",
+        "update_printer_reminder",
+        "delete_printer_reminder",
+        "complete_printer_reminder",
+        "set_printer_reminder_paused",
+        "reschedule_printer_reminder",
+    ] {
+        assert!(!adapter.supports_tool(&reader, name), "{name}");
+        assert!(adapter.supports_tool(&writer, name), "{name}");
+    }
+    let input = json!({"nickname":"Synthetic","notes":"","host":"192.0.2.10","webUrl":"http://192.0.2.10/private?token=discarded"});
+    assert_eq!(
+        adapter
+            .call_tool(&reader, "create_printer", json!({"input":input}))
+            .unwrap_err()
+            .code,
+        "forbidden"
+    );
+    let printer = adapter
+        .call_tool(&writer, "create_printer", json!({"input":input}))
+        .unwrap();
+    assert_eq!(printer["webUrl"], "http://192.0.2.10");
+    let id = printer["id"].as_str().unwrap();
+    let edit = json!({"printerId":id,"expectedVersion":"1","input":{"nickname":"Updated","notes":"","host":"192.0.2.11","webUrl":"https://192.0.2.11"}});
+    let changed = adapter
+        .call_tool(&writer, "update_printer", edit.clone())
+        .unwrap();
+    assert_eq!(changed["metadataVersion"], "2");
+    assert_eq!(changed["endpointApproved"], false);
+    let conflict = adapter
+        .call_tool(&writer, "update_printer", edit)
+        .unwrap_err();
+    assert_eq!(conflict.code, "conflict");
+    assert_eq!(conflict.current_version, Some(2));
+    assert!(adapter.call_tool(&writer,"create_printer",json!({"input":{"nickname":"bad","notes":"","webUrl":"https://user:password@192.0.2.10"}})).is_err());
+    assert!(adapter.call_tool(&writer,"update_printer",json!({"printerId":id,"expectedVersion":"2","input":{"nickname":"bad","notes":"","jobStatus":"printing"}})).is_err());
+    let log=adapter.call_tool(&writer,"create_printer_maintenance_log",json!({"printerId":id,"input":{"title":"Check","performedAt":"2026-10-19T12:00:00Z","notes":""}})).unwrap();
+    let log_id = log["id"].as_str().unwrap();
+    let edited_log=adapter.call_tool(&writer,"update_printer_maintenance_log",json!({"logId":log_id,"expectedVersion":"1","input":{"title":"Check complete","performedAt":"2026-10-19T12:00:00Z","notes":""}})).unwrap();
+    assert_eq!(edited_log["metadataVersion"], "2");
+    assert!(adapter
+        .call_tool(
+            &writer,
+            "delete_printer_maintenance_log",
+            json!({"logId":log_id,"expectedVersion":"1"})
+        )
+        .is_err());
+    let reminder=adapter.call_tool(&writer,"create_printer_reminder",json!({"printerId":id,"input":{"title":"Clean","notes":"","dueAt":"2026-10-20T12:00:00Z","intervalDays":null}})).unwrap();
+    let reminder_id = reminder["id"].as_str().unwrap();
+    let paused = adapter
+        .call_tool(
+            &writer,
+            "set_printer_reminder_paused",
+            json!({"reminderId":reminder_id,"expectedVersion":"1","paused":true}),
+        )
+        .unwrap();
+    assert_eq!(paused["status"], "paused");
+    let rejected=adapter.call_tool(&writer,"complete_printer_reminder",json!({"reminderId":reminder_id,"expectedVersion":"2","completedAt":"2026-10-20T12:00:00Z","notes":""}));
+    assert!(rejected.is_err());
+    let logs = adapter
+        .call_tool(
+            &reader,
+            "list_printer_maintenance_logs",
+            json!({"printerId":id}),
+        )
+        .unwrap();
+    assert_eq!(
+        logs.as_array().unwrap().len(),
+        1,
+        "invalid completion adds no log"
+    );
+    let resumed = adapter
+        .call_tool(
+            &writer,
+            "reschedule_printer_reminder",
+            json!({"reminderId":reminder_id,"expectedVersion":"2","dueAt":"2026-10-21T12:00:00Z"}),
+        )
+        .unwrap();
+    assert_eq!(resumed["status"], "active");
+    assert_eq!(resumed["metadataVersion"], "3");
+    adapter
+        .call_tool(
+            &writer,
+            "delete_printer",
+            json!({"printerId":id,"expectedVersion":"2"}),
+        )
+        .unwrap();
+    let history = adapter
+        .call_tool(&reader, "list_printer_maintenance_logs", json!({}))
+        .unwrap();
+    assert_eq!(history[0]["printerId"], Value::Null);
+    assert_eq!(history[0]["printerNickname"], "Updated");
+    assert_eq!(history[0]["metadataVersion"], "3");
+    let app = router(adapter, security(8));
+    let response = app
+        .oneshot(
+            request("GET", "/api/v1/openapi.json", true)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let spec: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    for path in [
+        "/api/v1/printers",
+        "/api/v1/printer-maintenance-logs",
+        "/api/v1/printer-reminders",
+        "/api/v1/printer-reminders/{id}/complete",
+        "/api/v1/printer-reminders/{id}/pause",
+        "/api/v1/printer-reminders/{id}/reschedule",
+    ] {
+        assert!(spec["paths"].get(path).is_some(), "{path}");
+    }
+    assert_eq!(
+        spec["paths"]["/api/v1/printers"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["additionalProperties"],
+        false
+    );
+    assert!(
+        spec["paths"]["/api/v1/printers"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]
+            .get("endpointApproved")
+            .is_none()
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["Printer"]["properties"]["printCount"]["type"],
+        "string"
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["Printer"]["properties"]["metadataVersion"]["type"],
+        "string"
+    );
+}
+
+#[test]
+fn fleet_mcp_shapes_and_u64_wire_contracts_are_strict() {
+    for arguments in [
+        json!({"printerId":"x","expectedVersion":1,"input":{"nickname":"x","notes":""}}),
+        json!({"printerId":"x","expectedVersion":"01","input":{"nickname":"x","notes":""}}),
+        json!({"printerId":"x","expectedVersion":"1","input":{"nickname":"x","notes":"","endpointApproved":true}}),
+        json!({"printerId":"x","expectedVersion":"1","input":{"nickname":"x","notes":""},"credentials":"secret"}),
+    ] {
+        assert!(super::validate_tool_shape("update_printer", &arguments).is_err());
+    }
+    assert!(super::validate_tool_shape(
+        "list_printer_reminders",
+        &json!({"includeCompleted":"yes"})
+    )
+    .is_err());
+    let log = library_protocol::PrinterMaintenanceLog {
+        id: "log".into(),
+        metadata_version: u64::MAX,
+        printer_id: None,
+        printer_nickname: "".into(),
+        title: "History".into(),
+        performed_at: "2026-10-19T00:00:00Z".into(),
+        notes: "".into(),
+        created_at: "2026-10-19T00:00:00Z".into(),
+    };
+    let mut wire = serde_json::to_value(&log).unwrap();
+    assert_eq!(wire["metadataVersion"], u64::MAX.to_string());
+    let restored: library_protocol::PrinterMaintenanceLog =
+        serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(restored.metadata_version, u64::MAX);
+    wire["metadataVersion"] = json!(9007199254740993_u64);
+    assert!(serde_json::from_value::<library_protocol::PrinterMaintenanceLog>(wire).is_err());
+}
