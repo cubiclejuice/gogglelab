@@ -169,6 +169,15 @@ Before manual move/trash/purge/undo, list exact fixture paths and obtain approva
 - Exercise supported restart recovery with pending holds. Verify holds remain visible/recoverable and junction/reparse paths cannot escape configured roots. Do not force-kill during an arbitrary write and call it the supported fixture.
 - Keep purge/permanent deletion `NOT-RUN` without exact approval for the synthetic hold. Do not delete an unreviewed orphan path.
 
+For a supported source-build fixture, record the staging entry set before and
+after default thumbnail indexing. It must not gain retained model-source copies;
+original bytes and an unrelated staging sentinel must remain unchanged. Generated
+purge/restore control metadata has a separate bounded receipt/recovery path.
+Platform-disabled atomic exchange or directory synchronization must stay disabled
+on Windows; record that coverage as `BLOCKED`/unsupported, never enable it just to
+pass. A Unix test result does not establish Windows mutation safety. Do not delete
+historical holds based on a generated-looking name.
+
 Recheck outside/unrelated original hashes. Preserve holds and logs for review.
 
 ## 7. Offline printer history, stock, JSON, and recovery

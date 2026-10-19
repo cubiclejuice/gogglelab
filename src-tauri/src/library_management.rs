@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use library_core::{
     DuplicateGroup, IndexRoot, LibraryDb, Model, RemovalResult, RemovedModel, VersionedTarget,
 };
+use library_runtime::{GeneratedControlKind, GeneratedTransactionJournal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
@@ -126,6 +127,7 @@ struct TauriRestoreJournal {
     committed: bool,
 }
 
+#[cfg(test)]
 fn purge_journal_name_for_runtime(root: &Path) -> Result<std::ffi::OsString, AppError> {
     let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
     let suffix = digest[..16]
@@ -137,6 +139,7 @@ fn purge_journal_name_for_runtime(root: &Path) -> Result<std::ffi::OsString, App
     )))
 }
 
+#[cfg(test)]
 fn restore_journal_name_for_runtime(root: &Path) -> Result<std::ffi::OsString, AppError> {
     let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
     let suffix = digest[..16]
@@ -155,7 +158,7 @@ fn write_tauri_restore_journal(
     staged_name: &std::ffi::OsStr,
     previous_name: &std::ffi::OsStr,
     failed_name: &std::ffi::OsStr,
-) -> Result<std::ffi::OsString, AppError> {
+) -> Result<GeneratedTransactionJournal, AppError> {
     let root_text = root.to_str().ok_or_else(|| AppError::Library {
         message: "Restore journal requires a Unicode Library path".into(),
     })?;
@@ -179,77 +182,33 @@ fn write_tauri_restore_journal(
             message: "Restore journal does not match the Library root".into(),
         });
     }
-    let journal_name = restore_journal_name_for_runtime(root)?;
-    if parent.entry_exists(&journal_name).map_err(map_io)? {
-        return Err(AppError::Library {
-            message: "A restore recovery journal already exists".into(),
-        });
-    }
-    let temp_name = std::ffi::OsString::from(format!("{}.tmp", journal_name.to_string_lossy()));
     let bytes = serde_json::to_vec(&journal).map_err(|error| AppError::Library {
-        message: format!("Restore journal encoding failed: {error}"),
+        message: error.to_string(),
     })?;
-    parent.write_new_file(&temp_name, &bytes).map_err(map_io)?;
-    if let Err(error) = parent.rename_child_exclusive(&temp_name, &journal_name) {
-        let _ = parent.remove_file(&temp_name);
-        return Err(map_io(error));
-    }
-    parent.sync().map_err(map_io)?;
-    Ok(journal_name)
+    GeneratedTransactionJournal::create(parent, root, GeneratedControlKind::Restore, &bytes)
+        .map_err(map_io)
 }
-
 fn mark_tauri_restore_committed(
     parent: &library_runtime::GuardedDirectoryParent,
     root: &Path,
-    journal_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
     nonce: &str,
 ) -> Result<(), AppError> {
-    let input = parent.open_file_handle(journal_name).map_err(map_io)?;
-    let mut bytes = Vec::new();
-    input
-        .take(8 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(map_io)?;
-    if bytes.len() > 8 * 1024 {
-        return Err(AppError::Library {
-            message: "Restore journal exceeds its size limit".into(),
-        });
-    }
-    let mut journal: TauriRestoreJournal =
-        serde_json::from_slice(&bytes).map_err(|error| AppError::Library {
-            message: format!("Restore journal is invalid: {error}"),
-        })?;
-    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
-    if journal.version != 1
-        || journal.root_path != root.to_string_lossy()
-        || journal.nonce != nonce
-        || journal.staged_name != format!(".gogglelab-restore-{nonce}")
-        || journal.previous_name != format!("{root_name}.previous-{nonce}")
-        || journal.failed_name != format!(".gogglelab-failed-restore-{nonce}")
-        || journal.committed
+    if journal.root() != root
+        || journal.nonce() != nonce
+        || journal.kind() != GeneratedControlKind::Restore
     {
         return Err(AppError::Library {
             message: "Restore journal changed before commit".into(),
         });
     }
-    journal.committed = true;
-    let committed_bytes = serde_json::to_vec(&journal).map_err(|error| AppError::Library {
-        message: format!("Committed restore journal encoding failed: {error}"),
-    })?;
-    let temp_name = std::ffi::OsString::from(format!("{}.commit", journal_name.to_string_lossy()));
-    parent
-        .write_new_file(&temp_name, &committed_bytes)
-        .map_err(map_io)?;
-    parent
-        .replace_child(&temp_name, journal_name)
-        .map_err(map_io)?;
-    parent.sync().map_err(map_io)
+    journal.mark_committed(parent).map_err(map_io)
 }
 
 fn finish_tauri_restore_commit(
     parent: &library_runtime::GuardedDirectoryParent,
     root: &Path,
-    journal_name: &std::ffi::OsStr,
+    journal_name: &mut GeneratedTransactionJournal,
     nonce: &str,
 ) -> Result<(), AppError> {
     mark_tauri_restore_committed(parent, root, journal_name, nonce)?;
@@ -258,17 +217,9 @@ fn finish_tauri_restore_commit(
 
 fn clear_tauri_restore_journal(
     parent: &library_runtime::GuardedDirectoryParent,
-    journal_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
 ) -> Result<(), AppError> {
-    parent.remove_file(journal_name).map_err(map_io)?;
-    for suffix in ["tmp", "commit"] {
-        let temp_name =
-            std::ffi::OsString::from(format!("{}.{}", journal_name.to_string_lossy(), suffix));
-        if parent.entry_exists(&temp_name).map_err(map_io)? {
-            parent.remove_file(&temp_name).map_err(map_io)?;
-        }
-    }
-    parent.sync().map_err(map_io)
+    journal.clear(parent).map_err(map_io)
 }
 
 fn write_tauri_purge_journal(
@@ -277,7 +228,7 @@ fn write_tauri_purge_journal(
     nonce: &str,
     staged_name: &std::ffi::OsStr,
     previous_name: &std::ffi::OsStr,
-) -> Result<std::ffi::OsString, AppError> {
+) -> Result<GeneratedTransactionJournal, AppError> {
     let root_text = root.to_str().ok_or_else(|| AppError::Library {
         message: "Purge journal requires a Unicode Library path".into(),
     })?;
@@ -299,81 +250,34 @@ fn write_tauri_purge_journal(
             message: "Purge journal does not match the Library root".into(),
         });
     }
-    let journal_name = purge_journal_name_for_runtime(root)?;
-    if parent.entry_exists(&journal_name).map_err(map_io)? {
-        return Err(AppError::Library {
-            message: "A purge recovery journal already exists".into(),
-        });
-    }
-    let temp_name = std::ffi::OsString::from(format!("{}.tmp", journal_name.to_string_lossy()));
     let bytes = serde_json::to_vec(&journal).map_err(|error| AppError::Library {
-        message: format!("Purge journal encoding failed: {error}"),
+        message: error.to_string(),
     })?;
-    parent.write_new_file(&temp_name, &bytes).map_err(map_io)?;
-    if let Err(error) = parent.rename_child_exclusive(&temp_name, &journal_name) {
-        let _ = parent.remove_file(&temp_name);
-        return Err(map_io(error));
-    }
-    parent.sync().map_err(map_io)?;
-    Ok(journal_name)
+    GeneratedTransactionJournal::create(parent, root, GeneratedControlKind::Purge, &bytes)
+        .map_err(map_io)
 }
-
 fn mark_tauri_purge_journal_committed(
     parent: &library_runtime::GuardedDirectoryParent,
     root: &Path,
-    journal_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
     nonce: &str,
 ) -> Result<(), AppError> {
-    let input = parent.open_file_handle(journal_name).map_err(map_io)?;
-    let mut bytes = Vec::new();
-    input
-        .take(8 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(map_io)?;
-    if bytes.len() > 8 * 1024 {
-        return Err(AppError::Library {
-            message: "Purge journal exceeds its size limit".into(),
-        });
-    }
-    let mut journal: TauriPurgeJournal =
-        serde_json::from_slice(&bytes).map_err(|error| AppError::Library {
-            message: format!("Purge journal is invalid: {error}"),
-        })?;
-    if journal.version != 1
-        || journal.root_path != root.to_string_lossy()
-        || journal.nonce != nonce
-        || journal.committed
+    if journal.root() != root
+        || journal.nonce() != nonce
+        || journal.kind() != GeneratedControlKind::Purge
     {
         return Err(AppError::Library {
             message: "Purge journal changed before commit".into(),
         });
     }
-    journal.committed = true;
-    let committed_bytes = serde_json::to_vec(&journal).map_err(|error| AppError::Library {
-        message: format!("Committed purge journal encoding failed: {error}"),
-    })?;
-    let temp_name = std::ffi::OsString::from(format!("{}.commit", journal_name.to_string_lossy()));
-    parent
-        .write_new_file(&temp_name, &committed_bytes)
-        .map_err(map_io)?;
-    parent
-        .replace_child(&temp_name, journal_name)
-        .map_err(map_io)
+    journal.mark_committed(parent).map_err(map_io)
 }
 
 fn clear_tauri_purge_journal(
     parent: &library_runtime::GuardedDirectoryParent,
-    journal_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
 ) -> Result<(), AppError> {
-    parent.remove_file(journal_name).map_err(map_io)?;
-    for suffix in ["tmp", "commit"] {
-        let temp_name =
-            std::ffi::OsString::from(format!("{}.{}", journal_name.to_string_lossy(), suffix));
-        if parent.entry_exists(&temp_name).map_err(map_io)? {
-            parent.remove_file(&temp_name).map_err(map_io)?;
-        }
-    }
-    parent.sync().map_err(map_io)
+    journal.clear(parent).map_err(map_io)
 }
 
 fn index_root_settings_match(actual: &[IndexRoot], expected: &[IndexRoot]) -> bool {
@@ -1155,7 +1059,7 @@ fn restore_backup_impl(
 
     staged.sync_tree().map_err(map_io)?;
     parent_handle.sync().map_err(map_io)?;
-    let journal_name = write_tauri_restore_journal(
+    let mut journal_name = write_tauri_restore_journal(
         &parent_handle,
         &root,
         &nonce,
@@ -1181,7 +1085,9 @@ fn restore_backup_impl(
                     ),
                 });
             }
-            if let Err(cleanup_error) = clear_tauri_restore_journal(&parent_handle, &journal_name) {
+            if let Err(cleanup_error) =
+                clear_tauri_restore_journal(&parent_handle, &mut journal_name)
+            {
                 guard.remain_armed();
                 return Err(cleanup_error);
             }
@@ -1217,7 +1123,9 @@ fn restore_backup_impl(
             return Err(map_io(error));
         }
     }
-    if let Err(error) = finish_tauri_restore_commit(&parent_handle, &root, &journal_name, &nonce) {
+    if let Err(error) =
+        finish_tauri_restore_commit(&parent_handle, &root, &mut journal_name, &nonce)
+    {
         guard.remain_armed();
         return Err(error);
     }
@@ -1376,6 +1284,7 @@ fn purge_catalog_impl(
     let staged = parent_handle
         .create_empty_library_child(&staged_name)
         .map_err(map_io)?;
+    let mut marker_receipt = None;
     let staged_setup = (|| {
         let staged_path = staged.io_path().map_err(map_io)?;
         if !staged.matches_path(&staged_path).map_err(map_io)? {
@@ -1403,12 +1312,10 @@ fn purge_catalog_impl(
                 message: "Purge staging identity changed during catalog configuration".into(),
             });
         }
-        staged
-            .write_new_file(
-                std::ffi::OsStr::new(".gogglelab-purge-stage"),
-                nonce.as_bytes(),
-            )
-            .map_err(map_io)?;
+        marker_receipt = Some(
+            library_runtime::create_generated_purge_marker(&staged, &root, &nonce)
+                .map_err(map_io)?,
+        );
         staged.sync_tree().map_err(map_io)?;
         parent_handle.sync().map_err(map_io)?;
         Ok(())
@@ -1426,7 +1333,7 @@ fn purge_catalog_impl(
             message: "Library or parent directory identity changed before purge".into(),
         });
     }
-    let journal_name = match write_tauri_purge_journal(
+    let mut journal_name = match write_tauri_purge_journal(
         &parent_handle,
         &root,
         &nonce,
@@ -1445,7 +1352,7 @@ fn purge_catalog_impl(
         parent_handle.swap_library_children(&root_name, &staged_name, &previous_name)
     {
         if recovered {
-            if let Err(error) = clear_tauri_purge_journal(&parent_handle, &journal_name) {
+            if let Err(error) = clear_tauri_purge_journal(&parent_handle, &mut journal_name) {
                 guard.remain_armed();
                 return Err(error);
             }
@@ -1486,7 +1393,7 @@ fn purge_catalog_impl(
                 ),
             });
         }
-        if let Err(error) = clear_tauri_purge_journal(&parent_handle, &journal_name) {
+        if let Err(error) = clear_tauri_purge_journal(&parent_handle, &mut journal_name) {
             guard.remain_armed();
             return Err(error);
         }
@@ -1495,25 +1402,19 @@ fn purge_catalog_impl(
         });
     }
     if let Err(error) =
-        mark_tauri_purge_journal_committed(&parent_handle, &root, &journal_name, &nonce)
+        mark_tauri_purge_journal_committed(&parent_handle, &root, &mut journal_name, &nonce)
     {
         guard.remain_armed();
         return Err(error);
     }
-    let expected_marker = (
-        nonce.len() as u64,
-        format!("{:x}", Sha256::digest(nonce.as_bytes())),
-    );
-    if let Err(error) = staged.remove_verified_file(
-        Path::new(".gogglelab-purge-stage"),
-        expected_marker.0,
-        &expected_marker.1,
-        64,
-    ) {
+    let mut marker_receipt = marker_receipt.ok_or_else(|| AppError::Library {
+        message: "Purge marker receipt is missing".into(),
+    })?;
+    if let Err(error) = staged.delete_generated_file(&mut marker_receipt) {
         guard.remain_armed();
         return Err(map_io(error));
     }
-    if let Err(error) = clear_tauri_purge_journal(&parent_handle, &journal_name) {
+    if let Err(error) = clear_tauri_purge_journal(&parent_handle, &mut journal_name) {
         guard.remain_armed();
         return Err(error);
     }
@@ -2887,6 +2788,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn native_transaction_journal_cycles_leave_no_generated_recovery_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        for (kind, nonce) in [("purge", "a".repeat(32)), ("restore", "b".repeat(32))] {
+            let root = temp.path().join(kind);
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("sentinel"), b"preserve native library").unwrap();
+            let root = root.canonicalize().unwrap();
+            let parent =
+                library_runtime::GuardedDirectoryParent::open(root.parent().unwrap()).unwrap();
+            let previous = std::ffi::OsString::from(if kind == "purge" {
+                format!("purge.previous-purge-{nonce}")
+            } else {
+                format!("restore.previous-{nonce}")
+            });
+            if kind == "purge" {
+                let staged = std::ffi::OsString::from(format!(".gogglelab-empty-{nonce}"));
+                let mut journal =
+                    write_tauri_purge_journal(&parent, &root, &nonce, &staged, &previous).unwrap();
+                let directory = library_runtime::GuardedDirectory::open(&root).unwrap();
+                let mut marker =
+                    library_runtime::create_generated_purge_marker(&directory, &root, &nonce)
+                        .unwrap();
+                mark_tauri_purge_journal_committed(&parent, &root, &mut journal, &nonce).unwrap();
+                directory.delete_generated_file(&mut marker).unwrap();
+                clear_tauri_purge_journal(&parent, &mut journal).unwrap();
+            } else {
+                let staged = std::ffi::OsString::from(format!(".gogglelab-restore-{nonce}"));
+                let failed = std::ffi::OsString::from(format!(".gogglelab-failed-restore-{nonce}"));
+                let mut journal = write_tauri_restore_journal(
+                    &parent, &root, &nonce, &staged, &previous, &failed,
+                )
+                .unwrap();
+                finish_tauri_restore_commit(&parent, &root, &mut journal, &nonce).unwrap();
+            }
+            assert_eq!(
+                fs::read(root.join("sentinel")).unwrap(),
+                b"preserve native library"
+            );
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn restore_archive_writes_stay_in_the_existing_child_handle_after_path_swap() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -3009,7 +2955,7 @@ mod tests {
         ));
         let (second_parent, _second_staged) =
             staged_empty_library_with_roots(&second_root, &second_staged_name, &second_nonce);
-        let second_journal = write_tauri_purge_journal(
+        let mut second_journal = write_tauri_purge_journal(
             &second_parent,
             &second_root,
             &second_nonce,
@@ -3026,7 +2972,7 @@ mod tests {
         mark_tauri_purge_journal_committed(
             &second_parent,
             &second_root,
-            &second_journal,
+            &mut second_journal,
             &second_nonce,
         )
         .unwrap();
@@ -3145,7 +3091,7 @@ mod tests {
             &second_staged.io_path().unwrap(),
             "Committed restored catalog",
         );
-        let second_journal = write_tauri_restore_journal(
+        let mut second_journal = write_tauri_restore_journal(
             &second_parent,
             &second_root,
             &second_nonce,
@@ -3161,8 +3107,13 @@ mod tests {
             .rename_child_exclusive(&second_staged_name, second_root.file_name().unwrap())
             .unwrap();
         second_parent.sync().unwrap();
-        mark_tauri_restore_committed(&second_parent, &second_root, &second_journal, &second_nonce)
-            .unwrap();
+        mark_tauri_restore_committed(
+            &second_parent,
+            &second_root,
+            &mut second_journal,
+            &second_nonce,
+        )
+        .unwrap();
         drop(second_staged);
         drop(second_parent);
 

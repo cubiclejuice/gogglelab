@@ -2,7 +2,7 @@
 
 Date: 2026-10-15 (updated 2026-10-19)
 Open Phase 6 release gates: friend-run native Windows runtime/DACL/junction/replacement checks and final release review. Ordinary concurrent changes are guarded by pinned file/directory identities; hostile same-UID swap-and-restore windows are documented residuals outside the requested threat model. At the owner's direction, Phase 7 and subsequent phases proceed in order while native validation remains pending; no cross-platform parity claim is made until those checks pass.
-Status (2026-10-19): local phases 1–10 include reviewed printer/parts/slicer JSON in Free and schema v11. Delivery audit exposed missing native stock IPC and browser fleet coverage; those backfills are pushed at `2a6847fa605422e122c5f370041a4baa99457579`. Complete isolated native slicer import/export/restart acceptance now passes. Browser/MCP discovery and selected-printer checks are implemented with separately admitted host policy, default-off multicast/broadcast permissions, one-use review, version checks, and cancellation/revocation guards. The latest full serial Rust workspace suite, Clippy, and 326-test frontend gate pass; the network slice also passes isolated native default-off inspection, synthetic browser acceptance, and a Community production build/signature check. Synthetic browser acceptance covers discovery, unapproved profile saving, approval, fake Moonraker/Carbon printing status, cancellation, and disconnect; no real printer request was made. Remaining gates include the official unified core pin/composition, current Linux/container delivery (Docker is unresponsive), friend-run Windows checks, hardware acceptance, generated metadata-journal retention, and final release review. Bambu MQTT remains deferred in issue #3. The [Windows handoff](WINDOWS-FRIEND-ACCEPTANCE.md) is embedded in issue #2 with exact source provenance. Verified prior candidates and active builds are preserved; no cleanup or installed-app replacement occurred. No full parity or Windows/hardware acceptance claim is made.
+Status (2026-10-19): local phases 1–10 include reviewed printer/parts/slicer JSON in Free and schema v11. Delivery audit exposed missing native stock IPC and browser fleet coverage; those backfills are pushed at `2a6847fa605422e122c5f370041a4baa99457579`. Complete isolated native slicer import/export/restart acceptance now passes. Browser/MCP discovery and selected-printer checks are implemented with separately admitted host policy, default-off multicast/broadcast permissions, one-use review, version checks, and cancellation/revocation guards. The latest full serial Rust workspace suite, Clippy, and 326-test frontend gate pass; the network slice also passes isolated native default-off inspection, synthetic browser acceptance, and a Community production build/signature check. Synthetic browser acceptance covers discovery, unapproved profile saving, approval, fake Moonraker/Carbon printing status, cancellation, and disconnect; no real printer request was made. Remaining gates include the official unified core pin/composition, remaining Linux desktop delivery, friend-run Windows checks, hardware acceptance, final generated-metadata package checks, provenance-aware generated-media follow-ups, and final release review. Bambu MQTT remains deferred in issue #3. The [Windows handoff](WINDOWS-FRIEND-ACCEPTANCE.md) is embedded in issue #2 with exact source provenance. Verified prior candidates and active builds are preserved; no cleanup or installed-app replacement occurred. No full parity or Windows/hardware acceptance claim is made.
 
 ## Decision
 
@@ -432,10 +432,66 @@ The standalone Community production app built successfully with `CARGO_NET_OFFLI
 
 Post-build storage inventory: the reused `/tmp/gogglelab-phase6-created-at-target` is 35 GiB, repository `target/debug` 19 GiB and `target/release` 2.6 GiB, desktop web output 22 MiB and browser output 712 KiB. Data-volume free space was 34 GiB before packaging and 29 GiB afterward; those are whole-volume observations, not isolated build-allocation measurements. No cleanup occurred: space recovered is zero. The existing signed repository app and new Community candidate are both preserved, along with the QA fixtures and audit/license artifacts.
 
-Delivery follow-ups remain: update the official unified app's public-core pin and validate its Free/Pro composition; build the official unified and current non-macOS release artifacts; refresh current-source Linux/container acceptance (the Docker socket currently times out, without an attempted forced restart); and complete final release review. The supported unified core-pin update requires a commit published on public `main`; the current work remains on the feature branch, so production pin advancement needs that integration gate first. Windows issue #2 and deferred Bambu issue #3 remain external gates. The latest Carbon discovery timed out as recorded above. No build cleanup was performed or space reclaimed; protected builds and active targets remain intact.
+Delivery follow-ups remain: update the official unified app's public-core pin and validate its Free/Pro composition; build the official unified and current non-macOS release artifacts; retain current-source Linux/container acceptance evidence and verify native Linux desktop delivery; and complete final release review. The supported unified core-pin update requires a commit published on public `main`; the current work remains on the feature branch, so production pin advancement needs that integration gate first. Windows issue #2 and deferred Bambu issue #3 remain external gates. The latest Carbon discovery timed out as recorded above. No build cleanup was performed or space reclaimed; protected builds and active targets remain intact.
 
 ### Guarded browser/MCP networking accepted locally (2026-10-19)
 
 The implementation and evidence are recorded in [PRINTER-NETWORK-BROWSER-PLAN.md](PRINTER-NETWORK-BROWSER-PLAN.md). Independent reviews closed scope-narrowing revocation and stale native-settings authority races. Actual browser acceptance required explicit review/start, unapproved save, endpoint approval, and selected fake status checks; the owner completed browser confirmations that automation could not reach. Cancellation and disconnect/key clearing passed. Native isolated Settings shows the server, AI access, printer access, multicast, and Carbon broadcast off. Rebuild, full serial Rust tests, Clippy, formatting/diff checks, and 326 frontend tests / 1,287 assertions pass. The Community production executable SHA-256 is `cd4ffa8c7354dccbca6c4f448124898630d63631e403a776ef809c4a2c35752e`; deep/strict signing and `com.cubiclejuice.gogglelab.community` identity pass. No installed app was replaced.
 
 The previous verified candidate is preserved at `output/build-preservation/community-2a6847f.app` (59 MiB), and the existing repository app is intact. Post-build inventory: reused target 39 GiB, repository debug 19 GiB, repository release 2.6 GiB. Data-volume free space measured 26 GiB before the final package work and 22 GiB afterward. No cleanup occurred: recovered space is zero. The immediate idle recheck found VM PID 44771 still holding 4,604 handles under the repository target, so the existing conditional cleanup approval cannot be exercised. No process was stopped to bypass that condition.
+
+### Current-source Linux/container acceptance (2026-10-19)
+
+After the owner started Docker Desktop normally, the engine responded. An immutable
+Git archive of `444e3aebc9e7f1c4c1404f98f72c07eab960dc77` built the Linux ARM64
+headless image successfully. Source archive SHA-256:
+`eae544e82aa2c5ed7f6e8609802ffd913201a8502fbc14ab18c797ceeba2cbb3`.
+The fixture published only `127.0.0.1:3848`, ran as UID/GID 10001 with a
+read-only container root and source/config mounts, dropped all capabilities, and
+used a dedicated synthetic catalog volume. Authentication and origin rejection,
+source indexing and thumbnails, versioned fleet CRUD/stale conflicts, maintenance
+and reminders, MCP initialization/tool listing/fleet reads, restart persistence,
+and license notices all passed. Source bytes remained unchanged; AI integrations
+and printer networking stayed off. Restart changes the pagination snapshot
+revision, while model records and fleet data remain identical.
+
+Evidence: `output/container-acceptance-444e3ae/checks.json`, before/after snapshots,
+fixture script, and `output/source-snapshots/444e3ae-provenance.json`. The test
+container was stopped; its dedicated synthetic volume/image and evidence were
+preserved. Other running containers were untouched. No real printer/provider
+request or normal library access occurred. This verifies the headless Linux
+container, not native Linux desktop, Windows, or real hardware acceptance.
+Data-volume free space measured 27 GiB after this build; no cleanup ran and no
+space recovery is claimed. Generated transaction-metadata retention remains
+a separate implementation/review gate.
+
+The container fixture also identified a generated-source-copy retention bug in
+default thumbnail indexing. A focused regression first reproduced four additional
+staging hold artifacts, then passed after rendering directly from the already
+verified source buffer. The thumbnail still persists; original source bytes and an
+unrelated staging file remain unchanged, and the staging entry set does not grow.
+This removes redundant materialization and deletes no existing hold. Different
+generated cache replacements and geometry lease retirement still need independent
+provenance-aware treatment; custom/uploaded previews remain outside that work.
+
+Before the next package rebuild, the verified `444e3ae` Community app was preserved
+at `output/build-preservation/community-444e3ae.app`. Its executable SHA-256 remains
+`cd4ffa8c7354dccbca6c4f448124898630d63631e403a776ef809c4a2c35752e`, and strict deep
+signature verification passes. The prior candidate and installed app remain intact.
+
+### Generated transaction metadata checkpoint (2026-10-19)
+
+Shared native/runtime receipts now retire verified generated purge/restore control
+files through private atomic capture, with bounded claim recovery and scratch
+cleanup before main finalization. Original descriptors remain authoritative.
+Unknown bytes, original-source holds, previous Libraries, and existing historical
+holds are preserved. Fourteen primitive fault/recovery tests and the caller
+regressions pass, and independent review has no remaining actionable findings.
+The final serial workspace suite, Clippy, formatting, and diff checks pass under
+an isolated macOS temp parent. The Community production package builds and passes
+deep strict signature verification (executable SHA-256
+`202eecf5079d48cbc3d330f1f631251caffb079f12191b386a4b4acbb8454d31`).
+See the generated-control metadata plan for concurrency residuals, the 4,096-entry
+parent bound, and preserved logs from the two environment-dependent test attempts.
+The updated isolated app launch and Linux image checks remain pending at this
+checkpoint. Existing Linux container evidence is for the earlier `444e3ae` source.

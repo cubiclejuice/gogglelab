@@ -70,7 +70,10 @@ pub mod printer_network;
 pub mod printer_network_api;
 pub mod scanner;
 mod secure_fs;
-pub use secure_fs::{HeldEntry, MovedEntry};
+pub use secure_fs::{
+    GeneratedControlKind, GeneratedControlNamespace, GeneratedControlRole, GeneratedFileLocation,
+    GeneratedFileReceipt, HeldEntry, MovedEntry,
+};
 pub mod thumbnails;
 
 /// Opaque handle used by native management code for one admitted directory.
@@ -78,6 +81,55 @@ pub mod thumbnails;
 pub struct GuardedDirectory(secure_fs::Directory);
 
 impl GuardedDirectory {
+    #[doc(hidden)]
+    pub fn create_new_file_read_write(&self, name: &std::ffi::OsStr) -> std::io::Result<File> {
+        self.0.create_new_file_read_write(name)
+    }
+
+    #[doc(hidden)]
+    pub fn admit_created_generated(
+        &self,
+        namespace: &GeneratedControlNamespace,
+        nonce: &str,
+        role: GeneratedControlRole,
+        file: File,
+        bytes: &[u8],
+    ) -> std::io::Result<GeneratedFileReceipt> {
+        self.0
+            .admit_created_generated(namespace, nonce, role, file, bytes)
+    }
+    #[doc(hidden)]
+    pub fn recover_generated_file<T>(
+        &self,
+        namespace: &GeneratedControlNamespace,
+        role: GeneratedControlRole,
+        maximum: u64,
+        validate: impl FnOnce(&[u8], Option<&str>) -> std::io::Result<(String, T)>,
+    ) -> std::io::Result<Option<(GeneratedFileReceipt, T)>> {
+        self.0
+            .recover_generated_file(namespace, role, maximum, validate)
+    }
+    #[doc(hidden)]
+    pub fn publish_generated_file(
+        &self,
+        receipt: &mut GeneratedFileReceipt,
+        destination: GeneratedControlRole,
+    ) -> std::io::Result<()> {
+        self.0.publish_generated_file(receipt, destination)
+    }
+    #[doc(hidden)]
+    pub fn exchange_generated_files(
+        &self,
+        new: &mut GeneratedFileReceipt,
+        old: &mut GeneratedFileReceipt,
+    ) -> std::io::Result<()> {
+        self.0.exchange_generated_files(new, old)
+    }
+    #[doc(hidden)]
+    pub fn delete_generated_file(&self, receipt: &mut GeneratedFileReceipt) -> std::io::Result<()> {
+        self.0.delete_generated_file(receipt)
+    }
+
     #[doc(hidden)]
     pub fn open(path: &Path) -> std::io::Result<Self> {
         secure_fs::Directory::open(path).map(Self)
@@ -385,6 +437,50 @@ impl library_backup::RestoreTarget for GuardedDirectory {
 pub struct GuardedDirectoryParent(secure_fs::Directory);
 
 impl GuardedDirectoryParent {
+    #[doc(hidden)]
+    pub fn admit_created_generated(
+        &self,
+        namespace: &GeneratedControlNamespace,
+        nonce: &str,
+        role: GeneratedControlRole,
+        file: File,
+        bytes: &[u8],
+    ) -> std::io::Result<GeneratedFileReceipt> {
+        self.0
+            .admit_created_generated(namespace, nonce, role, file, bytes)
+    }
+    #[doc(hidden)]
+    pub fn recover_generated_file<T>(
+        &self,
+        namespace: &GeneratedControlNamespace,
+        role: GeneratedControlRole,
+        maximum: u64,
+        validate: impl FnOnce(&[u8], Option<&str>) -> std::io::Result<(String, T)>,
+    ) -> std::io::Result<Option<(GeneratedFileReceipt, T)>> {
+        self.0
+            .recover_generated_file(namespace, role, maximum, validate)
+    }
+    #[doc(hidden)]
+    pub fn publish_generated_file(
+        &self,
+        receipt: &mut GeneratedFileReceipt,
+        destination: GeneratedControlRole,
+    ) -> std::io::Result<()> {
+        self.0.publish_generated_file(receipt, destination)
+    }
+    #[doc(hidden)]
+    pub fn exchange_generated_files(
+        &self,
+        new: &mut GeneratedFileReceipt,
+        old: &mut GeneratedFileReceipt,
+    ) -> std::io::Result<()> {
+        self.0.exchange_generated_files(new, old)
+    }
+    #[doc(hidden)]
+    pub fn delete_generated_file(&self, receipt: &mut GeneratedFileReceipt) -> std::io::Result<()> {
+        self.0.delete_generated_file(receipt)
+    }
+
     #[doc(hidden)]
     pub fn open(path: &Path) -> std::io::Result<Self> {
         secure_fs::Directory::open(path).map(Self)
@@ -1033,6 +1129,369 @@ struct OrphanFileSnapshot {
     kind: OrphanFileKind,
 }
 
+use std::io;
+
+/// Opaque authority for one generated purge/restore journal and its scratch files.
+#[doc(hidden)]
+pub struct GeneratedTransactionJournal {
+    namespace: GeneratedControlNamespace,
+    kind: GeneratedControlKind,
+    document: GeneratedJournalDocument,
+    main: GeneratedFileReceipt,
+    scratch: Vec<GeneratedFileReceipt>,
+    public_name: std::ffi::OsString,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GeneratedJournalDocument {
+    version: u32,
+    root_path: String,
+    nonce: String,
+    staged_name: String,
+    previous_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed_name: Option<String>,
+    #[serde(default)]
+    committed: bool,
+}
+fn generated_metadata_error(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+fn validate_generated_journal(
+    namespace: &GeneratedControlNamespace,
+    kind: GeneratedControlKind,
+    bytes: &[u8],
+    expected_nonce: Option<&str>,
+) -> io::Result<(String, GeneratedJournalDocument)> {
+    if bytes.len() > 8192 {
+        return Err(generated_metadata_error("Generated journal is oversized"));
+    }
+    let value: GeneratedJournalDocument = serde_json::from_slice(bytes)
+        .map_err(|_| generated_metadata_error("Generated journal is invalid"))?;
+    let root = namespace.root();
+    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
+    let nonce = &value.nonce;
+    let valid_nonce = nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let (staged, previous, failed) = match kind {
+        GeneratedControlKind::Purge => (
+            format!(".gogglelab-empty-{nonce}"),
+            format!("{root_name}.previous-purge-{nonce}"),
+            None,
+        ),
+        GeneratedControlKind::Restore => (
+            format!(".gogglelab-restore-{nonce}"),
+            format!("{root_name}.previous-{nonce}"),
+            Some(format!(".gogglelab-failed-restore-{nonce}")),
+        ),
+    };
+    if value.version != 1
+        || !valid_nonce
+        || value.root_path != root.to_string_lossy()
+        || expected_nonce.is_some_and(|expected| expected != nonce)
+        || value.staged_name != staged
+        || value.previous_name != previous
+        || value.failed_name != failed
+    {
+        return Err(generated_metadata_error(
+            "Generated journal does not match its transaction",
+        ));
+    }
+    Ok((nonce.clone(), value))
+}
+impl AsRef<Path> for GeneratedTransactionJournal {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.public_name)
+    }
+}
+impl GeneratedTransactionJournal {
+    pub fn create(
+        parent: &GuardedDirectoryParent,
+        root: &Path,
+        kind: GeneratedControlKind,
+        bytes: &[u8],
+    ) -> io::Result<Self> {
+        let namespace = GeneratedControlNamespace::new(root, kind)?;
+        let (nonce, document) = validate_generated_journal(&namespace, kind, bytes, None)?;
+        if document.committed {
+            return Err(generated_metadata_error("New journal must be prepared"));
+        }
+        for role in [
+            GeneratedControlRole::Main,
+            GeneratedControlRole::Temporary,
+            GeneratedControlRole::Commit,
+        ] {
+            if parent
+                .recover_generated_file(&namespace, role, 8192, |bytes, nonce| {
+                    validate_generated_journal(&namespace, kind, bytes, nonce)
+                })?
+                .is_some()
+            {
+                return Err(generated_metadata_error(
+                    "Transaction metadata already exists",
+                ));
+            }
+        }
+        let public_name = namespace.public_name(GeneratedControlRole::Main)?;
+        if parent.entry_exists(&public_name)? {
+            return Err(generated_metadata_error(
+                "A recovery journal already exists",
+            ));
+        }
+        let name = namespace.public_name(GeneratedControlRole::Temporary)?;
+        let mut file = parent.create_new_file_read_write(&name)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let mut main = parent.admit_created_generated(
+            &namespace,
+            &nonce,
+            GeneratedControlRole::Temporary,
+            file,
+            bytes,
+        )?;
+        parent.publish_generated_file(&mut main, GeneratedControlRole::Main)?;
+        Ok(Self {
+            namespace,
+            kind,
+            document,
+            main,
+            scratch: Vec::new(),
+            public_name,
+        })
+    }
+    pub fn recover(
+        parent: &GuardedDirectoryParent,
+        root: &Path,
+        kind: GeneratedControlKind,
+    ) -> io::Result<Option<Self>> {
+        let namespace = GeneratedControlNamespace::new(root, kind)?;
+        let recovered = parent.recover_generated_file(
+            &namespace,
+            GeneratedControlRole::Main,
+            8192,
+            |bytes, nonce| validate_generated_journal(&namespace, kind, bytes, nonce),
+        )?;
+        let Some((main, document)) = recovered else {
+            let mut temporary = parent.recover_generated_file(
+                &namespace,
+                GeneratedControlRole::Temporary,
+                8192,
+                |bytes, nonce| validate_generated_journal(&namespace, kind, bytes, nonce),
+            )?;
+            let commit = parent.recover_generated_file(
+                &namespace,
+                GeneratedControlRole::Commit,
+                8192,
+                |bytes, nonce| validate_generated_journal(&namespace, kind, bytes, nonce),
+            )?;
+            if commit.is_some() {
+                return Err(generated_metadata_error(
+                    "Commit scratch exists without an authoritative journal",
+                ));
+            }
+            if let Some((receipt, document)) = temporary.as_mut() {
+                if document.committed {
+                    return Err(generated_metadata_error(
+                        "Unpublished journal must be prepared",
+                    ));
+                }
+                parent.delete_generated_file(receipt)?;
+            }
+            parent.sync()?;
+            return Ok(None);
+        };
+        let public_name = namespace.public_name(GeneratedControlRole::Main)?;
+        let mut result = Self {
+            namespace,
+            kind,
+            document,
+            main,
+            scratch: Vec::new(),
+            public_name,
+        };
+        for role in [
+            GeneratedControlRole::Temporary,
+            GeneratedControlRole::Commit,
+        ] {
+            if let Some((receipt, _)) = result.recover_scratch(parent, role)? {
+                result.scratch.push(receipt);
+            }
+        }
+        Ok(Some(result))
+    }
+    fn recover_scratch(
+        &self,
+        parent: &GuardedDirectoryParent,
+        role: GeneratedControlRole,
+    ) -> io::Result<Option<(GeneratedFileReceipt, GeneratedJournalDocument)>> {
+        parent.recover_generated_file(&self.namespace, role, 8192, |bytes, claim_nonce| {
+            let (nonce, mut document) =
+                validate_generated_journal(&self.namespace, self.kind, bytes, claim_nonce)?;
+            let mut expected = self.document.clone();
+            if nonce != expected.nonce
+                || (role == GeneratedControlRole::Temporary && document.committed)
+            {
+                return Err(generated_metadata_error(
+                    "Scratch journal does not match the active transaction",
+                ));
+            }
+            expected.committed = false;
+            let committed = document.committed;
+            document.committed = false;
+            if document != expected {
+                return Err(generated_metadata_error("Scratch journal fields changed"));
+            }
+            document.committed = committed;
+            Ok((nonce, document))
+        })
+    }
+    pub fn root(&self) -> &Path {
+        self.namespace.root()
+    }
+    pub fn kind(&self) -> GeneratedControlKind {
+        self.kind
+    }
+    pub fn nonce(&self) -> &str {
+        &self.document.nonce
+    }
+    pub fn committed(&self) -> bool {
+        self.document.committed
+    }
+    pub fn bytes(&self) -> &[u8] {
+        self.main.bytes()
+    }
+    pub fn public_name(&self) -> &std::ffi::OsStr {
+        &self.public_name
+    }
+    pub fn mark_committed(&mut self, parent: &GuardedDirectoryParent) -> io::Result<()> {
+        if self.document.committed {
+            return Err(generated_metadata_error("Journal is already committed"));
+        }
+        let mut document = self.document.clone();
+        document.committed = true;
+        let bytes = serde_json::to_vec(&document).map_err(io::Error::other)?;
+        let name = self.namespace.public_name(GeneratedControlRole::Commit)?;
+        let mut file = parent.create_new_file_read_write(&name)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let replacement = parent.admit_created_generated(
+            &self.namespace,
+            self.nonce(),
+            GeneratedControlRole::Commit,
+            file,
+            &bytes,
+        )?;
+        self.scratch.push(replacement);
+        let replacement = self.scratch.last_mut().unwrap();
+        let exchanged = parent.exchange_generated_files(replacement, &mut self.main);
+        // The syscall can succeed before a later synchronization error. Keep
+        // receipt roles aligned without reopening or reauthorizing either name.
+        if replacement.role() == GeneratedControlRole::Main {
+            std::mem::swap(replacement, &mut self.main);
+            self.document = document;
+        }
+        exchanged
+    }
+    pub fn clear(&mut self, parent: &GuardedDirectoryParent) -> io::Result<()> {
+        let observed_main = parent.recover_generated_file(
+            &self.namespace,
+            GeneratedControlRole::Main,
+            8192,
+            |bytes, nonce| validate_generated_journal(&self.namespace, self.kind, bytes, nonce),
+        )?;
+        match (observed_main, self.main.location()) {
+            (None, GeneratedFileLocation::Unlinked) => {}
+            (Some((observed, _)), location)
+                if !matches!(location, GeneratedFileLocation::Unlinked)
+                    && observed.current_name() == self.main.current_name()
+                    && observed.bytes() == self.main.bytes() => {}
+            _ => {
+                return Err(generated_metadata_error(
+                    "Unexpected or changed main journal was preserved",
+                ));
+            }
+        }
+        for role in [
+            GeneratedControlRole::Temporary,
+            GeneratedControlRole::Commit,
+        ] {
+            let observed = self.recover_scratch(parent, role)?;
+            let owned = self.scratch.iter().find(|entry| {
+                entry.role() == role && !matches!(entry.location(), GeneratedFileLocation::Unlinked)
+            });
+            match (observed, owned) {
+                (None, None) => {}
+                (Some((observed, _)), Some(owned))
+                    if observed.current_name() == owned.current_name()
+                        && observed.bytes() == owned.bytes() => {}
+                _ => {
+                    return Err(generated_metadata_error(
+                        "Unexpected or changed transaction scratch was preserved",
+                    ))
+                }
+            }
+        }
+        for scratch in &mut self.scratch {
+            if !matches!(scratch.location(), GeneratedFileLocation::Unlinked) {
+                parent.delete_generated_file(scratch)?;
+            }
+        }
+        parent.sync()?;
+        if !matches!(self.main.location(), GeneratedFileLocation::Unlinked) {
+            parent.delete_generated_file(&mut self.main)?;
+        }
+        parent.sync()
+    }
+}
+#[doc(hidden)]
+pub fn create_generated_purge_marker(
+    directory: &GuardedDirectory,
+    root: &Path,
+    nonce: &str,
+) -> io::Result<GeneratedFileReceipt> {
+    if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(generated_metadata_error("Invalid purge nonce"));
+    }
+    let namespace = GeneratedControlNamespace::new(root, GeneratedControlKind::Purge)?;
+    let name = namespace.public_name(GeneratedControlRole::PurgeMarker)?;
+    let mut file = directory.create_new_file_read_write(&name)?;
+    file.write_all(nonce.as_bytes())?;
+    file.sync_all()?;
+    let receipt = directory.admit_created_generated(
+        &namespace,
+        nonce,
+        GeneratedControlRole::PurgeMarker,
+        file,
+        nonce.as_bytes(),
+    )?;
+    directory.sync()?;
+    Ok(receipt)
+}
+#[doc(hidden)]
+pub fn recover_generated_purge_marker(
+    directory: &GuardedDirectory,
+    root: &Path,
+    nonce: &str,
+) -> io::Result<Option<GeneratedFileReceipt>> {
+    let namespace = GeneratedControlNamespace::new(root, GeneratedControlKind::Purge)?;
+    directory
+        .recover_generated_file(
+            &namespace,
+            GeneratedControlRole::PurgeMarker,
+            64,
+            |bytes, claimed| {
+                if nonce.len() != 32
+                    || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || bytes != nonce.as_bytes()
+                    || claimed.is_some_and(|value| value != nonce)
+                {
+                    return Err(generated_metadata_error("Purge staging marker changed"));
+                }
+                Ok((nonce.to_owned(), ()))
+            },
+        )
+        .map(|value| value.map(|(receipt, ())| receipt))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PurgeJournal {
@@ -1066,30 +1525,33 @@ struct OwnedDirectory {
     child_name: Option<std::ffi::OsString>,
 }
 
-struct PurgeJournalGuard {
+struct PurgeJournalGuard<'a> {
     parent_directory: secure_fs::Directory,
-    file_name: std::ffi::OsString,
+    journal: &'a mut GeneratedTransactionJournal,
     cleanup_on_drop: bool,
 }
 
-impl PurgeJournalGuard {
-    fn new(parent_directory: secure_fs::Directory, file_name: std::ffi::OsString) -> Self {
+impl<'a> PurgeJournalGuard<'a> {
+    fn new(
+        parent_directory: secure_fs::Directory,
+        journal: &'a mut GeneratedTransactionJournal,
+    ) -> Self {
         Self {
             parent_directory,
-            file_name,
+            journal,
             cleanup_on_drop: true,
         }
     }
 
-    fn disarm(&mut self) {
+    fn disarm(mut self) {
         self.cleanup_on_drop = false;
     }
 }
 
-impl Drop for PurgeJournalGuard {
+impl Drop for PurgeJournalGuard<'_> {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
-            let _ = clear_purge_journal_at(&self.parent_directory, &self.file_name);
+            let _ = clear_purge_journal_at(&self.parent_directory, self.journal);
         }
     }
 }
@@ -5766,38 +6228,40 @@ fn purge_stage_marker_matches_at(
 }
 
 fn write_purge_stage_marker_at(
-    root: &secure_fs::Directory,
+    directory: &secure_fs::Directory,
+    root: &Path,
     nonce: &str,
-) -> Result<(), RuntimeError> {
-    let name = std::ffi::OsStr::new(".gogglelab-purge-stage");
-    let mut file = root.create_new_file(name).map_err(|_| io_error())?;
-    if file
-        .write_all(nonce.as_bytes())
-        .and_then(|()| file.sync_all())
-        .is_err()
-        || root.sync().is_err()
-    {
-        let _ = root.unlink_file(name);
-        return Err(io_error());
-    }
-    Ok(())
-}
-
-fn remove_purge_stage_marker_at(
-    root: &secure_fs::Directory,
-    nonce: &str,
-) -> Result<(), RuntimeError> {
-    let expected = (
-        nonce.len() as u64,
-        format!("{:x}", Sha256::digest(nonce.as_bytes())),
-    );
-    root.unlink_verified_file(
-        std::ffi::OsStr::new(".gogglelab-purge-stage"),
-        &expected,
-        64,
+) -> Result<GeneratedFileReceipt, RuntimeError> {
+    create_generated_purge_marker(
+        &GuardedDirectory(directory.try_clone().map_err(|_| io_error())?),
+        root,
+        nonce,
     )
-    .map(|_| ())
-    .map_err(|_| stale("Purge staging marker changed before commit"))
+    .map_err(generated_runtime_error)
+}
+fn remove_purge_stage_marker_at(
+    directory: &secure_fs::Directory,
+    root: &Path,
+    nonce: &str,
+) -> Result<(), RuntimeError> {
+    let directory = GuardedDirectory(directory.try_clone().map_err(|_| io_error())?);
+    if let Some(mut marker) =
+        recover_generated_purge_marker(&directory, root, nonce).map_err(generated_runtime_error)?
+    {
+        directory
+            .delete_generated_file(&mut marker)
+            .map_err(generated_runtime_error)?;
+    }
+    directory.sync().map_err(generated_runtime_error)
+}
+fn generated_runtime_error(error: io::Error) -> RuntimeError {
+    RuntimeError {
+        code: RuntimeErrorCode::Corrupt,
+        message: format!("Generated transaction metadata cleanup or finalization failed: {error}"),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -5871,143 +6335,45 @@ fn write_purge_journal_at(
     parent: &secure_fs::Directory,
     root: &Path,
     journal: &PurgeJournal,
-) -> Result<(PathBuf, std::ffi::OsString), RuntimeError> {
-    let root_name = root
-        .file_name()
-        .ok_or_else(|| invalid("Library root name is invalid"))?
-        .to_string_lossy();
-    if journal.root_path != root.to_string_lossy()
-        || journal.version != 1
-        || journal.nonce.len() != 32
-        || !journal.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || journal.staged_name != format!(".gogglelab-empty-{}", journal.nonce)
-        || journal.previous_name != format!("{root_name}.previous-purge-{}", journal.nonce)
-        || journal.committed
-    {
-        return Err(invalid("Purge journal does not match the Library root"));
-    }
+) -> Result<(PathBuf, GeneratedTransactionJournal), RuntimeError> {
     let path = purge_journal_path(root)?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| invalid("Purge journal name is invalid"))?
-        .to_os_string();
-    let temporary_name = std::ffi::OsString::from(format!("{}.tmp", file_name.to_string_lossy()));
     let bytes =
         serde_json::to_vec(journal).map_err(|_| internal("Purge journal encoding failed"))?;
-    if bytes.len() > 8 * 1024 {
-        return Err(invalid("Purge journal exceeds its size limit"));
-    }
-    let mut temporary = parent
-        .create_new_file(&temporary_name)
-        .map_err(|_| stale("A purge journal temporary path is already occupied"))?;
-    let write_result = temporary
-        .write_all(&bytes)
-        .and_then(|()| temporary.sync_all());
-    drop(temporary);
-    if write_result.is_err() {
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(io_error());
-    }
-    if parent.link_child(&temporary_name, &file_name).is_err() {
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(stale("A purge recovery journal already exists"));
-    }
-    if parent.unlink_file(&temporary_name).is_err() || parent.sync().is_err() {
-        let _ = parent.unlink_file(&file_name);
-        let _ = parent.unlink_file(&temporary_name);
-        let _ = parent.sync();
-        return Err(io_error());
-    }
-    Ok((path, file_name))
+    let parent = GuardedDirectoryParent(parent.try_clone().map_err(|_| io_error())?);
+    let journal =
+        GeneratedTransactionJournal::create(&parent, root, GeneratedControlKind::Purge, &bytes)
+            .map_err(generated_runtime_error)?;
+    Ok((path, journal))
 }
 
 fn clear_purge_journal_at(
     parent: &secure_fs::Directory,
-    file_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
 ) -> Result<(), RuntimeError> {
-    let temporary_name = std::ffi::OsString::from(format!("{}.tmp", file_name.to_string_lossy()));
-    let commit_name = std::ffi::OsString::from(format!("{}.commit", file_name.to_string_lossy()));
-    parent.unlink_file(file_name).map_err(|_| io_error())?;
-    for temporary in [&temporary_name, &commit_name] {
-        match parent.unlink_file(temporary) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(io_error()),
-        }
-    }
-    parent.sync().map_err(|_| io_error())
+    journal
+        .clear(&GuardedDirectoryParent(
+            parent.try_clone().map_err(|_| io_error())?,
+        ))
+        .map_err(generated_runtime_error)
 }
 
 fn mark_purge_journal_committed_at(
     parent: &secure_fs::Directory,
     root: &Path,
-    file_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
     nonce: &str,
 ) -> Result<(), RuntimeError> {
-    let input = parent.open_file(file_name).map_err(|_| io_error())?;
-    let mut bytes = Vec::new();
-    input
-        .take(8 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| io_error())?;
-    if bytes.len() > 8 * 1024 {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Purge journal exceeds its size limit".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
-    }
-    let mut journal: PurgeJournal = serde_json::from_slice(&bytes).map_err(|_| RuntimeError {
-        code: RuntimeErrorCode::Corrupt,
-        message: "Purge journal is invalid at commit".into(),
-        retryable: false,
-        current_version: None,
-        source_holds: Vec::new(),
-    })?;
-    let root_text = root
-        .to_str()
-        .ok_or_else(|| invalid("Purge requires a Unicode Library path"))?;
-    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
-    if journal.version != 1
-        || journal.root_path != root_text
-        || journal.nonce != nonce
-        || journal.staged_name != format!(".gogglelab-empty-{nonce}")
-        || journal.previous_name != format!("{root_name}.previous-purge-{nonce}")
-        || journal.committed
+    if journal.namespace.root() != root
+        || journal.nonce() != nonce
+        || journal.kind != GeneratedControlKind::Purge
     {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Purge journal changed before commit".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
+        return Err(stale("Purge journal changed before commit"));
     }
-    journal.committed = true;
-    let committed_bytes = serde_json::to_vec(&journal)
-        .map_err(|_| internal("Committed purge journal encoding failed"))?;
-    let temporary_name =
-        std::ffi::OsString::from(format!("{}.commit", file_name.to_string_lossy()));
-    let mut output = parent
-        .create_new_file(&temporary_name)
-        .map_err(|_| stale("Purge commit journal temporary path is occupied"))?;
-    if output
-        .write_all(&committed_bytes)
-        .and_then(|()| output.sync_all())
-        .is_err()
-    {
-        drop(output);
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(io_error());
-    }
-    drop(output);
-    if parent.sync().is_err() || parent.replace_child(&temporary_name, file_name).is_err() {
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(io_error());
-    }
-    Ok(())
+    journal
+        .mark_committed(&GuardedDirectoryParent(
+            parent.try_clone().map_err(|_| io_error())?,
+        ))
+        .map_err(generated_runtime_error)
 }
 
 fn finish_catalog_purge_commit<M, C>(
@@ -6015,14 +6381,14 @@ fn finish_catalog_purge_commit<M, C>(
     staged_root: &secure_fs::Directory,
     parent: &secure_fs::Directory,
     root: &Path,
-    journal_name: &std::ffi::OsStr,
+    journal_name: &mut GeneratedTransactionJournal,
     nonce: &str,
     remove_marker: M,
     clear_journal: C,
 ) -> Result<(), RuntimeError>
 where
     M: FnOnce(&secure_fs::Directory, &str) -> Result<(), RuntimeError>,
-    C: FnOnce(&secure_fs::Directory, &std::ffi::OsStr) -> Result<(), RuntimeError>,
+    C: FnOnce(&secure_fs::Directory, &mut GeneratedTransactionJournal) -> Result<(), RuntimeError>,
 {
     let result = (|| {
         mark_purge_journal_committed_at(parent, root, journal_name, nonce)?;
@@ -6036,6 +6402,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn restore_journal_path(root: &Path) -> Result<PathBuf, RuntimeError> {
     let canonical = canonical_path_allow_missing_tail(root)?;
     let parent = canonical
@@ -6049,150 +6416,50 @@ fn restore_journal_path(root: &Path) -> Result<PathBuf, RuntimeError> {
     Ok(parent.join(format!(".gogglelab-restore-{suffix}.journal")))
 }
 
-fn restore_journal_temp_name(journal_name: &std::ffi::OsStr, suffix: &str) -> std::ffi::OsString {
-    std::ffi::OsString::from(format!("{}.{}", journal_name.to_string_lossy(), suffix))
-}
-
 fn write_restore_journal_at(
     parent: &secure_fs::Directory,
     root: &Path,
     journal: &RestoreJournal,
-) -> Result<std::ffi::OsString, RuntimeError> {
-    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
-    if journal.version != 1
-        || journal.root_path != root.to_string_lossy()
-        || journal.nonce.len() != 32
-        || !journal.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || journal.staged_name != format!(".gogglelab-restore-{}", journal.nonce)
-        || journal.previous_name != format!("{root_name}.previous-{}", journal.nonce)
-        || journal.failed_name != format!(".gogglelab-failed-restore-{}", journal.nonce)
-        || journal.committed
-    {
-        return Err(invalid("Restore journal does not match the Library root"));
-    }
-    let path = restore_journal_path(root)?;
-    let journal_name = path
-        .file_name()
-        .ok_or_else(|| invalid("Restore journal name is invalid"))?
-        .to_os_string();
-    if parent.entry_exists(&journal_name).map_err(|_| io_error())? {
-        return Err(stale("A restore recovery journal already exists"));
-    }
-    let temporary_name = restore_journal_temp_name(&journal_name, "tmp");
+) -> Result<GeneratedTransactionJournal, RuntimeError> {
     let bytes =
         serde_json::to_vec(journal).map_err(|_| internal("Restore journal encoding failed"))?;
-    if bytes.len() > 8 * 1024 {
-        return Err(invalid("Restore journal exceeds its size limit"));
-    }
-    let mut file = parent
-        .create_new_file(&temporary_name)
-        .map_err(|_| stale("Restore journal temporary path is occupied"))?;
-    if file
-        .write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .is_err()
-    {
-        drop(file);
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(io_error());
-    }
-    drop(file);
-    if parent.link_child(&temporary_name, &journal_name).is_err() {
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(stale("A restore recovery journal already exists"));
-    }
-    if parent.unlink_file(&temporary_name).is_err() || parent.sync().is_err() {
-        let _ = parent.unlink_file(&journal_name);
-        let _ = parent.unlink_file(&temporary_name);
-        let _ = parent.sync();
-        return Err(io_error());
-    }
-    Ok(journal_name)
+    GeneratedTransactionJournal::create(
+        &GuardedDirectoryParent(parent.try_clone().map_err(|_| io_error())?),
+        root,
+        GeneratedControlKind::Restore,
+        &bytes,
+    )
+    .map_err(generated_runtime_error)
 }
 
 fn mark_restore_journal_committed_at(
     parent: &secure_fs::Directory,
     root: &Path,
-    journal_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
     nonce: &str,
 ) -> Result<(), RuntimeError> {
-    let input = parent.open_file(journal_name).map_err(|_| io_error())?;
-    let mut bytes = Vec::new();
-    input
-        .take(8 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| io_error())?;
-    if bytes.len() > 8 * 1024 {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Restore journal exceeds its size limit".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
-    }
-    let mut journal: RestoreJournal = serde_json::from_slice(&bytes).map_err(|_| RuntimeError {
-        code: RuntimeErrorCode::Corrupt,
-        message: "Restore journal is invalid at commit".into(),
-        retryable: false,
-        current_version: None,
-        source_holds: Vec::new(),
-    })?;
-    let root_name = root.file_name().unwrap_or_default().to_string_lossy();
-    if journal.version != 1
-        || journal.root_path != root.to_string_lossy()
-        || journal.nonce != nonce
-        || journal.staged_name != format!(".gogglelab-restore-{nonce}")
-        || journal.previous_name != format!("{root_name}.previous-{nonce}")
-        || journal.failed_name != format!(".gogglelab-failed-restore-{nonce}")
-        || journal.committed
+    if journal.namespace.root() != root
+        || journal.nonce() != nonce
+        || journal.kind != GeneratedControlKind::Restore
     {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Restore journal changed before commit".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
+        return Err(stale("Restore journal changed before commit"));
     }
-    journal.committed = true;
-    let committed_bytes = serde_json::to_vec(&journal)
-        .map_err(|_| internal("Committed restore journal encoding failed"))?;
-    let temporary_name = restore_journal_temp_name(journal_name, "commit");
-    let mut output = parent
-        .create_new_file(&temporary_name)
-        .map_err(|_| stale("Restore commit journal temporary path is occupied"))?;
-    if output
-        .write_all(&committed_bytes)
-        .and_then(|()| output.sync_all())
-        .is_err()
-    {
-        drop(output);
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(io_error());
-    }
-    drop(output);
-    if parent.sync().is_err() || parent.replace_child(&temporary_name, journal_name).is_err() {
-        let _ = parent.unlink_file(&temporary_name);
-        return Err(io_error());
-    }
-    Ok(())
+    journal
+        .mark_committed(&GuardedDirectoryParent(
+            parent.try_clone().map_err(|_| io_error())?,
+        ))
+        .map_err(generated_runtime_error)
 }
 
 fn clear_restore_journal_at(
     parent: &secure_fs::Directory,
-    journal_name: &std::ffi::OsStr,
+    journal: &mut GeneratedTransactionJournal,
 ) -> Result<(), RuntimeError> {
-    parent.unlink_file(journal_name).map_err(|_| io_error())?;
-    for suffix in ["tmp", "commit"] {
-        let temporary_name = restore_journal_temp_name(journal_name, suffix);
-        match parent.unlink_file(&temporary_name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(io_error()),
-        }
-    }
-    parent.sync().map_err(|_| io_error())
+    journal
+        .clear(&GuardedDirectoryParent(
+            parent.try_clone().map_err(|_| io_error())?,
+        ))
+        .map_err(generated_runtime_error)
 }
 
 fn recover_interrupted_library_restore(configured_root: &Path) -> Result<(), RuntimeError> {
@@ -6204,54 +6471,22 @@ fn recover_interrupted_library_restore_with_hook(
     after_parent_open: impl FnOnce(),
 ) -> Result<(), RuntimeError> {
     let root = canonical_path_allow_missing_tail(configured_root)?;
-    let journal_path = restore_journal_path(&root)?;
     let parent_path = root
         .parent()
         .ok_or_else(|| invalid("Library root has no parent directory"))?;
     let parent = secure_fs::Directory::open(parent_path).map_err(|_| io_error())?;
-    let journal_name = journal_path
-        .file_name()
-        .ok_or_else(|| invalid("Restore journal name is invalid"))?
-        .to_os_string();
     after_parent_open();
-    let journal_exists = parent.entry_exists(&journal_name).map_err(|_| io_error())?;
-    if !journal_exists {
-        let mut removed = false;
-        for suffix in ["tmp", "commit"] {
-            let temporary = restore_journal_temp_name(&journal_name, suffix);
-            match parent.unlink_file(&temporary) {
-                Ok(()) => removed = true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(io_error()),
-            }
-        }
-        if removed {
-            parent.sync().map_err(|_| io_error())?;
-        }
+    let Some(mut journal_control) = GeneratedTransactionJournal::recover(
+        &GuardedDirectoryParent(parent.try_clone().map_err(|_| io_error())?),
+        &root,
+        GeneratedControlKind::Restore,
+    )
+    .map_err(generated_runtime_error)?
+    else {
         return Ok(());
-    }
-    let journal_file = parent.open_file(&journal_name).map_err(|_| io_error())?;
-    let mut bytes = Vec::new();
-    journal_file
-        .take(8 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| io_error())?;
-    if bytes.len() > 8 * 1024 {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Restore recovery journal is oversized".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
-    }
-    let journal: RestoreJournal = serde_json::from_slice(&bytes).map_err(|_| RuntimeError {
-        code: RuntimeErrorCode::Corrupt,
-        message: "Restore recovery journal is invalid".into(),
-        retryable: false,
-        current_version: None,
-        source_holds: Vec::new(),
-    })?;
+    };
+    let journal: RestoreJournal = serde_json::from_slice(journal_control.bytes())
+        .map_err(|_| internal("Recovered restore journal shape changed"))?;
     let root_text = root
         .to_str()
         .ok_or_else(|| invalid("Restore recovery requires a Unicode Library path"))?;
@@ -6295,7 +6530,7 @@ fn recover_interrupted_library_restore_with_hook(
                 source_holds: Vec::new(),
             });
         }
-        clear_restore_journal_at(&parent, &journal_name)?;
+        clear_restore_journal_at(&parent, &mut journal_control)?;
         return Ok(());
     }
     if previous_exists {
@@ -6342,7 +6577,7 @@ fn recover_interrupted_library_restore_with_hook(
             .map_err(|_| io_error())?;
         parent.sync().map_err(|_| io_error())?;
     }
-    clear_restore_journal_at(&parent, &journal_name)
+    clear_restore_journal_at(&parent, &mut journal_control)
 }
 
 fn recover_interrupted_catalog_purge(configured_root: &Path) -> Result<(), RuntimeError> {
@@ -6390,11 +6625,6 @@ fn recover_interrupted_catalog_purge_with_hook(
     let parent_path = root
         .parent()
         .ok_or_else(|| invalid("Library root has no parent directory"))?;
-    let journal_path = purge_journal_path(&root)?;
-    let journal_name = journal_path
-        .file_name()
-        .ok_or_else(|| invalid("Purge recovery journal name is missing"))?
-        .to_os_string();
     let root_name = root
         .file_name()
         .ok_or_else(|| invalid("Library root name is missing"))?
@@ -6404,75 +6634,17 @@ fn recover_interrupted_catalog_purge_with_hook(
         return Err(stale("Purge recovery parent identity changed"));
     }
     after_parent_open();
-
-    let mut journal_file = match parent.open_file(&journal_name) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let temporary_name =
-                std::ffi::OsString::from(format!("{}.tmp", journal_name.to_string_lossy()));
-            let commit_name =
-                std::ffi::OsString::from(format!("{}.commit", journal_name.to_string_lossy()));
-            let has_temporary = parent
-                .entry_exists(&temporary_name)
-                .map_err(|_| io_error())?;
-            let has_commit = parent.entry_exists(&commit_name).map_err(|_| io_error())?;
-            if has_temporary || has_commit {
-                require_durable_source_mutations()?;
-                remove_purge_journal_temporary_at(
-                    &parent,
-                    &temporary_name,
-                    "Purge journal temporary file is unsafe",
-                )?;
-                remove_purge_journal_temporary_at(
-                    &parent,
-                    &commit_name,
-                    "Purge commit temporary file is unsafe",
-                )?;
-                parent.sync().map_err(|_| io_error())?;
-            }
-            return Ok(());
-        }
-        Err(_) => {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Purge recovery journal is unsafe".into(),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
+    let Some(mut journal_control) = GeneratedTransactionJournal::recover(
+        &GuardedDirectoryParent(parent.try_clone().map_err(|_| io_error())?),
+        &root,
+        GeneratedControlKind::Purge,
+    )
+    .map_err(generated_runtime_error)?
+    else {
+        return Ok(());
     };
-    if journal_file.metadata().map_err(|_| io_error())?.len() > 8 * 1024 {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Purge recovery journal is unsafe".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
-    }
-    let mut journal_bytes = Vec::new();
-    (&mut journal_file)
-        .take(8 * 1024 + 1)
-        .read_to_end(&mut journal_bytes)
-        .map_err(|_| io_error())?;
-    if journal_bytes.len() > 8 * 1024 {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Purge recovery journal is unsafe".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
-    }
-    let journal: PurgeJournal =
-        serde_json::from_slice(&journal_bytes).map_err(|_| RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Purge recovery journal is invalid".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        })?;
+    let journal: PurgeJournal = serde_json::from_slice(journal_control.bytes())
+        .map_err(|_| internal("Recovered purge journal shape changed"))?;
     let root_text = root
         .to_str()
         .ok_or_else(|| invalid("Purge recovery requires a Unicode Library path"))?;
@@ -6517,13 +6689,8 @@ fn recover_interrupted_catalog_purge_with_hook(
             current_version: None,
             source_holds: Vec::new(),
         })?;
-        if root_directory
-            .entry_exists(std::ffi::OsStr::new(".gogglelab-purge-stage"))
-            .map_err(|_| io_error())?
-        {
-            remove_purge_stage_marker_at(&root_directory, &journal.nonce)?;
-        }
-        clear_purge_journal_at(&parent, &journal_name)?;
+        remove_purge_stage_marker_at(&root_directory, &root, &journal.nonce)?;
+        clear_purge_journal_at(&parent, &mut journal_control)?;
         return Ok(());
     }
 
@@ -6581,7 +6748,7 @@ fn recover_interrupted_catalog_purge_with_hook(
             .map_err(|_| io_error())?;
         parent.sync().map_err(|_| io_error())?;
     }
-    clear_purge_journal_at(&parent, &journal_name)
+    clear_purge_journal_at(&parent, &mut journal_control)
 }
 
 fn open_optional_real_directory_at(
@@ -6599,35 +6766,6 @@ fn open_optional_real_directory_at(
             source_holds: Vec::new(),
         }),
     }
-}
-
-fn remove_purge_journal_temporary_at(
-    parent: &secure_fs::Directory,
-    name: &std::ffi::OsStr,
-    unsafe_message: &str,
-) -> Result<bool, RuntimeError> {
-    if !parent.entry_exists(name).map_err(|_| io_error())? {
-        return Ok(false);
-    }
-    let file = parent.open_file(name).map_err(|_| RuntimeError {
-        code: RuntimeErrorCode::Corrupt,
-        message: unsafe_message.to_owned(),
-        retryable: false,
-        current_version: None,
-        source_holds: Vec::new(),
-    })?;
-    if file.metadata().map_err(|_| io_error())?.len() > 8 * 1024 {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: unsafe_message.to_owned(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
-    }
-    drop(file);
-    parent.unlink_file(name).map_err(|_| io_error())?;
-    Ok(true)
 }
 
 fn is_generated_thumbnail_name(name: &str) -> bool {
@@ -8698,10 +8836,11 @@ fn execute_purge_catalog(
         previous_name: previous_name.to_string_lossy().into_owned(),
         committed: false,
     };
-    let (_journal_path, journal_name) = write_purge_journal_at(&parent_directory, &root, &journal)?;
-    let mut journal_guard = PurgeJournalGuard::new(
+    let (_journal_path, mut journal_name) =
+        write_purge_journal_at(&parent_directory, &root, &journal)?;
+    let journal_guard = PurgeJournalGuard::new(
         parent_directory.try_clone().map_err(|_| io_error())?,
-        journal_name.clone(),
+        &mut journal_name,
     );
 
     let mut staged_temp =
@@ -8768,7 +8907,7 @@ fn execute_purge_catalog(
         16 * 1024 * 1024,
     )
     .map_err(|_| io_error())?;
-    write_purge_stage_marker_at(&staged_directory, &nonce)?;
+    let mut marker_receipt = write_purge_stage_marker_at(&staged_directory, &root, &nonce)?;
     drop(active_db);
     if !root_directory
         .matches_path(&configured_root)
@@ -8820,7 +8959,7 @@ fn execute_purge_catalog(
                 source_holds: Vec::new(),
             });
         }
-        if let Err(error) = clear_purge_journal_at(&parent_directory, &journal_name) {
+        if let Err(error) = clear_purge_journal_at(&parent_directory, &mut journal_name) {
             guard.remain_armed();
             return Err(error);
         }
@@ -8894,7 +9033,7 @@ fn execute_purge_catalog(
                 source_holds: Vec::new(),
             });
         }
-        if let Err(error) = clear_purge_journal_at(&parent_directory, &journal_name) {
+        if let Err(error) = clear_purge_journal_at(&parent_directory, &mut journal_name) {
             guard.remain_armed();
             return Err(error);
         }
@@ -8908,9 +9047,13 @@ fn execute_purge_catalog(
         &staged_directory,
         &parent_directory,
         &root,
-        &journal_name,
+        &mut journal_name,
         &nonce,
-        remove_purge_stage_marker_at,
+        |directory, _| {
+            GuardedDirectory(directory.try_clone().map_err(|_| io_error())?)
+                .delete_generated_file(&mut marker_receipt)
+                .map_err(generated_runtime_error)
+        },
         clear_purge_journal_at,
     )?;
 
@@ -11185,20 +11328,21 @@ fn execute_restore(
         failed_name: failed_name.to_string_lossy().into_owned(),
         committed: false,
     };
-    let journal_name = match write_restore_journal_at(&parent_directory, &root, &restore_journal) {
-        Ok(name) => name,
-        Err(error) => {
-            let stage_still_owned = parent_directory
-                .child_path(&staged_name)
-                .ok()
-                .and_then(|path| staged.matches_path(&path).ok())
-                .unwrap_or(false);
-            if stage_still_owned && parent_directory.remove_child_tree(&staged_name).is_err() {
-                guard.remain_armed();
+    let mut journal_name =
+        match write_restore_journal_at(&parent_directory, &root, &restore_journal) {
+            Ok(name) => name,
+            Err(error) => {
+                let stage_still_owned = parent_directory
+                    .child_path(&staged_name)
+                    .ok()
+                    .and_then(|path| staged.matches_path(&path).ok())
+                    .unwrap_or(false);
+                if stage_still_owned && parent_directory.remove_child_tree(&staged_name).is_err() {
+                    guard.remain_armed();
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     let mut swap_started = false;
     let result = (|| {
         let mut staged_target = GuardedDirectory(staged.try_clone().map_err(|_| io_error())?);
@@ -11351,7 +11495,9 @@ fn execute_restore(
                     source_holds: Vec::new(),
                 });
             }
-            if let Err(cleanup_error) = clear_restore_journal_at(&parent_directory, &journal_name) {
+            if let Err(cleanup_error) =
+                clear_restore_journal_at(&parent_directory, &mut journal_name)
+            {
                 guard.remain_armed();
                 return Err(cleanup_error);
             }
@@ -11372,12 +11518,12 @@ fn execute_restore(
             });
         }
         if let Err(error) =
-            mark_restore_journal_committed_at(&parent_directory, &root, &journal_name, &suffix)
+            mark_restore_journal_committed_at(&parent_directory, &root, &mut journal_name, &suffix)
         {
             guard.remain_armed();
             return Err(error);
         }
-        if let Err(error) = clear_restore_journal_at(&parent_directory, &journal_name) {
+        if let Err(error) = clear_restore_journal_at(&parent_directory, &mut journal_name) {
             guard.remain_armed();
             return Err(error);
         }
@@ -11395,7 +11541,7 @@ fn execute_restore(
         if stage_still_owned && parent_directory.remove_child_tree(&staged_name).is_err() {
             guard.remain_armed();
         }
-        if clear_restore_journal_at(&parent_directory, &journal_name).is_err() {
+        if clear_restore_journal_at(&parent_directory, &mut journal_name).is_err() {
             guard.remain_armed();
         }
     }
@@ -11919,7 +12065,7 @@ fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &s
         if runtime.scan_control().cancelled() {
             break;
         }
-        let result = (|| {
+        let result: Result<(), RuntimeError> = (|| {
             if runtime
                 .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))?
                 .is_some()
@@ -11932,48 +12078,25 @@ fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &s
                 .as_deref()
                 .ok_or_else(|| invalid("Thumbnail model has no content hash"))?;
             let bytes = runtime.verified_model_source_bytes(&model)?;
-            let staging = runtime.root.join("staging");
-            let staging_metadata = fs::symlink_metadata(&staging).map_err(|_| io_error())?;
-            if staging_metadata.file_type().is_symlink()
-                || !staging_metadata.is_dir()
-                || staging.canonicalize().map_err(|_| io_error())? != staging
-            {
-                return Err(invalid("Thumbnail staging namespace is unsafe"));
-            }
-            let temporary = staging.join(format!(
-                "thumbnail-source-{}.part",
-                uuid::Uuid::new_v4().simple()
-            ));
-            let render = (|| {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temporary)
-                    .map_err(|_| io_error())?;
-                file.write_all(&bytes).map_err(|_| io_error())?;
-                file.sync_all().map_err(|_| io_error())?;
-                let artifact = thumbnails::ensure_thumbnail(
-                    &runtime.root,
-                    &temporary,
+            let artifact = thumbnails::ensure_thumbnail_from_bytes(
+                &runtime.root,
+                &bytes,
+                content_hash,
+                bytes.len() as u64,
+                &settings,
+                false,
+            )
+            .map_err(|_| invalid("Thumbnail render failed"))?;
+            runtime.mutate_db(|db| {
+                db.set_thumbnail_for_source_and_settings(
+                    &model.id,
                     content_hash,
-                    bytes.len() as u64,
                     &settings,
-                    false,
+                    &artifact.png_hash,
+                    &artifact.relative_path,
                 )
-                .map_err(|_| invalid("Thumbnail render failed"))?;
-                runtime.mutate_db(|db| {
-                    db.set_thumbnail_for_source_and_settings(
-                        &model.id,
-                        content_hash,
-                        &settings,
-                        &artifact.png_hash,
-                        &artifact.relative_path,
-                    )
-                })?;
-                Ok(())
-            })();
-            let _ = hold_runtime_path(&temporary);
-            render
+            })?;
+            Ok(())
         })();
         if let Err(error) = result {
             runtime
@@ -14508,7 +14631,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_completed_scan_persists_default_thumbnail_without_source_writes() {
+    fn headless_completed_scan_persists_default_thumbnail_without_source_writes_or_staging_holds() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -14538,7 +14661,23 @@ mod tests {
             .read_db(|db| db.list_index_roots())
             .unwrap()
             .remove(0);
+        let staging = runtime.root.join("staging");
+        let unknown = staging.join("thumbnail-source-foreign.part");
+        fs::write(&unknown, b"unrelated staging bytes").unwrap();
+        let staging_names = || {
+            fs::read_dir(&staging)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>()
+        };
+        let before = staging_names();
         scanner::scan_root(&runtime, &root).unwrap();
+        assert_eq!(
+            staging_names(),
+            before,
+            "default rendering must not materialize source copies or generated recovery holds"
+        );
+        assert_eq!(fs::read(&unknown).unwrap(), b"unrelated staging bytes");
         let model = runtime
             .read_db(|db| db.list_models(None, None))
             .unwrap()
@@ -16034,7 +16173,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn startup_removes_an_unpublished_purge_journal_temp_without_touching_library() {
+    fn startup_preserves_unknown_unpublished_purge_bytes_without_touching_library() {
         let temp = tempfile::tempdir().unwrap();
         let library = temp.path().join("library");
         {
@@ -16046,9 +16185,12 @@ mod tests {
         let temporary = purge_journal_temp_path(&journal_path);
         fs::write(&temporary, b"partial unpublished journal").unwrap();
 
-        recover_interrupted_catalog_purge(&canonical_root).unwrap();
+        assert!(recover_interrupted_catalog_purge(&canonical_root).is_err());
 
-        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(&temporary).unwrap(),
+            b"partial unpublished journal"
+        );
         assert!(!journal_path.exists());
         let db = LibraryDb::open(&canonical_root).unwrap();
         assert_eq!(db.list_models(None, None).unwrap().len(), 1);
@@ -16117,6 +16259,251 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn generated_journal_cleanup_preserves_unowned_scratch_and_main_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let parent = GuardedDirectoryParent::open(root.parent().unwrap()).unwrap();
+        let nonce = "a".repeat(32);
+        let document = PurgeJournal {
+            version: 1,
+            root_path: root.to_string_lossy().into_owned(),
+            nonce: nonce.clone(),
+            staged_name: format!(".gogglelab-empty-{nonce}"),
+            previous_name: format!("library.previous-purge-{nonce}"),
+            committed: false,
+        };
+        let mut journal = GeneratedTransactionJournal::create(
+            &parent,
+            &root,
+            GeneratedControlKind::Purge,
+            &serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let scratch = root.parent().unwrap().join(
+            journal
+                .namespace
+                .public_name(GeneratedControlRole::Commit)
+                .unwrap(),
+        );
+        fs::write(&scratch, b"unknown replacement; preserve these bytes").unwrap();
+        assert!(journal.clear(&parent).is_err());
+        assert_eq!(
+            fs::read(&scratch).unwrap(),
+            b"unknown replacement; preserve these bytes"
+        );
+        assert!(root.parent().unwrap().join(journal.public_name()).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalized_journal_cleanup_cannot_readmit_a_reappearing_public_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let parent = GuardedDirectoryParent::open(root.parent().unwrap()).unwrap();
+        let nonce = "f".repeat(32);
+        let document = PurgeJournal {
+            version: 1,
+            root_path: root.to_string_lossy().into_owned(),
+            nonce: nonce.clone(),
+            staged_name: format!(".gogglelab-empty-{nonce}"),
+            previous_name: format!("library.previous-purge-{nonce}"),
+            committed: false,
+        };
+        let bytes = serde_json::to_vec(&document).unwrap();
+        let mut journal = GeneratedTransactionJournal::create(
+            &parent,
+            &root,
+            GeneratedControlKind::Purge,
+            &bytes,
+        )
+        .unwrap();
+        journal.clear(&parent).unwrap();
+        let replacement = root.parent().unwrap().join(journal.public_name());
+        fs::write(&replacement, &bytes).unwrap();
+        assert!(journal.clear(&parent).is_err());
+        assert_eq!(fs::read(replacement).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_journal_recovery_handles_both_commit_scratch_forms_without_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        for exchanged in [false, true] {
+            let root = temp.path().join(if exchanged { "after" } else { "before" });
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("sentinel"), b"preserve catalog data").unwrap();
+            let root = root.canonicalize().unwrap();
+            let parent = GuardedDirectoryParent::open(root.parent().unwrap()).unwrap();
+            let nonce = "b".repeat(32);
+            let document = RestoreJournal {
+                version: 1,
+                root_path: root.to_string_lossy().into_owned(),
+                nonce: nonce.clone(),
+                staged_name: format!(".gogglelab-restore-{nonce}"),
+                previous_name: format!(
+                    "{}.previous-{nonce}",
+                    root.file_name().unwrap().to_string_lossy()
+                ),
+                failed_name: format!(".gogglelab-failed-restore-{nonce}"),
+                committed: false,
+            };
+            let mut journal = GeneratedTransactionJournal::create(
+                &parent,
+                &root,
+                GeneratedControlKind::Restore,
+                &serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+            if exchanged {
+                journal.mark_committed(&parent).unwrap();
+            } else {
+                let mut committed = serde_json::to_value(&document).unwrap();
+                committed["committed"] = serde_json::json!(true);
+                fs::write(
+                    root.parent().unwrap().join(
+                        journal
+                            .namespace
+                            .public_name(GeneratedControlRole::Commit)
+                            .unwrap(),
+                    ),
+                    serde_json::to_vec(&committed).unwrap(),
+                )
+                .unwrap();
+            }
+            drop(journal);
+            let mut recovered =
+                GeneratedTransactionJournal::recover(&parent, &root, GeneratedControlKind::Restore)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(recovered.committed(), exchanged);
+            recovered.clear(&parent).unwrap();
+            assert_eq!(
+                fs::read(root.join("sentinel")).unwrap(),
+                b"preserve catalog data"
+            );
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovers_a_privately_claimed_main_journal_and_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("sentinel"), b"preserve current library").unwrap();
+        let root = root.canonicalize().unwrap();
+        let parent = GuardedDirectoryParent::open(root.parent().unwrap()).unwrap();
+        let nonce = "c".repeat(32);
+        let document = PurgeJournal {
+            version: 1,
+            root_path: root.to_string_lossy().into_owned(),
+            nonce: nonce.clone(),
+            staged_name: format!(".gogglelab-empty-{nonce}"),
+            previous_name: format!("library.previous-purge-{nonce}"),
+            committed: false,
+        };
+        let mut journal = GeneratedTransactionJournal::create(
+            &parent,
+            &root,
+            GeneratedControlKind::Purge,
+            &serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        journal.mark_committed(&parent).unwrap();
+        let directory = GuardedDirectory::open(&root).unwrap();
+        let marker = create_generated_purge_marker(&directory, &root, &nonce).unwrap();
+        let marker_claim = format!(
+            "{}.cleanup-{nonce}-marker-{}",
+            journal.public_name().to_string_lossy(),
+            "d".repeat(32)
+        );
+        fs::rename(
+            root.join(marker.current_name().unwrap()),
+            root.join(marker_claim),
+        )
+        .unwrap();
+        let main_claim = format!(
+            "{}.cleanup-{nonce}-main-{}",
+            journal.public_name().to_string_lossy(),
+            "e".repeat(32)
+        );
+        fs::rename(
+            root.parent().unwrap().join(journal.public_name()),
+            root.parent().unwrap().join(main_claim),
+        )
+        .unwrap();
+        drop(marker);
+        drop(journal);
+        recover_interrupted_catalog_purge(&root).unwrap();
+        assert_eq!(
+            fs::read(root.join("sentinel")).unwrap(),
+            b"preserve current library"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_transaction_journal_cycles_do_not_retain_generated_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        for (kind, nonce) in [("purge", "a".repeat(32)), ("restore", "b".repeat(32))] {
+            let root = temp.path().join(kind);
+            fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let parent = secure_fs::Directory::open(root.parent().unwrap()).unwrap();
+            if kind == "purge" {
+                let journal = PurgeJournal {
+                    version: 1,
+                    root_path: root.to_string_lossy().into_owned(),
+                    nonce: nonce.clone(),
+                    staged_name: format!(".gogglelab-empty-{nonce}"),
+                    previous_name: format!("purge.previous-purge-{nonce}"),
+                    committed: false,
+                };
+                let (_, mut name) = write_purge_journal_at(&parent, &root, &journal).unwrap();
+                let directory = secure_fs::Directory::open(&root).unwrap();
+                write_purge_stage_marker_at(&directory, &root, &nonce).unwrap();
+                mark_purge_journal_committed_at(&parent, &root, &mut name, &nonce).unwrap();
+                remove_purge_stage_marker_at(&directory, &root, &nonce).unwrap();
+                clear_purge_journal_at(&parent, &mut name).unwrap();
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            } else {
+                let journal = RestoreJournal {
+                    version: 1,
+                    root_path: root.to_string_lossy().into_owned(),
+                    nonce: nonce.clone(),
+                    staged_name: format!(".gogglelab-restore-{nonce}"),
+                    previous_name: format!("restore.previous-{nonce}"),
+                    failed_name: format!(".gogglelab-failed-restore-{nonce}"),
+                    committed: false,
+                };
+                let mut name = write_restore_journal_at(&parent, &root, &journal).unwrap();
+                mark_restore_journal_committed_at(&parent, &root, &mut name, &nonce).unwrap();
+                clear_restore_journal_at(&parent, &mut name).unwrap();
+            }
+        }
+        let mut entries = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from("purge"),
+                std::ffi::OsString::from("restore")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn purge_commit_marker_failure_keeps_runtime_maintenance_armed() {
         let temp = tempfile::tempdir().unwrap();
         let library = temp.path().join("library");
@@ -16142,8 +16529,14 @@ mod tests {
             committed: false,
         };
         let journal_path = write_purge_journal(&runtime.root, &journal).unwrap();
-        let journal_name = journal_path.file_name().unwrap().to_os_string();
         let parent_directory = secure_fs::Directory::open(parent_path).unwrap();
+        let mut journal_name = GeneratedTransactionJournal::recover(
+            &GuardedDirectoryParent(parent_directory.try_clone().unwrap()),
+            &runtime.root,
+            GeneratedControlKind::Purge,
+        )
+        .unwrap()
+        .unwrap();
         let staged_directory = secure_fs::Directory::open(&runtime.root).unwrap();
         let mut guard = runtime.begin_maintenance().unwrap();
 
@@ -16152,7 +16545,7 @@ mod tests {
             &staged_directory,
             &parent_directory,
             &runtime.root,
-            &journal_name,
+            &mut journal_name,
             &nonce,
             |_, _| {
                 Err(RuntimeError {
@@ -16223,8 +16616,14 @@ mod tests {
             committed: false,
         };
         let journal_path = write_purge_journal(&runtime.root, &journal).unwrap();
-        let journal_name = journal_path.file_name().unwrap().to_os_string();
         let parent_directory = secure_fs::Directory::open(parent_path).unwrap();
+        let mut journal_name = GeneratedTransactionJournal::recover(
+            &GuardedDirectoryParent(parent_directory.try_clone().unwrap()),
+            &runtime.root,
+            GeneratedControlKind::Purge,
+        )
+        .unwrap()
+        .unwrap();
         let staged_directory = secure_fs::Directory::open(&runtime.root).unwrap();
         let mut guard = runtime.begin_maintenance().unwrap();
 
@@ -16233,9 +16632,9 @@ mod tests {
             &staged_directory,
             &parent_directory,
             &runtime.root,
-            &journal_name,
+            &mut journal_name,
             &nonce,
-            remove_purge_stage_marker_at,
+            |directory, nonce| remove_purge_stage_marker_at(directory, &runtime.root, nonce),
             |_, _| Err(io_error()),
         )
         .unwrap_err();
@@ -16440,7 +16839,7 @@ mod tests {
         let third_parent_path = third_root.parent().unwrap();
         let third_journal = journal_for(&third_root, &"c".repeat(32));
         let third_parent = secure_fs::Directory::open(third_parent_path).unwrap();
-        let third_journal_name =
+        let mut third_journal_name =
             write_restore_journal_at(&third_parent, &third_root, &third_journal).unwrap();
         let third_previous = third_parent_path.join(&third_journal.previous_name);
         let third_staged = third_parent_path.join(&third_journal.staged_name);
@@ -16450,7 +16849,7 @@ mod tests {
         mark_restore_journal_committed_at(
             &third_parent,
             &third_root,
-            &third_journal_name,
+            &mut third_journal_name,
             &third_journal.nonce,
         )
         .unwrap();

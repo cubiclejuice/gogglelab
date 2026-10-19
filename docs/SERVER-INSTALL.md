@@ -35,6 +35,13 @@ Replace every example path with a real, deliberately selected directory. The con
 
 `allowExternalIntegrations` defaults to `false` for old and new configs. When explicitly enabled by the service operator, authenticated Browser/MCP clients may call the configured AI provider or Spoolman through the guarded HTTP transport. Requests happen only when a client explicitly calls Generate suggestions or Spoolman sync. Turning access off blocks new requests, while a request already in progress may finish. AI `categorySharing` (`local` by default) is a separate choice controlling which tag-category fields accompany an AI request. The desktop app has the same opt-in in its Browser and MCP server settings; it resets to off when that server stops. No network integration call is needed to build or test the server.
 
+Keep the Library under a dedicated parent directory. Generated transaction
+recovery scans at most 4,096 immediate parent entries, including unrelated names,
+and accepts at most 16 matching cleanup claims. Exceeding either bound, or finding
+ambiguous/changed metadata, blocks startup or management rather than deleting or
+ignoring files. The container layout `/data/library` satisfies this arrangement.
+Do not place the Library directly in a shared system temporary directory.
+
 ### Optional backup-only destination
 
 To enable consistent backups and selected exports over the browser/MCP API, create a dedicated directory outside the library and model roots, then add it as a `backupOnly` root and grant `backupWrite` alongside `maintenance`:

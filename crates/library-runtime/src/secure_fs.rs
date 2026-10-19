@@ -9,6 +9,126 @@
 #[cfg(not(unix))]
 use std::path::Path;
 
+/// Narrow namespace for generated purge/restore transaction metadata only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedControlKind {
+    Purge,
+    Restore,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedControlRole {
+    Main,
+    Temporary,
+    Commit,
+    PurgeMarker,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedControlNamespace {
+    root: std::path::PathBuf,
+    kind: GeneratedControlKind,
+    journal_name: std::ffi::OsString,
+}
+impl GeneratedControlNamespace {
+    pub fn new(root: &std::path::Path, kind: GeneratedControlKind) -> std::io::Result<Self> {
+        use sha2::{Digest, Sha256};
+        if !root.is_absolute()
+            || root.file_name().is_none()
+            || root.to_str().is_none()
+            || root.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::RootDir
+                        | std::path::Component::Normal(_)
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "generated control root must be an absolute normalized Unicode path",
+            ));
+        }
+        let hash = Sha256::digest(root.as_os_str().as_encoded_bytes());
+        let suffix = hash[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let kind_text = match kind {
+            GeneratedControlKind::Purge => "purge",
+            GeneratedControlKind::Restore => "restore",
+        };
+        Ok(Self {
+            root: root.to_path_buf(),
+            kind,
+            journal_name: format!(".gogglelab-{kind_text}-{suffix}.journal").into(),
+        })
+    }
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+    pub fn public_name(&self, role: GeneratedControlRole) -> std::io::Result<std::ffi::OsString> {
+        Ok(match role {
+            GeneratedControlRole::Main => self.journal_name.clone(),
+            GeneratedControlRole::Temporary => {
+                format!("{}.tmp", self.journal_name.to_string_lossy()).into()
+            }
+            GeneratedControlRole::Commit => {
+                format!("{}.commit", self.journal_name.to_string_lossy()).into()
+            }
+            GeneratedControlRole::PurgeMarker if self.kind == GeneratedControlKind::Purge => {
+                ".gogglelab-purge-stage".into()
+            }
+            GeneratedControlRole::PurgeMarker => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "restore transactions have no purge marker",
+                ))
+            }
+        })
+    }
+    fn claim_prefix(&self) -> String {
+        format!("{}.cleanup-", self.journal_name.to_string_lossy())
+    }
+}
+#[derive(Debug, Eq, PartialEq)]
+pub enum GeneratedFileLocation {
+    Public(std::ffi::OsString),
+    Claim(std::ffi::OsString),
+    Unlinked,
+}
+/// Ownership is retained from the original created or strictly recovered descriptor.
+/// This receipt cannot be cloned, serialized, or built from a fresh fingerprint.
+pub struct GeneratedFileReceipt {
+    file: std::fs::File,
+    parent_identity: (u64, u64, u32),
+    file_identity: (u64, u64, u32),
+    namespace: GeneratedControlNamespace,
+    nonce: String,
+    role: GeneratedControlRole,
+    bytes: Vec<u8>,
+    location: GeneratedFileLocation,
+}
+impl GeneratedFileReceipt {
+    pub fn current_name(&self) -> Option<&std::ffi::OsStr> {
+        match &self.location {
+            GeneratedFileLocation::Public(name) | GeneratedFileLocation::Claim(name) => Some(name),
+            GeneratedFileLocation::Unlinked => None,
+        }
+    }
+    pub fn location(&self) -> &GeneratedFileLocation {
+        &self.location
+    }
+    pub fn nonce(&self) -> &str {
+        &self.nonce
+    }
+    pub fn role(&self) -> GeneratedControlRole {
+        self.role
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeldEntry {
     pub original_name: std::ffi::OsString,
@@ -245,6 +365,319 @@ mod imp {
             ))
         }
 
+        pub fn admit_created_generated(
+            &self,
+            namespace: &super::GeneratedControlNamespace,
+            nonce: &str,
+            role: super::GeneratedControlRole,
+            file: File,
+            bytes: &[u8],
+        ) -> io::Result<super::GeneratedFileReceipt> {
+            generated_supported()?;
+            validate_generated_nonce(nonce)?;
+            validate_generated_bytes(role, nonce, bytes, 8192)?;
+            let name = namespace.public_name(role)?;
+            let receipt = super::GeneratedFileReceipt {
+                parent_identity: generated_identity(&self.0)?,
+                file_identity: generated_identity(&file)?,
+                file,
+                namespace: namespace.clone(),
+                nonce: nonce.to_owned(),
+                role,
+                bytes: bytes.to_vec(),
+                location: super::GeneratedFileLocation::Public(name),
+            };
+            self.verify_generated_receipt(&receipt)?;
+            Ok(receipt)
+        }
+
+        pub fn recover_generated_file<T>(
+            &self,
+            namespace: &super::GeneratedControlNamespace,
+            role: super::GeneratedControlRole,
+            maximum: u64,
+            validate: impl FnOnce(&[u8], Option<&str>) -> io::Result<(String, T)>,
+        ) -> io::Result<Option<(super::GeneratedFileReceipt, T)>> {
+            generated_supported()?;
+            if maximum == 0
+                || maximum > 8192
+                || (role == super::GeneratedControlRole::PurgeMarker && maximum > 64)
+            {
+                return Err(generated_invalid(
+                    "generated recovery byte limit is outside its bounds",
+                ));
+            }
+            let public_name = namespace.public_name(role)?;
+            let mut candidates = Vec::new();
+            if self.entry_exists(&public_name)? {
+                candidates.push((public_name.clone(), None));
+            }
+            let mut claim_count = 0;
+            let mut transaction_nonce: Option<String> = None;
+            for name in self.read_entry_names(4096)? {
+                if let Some(claim) = parse_generated_claim(namespace, &name)? {
+                    claim_count += 1;
+                    if claim_count > 16 {
+                        return Err(generated_invalid("generated control claim limit exceeded"));
+                    }
+                    if transaction_nonce
+                        .as_ref()
+                        .is_some_and(|nonce| nonce != &claim.nonce)
+                    {
+                        return Err(generated_invalid(
+                            "multiple generated control transaction nonces are ambiguous",
+                        ));
+                    }
+                    transaction_nonce = Some(claim.nonce.clone());
+                    if claim.role == role {
+                        candidates.push((name, Some(claim.nonce)));
+                    }
+                }
+            }
+            if candidates.len() > 1 {
+                return Err(generated_invalid(
+                    "public and claimed generated control files are ambiguous",
+                ));
+            }
+            let Some((name, claimed_nonce)) = candidates.pop() else {
+                return Ok(None);
+            };
+            let file = self.open_file(&name)?;
+            let file_identity = generated_identity(&file)?;
+            let bytes = read_generated_bytes(&file, maximum)?;
+            let (nonce, value) = validate(&bytes, claimed_nonce.as_deref())?;
+            validate_generated_nonce(&nonce)?;
+            if claimed_nonce
+                .as_ref()
+                .is_some_and(|expected| expected != &nonce)
+                || transaction_nonce
+                    .as_ref()
+                    .is_some_and(|expected| expected != &nonce)
+            {
+                return Err(generated_invalid(
+                    "generated control nonce does not match its recovery namespace",
+                ));
+            }
+            validate_generated_bytes(role, &nonce, &bytes, maximum)?;
+            let location = if claimed_nonce.is_some() {
+                super::GeneratedFileLocation::Claim(name)
+            } else {
+                super::GeneratedFileLocation::Public(name)
+            };
+            let receipt = super::GeneratedFileReceipt {
+                file,
+                parent_identity: generated_identity(&self.0)?,
+                file_identity,
+                namespace: namespace.clone(),
+                nonce,
+                role,
+                bytes,
+                location,
+            };
+            self.verify_generated_receipt(&receipt)?;
+            Ok(Some((receipt, value)))
+        }
+
+        fn verify_generated_receipt(
+            &self,
+            receipt: &super::GeneratedFileReceipt,
+        ) -> io::Result<()> {
+            generated_supported()?;
+            if generated_identity(&self.0)? != receipt.parent_identity
+                || generated_identity(&receipt.file)? != receipt.file_identity
+            {
+                return Err(generated_invalid(
+                    "generated control descriptor identity changed",
+                ));
+            }
+            let name = receipt.current_name().ok_or_else(|| {
+                generated_invalid("generated control file has already been unlinked")
+            })?;
+            match &receipt.location {
+                super::GeneratedFileLocation::Public(_)
+                    if receipt.namespace.public_name(receipt.role)? != name =>
+                {
+                    return Err(generated_invalid(
+                        "generated control public binding is invalid",
+                    ))
+                }
+                super::GeneratedFileLocation::Claim(_) => {
+                    let claim =
+                        parse_generated_claim(&receipt.namespace, name)?.ok_or_else(|| {
+                            generated_invalid("generated control claim binding is invalid")
+                        })?;
+                    if claim.nonce != receipt.nonce || claim.role != receipt.role {
+                        return Err(generated_invalid(
+                            "generated control claim role or nonce changed",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            let entry = EntryIdentity::at(self, name)?;
+            if (entry.device, entry.inode, entry.mode) != receipt.file_identity {
+                return Err(generated_invalid(
+                    "generated control entry no longer names its admitted descriptor",
+                ));
+            }
+            let bytes = read_generated_bytes(&receipt.file, 8192)?;
+            if bytes != receipt.bytes {
+                return Err(generated_invalid(
+                    "generated control bytes no longer match their admission",
+                ));
+            }
+            let entry = EntryIdentity::at(self, name)?;
+            if (entry.device, entry.inode, entry.mode) != receipt.file_identity
+                || generated_identity(&receipt.file)? != receipt.file_identity
+            {
+                return Err(generated_invalid(
+                    "generated control entry changed while checking its bytes",
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn publish_generated_file(
+            &self,
+            receipt: &mut super::GeneratedFileReceipt,
+            destination: super::GeneratedControlRole,
+        ) -> io::Result<()> {
+            self.publish_generated_file_with_hook(receipt, destination, |_, _| Ok(()))
+        }
+        pub(super) fn publish_generated_file_with_hook(
+            &self,
+            receipt: &mut super::GeneratedFileReceipt,
+            destination: super::GeneratedControlRole,
+            mut hook: impl FnMut(&'static str, &super::GeneratedFileReceipt) -> io::Result<()>,
+        ) -> io::Result<()> {
+            if receipt.role != super::GeneratedControlRole::Temporary
+                || destination != super::GeneratedControlRole::Main
+                || !matches!(receipt.location, super::GeneratedFileLocation::Public(_))
+            {
+                return Err(generated_invalid(
+                    "generated publication requires temporary to main",
+                ));
+            }
+            self.verify_generated_receipt(receipt)?;
+            let source = receipt.current_name().unwrap().to_owned();
+            let target = receipt.namespace.public_name(destination)?;
+            hook("before_publish", receipt)?;
+            self.rename_child_exclusive_raw(&source, &target)?;
+            receipt.role = destination;
+            receipt.location = super::GeneratedFileLocation::Public(target);
+            hook("after_publish", receipt)?;
+            self.verify_generated_receipt(receipt)?;
+            self.sync()
+        }
+
+        pub fn exchange_generated_files(
+            &self,
+            new: &mut super::GeneratedFileReceipt,
+            old: &mut super::GeneratedFileReceipt,
+        ) -> io::Result<()> {
+            self.exchange_generated_files_with_hook(new, old, |_, _, _| Ok(()))
+        }
+        pub(super) fn exchange_generated_files_with_hook(
+            &self,
+            new: &mut super::GeneratedFileReceipt,
+            old: &mut super::GeneratedFileReceipt,
+            mut hook: impl FnMut(
+                &'static str,
+                &super::GeneratedFileReceipt,
+                &super::GeneratedFileReceipt,
+            ) -> io::Result<()>,
+        ) -> io::Result<()> {
+            if new.role != super::GeneratedControlRole::Commit
+                || old.role != super::GeneratedControlRole::Main
+                || new.namespace != old.namespace
+                || new.nonce != old.nonce
+                || !matches!(new.location, super::GeneratedFileLocation::Public(_))
+                || !matches!(old.location, super::GeneratedFileLocation::Public(_))
+            {
+                return Err(generated_invalid(
+                    "generated exchange requires matching commit and main receipts",
+                ));
+            }
+            self.verify_generated_receipt(new)?;
+            self.verify_generated_receipt(old)?;
+            let new_name = new.current_name().unwrap().to_owned();
+            let old_name = old.current_name().unwrap().to_owned();
+            hook("before_exchange", new, old)?;
+            self.exchange_children_atomically_raw(&new_name, &old_name)?;
+            new.location = super::GeneratedFileLocation::Public(old_name);
+            new.role = super::GeneratedControlRole::Main;
+            old.location = super::GeneratedFileLocation::Public(new_name);
+            old.role = super::GeneratedControlRole::Commit;
+            hook("after_exchange", new, old)?;
+            self.verify_generated_receipt(new)?;
+            self.verify_generated_receipt(old)?;
+            self.sync()
+        }
+
+        /// Retire internal nonce-bound transaction metadata under the caller's
+        /// process/maintenance lock and single or cooperating-writer ownership.
+        /// Atomic capture protects replacements at the public name. An existing
+        /// writable descriptor can still mutate the captured inode after the
+        /// final hash without learning the private claim; that non-cooperating
+        /// writer is outside this narrow boundary. Never use this primitive for
+        /// sources, configuration, custom uploads, or arbitrary multiwriter files.
+        pub fn delete_generated_file(
+            &self,
+            receipt: &mut super::GeneratedFileReceipt,
+        ) -> io::Result<()> {
+            self.delete_generated_file_with_hook(receipt, |_, _| Ok(()))
+        }
+        /// Atomic capture closes the ordinary public-name replacement window.
+        /// A same-user program actively replacing the private claim/inode, or
+        /// writing through a previously opened descriptor, remains outside this
+        /// cooperating-writer boundary; no absolute content-CAS unlink exists.
+        pub(super) fn delete_generated_file_with_hook(
+            &self,
+            receipt: &mut super::GeneratedFileReceipt,
+            mut hook: impl FnMut(&'static str, &super::GeneratedFileReceipt) -> io::Result<()>,
+        ) -> io::Result<()> {
+            self.verify_generated_receipt(receipt)?;
+            let public_name = receipt.namespace.public_name(receipt.role)?;
+            if matches!(receipt.location, super::GeneratedFileLocation::Public(_)) {
+                let source = receipt.current_name().unwrap().to_owned();
+                let claim = std::ffi::OsString::from(format!(
+                    "{}{}-{}-{}",
+                    receipt.namespace.claim_prefix(),
+                    receipt.nonce,
+                    generated_role_name(receipt.role),
+                    uuid::Uuid::new_v4().simple()
+                ));
+                // Last public identity/content check precedes this hook. Even a
+                // replacement here is captured and rejected, never unlinked.
+                hook("before_capture", receipt)?;
+                self.rename_child_exclusive_raw(&source, &claim)?;
+                receipt.location = super::GeneratedFileLocation::Claim(claim);
+                hook("after_capture", receipt)?;
+                self.sync()?;
+            }
+            self.verify_generated_receipt(receipt)?;
+            hook("after_cleanup_hash", receipt)?;
+            self.verify_generated_receipt(receipt)?;
+            hook("before_private_unlink", receipt)?;
+            let claim = receipt.current_name().unwrap().to_owned();
+            let name = c_name(&claim)?;
+            let result = unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            receipt.location = super::GeneratedFileLocation::Unlinked;
+            hook("after_unlink", receipt)?;
+            self.sync()?;
+            // Never treat a concurrently recreated public entry as the removed
+            // metadata, even if it happens to contain the same bytes.
+            if self.entry_exists(&public_name)? {
+                return Err(generated_invalid(
+                    "public generated control entry reappeared during cleanup",
+                ));
+            }
+            Ok(())
+        }
+
         pub fn create_new_file(&self, name: &std::ffi::OsStr) -> io::Result<File> {
             let name = c_name(name)?;
             let fd = unsafe {
@@ -336,6 +769,15 @@ mod imp {
             source: &std::ffi::OsStr,
             destination: &std::ffi::OsStr,
         ) -> io::Result<()> {
+            self.rename_child_exclusive_raw(source, destination)?;
+            self.sync()
+        }
+
+        fn rename_child_exclusive_raw(
+            &self,
+            source: &std::ffi::OsStr,
+            destination: &std::ffi::OsStr,
+        ) -> io::Result<()> {
             let source = c_name(source)?;
             let destination = c_name(destination)?;
             #[cfg(target_os = "macos")]
@@ -366,7 +808,7 @@ mod imp {
             if result < 0 {
                 Err(io::Error::last_os_error())
             } else {
-                self.sync()
+                Ok(())
             }
         }
 
@@ -622,6 +1064,15 @@ mod imp {
             first: &std::ffi::OsStr,
             second: &std::ffi::OsStr,
         ) -> io::Result<()> {
+            self.exchange_children_atomically_raw(first, second)?;
+            self.sync()
+        }
+
+        fn exchange_children_atomically_raw(
+            &self,
+            first: &std::ffi::OsStr,
+            second: &std::ffi::OsStr,
+        ) -> io::Result<()> {
             let first = c_name(first)?;
             let second = c_name(second)?;
             #[cfg(target_os = "macos")]
@@ -652,7 +1103,7 @@ mod imp {
             if result < 0 {
                 Err(io::Error::last_os_error())
             } else {
-                self.sync()
+                Ok(())
             }
         }
 
@@ -1978,6 +2429,142 @@ mod imp {
         unsafe { *libc::__error() }
     }
 
+    fn generated_supported() -> io::Result<()> {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic generated control operations are unavailable on this platform",
+            ))
+        }
+    }
+    fn generated_invalid(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+    fn generated_identity(file: &File) -> io::Result<(u64, u64, u32)> {
+        let identity = EntryIdentity::from_file(file)?;
+        Ok((identity.device, identity.inode, identity.mode))
+    }
+    fn validate_generated_nonce(nonce: &str) -> io::Result<()> {
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Err(generated_invalid(
+                "generated control nonce must contain exactly 32 hexadecimal characters",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    fn validate_generated_bytes(
+        role: super::GeneratedControlRole,
+        nonce: &str,
+        bytes: &[u8],
+        maximum: u64,
+    ) -> io::Result<()> {
+        if bytes.is_empty() || bytes.len() as u64 > maximum || maximum > 8192 {
+            return Err(generated_invalid(
+                "generated control bytes exceed their admission bounds",
+            ));
+        }
+        if role == super::GeneratedControlRole::PurgeMarker && bytes != nonce.as_bytes() {
+            return Err(generated_invalid(
+                "purge stage marker does not match its admitted nonce",
+            ));
+        }
+        Ok(())
+    }
+    fn read_generated_bytes(file: &File, maximum: u64) -> io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > maximum {
+            return Err(generated_invalid(
+                "generated control file is not regular or exceeds its byte bound",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let mut buffer = [0u8; 1024];
+        loop {
+            let remaining = (maximum + 1).saturating_sub(bytes.len() as u64) as usize;
+            if remaining == 0 {
+                return Err(generated_invalid(
+                    "generated control file grew while reading",
+                ));
+            }
+            let take = remaining.min(buffer.len());
+            let read = file.read_at(&mut buffer[..take], bytes.len() as u64)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.len() as u64 > maximum {
+                return Err(generated_invalid(
+                    "generated control file grew while reading",
+                ));
+            }
+        }
+        if bytes.len() as u64 != metadata.len() || file.metadata()?.len() != metadata.len() {
+            return Err(generated_invalid(
+                "generated control size changed while reading",
+            ));
+        }
+        Ok(bytes)
+    }
+    fn generated_role_name(role: super::GeneratedControlRole) -> &'static str {
+        match role {
+            super::GeneratedControlRole::Main => "main",
+            super::GeneratedControlRole::Temporary => "tmp",
+            super::GeneratedControlRole::Commit => "commit",
+            super::GeneratedControlRole::PurgeMarker => "marker",
+        }
+    }
+    struct ParsedGeneratedClaim {
+        nonce: String,
+        role: super::GeneratedControlRole,
+    }
+    fn parse_generated_claim(
+        namespace: &super::GeneratedControlNamespace,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<Option<ParsedGeneratedClaim>> {
+        let prefix = namespace.claim_prefix();
+        if !name.as_bytes().starts_with(prefix.as_bytes()) {
+            return Ok(None);
+        }
+        let text = name
+            .to_str()
+            .ok_or_else(|| generated_invalid("generated control claim name is not Unicode"))?;
+        let mut parts = text[prefix.len()..].split('-');
+        let nonce = parts.next().unwrap_or_default();
+        let role_text = parts.next().unwrap_or_default();
+        let capture = parts.next().unwrap_or_default();
+        validate_generated_nonce(nonce)?;
+        if parts.next().is_some()
+            || capture.len() != 32
+            || !capture
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(generated_invalid(
+                "generated control capture name is malformed",
+            ));
+        }
+        let role = match role_text {
+            "main" => super::GeneratedControlRole::Main,
+            "tmp" => super::GeneratedControlRole::Temporary,
+            "commit" => super::GeneratedControlRole::Commit,
+            "marker" => super::GeneratedControlRole::PurgeMarker,
+            _ => {
+                return Err(generated_invalid(
+                    "generated control capture role is invalid",
+                ))
+            }
+        };
+        namespace.public_name(role)?;
+        Ok(Some(ParsedGeneratedClaim {
+            nonce: nonce.to_owned(),
+            role,
+        }))
+    }
+
     fn open_at(directory: libc::c_int, name: &[u8], flags: libc::c_int) -> io::Result<File> {
         let name = CString::new(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
@@ -1998,6 +2585,46 @@ pub(crate) struct Directory;
 
 #[cfg(not(unix))]
 impl Directory {
+    pub fn admit_created_generated(
+        &self,
+        _namespace: &GeneratedControlNamespace,
+        _nonce: &str,
+        _role: GeneratedControlRole,
+        _file: std::fs::File,
+        _bytes: &[u8],
+    ) -> std::io::Result<GeneratedFileReceipt> {
+        Err(unsupported())
+    }
+    pub fn recover_generated_file<T>(
+        &self,
+        _namespace: &GeneratedControlNamespace,
+        _role: GeneratedControlRole,
+        _maximum: u64,
+        _validate: impl FnOnce(&[u8], Option<&str>) -> std::io::Result<(String, T)>,
+    ) -> std::io::Result<Option<(GeneratedFileReceipt, T)>> {
+        Err(unsupported())
+    }
+    pub fn publish_generated_file(
+        &self,
+        _receipt: &mut GeneratedFileReceipt,
+        _destination: GeneratedControlRole,
+    ) -> std::io::Result<()> {
+        Err(unsupported())
+    }
+    pub fn exchange_generated_files(
+        &self,
+        _new: &mut GeneratedFileReceipt,
+        _old: &mut GeneratedFileReceipt,
+    ) -> std::io::Result<()> {
+        Err(unsupported())
+    }
+    pub fn delete_generated_file(
+        &self,
+        _receipt: &mut GeneratedFileReceipt,
+    ) -> std::io::Result<()> {
+        Err(unsupported())
+    }
+
     pub(crate) fn open(_path: &Path) -> std::io::Result<Self> {
         Err(unsupported())
     }
@@ -2273,6 +2900,525 @@ mod tests {
 
     use super::imp::{copy_verified_file_with, remove_verified_file_with, Directory};
 
+    #[test]
+    fn generated_control_publication_exchange_and_retirement_leave_no_holds() {
+        use super::{
+            GeneratedControlKind, GeneratedControlNamespace, GeneratedControlRole as Role,
+            GeneratedFileLocation,
+        };
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Library");
+        let namespace = GeneratedControlNamespace::new(&root, GeneratedControlKind::Purge).unwrap();
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "a".repeat(32);
+        let temporary = namespace.public_name(Role::Temporary).unwrap();
+        let mut file = directory.create_new_file_read_write(&temporary).unwrap();
+        file.write_all(b"prepared metadata").unwrap();
+        file.sync_all().unwrap();
+        let mut prepared = directory
+            .admit_created_generated(
+                &namespace,
+                &nonce,
+                Role::Temporary,
+                file,
+                b"prepared metadata",
+            )
+            .unwrap();
+        directory
+            .publish_generated_file(&mut prepared, Role::Main)
+            .unwrap();
+        let commit = namespace.public_name(Role::Commit).unwrap();
+        let mut file = directory.create_new_file_read_write(&commit).unwrap();
+        file.write_all(b"committed metadata").unwrap();
+        file.sync_all().unwrap();
+        let mut committed = directory
+            .admit_created_generated(
+                &namespace,
+                &nonce,
+                Role::Commit,
+                file,
+                b"committed metadata",
+            )
+            .unwrap();
+        directory
+            .exchange_generated_files(&mut committed, &mut prepared)
+            .unwrap();
+        assert_eq!(prepared.role(), Role::Commit);
+        assert_eq!(committed.role(), Role::Main);
+        directory.delete_generated_file(&mut prepared).unwrap();
+        assert_eq!(prepared.location(), &GeneratedFileLocation::Unlinked);
+        directory.delete_generated_file(&mut committed).unwrap();
+        assert_eq!(committed.location(), &GeneratedFileLocation::Unlinked);
+        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    fn generated_control_file(
+        directory: &Directory,
+        namespace: &super::GeneratedControlNamespace,
+        nonce: &str,
+        role: super::GeneratedControlRole,
+        bytes: &[u8],
+    ) -> super::GeneratedFileReceipt {
+        use std::io::Write;
+        let name = namespace.public_name(role).unwrap();
+        let mut file = directory.create_new_file_read_write(&name).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        directory
+            .admit_created_generated(namespace, nonce, role, file, bytes)
+            .unwrap()
+    }
+    fn generated_control_main(
+        directory: &Directory,
+        namespace: &super::GeneratedControlNamespace,
+        nonce: &str,
+        bytes: &[u8],
+    ) -> super::GeneratedFileReceipt {
+        let mut receipt = generated_control_file(
+            directory,
+            namespace,
+            nonce,
+            super::GeneratedControlRole::Temporary,
+            bytes,
+        );
+        directory
+            .publish_generated_file(&mut receipt, super::GeneratedControlRole::Main)
+            .unwrap();
+        receipt
+    }
+    fn generated_control_namespace(root: &Path) -> super::GeneratedControlNamespace {
+        super::GeneratedControlNamespace::new(root, super::GeneratedControlKind::Purge).unwrap()
+    }
+    fn generated_test_error() -> std::io::Error {
+        std::io::Error::other("injected generated control interruption")
+    }
+
+    #[test]
+    fn generated_control_capture_preserves_public_replacement_after_last_identity_check() {
+        use super::{GeneratedControlRole as Role, GeneratedFileLocation};
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = generated_control_namespace(&temp.path().join("Library"));
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "a".repeat(32);
+        let mut receipt =
+            generated_control_main(&directory, &namespace, &nonce, b"admitted metadata");
+        let public = temp.path().join(namespace.public_name(Role::Main).unwrap());
+        let displaced = temp.path().join("admitted.displaced");
+        let result = directory.delete_generated_file_with_hook(&mut receipt, |stage, _| {
+            if stage == "before_capture" {
+                fs::rename(&public, &displaced).unwrap();
+                fs::write(&public, b"unknown replacement").unwrap();
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(matches!(
+            receipt.location(),
+            GeneratedFileLocation::Claim(_)
+        ));
+        assert_eq!(
+            fs::read(temp.path().join(receipt.current_name().unwrap())).unwrap(),
+            b"unknown replacement"
+        );
+        assert_eq!(fs::read(displaced).unwrap(), b"admitted metadata");
+        assert!(!public.exists());
+    }
+
+    #[test]
+    fn generated_control_unlinks_only_private_claim_when_public_name_reappears_after_hash() {
+        use super::{GeneratedControlRole as Role, GeneratedFileLocation};
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = generated_control_namespace(&temp.path().join("Library"));
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "b".repeat(32);
+        let mut receipt =
+            generated_control_main(&directory, &namespace, &nonce, b"known generated metadata");
+        let public = temp.path().join(namespace.public_name(Role::Main).unwrap());
+        let result = directory.delete_generated_file_with_hook(&mut receipt, |stage, _| {
+            if stage == "before_private_unlink" {
+                fs::write(&public, b"unknown new public bytes").unwrap();
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(receipt.location(), &GeneratedFileLocation::Unlinked);
+        assert!(receipt.current_name().is_none());
+        assert_eq!(fs::read(public).unwrap(), b"unknown new public bytes");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn generated_control_receipt_does_not_readmit_same_bytes_from_another_inode() {
+        use super::GeneratedControlRole as Role;
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = generated_control_namespace(&temp.path().join("Library"));
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "c".repeat(32);
+        let mut receipt =
+            generated_control_main(&directory, &namespace, &nonce, b"identical bytes");
+        let public = temp.path().join(namespace.public_name(Role::Main).unwrap());
+        let displaced = temp.path().join("original-descriptor");
+        fs::rename(&public, &displaced).unwrap();
+        fs::write(&public, b"identical bytes").unwrap();
+        assert!(directory.delete_generated_file(&mut receipt).is_err());
+        assert_eq!(fs::read(public).unwrap(), b"identical bytes");
+        assert_eq!(fs::read(displaced).unwrap(), b"identical bytes");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn generated_control_exchange_preserves_unknown_entries_before_and_after_swap() {
+        use super::GeneratedControlRole as Role;
+        for fault in ["before_exchange", "after_exchange"] {
+            let temp = tempfile::tempdir().unwrap();
+            let namespace = generated_control_namespace(&temp.path().join("Library"));
+            let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let nonce = "d".repeat(32);
+            let mut old = generated_control_main(&directory, &namespace, &nonce, b"prepared");
+            let mut new =
+                generated_control_file(&directory, &namespace, &nonce, Role::Commit, b"committed");
+            let displaced = temp.path().join("preserved-old-descriptor");
+            let result = directory.exchange_generated_files_with_hook(
+                &mut new,
+                &mut old,
+                |stage, _, old| {
+                    if stage == fault {
+                        let path = temp.path().join(old.current_name().unwrap());
+                        fs::rename(&path, &displaced).unwrap();
+                        fs::write(path, b"unknown exchange replacement").unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(old.role(), Role::Commit);
+            assert_eq!(new.role(), Role::Main);
+            assert_eq!(
+                fs::read(
+                    temp.path()
+                        .join(namespace.public_name(Role::Commit).unwrap())
+                )
+                .unwrap(),
+                b"unknown exchange replacement"
+            );
+            assert_eq!(fs::read(displaced).unwrap(), b"prepared");
+            assert_eq!(
+                fs::read(temp.path().join(namespace.public_name(Role::Main).unwrap())).unwrap(),
+                b"committed"
+            );
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
+    fn generated_control_exclusive_publication_preserves_an_occupied_main() {
+        use super::GeneratedControlRole as Role;
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = generated_control_namespace(&temp.path().join("Library"));
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "e".repeat(32);
+        let mut receipt =
+            generated_control_file(&directory, &namespace, &nonce, Role::Temporary, b"prepared");
+        let public = temp.path().join(namespace.public_name(Role::Main).unwrap());
+        fs::write(&public, b"unknown occupied entry").unwrap();
+        assert!(directory
+            .publish_generated_file(&mut receipt, Role::Main)
+            .is_err());
+        assert_eq!(receipt.role(), Role::Temporary);
+        assert_eq!(fs::read(public).unwrap(), b"unknown occupied entry");
+    }
+
+    #[test]
+    fn generated_control_strict_recovery_finds_a_claimed_main_without_its_public_name() {
+        use super::{GeneratedControlRole as Role, GeneratedFileLocation};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Library");
+        let namespace = generated_control_namespace(&root);
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "f".repeat(32);
+        let bytes=serde_json::to_vec(&serde_json::json!({"version":1,"rootPath":root.to_str().unwrap(),"nonce":nonce,"committed":true})).unwrap();
+        let mut receipt = generated_control_main(&directory, &namespace, &nonce, &bytes);
+        assert!(directory
+            .delete_generated_file_with_hook(&mut receipt, |stage, _| if stage == "after_capture" {
+                Err(generated_test_error())
+            } else {
+                Ok(())
+            })
+            .is_err());
+        drop(receipt);
+        let (mut recovered, committed) = directory
+            .recover_generated_file(&namespace, Role::Main, 8192, |bytes, claim_nonce| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+                assert_eq!(value["rootPath"], root.to_str().unwrap());
+                assert_eq!(value["version"], 1);
+                let parsed = value["nonce"].as_str().unwrap();
+                assert_eq!(claim_nonce, Some(parsed));
+                Ok((parsed.to_owned(), value["committed"].as_bool().unwrap()))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(committed);
+        assert!(matches!(
+            recovered.location(),
+            GeneratedFileLocation::Claim(_)
+        ));
+        directory.delete_generated_file(&mut recovered).unwrap();
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn generated_control_recovery_rejects_public_claim_ambiguity_and_malformed_names() {
+        use super::GeneratedControlRole as Role;
+        for mode in ["ambiguous", "malformed", "multiple-nonces"] {
+            let temp = tempfile::tempdir().unwrap();
+            let namespace = generated_control_namespace(&temp.path().join("Library"));
+            let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let nonce = "1".repeat(32);
+            let base = namespace
+                .public_name(Role::Main)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let claim = format!("{base}.cleanup-{nonce}-main-{}", "a".repeat(32));
+            fs::write(temp.path().join(&claim), b"known metadata").unwrap();
+            if mode == "ambiguous" {
+                fs::write(temp.path().join(&base), b"known metadata").unwrap();
+            }
+            if mode == "malformed" {
+                fs::write(
+                    temp.path().join(format!("{base}.cleanup-unknown")),
+                    b"unknown",
+                )
+                .unwrap();
+            }
+            if mode == "multiple-nonces" {
+                fs::write(
+                    temp.path().join(format!(
+                        "{base}.cleanup-{}-tmp-{}",
+                        "2".repeat(32),
+                        "b".repeat(32)
+                    )),
+                    b"other operation",
+                )
+                .unwrap();
+            }
+            assert!(directory
+                .recover_generated_file(&namespace, Role::Main, 8192, |_, _| Ok((
+                    nonce.clone(),
+                    ()
+                )))
+                .is_err());
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+            assert_eq!(
+                fs::read(temp.path().join(claim)).unwrap(),
+                b"known metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_control_recovery_never_readmits_a_replacement_during_validation() {
+        use super::GeneratedControlRole as Role;
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = generated_control_namespace(&temp.path().join("Library"));
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "3".repeat(32);
+        let receipt =
+            generated_control_main(&directory, &namespace, &nonce, b"strictly validated bytes");
+        let public = temp.path().join(receipt.current_name().unwrap());
+        drop(receipt);
+        let displaced = temp.path().join("original-recovery-descriptor");
+        assert!(directory
+            .recover_generated_file(&namespace, Role::Main, 8192, |bytes, _| {
+                assert_eq!(bytes, b"strictly validated bytes");
+                fs::rename(&public, &displaced).unwrap();
+                fs::write(&public, b"unknown replacement").unwrap();
+                Ok((nonce.clone(), ()))
+            })
+            .is_err());
+        assert_eq!(fs::read(public).unwrap(), b"unknown replacement");
+        assert_eq!(fs::read(displaced).unwrap(), b"strictly validated bytes");
+    }
+
+    #[test]
+    fn generated_control_recovery_bounds_claims_entries_and_file_sizes() {
+        use super::GeneratedControlRole as Role;
+        for mode in ["claims", "entries", "oversized", "symlink", "wrong-nonce"] {
+            let temp = tempfile::tempdir().unwrap();
+            let namespace = generated_control_namespace(&temp.path().join("Library"));
+            let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let nonce = "4".repeat(32);
+            let public = namespace.public_name(Role::Main).unwrap();
+            let base = public.to_string_lossy();
+            match mode {
+                "claims" => {
+                    for index in 0..17 {
+                        fs::write(
+                            temp.path()
+                                .join(format!("{base}.cleanup-{nonce}-main-{index:032x}")),
+                            b"metadata",
+                        )
+                        .unwrap();
+                    }
+                }
+                "entries" => {
+                    for index in 0..4097 {
+                        fs::write(temp.path().join(format!("entry-{index}")), b"").unwrap();
+                    }
+                }
+                "oversized" => fs::write(temp.path().join(&public), vec![b'a'; 8193]).unwrap(),
+                "symlink" => {
+                    let target = temp.path().join("unknown-target");
+                    fs::write(&target, b"unknown target bytes").unwrap();
+                    std::os::unix::fs::symlink(&target, temp.path().join(&public)).unwrap();
+                }
+                _ => fs::write(
+                    temp.path()
+                        .join(format!("{base}.cleanup-{nonce}-main-{}", "a".repeat(32))),
+                    b"metadata",
+                )
+                .unwrap(),
+            }
+            let before = fs::read_dir(temp.path()).unwrap().count();
+            assert!(
+                directory
+                    .recover_generated_file(&namespace, Role::Main, 8192, |_, _| Ok((
+                        "5".repeat(32),
+                        ()
+                    )))
+                    .is_err(),
+                "{mode}"
+            );
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), before);
+        }
+    }
+
+    #[test]
+    fn generated_control_sync_failures_retain_precise_receipt_locations_and_library_data() {
+        use super::GeneratedFileLocation;
+        for fault in ["after_capture", "before_private_unlink", "after_unlink"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("Library");
+            let previous = temp.path().join("Library.previous");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&previous).unwrap();
+            fs::write(root.join("model.stl"), b"current original").unwrap();
+            fs::write(previous.join("model.stl"), b"previous original").unwrap();
+            let namespace = generated_control_namespace(&root);
+            let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let nonce = "6".repeat(32);
+            let mut receipt =
+                generated_control_main(&directory, &namespace, &nonce, b"committed metadata");
+            assert!(directory
+                .delete_generated_file_with_hook(&mut receipt, |stage, _| if stage == fault {
+                    Err(generated_test_error())
+                } else {
+                    Ok(())
+                })
+                .is_err());
+            if fault == "after_unlink" {
+                assert_eq!(receipt.location(), &GeneratedFileLocation::Unlinked);
+                assert!(receipt.current_name().is_none());
+            } else {
+                assert!(matches!(
+                    receipt.location(),
+                    GeneratedFileLocation::Claim(_)
+                ));
+                assert!(temp.path().join(receipt.current_name().unwrap()).is_file());
+            }
+            assert_eq!(
+                fs::read(root.join("model.stl")).unwrap(),
+                b"current original"
+            );
+            assert_eq!(
+                fs::read(previous.join("model.stl")).unwrap(),
+                b"previous original"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_control_scratch_cleanup_failure_leaves_the_authoritative_main() {
+        use super::GeneratedControlRole as Role;
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = generated_control_namespace(&temp.path().join("Library"));
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "7".repeat(32);
+        let main = generated_control_main(
+            &directory,
+            &namespace,
+            &nonce,
+            b"authoritative committed metadata",
+        );
+        let mut scratch = generated_control_file(
+            &directory,
+            &namespace,
+            &nonce,
+            Role::Commit,
+            b"displaced prepared metadata",
+        );
+        assert!(directory
+            .delete_generated_file_with_hook(&mut scratch, |stage, _| if stage == "after_capture" {
+                Err(generated_test_error())
+            } else {
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(
+            fs::read(temp.path().join(main.current_name().unwrap())).unwrap(),
+            b"authoritative committed metadata"
+        );
+    }
+
+    #[test]
+    fn generated_control_parent_handle_swap_never_redirects_cleanup_into_the_new_path() {
+        use super::GeneratedControlRole as Role;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let outside = temp.path().join("outside");
+        let held = temp.path().join("held-parent");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let namespace = generated_control_namespace(&parent.join("Library"));
+        let directory = Directory::open(&parent.canonicalize().unwrap()).unwrap();
+        let nonce = "8".repeat(32);
+        let mut receipt =
+            generated_control_main(&directory, &namespace, &nonce, b"owned generated metadata");
+        fs::write(
+            outside.join(namespace.public_name(Role::Main).unwrap()),
+            b"unknown outside metadata",
+        )
+        .unwrap();
+        fs::rename(&parent, &held).unwrap();
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        directory.delete_generated_file(&mut receipt).unwrap();
+        assert_eq!(
+            fs::read(outside.join(namespace.public_name(Role::Main).unwrap())).unwrap(),
+            b"unknown outside metadata"
+        );
+        assert_eq!(fs::read_dir(held).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn generated_control_purge_marker_requires_exact_known_nonce_and_retains_original_descriptor() {
+        use super::GeneratedControlRole as Role;
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = generated_control_namespace(&temp.path().join("Library"));
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let nonce = "9".repeat(32);
+        let mut marker = generated_control_file(
+            &directory,
+            &namespace,
+            &nonce,
+            Role::PurgeMarker,
+            nonce.as_bytes(),
+        );
+        assert_eq!(marker.bytes().len(), 32);
+        directory.delete_generated_file(&mut marker).unwrap();
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
     #[test]
     fn generated_file_delete_preserves_a_replacement_after_hashing() {
         let temp = tempfile::tempdir().unwrap();
