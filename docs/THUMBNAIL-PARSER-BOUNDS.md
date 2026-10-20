@@ -2,6 +2,22 @@
 
 ## Current checkpoint (2026-10-20)
 
+The STL correction follows shared-runtime checkpoint `743c863`. Both binary and
+ASCII parsing now enforce the existing 2,000,000-triangle policy before output
+growth. Exact-size binary detection still precedes ASCII fallback; malformed and
+nonfinite ASCII facet errors keep their previous order, and stored nonfinite
+normals remain supported. Binary reservations are checked/fallible; ASCII stages
+one complete facet on the stack and reserves both capped output vectors before
+appending either. Known allocation failures use the same operation observer.
+Legacy `TooManyTriangles` count/limit and native error shape remain unchanged.
+
+Three real RED regressions failed before the fix (binary accepted two under a
+private one-triangle profile; ASCII appended 18/6 floats before refusing). The
+corrected core suite passes 205 tests plus one existing ignored fixture, including
+15 new admission/allocation controls. Full workspace regressions pass. Evidence:
+`output/stl-before-growth-implementation-gates.json`; exact hosted verification
+is tracked in [PR #4](https://github.com/cubiclejuice/gogglelab/pull/4).
+
 The current runtime integration follows core checkpoint `128da5e`. Shared mutable
 package contexts now span archived-source validation and later geometry, metadata,
 preview and viewer/bundle loading. Runtime model ZIP reads use the actual inflation
@@ -16,7 +32,7 @@ backup restoration keeps its separate format policy. Default ZIP APIs remain
 unchanged. Runtime metadata now streams root XML instead of retaining its complete
 buffer; images use fixed 16 MiB binary input and 64 KiB retained relationships.
 
-Local full-workspace regressions pass: 190 core tests plus one existing ignored,
+Local full-workspace regressions pass: 205 core tests plus one existing ignored,
 366 runtime, 209 native, 70 server and other suites. A real reset control fails when
 hidden validation receives a fresh counter with the same observer, then passes
 after exact restoration. Independent plan/collector/caller reviews are closed.
@@ -45,8 +61,11 @@ fallible SDK-allocation guarantee, RSS bound or completed Owned permit.
   **INPUT**, not every owned name/path/normalized metadata copy. Input mesh/object/
   component/build collections, JSON Value/auxiliary arrays and their controlled
   capacities remain OPEN; the flattened output cap alone does not close them.
-- `parse.rs` binary/ASCII dispatch growth and capacity guards still need their
-  remaining explicit preallocation audit; do not infer a whole-parser memory cap.
+- `parse.rs` binary/ASCII output admission and checked/fallible growth are active.
+  Their two vectors retain the existing 9/3 floats per accepted triangle. This is
+  not a whole-parser/producer memory cap or an immediate pure-decode cancellation
+  guarantee; SDK float parsing, capacities, reallocation and pipeline overlap
+  remain inputs to the later profile.
 - Runtime `archives.rs` has bounded ZIP/typed pure-read-before-stage handling,
   regular-source/1 GiB outer admission, one actual outer budget across scan members,
   and before-growth member collection. Nested 3MF budgets are separate from outer

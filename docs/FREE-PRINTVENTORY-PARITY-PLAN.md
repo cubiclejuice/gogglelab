@@ -2,7 +2,27 @@
 
 Date: 2026-10-15 (updated 2026-10-20)
 
-## Current checkpoint: shared runtime parser contexts (2026-10-20)
+## Current checkpoint: STL output admission (2026-10-20)
+
+Following shared-runtime checkpoint `743c863`, both STL formats now enforce the
+existing two-million-triangle policy before output allocation/append. This closes
+the exact-size binary bypass and the ASCII extra-facet growth. Binary/ASCII
+recognition, malformed/nonfinite error priority and recorded nonfinite normals
+remain compatible. Checked/fallible paired reservations share the existing
+observer, while legacy triangle-limit error fields remain unchanged.
+
+The test-first control recorded three intended failures and four passing controls
+before implementation. The corrected core suite passes 205 tests plus one existing
+ignored fixture, including 15 new focused admission/allocation checks. The full
+workspace regression suite passes. See `output/stl-before-growth-implementation-gates.json`
+and [PR #4](https://github.com/cubiclejuice/gogglelab/pull/4) for current verification.
+This does not finish 3MF input collections, JSON/owned metadata, producer admission
+or immutable publication. JSON migration follows this small correction.
+
+## Runtime context checkpoint `743c863` (2026-10-20)
+
+Evidence in this section belongs to its named earlier sources.
+
 
 The current runtime integration follows core checkpoint
 `128da5ecc0c47bd2864d295f886187ee0844715a`. Shared contexts now span hidden

@@ -116,7 +116,7 @@ pub fn parse_model_with_plates_in_context(
         if crate::threemf::is_zip(bytes) {
             crate::threemf::parse_3mf_with_plates_in_context(bytes, context)
         } else {
-            let model = crate::parse::parse(bytes)?;
+            let model = crate::parse::parse_observed(bytes, &observer)?;
             observer.check()?;
             let triangle_count = model.triangle_count;
             Ok(ParsedModel {
