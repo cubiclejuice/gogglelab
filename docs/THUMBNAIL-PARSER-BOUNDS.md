@@ -107,6 +107,54 @@ not a measured or guaranteed process RSS number; decoder/parser internals and
 allocator overhead need explicit conservative allowances. If a defensible bound
 is still missing, keep publication wiring gated and report that gap.
 
+## Review findings that block wiring
+
+The plan review found the following concrete requirements. They describe existing
+allocation/fallback behavior, not regressions introduced by the unwired foundation.
+
+- **High — constructor fallback:** ZIP 8.6 retries earlier EOCD records after a
+  central decode failure. A terminal-envelope preflight followed by unrestricted
+  `ZipArchive::new` is insufficient; `ArchiveOffset::Known` does not pin the chosen
+  EOCD. Bind construction to the exact approved envelope or enforce allocation
+  limits at every constructor attempt, potentially through a narrow reviewed
+  dependency patch. Test a bounded last footer with a rejected extra field and an
+  earlier forged large-count footer. Do not enable a partial guard.
+- **High — mutable metadata:** a retained outer-file FD does not prevent in-place
+  footer/central changes between preflight and construction. Consume a bounded
+  immutable approved metadata snapshot, or enforce limits during construction;
+  post-constructor size/hash checks are too late. Test a paused-after-preflight
+  same-inode overwrite before any large allocation.
+- Bound EOCD comments and ZIP64 `record_size`/extensible data before allocation,
+  including checked integer conversions and single-volume consistency. Add raw
+  read/seek/candidate work limits covering footer searches, local metadata,
+  constructor retries and outer hash passes, separately from inflated work.
+- Validate local headers and compressed ranges against approved central metadata,
+  including ZIP64 fields and data-descriptor flags. Legitimate bit-3 zero local
+  sizes must use descriptor-aware rules. Refuse overlaps or offsets into central
+  metadata/footer before member reads; charge local variable fields too.
+- Enforce JSON node/text/depth limits before a `serde_json::Value` DOM or complete
+  settings/type/vendor array clones allocate. Streaming consumers must preserve
+  existing first-256 palette clipping and bound unknown-field skipping.
+- Introduce typed resource-stop errors through optional metadata/image paths.
+  Budget exhaustion, changed envelopes and exhausted read work must not be
+  swallowed by `.ok()`, `if let Ok` or catch-all raster fallback. Ordinary absent,
+  unsupported or bounded malformed optional metadata should still permit valid
+  geometry where the existing feature does so.
+- A bounded PNG sink must be paired with explicit encoder `finish()` and propagated
+  footer errors. Test exact fit and a one-byte-short IEND/finalization allowance;
+  encoder Drop cannot report those failures.
+- Replace declared-size debits with actual-delivered-byte charging; do not add both.
+  Put lexical guards on the same streaming XML read rather than reinflating a
+  preflight copy. Parsing one retained settings string twice is not two inflated
+  reads. Temporary numeric coordinate strings are not permanently retained text;
+  keep live storage charges distinct from bounded total processing work.
+
+Smallest next implementation slice: bounded encoder sink plus explicit finalization
+in both PNG producers, preserving normal bytes. Then close typed propagation and
+constructor binding before the package-wide parser/JSON changes and producer
+allowance. These plan findings remain open requirements until their corresponding
+implementation tests pass; no unsafe producer wiring is authorized by this plan.
+
 ## Compatibility and small boundary tests
 
 Keep the existing 3MF tests for deflated cubes, `p:path` components, distinct-part
