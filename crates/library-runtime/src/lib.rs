@@ -10714,47 +10714,32 @@ impl Write for FailAfterWriter<'_> {
     }
 }
 
-fn same_export_file_identity(expected: &File, current: &fs::Metadata) -> bool {
-    let Ok(expected_metadata) = expected.metadata() else {
-        return false;
-    };
-    if !expected_metadata.is_file() || !current.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        expected_metadata.dev() == current.dev() && expected_metadata.ino() == current.ino()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        expected_metadata.volume_serial_number() == current.volume_serial_number()
-            && expected_metadata.file_index() == current.file_index()
-            && expected_metadata.volume_serial_number().is_some()
-            && expected_metadata.file_index().is_some()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        false
-    }
+fn same_export_file_identity(expected: &File, current: &File) -> bool {
+    library_core::catalog_vfs::same_file_identity(expected, current).is_ok_and(|same| same)
 }
 
 #[cfg(windows)]
-fn file_fingerprint(file: &File) -> std::io::Result<ExportFingerprint> {
-    let mut input = file.try_clone()?;
-    input.seek(std::io::SeekFrom::Start(0))?;
+fn file_fingerprint(file: File) -> std::io::Result<ExportFingerprint> {
+    use std::os::windows::fs::FileExt;
+    // Windows seek_read advances this handle's cursor. Consume only the fresh
+    // verification handle, never a clone sharing the created output's cursor.
     let mut digest = Sha256::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let read = input.read(&mut buffer)?;
+        let read = file.seek_read(&mut buffer, bytes)?;
         if read == 0 {
             break;
         }
         bytes = bytes
             .checked_add(read as u64)
             .ok_or_else(|| std::io::Error::other("export byte count overflow"))?;
+        if bytes > MAX_PRINTVENTORY_JSON_BYTES as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "export exceeds its byte limit",
+            ));
+        }
         digest.update(&buffer[..read]);
     }
     Ok(ExportFingerprint {
@@ -10773,11 +10758,7 @@ fn destination_matches_open_file(
         let Ok(mut current) = destination.directory.open_file_handle(&destination.name) else {
             return false;
         };
-        let same_handle = current
-            .metadata()
-            .ok()
-            .is_some_and(|metadata| same_export_file_identity(output, &metadata));
-        if !same_handle {
+        if !same_export_file_identity(output, &current) {
             return false;
         }
         return secure_fs::hash_file(&mut current, MAX_PRINTVENTORY_JSON_BYTES as u64)
@@ -10786,13 +10767,13 @@ fn destination_matches_open_file(
     }
     #[cfg(windows)]
     {
-        let Ok(metadata) = fs::symlink_metadata(&destination.path) else {
+        let Ok(current) = library_core::catalog_vfs::open_pinned_file(&destination.path) else {
             return false;
         };
-        if metadata.file_type().is_symlink() || !same_export_file_identity(output, &metadata) {
+        if !same_export_file_identity(output, &current) {
             return false;
         }
-        return file_fingerprint(output).ok().as_ref() == Some(fingerprint);
+        return file_fingerprint(current).ok().as_ref() == Some(fingerprint);
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -13843,6 +13824,43 @@ mod tests {
             std::fs::read(&replaced_destination).unwrap(),
             b"created concurrently"
         );
+    }
+
+    #[test]
+    fn export_destination_verification_rejects_equal_bytes_on_a_different_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("export.json");
+        let displaced = temp.path().join("displaced-export.json");
+        let destination = export_destination(&selected).unwrap();
+        let bytes = b"same-size export bytes";
+        let mut original = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&selected)
+            .unwrap();
+        original.write_all(bytes).unwrap();
+        original.sync_all().unwrap();
+        let fingerprint = ExportFingerprint {
+            bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        };
+        original.seek(std::io::SeekFrom::Start(3)).unwrap();
+        assert!(destination_matches_open_file(
+            &destination,
+            &original,
+            &fingerprint
+        ));
+        assert_eq!(original.stream_position().unwrap(), 3);
+        fs::rename(&selected, &displaced).unwrap();
+        fs::write(&selected, bytes).unwrap();
+        assert!(!destination_matches_open_file(
+            &destination,
+            &original,
+            &fingerprint
+        ));
+        assert_eq!(fs::read(&selected).unwrap(), bytes);
+        assert_eq!(fs::read(&displaced).unwrap(), bytes);
     }
 
     #[test]

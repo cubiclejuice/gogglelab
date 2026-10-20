@@ -2858,6 +2858,13 @@ pub(crate) struct Directory;
 
 #[cfg(not(unix))]
 impl Directory {
+    pub(crate) fn read_entry_names(
+        &self,
+        _maximum: usize,
+    ) -> std::io::Result<Vec<std::ffi::OsString>> {
+        Err(unsupported())
+    }
+
     pub(crate) fn create_anonymous_geometry_writer(&self) -> std::io::Result<GeometryFileWriter> {
         Err(unsupported())
     }

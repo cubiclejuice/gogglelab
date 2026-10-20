@@ -1,6 +1,6 @@
 # Generated media retention
 
-Status: anonymous geometry implementation and independent review complete; final serial workspace, Clippy, formatting and Community production build/signature checks pass; live isolated/container checks remain. Thumbnail/orphan proof remains a subsequent gate.
+Status: anonymous geometry implementation and independent review complete; final serial workspace, Clippy, formatting and Community production build/signature checks pass; live Linux packet/restart checks pass. Unlicensed combined-app stock/index/preview checks pass, with native scan refresh and collection-dialog issues found and being corrected. Thumbnail/orphan proof remains a subsequent gate.
 
 ## Required outcome
 
@@ -165,3 +165,22 @@ or runtime acceptance. No host compiler/toolchain was installed; friend-run nati
 Windows acceptance remains required.
 
 The final optimized Community app builds and passes deep strict signature verification. Executable SHA-256: `aa495584633fd3a9e33beab7cdd6e2ec7de8cbc66c60e51edef6d92a10d902fe`. Current-source Linux runtime and updated development composition checks remain before closing the geometry delivery slice.
+
+## Geometry delivery and platform follow-up (2026-10-19)
+
+The immutable `9331722` Linux image passes authenticated packet streaming without
+a named staging file, repeat reads, stale-token rejection after restart, new
+lease streaming, and source-hash preservation. The fixture is stopped; its volume,
+scripts, packet/hash and logs remain under `output/container-acceptance-9331722/`.
+
+An isolated Windows GNU cross-compiler container reached actual Rust checks and
+found two compile defects: a missing non-Unix directory inventory stub and unstable
+Windows metadata identity calls in JSON export. The follow-up adds only an
+Unsupported inventory stub and reuses the existing stable pinned-file/handle
+identity helpers for exports. Verification fingerprints a freshly opened current
+handle, preserves the created writer's cursor and sharing protections, and never
+adds path deletion. An equal-byte replacement/cursor regression passes; the full
+278-test runtime suite passes on macOS. The Windows runtime/test-target cross-check
+passes with the exact synthetic JSON/PEM fixtures included. This is compilation
+evidence, not Windows execution or installer acceptance. Independent review found
+no actionable defect.
