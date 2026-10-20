@@ -1,5 +1,42 @@
 # Thumbnail parser resource prerequisite
 
+## Optional part-row retention checkpoint (2026-10-20)
+
+One private accumulator now retains at most the existing 1,024 optional viewer
+part rows across the entire build, including all authored plates. Geometry is
+always emitted and validated first. A further nonempty boundary permanently
+omits part metadata and drops its retained rows/text/backing, preserving the exact
+existing part warning and all geometry. Empty, disabled and unprinted candidates
+at the limit do not cause omission. Final range/coverage validation still handles
+ordinary unusable boundaries; plate ranges, display order and warnings keep their
+independent behavior.
+
+Optional row-vector growth is checked, capped and fallible. IDs and names are
+constructed only after a nonempty candidate receives a reserved slot. Known
+reserve failures and post-reserve stops preserve the same observer's first cause;
+they cannot become ordinary optional fallback. At capacity or after omission,
+appearance observation uses its existing nonuniform state to suppress optional
+material-ID copies. Below capacity, one in-flight Uniform String can still be
+created during geometry emission before row admission. That scratch and other
+String constructors are separate allocation/lifetime contributors.
+
+Both public-parser RED cases retained three rows/built three names under a private
+two-row profile after geometry/warning assertions passed. Final frozen core
+verification passes 260 tests plus one existing ignored fixture: nine local
+retention/fault controls and four independent public Stored/Deflate cases cover
+exact limits, global authored-plate overflow, late errors and geometry preservation.
+Full serial workspace verification also passes 375 runtime, 209 native and 70
+server tests. Workspace Clippy introduces no new diagnostic; its existing
+eight-argument emitter warning changes only the part-output parameter type.
+Downstream and packaged results remain separate gates in `output/part-retention-*`;
+these local results alone do not close them.
+
+The row limit bounds retained row count and requested vector growth, not all
+String payloads, allocator capacity/overlap, public Clone lifetimes or process RSS.
+Plate assignments/occurrences/resolution, diagnostic paths, material containers,
+aggregate owned metadata, producer admission and publication remain open. No
+source mutation, cleanup or new producer allowance follows from this change.
+
 ## Physical input-record storage checkpoint (2026-10-20)
 
 The parser enforces fixed per-Package limits of 6,000,000 vertices,
@@ -32,8 +69,8 @@ hosted and container status must be read from `output/input-collections-*`; thes
 local results do not imply those gates passed.
 
 The physical limits do not bound all owned strings, map buckets, spare/reallocation capacity,
-simultaneously live output, SDK/decoder workspaces or process RSS. Derived part,
-plate and material containers remain a later unit. No producer allowance or
+simultaneously live output, SDK/decoder workspaces or process RSS. Optional part rows are covered above; remaining plate, assignment/occurrence,
+diagnostic-path and material containers remain later work. No producer allowance or
 publication authority follows from this policy selection.
 
 ## Current standard-field retention checkpoint (2026-10-20)
@@ -158,7 +195,7 @@ fallible SDK-allocation guarantee, RSS bound or completed Owned permit.
   before growth, settings are retained once/reparsed without another inflation
   debit, and ordinary EINTR is retried. Its 16 MiB counter is cumulative collected
   **INPUT**, not every owned name/path/normalized metadata copy. Physical input mesh/object/
-  component/build collections now use the per-Package limits above. Derived
+  component/build collections now use the per-Package limits above. Remaining derived
   containers and aggregate owned metadata remain OPEN. The JSON
   DOM/auxiliary-array correction is described above; its local bounds do not close
   whole-parser capacity or the flattened-output overlap.

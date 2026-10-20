@@ -1013,3 +1013,44 @@ Derived part/plate/material containers and owned string lifetimes, allocator
 capacity/overlap, global metadata/producer admission, immutable publication and
 final platform/package gates remain open. These physical counts do not establish
 a hard RAM bound, authorize cleanup or enable the proposed producer allowance.
+
+### Bounded optional part retention (2026-10-20)
+
+Free now shares one optional-part accumulator across whole-build and assigned-plate
+emission. It retains at most the existing 1,024 rows, then drops part rows/text and
+backing on the next nonempty boundary. Geometry and later validation continue;
+the existing exact warning/empty-parts behavior remains. Zero-geometry, disabled
+and unprinted candidates do not invalidate exactly 1,024 useful parts. IDs/names
+are built after successful nonempty slot reservation, and vector growth is capped
+and fallible with the same terminal observer. Appearance copies are suppressed
+at capacity/after omission; below-cap in-flight appearance scratch remains a
+separate contributor. Global material lists and public model fields are unchanged.
+
+Two real parser RED cases demonstrated three retained rows/name builds under a
+private two-row profile after geometry and warning assertions passed. The final
+core suite passes 260 tests plus one existing ignored fixture, including nine
+local retention/fault tests and four public Stored/Deflate exact-limit, authored
+plate, late-error and geometry controls. The full serial workspace also passes
+375 runtime, 209 native and 70 server tests; Clippy adds no new diagnostics.
+Downstream and packaged verification remain separate gates under
+`output/part-retention-*`.
+
+This closes optional part-row accumulation before the existing overflow fallback.
+Remaining plate/assignment/occurrence/diagnostic/material containers, other owned
+strings and public clones, producer memory admission, immutable publication and
+final platform/release acceptance stay in the original scope. No cleanup, original
+source changes, installed-app replacement or live private core-pin update occurs.
+
+Build cleanup (2026-10-20): after fresh idle/open-file and generated-output checks,
+the user-approved exact `cargo clean` for the older repository target’s dev
+`library-runtime` outputs completed. Cargo reports 23,487 files / 3.5 GiB; measured
+Data-volume free space increased by 2.09 GiB (5.5 to 7.6 GiB). The existing working
+test binary still passes and the protected release bundle still verifies its
+signature. Source hashes were unchanged by cleanup. The original failed
+post-check is preserved: Cargo’s printed dry-run paths omitted package-named
+dependency artifacts counted in its summary, so the helper incorrectly expected
+those generated hard-link aliases to remain. All such missing aliases were also
+compiler output in the same older target, covered by the exact approved command.
+The policy now requires inspecting that dependency namespace and linked outputs
+as well. No further deletion or neighboring-target/cache cleanup was performed.
+Evidence: `output/approved-runtime-cleanup-20261020/reconciliation.json`.

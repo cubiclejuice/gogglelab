@@ -499,6 +499,50 @@ thread_local! {
         };
 }
 
+#[cfg(test)]
+struct PartRetentionTestProfile {
+    limit: usize,
+    high_water: std::cell::Cell<usize>,
+    name_builders: std::cell::Cell<usize>,
+    id_builders: std::cell::Cell<usize>,
+    appearance_copies: std::cell::Cell<usize>,
+    reserves: std::cell::Cell<usize>,
+    requested_capacity: std::cell::RefCell<Vec<usize>>,
+    fail_reserve_at: Option<usize>,
+    stop_after_reserve: Option<(usize, ParserTestFailure)>,
+}
+
+#[cfg(test)]
+impl PartRetentionTestProfile {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            high_water: std::cell::Cell::new(0),
+            name_builders: std::cell::Cell::new(0),
+            id_builders: std::cell::Cell::new(0),
+            appearance_copies: std::cell::Cell::new(0),
+            reserves: std::cell::Cell::new(0),
+            requested_capacity: std::cell::RefCell::new(Vec::new()),
+            fail_reserve_at: None,
+            stop_after_reserve: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartRetentionTestProfile {
+    fn record_retained(&self, len: usize) {
+        self.high_water.set(self.high_water.get().max(len));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PART_RETENTION_TEST_PROFILE: std::cell::RefCell<Option<Rc<PartRetentionTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// Original input cursor; its private fault seam exists only in parser tests.
 struct PackageInput<'a> {
     inner: Cursor<&'a [u8]>,
@@ -535,6 +579,8 @@ struct Package<'a, 'context> {
     probe: Option<Rc<ParserTestProbe>>,
     #[cfg(test)]
     input_test: Option<InputCollectionsTestSession>,
+    #[cfg(test)]
+    part_retention_test: Option<Rc<PartRetentionTestProfile>>,
     collections: InputCollections,
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
@@ -574,6 +620,8 @@ impl<'a, 'context> Package<'a, 'context> {
             probe,
             #[cfg(test)]
             input_test,
+            #[cfg(test)]
+            part_retention_test: PART_RETENTION_TEST_PROFILE.with(|slot| slot.borrow().clone()),
             collections,
             parts: HashMap::new(),
             materials: Vec::new(),
@@ -1210,7 +1258,12 @@ fn boundary_name(
     slicer_object: Option<&SettingsRecord>,
     slicer_part: Option<&SettingsRecord>,
     object_id: u32,
+    #[cfg(test)] probe: Option<&PartRetentionTestProfile>,
 ) -> String {
+    #[cfg(test)]
+    if let Some(probe) = probe {
+        probe.name_builders.set(probe.name_builders.get() + 1);
+    }
     let object_name = setting_name(slicer_object);
     let part_name = setting_name(slicer_part);
     if let (Some(object_name), Some(part_name)) = (object_name, part_name) {
@@ -1941,7 +1994,11 @@ enum StandardAppearance {
 }
 
 impl StandardAppearance {
-    fn observe(&mut self, material_id: Option<&str>) {
+    fn observe(
+        &mut self,
+        material_id: Option<&str>,
+        #[cfg(test)] probe: Option<&PartRetentionTestProfile>,
+    ) {
         if matches!(self, Self::NonUniform) {
             return;
         }
@@ -1950,7 +2007,15 @@ impl StandardAppearance {
             return;
         };
         match self {
-            Self::Empty => *self = Self::Uniform(material_id.to_string()),
+            Self::Empty => {
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe
+                        .appearance_copies
+                        .set(probe.appearance_copies.get() + 1);
+                }
+                *self = Self::Uniform(material_id.to_string());
+            }
             Self::Uniform(current) if current.as_str() != material_id => {
                 *self = Self::NonUniform;
             }
@@ -2012,7 +2077,11 @@ fn emit_object(
                 } else {
                     standard_material_id(pkg, &part, object)
                 };
-                appearance.observe(material_id);
+                appearance.observe(
+                    material_id,
+                    #[cfg(test)]
+                    pkg.part_retention_test.as_deref(),
+                );
             }
             let flip = is_mirror(transform);
             for t in triangles {
@@ -2063,6 +2132,150 @@ fn new_out(scale: f32, collections: &InputCollections) -> Out {
     }
 }
 
+// Optional viewer rows may be omitted without omitting any geometry work.
+// The state is shared across all authored plates, and cannot revive after overflow.
+enum PartRows {
+    Collecting(Vec<ParsedPart>),
+    Omitted,
+}
+
+struct PartOutput {
+    rows: PartRows,
+    limit: usize,
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    test: Option<Rc<PartRetentionTestProfile>>,
+}
+
+impl PartOutput {
+    fn new(pkg: &Package<'_, '_>) -> Self {
+        #[cfg(not(test))]
+        let limit = MAX_VIEWER_PARTS;
+        #[cfg(test)]
+        let limit = pkg
+            .part_retention_test
+            .as_ref()
+            .map_or(MAX_VIEWER_PARTS, |test| test.limit);
+        Self {
+            rows: PartRows::Collecting(Vec::new()),
+            limit,
+            observer: pkg.observer.clone(),
+            #[cfg(test)]
+            test: pkg.part_retention_test.clone(),
+        }
+    }
+
+    fn can_collect_next(&self) -> bool {
+        matches!(&self.rows, PartRows::Collecting(parts) if parts.len() < self.limit)
+    }
+
+    fn appearance(&self) -> StandardAppearance {
+        // Below capacity one in-flight Uniform ID remains a separate scratch
+        // contribution. At capacity/after omission it need not be constructed.
+        if self.can_collect_next() {
+            StandardAppearance::Empty
+        } else {
+            StandardAppearance::NonUniform
+        }
+    }
+
+    // Called only AFTER a candidate emitted nonzero geometry.
+    fn admit_nonempty(&mut self) -> Result<bool, StlError> {
+        self.observer.check()?;
+        let PartRows::Collecting(parts) = &mut self.rows else {
+            return Ok(false);
+        };
+        if parts.len() == self.limit {
+            self.rows = PartRows::Omitted; // drop retained text and backing permanently
+            return Ok(false);
+        }
+        let needed = parts
+            .len()
+            .checked_add(1)
+            .filter(|&n| n <= self.limit)
+            .ok_or_else(|| input_error(&self.observer))?;
+        if needed > parts.capacity() {
+            let target = parts
+                .capacity()
+                .checked_mul(2)
+                .unwrap_or(self.limit)
+                .max(needed)
+                .min(self.limit);
+            target
+                .checked_mul(std::mem::size_of::<ParsedPart>())
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+                .ok_or_else(|| input_error(&self.observer))?;
+            self.observer.check()?;
+            #[cfg(test)]
+            let attempt = self.test.as_ref().map(|test| {
+                let n = test.reserves.get() + 1;
+                test.reserves.set(n);
+                test.requested_capacity.borrow_mut().push(target);
+                n
+            });
+            #[cfg(test)]
+            if let Some(test) = &self.test {
+                if test.fail_reserve_at == attempt {
+                    let _ = self.observer.allocation_failed_io();
+                    self.observer.check()?;
+                }
+            }
+            if parts.try_reserve_exact(target - parts.len()).is_err() {
+                let _ = self.observer.allocation_failed_io();
+                self.observer.check()?;
+            }
+            #[cfg(test)]
+            if let Some(test) = &self.test {
+                if let Some((at, failure)) = test.stop_after_reserve {
+                    if Some(at) == attempt {
+                        self.observer.observe_io(&failure.io_error());
+                    }
+                }
+            }
+            self.observer.check()?;
+        }
+        Ok(true)
+    }
+
+    // Admission has already reserved a slot; this append cannot grow the Vec.
+    fn push_admitted(&mut self, part: ParsedPart) {
+        let PartRows::Collecting(parts) = &mut self.rows else {
+            unreachable!("admitted part output");
+        };
+        debug_assert!(parts.len() < self.limit && parts.len() < parts.capacity());
+        parts.push(part);
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.record_retained(parts.len());
+        }
+    }
+
+    fn finish(
+        self,
+        plates: &[Plate],
+        total: u32,
+    ) -> Result<(Vec<ParsedPart>, Option<String>), StlError> {
+        self.observer.check()?;
+        match self.rows {
+            PartRows::Omitted => Ok((Vec::new(), Some(PART_WARNING.into()))),
+            PartRows::Collecting(mut parts) => {
+                if validate_parts(
+                    &parts,
+                    plates,
+                    total,
+                    #[cfg(test)]
+                    self.limit,
+                ) {
+                    Ok((parts, None))
+                } else {
+                    parts.clear();
+                    Ok((parts, Some(PART_WARNING.into())))
+                }
+            }
+        }
+    }
+}
+
 fn emit_build_item(
     pkg: &mut Package,
     root_path: &str,
@@ -2071,7 +2284,7 @@ fn emit_build_item(
     slicer: &SlicerMetadata,
     component_paths: &HashMap<u32, HashSet<String>>,
     out: &mut Out,
-    parts: &mut Vec<ParsedPart>,
+    parts: &mut PartOutput,
 ) -> Result<(), StlError> {
     #[cfg(test)]
     if let Some(probe) = &pkg.probe {
@@ -2099,7 +2312,7 @@ fn emit_build_item(
     match &object.kind {
         ObjectKind::Mesh { .. } => {
             let triangle_start = out.triangle_count;
-            let mut appearance = StandardAppearance::Empty;
+            let mut appearance = parts.appearance();
             emit_object(
                 pkg,
                 path,
@@ -2110,10 +2323,22 @@ fn emit_build_item(
                 &mut appearance,
             )?;
             let triangle_count = out.triangle_count - triangle_start;
-            if triangle_count != 0 {
-                parts.push(ParsedPart {
+            if triangle_count != 0 && parts.admit_nonempty()? {
+                #[cfg(test)]
+                if let Some(probe) = &pkg.part_retention_test {
+                    probe.id_builders.set(probe.id_builders.get() + 1);
+                }
+                parts.push_admitted(ParsedPart {
                     id: format!("object:{}:instance:{occurrence}", item.object_id),
-                    name: boundary_name(object, None, root_metadata, None, item.object_id),
+                    name: boundary_name(
+                        object,
+                        None,
+                        root_metadata,
+                        None,
+                        item.object_id,
+                        #[cfg(test)]
+                        pkg.part_retention_test.as_deref(),
+                    ),
                     triangle_start,
                     triangle_count,
                     material_id: appearance.into_material_id(),
@@ -2139,18 +2364,9 @@ fn emit_build_item(
                     && !component_part_metadata_ambiguous(component_paths, component.object_id))
                 .then(|| slicer.parts.get(&component.object_id))
                 .flatten();
-                let name = boundary_name(
-                    object,
-                    Some(child_object),
-                    root_metadata,
-                    part_metadata,
-                    component.object_id,
-                );
-                let filament_slot =
-                    setting_extruder(part_metadata).or_else(|| setting_extruder(root_metadata));
                 let child_transform = compose(&component.transform, &item.transform);
                 let triangle_start = out.triangle_count;
-                let mut appearance = StandardAppearance::Empty;
+                let mut appearance = parts.appearance();
                 emit_object(
                     pkg,
                     child_path,
@@ -2161,8 +2377,23 @@ fn emit_build_item(
                     &mut appearance,
                 )?;
                 let triangle_count = out.triangle_count - triangle_start;
-                if triangle_count != 0 {
-                    parts.push(ParsedPart {
+                if triangle_count != 0 && parts.admit_nonempty()? {
+                    let name = boundary_name(
+                        object,
+                        Some(child_object),
+                        root_metadata,
+                        part_metadata,
+                        component.object_id,
+                        #[cfg(test)]
+                        pkg.part_retention_test.as_deref(),
+                    );
+                    let filament_slot =
+                        setting_extruder(part_metadata).or_else(|| setting_extruder(root_metadata));
+                    #[cfg(test)]
+                    if let Some(probe) = &pkg.part_retention_test {
+                        probe.id_builders.set(probe.id_builders.get() + 1);
+                    }
+                    parts.push_admitted(ParsedPart {
                         id: format!(
                             "object:{}:instance:{occurrence}/component:{component_index}:object:{}",
                             item.object_id, component.object_id
@@ -2202,8 +2433,15 @@ fn finish_model(out: Out) -> ParsedStl {
     }
 }
 
-fn validate_parts(parts: &[ParsedPart], plates: &[Plate], total: u32) -> bool {
-    if parts.len() > MAX_VIEWER_PARTS {
+fn validate_parts(
+    parts: &[ParsedPart],
+    plates: &[Plate],
+    total: u32,
+    #[cfg(test)] limit: usize,
+) -> bool {
+    #[cfg(not(test))]
+    let limit = MAX_VIEWER_PARTS;
+    if parts.len() > limit {
         return false;
     }
     let mut index = 0;
@@ -2254,7 +2492,7 @@ fn whole_build(
         probe.record_work();
     }
     let mut out = new_out(root.scale, &pkg.collections);
-    let mut parts = Vec::new();
+    let mut parts = PartOutput::new(pkg);
     let occurrences = build_item_occurrences(&root.build)?;
     for (index, item) in root.build.iter().enumerate() {
         emit_build_item(
@@ -2275,12 +2513,7 @@ fn whole_build(
         triangle_start: 0,
         triangle_count,
     }];
-    let part_warning = if validate_parts(&parts, &plates, triangle_count) {
-        None
-    } else {
-        parts.clear();
-        Some(PART_WARNING.into())
-    };
+    let (parts, part_warning) = parts.finish(&plates, triangle_count)?;
     Ok(ParsedModel {
         model: finish_model(out),
         plates,
@@ -2432,7 +2665,7 @@ fn parse_3mf_with_context(
     // Transforms are expressed in the model's unit, so unit conversion is
     // applied last, to already-placed coordinates.
     let mut out = new_out(root.scale, &pkg.collections);
-    let mut parts = Vec::new();
+    let mut parts = PartOutput::new(&pkg);
     let occurrences = build_item_occurrences(&root.build)?;
     let mut plates = Vec::with_capacity(specs.len());
     for (plate_index, (spec, item_indices)) in specs.iter().zip(&resolved).enumerate() {
@@ -2457,12 +2690,7 @@ fn parse_3mf_with_context(
         });
     }
 
-    let part_warning = if validate_parts(&parts, &plates, out.triangle_count) {
-        None
-    } else {
-        parts.clear();
-        Some(PART_WARNING.into())
-    };
+    let (parts, part_warning) = parts.finish(&plates, out.triangle_count)?;
     Ok(ParsedModel {
         model: finish_model(out),
         plates,
@@ -4302,6 +4530,328 @@ mod tests {
         assert_eq!(parsed.parts[0].name, "Object 1");
         assert_eq!(parsed.parts[0].filament_slot, None);
         assert!(parsed.embedded_filaments.is_empty());
+    }
+
+    struct PartRetentionProfileGuard(Option<Rc<PartRetentionTestProfile>>);
+
+    impl PartRetentionProfileGuard {
+        fn install(profile: Rc<PartRetentionTestProfile>) -> Self {
+            Self(PART_RETENTION_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for PartRetentionProfileGuard {
+        fn drop(&mut self) {
+            PART_RETENTION_TEST_PROFILE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    fn tiny_part_retention_fixture(assigned: bool) -> Vec<u8> {
+        let resources = r#"<object id="1" name="triangle"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>"#;
+        let model = model_xml(
+            "millimeter",
+            resources,
+            &r#"<item objectid="1"/>"#.repeat(3),
+        );
+        let settings = plate_settings(&format!(
+            "{}{}",
+            plate_xml(10, "First", &[(1, 0), (1, 2)]),
+            plate_xml(20, "Second", &[(1, 1)])
+        ));
+        let mut entries = vec![(ROOT_MODEL_FALLBACK, model.as_str())];
+        if assigned {
+            entries.push((PLATE_SETTINGS_PATH, settings.as_str()));
+        }
+        package(&entries, assigned)
+    }
+
+    fn assert_part_retention_high_water(assigned: bool) {
+        let profile = Rc::new(PartRetentionTestProfile::new(2));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let parsed =
+            crate::parse_model_with_plates(&tiny_part_retention_fixture(assigned)).unwrap();
+        assert_eq!(parsed.model.triangle_count, 3);
+        assert_eq!(parsed.model.positions.len(), 27);
+        assert!(parsed.parts.is_empty());
+        assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+        assert_eq!(parsed.plate_metadata, assigned);
+        if assigned {
+            assert!(parsed.plate_warning.is_none());
+            assert_eq!(
+                parsed
+                    .plates
+                    .iter()
+                    .map(|plate| (
+                        plate.name.as_str(),
+                        plate.triangle_start,
+                        plate.triangle_count
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![("First", 0, 2), ("Second", 2, 1)]
+            );
+        } else {
+            assert!(parsed.plate_warning.is_some());
+            assert_eq!(parsed.plates.len(), 1);
+            assert_eq!(parsed.plates[0].triangle_count, 3);
+        }
+        // Observe the actual retained-row high-water, not the already-cleared
+        // final output. Geometry/warning compatibility was asserted above.
+        assert!(
+            profile.high_water.get() <= profile.limit,
+            "actual retained high-water {} exceeds {} (name builders {})",
+            profile.high_water.get(),
+            profile.limit,
+            profile.name_builders.get()
+        );
+        assert_eq!(
+            profile.name_builders.get(),
+            2,
+            "third optional name must never be built"
+        );
+        assert_eq!(profile.id_builders.get(), 2);
+        assert!(!profile.requested_capacity.borrow().is_empty());
+        assert!(profile
+            .requested_capacity
+            .borrow()
+            .iter()
+            .all(|&target| target <= profile.limit));
+    }
+
+    #[test]
+    fn part_retention_whole_build_never_retains_third_optional_boundary() {
+        assert_part_retention_high_water(false);
+    }
+
+    #[test]
+    fn part_retention_assigned_plates_share_one_bounded_accumulator() {
+        assert_part_retention_high_water(true);
+    }
+
+    fn part_retention_triangle() -> &'static str {
+        r#"<object id="1" name="triangle"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>"#
+    }
+
+    fn part_retention_fixture_with_build(resources: &str, build: &str) -> Vec<u8> {
+        let model = model_xml("millimeter", resources, build);
+        package(&[(ROOT_MODEL_FALLBACK, &model)], false)
+    }
+
+    #[test]
+    fn part_retention_exact_capacity_empty_disabled_unprinted_do_not_omit() {
+        for later_overflow in [false, true] {
+            let resources = format!(
+                "{}<object id=\"2\"/>{}",
+                part_retention_triangle(),
+                part_retention_triangle().replace("id=\"1\"", "id=\"3\" type=\"support\"")
+            );
+            let mut build = format!(
+                "{}{}",
+                r#"<item objectid="1"/>"#.repeat(2),
+                r#"<item objectid="2"/><item objectid="1" printable="0"/><item objectid="3"/>"#
+            );
+            if later_overflow {
+                build.push_str(r#"<item objectid="1"/><item objectid="2"/><item objectid="1"/>"#);
+            }
+            let profile = Rc::new(PartRetentionTestProfile::new(2));
+            let _guard = PartRetentionProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+                &resources, &build,
+            ))
+            .unwrap();
+            assert_eq!(
+                parsed.model.triangle_count,
+                if later_overflow { 4 } else { 2 }
+            );
+            assert_eq!(profile.high_water.get(), 2);
+            assert_eq!(profile.name_builders.get(), 2);
+            assert_eq!(profile.id_builders.get(), 2);
+            if later_overflow {
+                assert!(parsed.parts.is_empty());
+                assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+            } else {
+                assert_eq!(parsed.parts.len(), 2);
+                assert!(parsed.part_warning.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn part_retention_component_boundaries_use_the_same_nonempty_admission() {
+        let resources = format!("{}<object id=\"2\"/><object id=\"3\"><components><component objectid=\"1\"/><component objectid=\"1\"/><component objectid=\"2\"/><component objectid=\"1\"/></components></object>", part_retention_triangle());
+        let profile = Rc::new(PartRetentionTestProfile::new(2));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+            &resources,
+            r#"<item objectid="3"/>"#,
+        ))
+        .unwrap();
+        assert_eq!(parsed.model.triangle_count, 3);
+        assert!(parsed.parts.is_empty());
+        assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+        assert_eq!(profile.high_water.get(), 2);
+        assert_eq!(
+            profile.name_builders.get(),
+            2,
+            "empty child and overflow do not build names"
+        );
+        assert_eq!(profile.id_builders.get(), 2);
+    }
+
+    #[test]
+    fn part_retention_capacity_and_omission_suppress_uniform_appearance_copies() {
+        let resources = format!(
+            "{}{}",
+            r##"<basematerials id="5"><base name="Red" displaycolor="#ff0000"/></basematerials>"##,
+            part_retention_triangle().replacen(
+                "<object id=\"1\"",
+                "<object id=\"1\" pid=\"5\" pindex=\"0\"",
+                1
+            )
+        );
+        let profile = Rc::new(PartRetentionTestProfile::new(2));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+            &resources,
+            &r#"<item objectid="1"/>"#.repeat(5),
+        ))
+        .unwrap();
+        assert_eq!(parsed.model.triangle_count, 5);
+        assert_eq!(
+            parsed.materials.len(),
+            1,
+            "global material behavior stays intact"
+        );
+        assert!(parsed.parts.is_empty());
+        assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+        assert_eq!(
+            profile.appearance_copies.get(),
+            2,
+            "only below-cap in-flight Uniform scratch remains"
+        );
+        assert_eq!(profile.name_builders.get(), 2);
+        assert_eq!(profile.id_builders.get(), 2);
+    }
+
+    #[test]
+    fn part_retention_row_reserve_failures_are_terminal_before_record_building() {
+        for assigned in [false, true] {
+            for attempt in [1, 2] {
+                let mut profile = PartRetentionTestProfile::new(2);
+                profile.fail_reserve_at = Some(attempt);
+                let profile = Rc::new(profile);
+                let _guard = PartRetentionProfileGuard::install(profile.clone());
+                assert_input_failure(
+                    parse_3mf(&tiny_part_retention_fixture(assigned)),
+                    ParserTestFailure::Allocation,
+                );
+                assert_eq!(profile.reserves.get(), attempt);
+                assert_eq!(profile.high_water.get(), attempt - 1);
+                assert_eq!(profile.name_builders.get(), attempt - 1);
+                assert_eq!(profile.id_builders.get(), attempt - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn part_retention_post_reserve_first_cause_is_not_optional_fallback() {
+        for assigned in [false, true] {
+            for attempt in [1, 2] {
+                for failure in PARSER_TEST_FAILURES {
+                    let mut profile = PartRetentionTestProfile::new(2);
+                    profile.stop_after_reserve = Some((attempt, failure));
+                    let profile = Rc::new(profile);
+                    let _guard = PartRetentionProfileGuard::install(profile.clone());
+                    assert_input_failure(
+                        parse_3mf(&tiny_part_retention_fixture(assigned)),
+                        failure,
+                    );
+                    assert_eq!(profile.reserves.get(), attempt);
+                    assert_eq!(profile.high_water.get(), attempt - 1);
+                    assert_eq!(profile.name_builders.get(), attempt - 1);
+                    assert_eq!(profile.id_builders.get(), attempt - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn part_retention_omitted_metadata_never_hides_later_geometry_errors() {
+        for nonfinite in [false, true] {
+            let resources = if nonfinite {
+                format!(
+                    "{}{}",
+                    part_retention_triangle(),
+                    part_retention_triangle()
+                        .replacen("id=\"1\"", "id=\"4\"", 1)
+                        .replacen("x=\"0\"", "x=\"NaN\"", 1)
+                )
+            } else {
+                part_retention_triangle().to_owned()
+            };
+            let build = format!(
+                "{}<item objectid=\"{}\"/>",
+                r#"<item objectid="1"/>"#.repeat(3),
+                if nonfinite { 4 } else { 999 }
+            );
+            let profile = Rc::new(PartRetentionTestProfile::new(2));
+            let _guard = PartRetentionProfileGuard::install(profile.clone());
+            let result = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+                &resources, &build,
+            ));
+            if nonfinite {
+                assert!(matches!(
+                    result,
+                    Err(StlError::NonFiniteCoordinate { triangle_index: 3 })
+                ));
+            } else {
+                assert!(matches!(result, Err(StlError::Malformed3mf { .. })));
+            }
+            assert_eq!(profile.high_water.get(), 2);
+            assert_eq!(profile.name_builders.get(), 2);
+            assert_eq!(profile.id_builders.get(), 2);
+        }
+    }
+
+    #[test]
+    fn part_retention_omitted_state_still_obeys_existing_flattened_triangle_limit() {
+        let bytes =
+            part_retention_fixture_with_build(part_retention_triangle(), r#"<item objectid="1"/>"#);
+        let profile = Rc::new(PartRetentionTestProfile::new(0));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        let root = pkg.part(ROOT_MODEL_FALLBACK).unwrap();
+        let mut rows = PartOutput::new(&pkg);
+        let mut out = new_out(1.0, &pkg.collections);
+        let slicer = SlicerMetadata::default();
+        let paths = HashMap::new();
+        emit_build_item(
+            &mut pkg,
+            ROOT_MODEL_FALLBACK,
+            &root.build[0],
+            0,
+            &slicer,
+            &paths,
+            &mut out,
+            &mut rows,
+        )
+        .unwrap();
+        assert!(matches!(rows.rows, PartRows::Omitted));
+        out.triangle_count = MAX_TRIANGLES; // tiny seam into existing output check
+        let error = emit_build_item(
+            &mut pkg,
+            ROOT_MODEL_FALLBACK,
+            &root.build[0],
+            1,
+            &slicer,
+            &paths,
+            &mut out,
+            &mut rows,
+        );
+        assert!(
+            matches!(error, Err(StlError::TooManyTriangles { count, limit }) if count == MAX_TRIANGLES + 1 && limit == MAX_TRIANGLES)
+        );
+        assert_eq!(profile.name_builders.get(), 0);
+        assert_eq!(profile.id_builders.get(), 0);
     }
 
     #[test]
