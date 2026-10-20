@@ -67,6 +67,7 @@ pub mod geometry;
 pub mod images;
 pub mod integration_state;
 pub mod integrations;
+mod png_output;
 pub mod printer_network;
 pub mod printer_network_api;
 pub mod scanner;

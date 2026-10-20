@@ -9,6 +9,7 @@ use image::{ImageDecoder, ImageFormat, ImageReader, Limits};
 use quick_xml::{events::Event, Reader};
 use sha2::{Digest, Sha256};
 
+use crate::png_output::BoundedPngOutput;
 use crate::secure_fs::Directory;
 
 const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -25,6 +26,10 @@ static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Only the two advertised raster formats are decoded. Check dimensions and
 /// pixel count before allocating the full image, then normalize to a small PNG.
 pub fn normalize_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    normalize_image_with_output_limit(bytes, MAX_OUTPUT_BYTES)
+}
+
+fn normalize_image_with_output_limit(bytes: &[u8], output_limit: usize) -> Result<Vec<u8>, String> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err("Preview image must be between 1 byte and 16 MiB".into());
     }
@@ -64,20 +69,20 @@ pub fn normalize_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
             decoded
         };
     let rgba = decoded.into_rgba8();
-    let mut output = Vec::new();
-    {
+    let mut output = BoundedPngOutput::new(output_limit);
+    let encoded = (|| {
         let mut encoder = png::Encoder::new(&mut output, rgba.width(), rgba.height());
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
-        writer
-            .write_image_data(rgba.as_raw())
-            .map_err(|error| error.to_string())?;
-    }
-    if output.len() > MAX_OUTPUT_BYTES {
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(rgba.as_raw())?;
+        writer.finish()
+    })();
+    if output.limit_exceeded() {
         return Err("Normalized preview exceeds its output limit".into());
     }
-    Ok(output)
+    encoded.map_err(|error| error.to_string())?;
+    output.into_bytes().map_err(|error| error.to_string())
 }
 
 pub fn import_custom_image_file(root: &Path, path: &Path) -> Result<(PathBuf, String), String> {
@@ -366,6 +371,36 @@ mod tests {
     fn dimensions(bytes: &[u8]) -> (u32, u32) {
         let reader = png::Decoder::new(Cursor::new(bytes)).read_info().unwrap();
         (reader.info().width, reader.info().height)
+    }
+    #[test]
+    fn normalization_bounded_output_preserves_bytes_and_requires_complete_iend() {
+        let input = png(48, 24);
+        let baseline = input.clone();
+        let output = normalize_image_with_output_limit(&input, baseline.len()).unwrap();
+        assert_eq!(output, baseline);
+        assert_eq!(normalize_image(&input).unwrap(), baseline);
+        assert_eq!(
+            normalize_image_with_output_limit(&input, baseline.len() - 1).unwrap_err(),
+            "Normalized preview exceeds its output limit"
+        );
+        assert_eq!(
+            &output[output.len() - 12..],
+            b"\0\0\0\0IEND\xae\x42\x60\x82"
+        );
+        let mut reader = png::Decoder::new(Cursor::new(&output)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut pixels).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(pixels, vec![127; 48 * 24 * 4]);
+        drop(reader);
+
+        let mut bad_crc = output;
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let mut reader = png::Decoder::new(Cursor::new(&bad_crc))
+            .read_info()
+            .unwrap();
+        reader.next_frame(&mut pixels).unwrap();
+        assert!(reader.finish().is_err());
     }
     #[test]
     fn accepts_real_png_and_preserves_aspect_ratio_with_bounded_output() {

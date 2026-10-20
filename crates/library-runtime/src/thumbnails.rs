@@ -9,6 +9,7 @@ use library_core::CatalogSettings;
 use sha2::{Digest, Sha256};
 use stl_core::ParsedStl;
 
+use crate::png_output::BoundedPngOutput;
 use crate::secure_fs::Directory;
 
 const RENDER_VERSION: u32 = 1;
@@ -540,6 +541,14 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
 }
 
 fn render_png(model: &ParsedStl, settings: &CatalogSettings) -> Result<Vec<u8>, String> {
+    render_png_with_output_limit(model, settings, MAX_CACHED_PNG_BYTES as usize)
+}
+
+fn render_png_with_output_limit(
+    model: &ParsedStl,
+    settings: &CatalogSettings,
+    output_limit: usize,
+) -> Result<Vec<u8>, String> {
     let size = usize::try_from(settings.thumbnail_size)
         .map_err(|_| "Thumbnail size is invalid".to_string())?;
     if !matches!(size, 128 | 256 | 512) {
@@ -610,18 +619,21 @@ fn render_png(model: &ParsedStl, settings: &CatalogSettings) -> Result<Vec<u8>, 
         }
     }
 
-    let mut output = Vec::new();
-    {
+    let mut output = BoundedPngOutput::new(output_limit);
+    let encoded = (|| {
         let mut encoder = png::Encoder::new(&mut output, size as u32, size as u32);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
-        writer
-            .write_image_data(&rgba)
-            .map_err(|error| error.to_string())?;
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&rgba)?;
+        writer.finish()
+    })();
+    if output.limit_exceeded() {
+        return Err("Generated thumbnail exceeds its cache size limit".into());
     }
-    Ok(output)
+    encoded.map_err(|error| error.to_string())?;
+    output.into_bytes().map_err(|error| error.to_string())
 }
 
 fn project(point: impl AsRef<[f32]>) -> [f32; 3] {
@@ -785,6 +797,53 @@ mod tests {
             positions: vec![0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 20.0, 0.0],
             stored_normals: vec![0.0, 0.0, 1.0],
         }
+    }
+
+    #[test]
+    fn raster_bounded_output_preserves_legacy_encoding_and_requires_complete_iend() {
+        let model = ParsedStl {
+            format: StlFormat::Binary,
+            triangle_count: 0,
+            positions: Vec::new(),
+            stored_normals: Vec::new(),
+        };
+        let settings = settings();
+        let rgba = [0x12, 0x17, 0x1f, 255].repeat(256 * 256);
+        let mut baseline = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut baseline, 256, 256);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgba).unwrap();
+            // Match the previous production encoder's successful Drop footer.
+        }
+        let output = render_png_with_output_limit(&model, &settings, baseline.len()).unwrap();
+        assert_eq!(output, baseline);
+        assert_eq!(render_png(&model, &settings).unwrap(), baseline);
+        assert_eq!(
+            render_png_with_output_limit(&model, &settings, baseline.len() - 1).unwrap_err(),
+            "Generated thumbnail exceeds its cache size limit"
+        );
+        assert_eq!(
+            &output[output.len() - 12..],
+            b"\0\0\0\0IEND\xae\x42\x60\x82"
+        );
+        let mut reader = png::Decoder::new(Cursor::new(&output)).read_info().unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut decoded).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(decoded, rgba);
+        drop(reader);
+
+        let mut bad_crc = output;
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let mut reader = png::Decoder::new(Cursor::new(&bad_crc))
+            .read_info()
+            .unwrap();
+        reader.next_frame(&mut decoded).unwrap();
+        assert!(reader.finish().is_err());
     }
 
     fn proof_recipe(source: &[u8]) -> ThumbnailRecipe {

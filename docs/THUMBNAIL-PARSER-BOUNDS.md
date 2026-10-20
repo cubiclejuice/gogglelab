@@ -27,8 +27,10 @@ is part of this prerequisite.
 - `crates/library-runtime/src/images.rs`: `embedded_3mf_thumbnail` also constructs
   ZIP metadata before its entry check. `normalize_image` has decoder limits, but
   input, decoded/oriented image, resized/RGBA image and encoded output can overlap.
-  Both its PNG encoder and `thumbnails.rs::render_png` check output size only after
-  growing a `Vec`; use a bounded encoder sink.
+  Both its PNG encoder and `thumbnails.rs::render_png` now use a shared bounded
+  output sink and explicitly finish the PNG stream. The sink refuses a write
+  before it would exceed 4 MiB and retains errors through footer retries. This
+  bounds encoded output, not compressor workspace or the complete producer.
 
 The locked ZIP implementation has no application entry-budget option and may
 reserve from the EOCD count during construction. A subsequent `archive.len()` check
