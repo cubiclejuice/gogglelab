@@ -1,6 +1,6 @@
 # Generated media retention
 
-Status: anonymous geometry implementation and independent review complete; final serial workspace, Clippy, formatting and Community production build/signature checks pass; live Linux packet/restart checks pass. Unlicensed combined-app stock/index/preview checks pass, with native scan refresh and collection-dialog issues found and being corrected. Thumbnail/orphan proof remains a subsequent gate.
+Status: anonymous geometry implementation and independent review complete; final serial workspace, Clippy, formatting and Community production build/signature checks pass; live Linux packet/restart checks pass. Unlicensed combined-app stock/index/preview and the repaired native scan/collection workflows pass at `0ffc262`, including keyboard focus and actual synthetic slicer handoff. Thumbnail/orphan proof remains a subsequent gate.
 
 ## Required outcome
 
@@ -184,3 +184,11 @@ adds path deletion. An equal-byte replacement/cursor regression passes; the full
 passes with the exact synthetic JSON/PEM fixtures included. This is compilation
 evidence, not Windows execution or installer acceptance. Independent review found
 no actionable defect.
+
+Native development-composition acceptance closes at public `0ffc262`: fast scan
+refresh, visible collection create/rename/validation, keyboard focus fallback,
+finished thumbnail job and actual synthetic slicer handoff pass without a license.
+Same-output native regeneration leaves staging empty. The isolated app is stopped;
+normal profile/install and official pin are unchanged. This closes the geometry/UI
+checkpoint; the separate thumbnail/orphan provenance design is the next media
+implementation gate. Known native purge/MainboardID prompt follow-ups remain.

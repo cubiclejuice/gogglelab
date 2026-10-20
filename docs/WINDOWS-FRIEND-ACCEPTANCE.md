@@ -124,6 +124,15 @@ Record the displayed exact fixture root. If junction creation is unavailable, ma
 
 Add `$library` as an in-place indexed root and scan. Verify both STL entries, thumbnails, selection, search/filter, tags/categories, favorites/collections, and basic management work in Free. Restart and re-scan: state must persist without duplicate entries. Originals must stay at their source paths with unchanged hashes after scanning, thumbnail generation, metadata edits, and catalog-only removal.
 
+Check fast completion without closing/reopening Library: add another synthetic STL,
+scan that root, and require the visible model count, source scan time and preview
+to update. Repeat a quick scan and a preview job; a completed job must not leave
+the old catalog visible. Create and rename a collection through the visible
+labelled in-app dialog, test Cancel/invalid names, and verify keyboard focus stays
+in Library after a successful refresh. Missing native prompts or refresh only
+after reopening are failures.
+
+
 Test valid owner-supplied synthetic 3MF/ZIP fixtures separately, including grouping and safe extraction. Do not rename arbitrary bytes to those extensions. Missing fixtures are `BLOCKED`. Malformed input must give a safe error without crashing or writing outside the test area.
 
 Confirm `outside.stl` is not indexed/reachable through the junction. Use only app actions expected to reject an out-of-root path; do not manually move, trash, or edit the outside file. Recheck:

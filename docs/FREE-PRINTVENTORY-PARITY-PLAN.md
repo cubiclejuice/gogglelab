@@ -639,3 +639,55 @@ The corrected frontend command uses explicit `./src` and build-argument test pat
 so Bun cannot count archived source snapshots. All 334 tests / 1,322 assertions
 across 38 current-worktree files pass, along with format, lint and typecheck
 (existing warning only). Actual rebuilt combined-app QA remains the next gate.
+
+### Native delivery checkpoint at `0ffc262` (2026-10-19)
+
+The exact public code commit is
+`0ffc262dff1b425f0aa880cd6d112d0800a3c679`. Both production web bundles and
+the Community app build; the app's deep strict signature verifies, with executable
+SHA-256 `3260384543ef9854c0e600256966e3b85e2279b0fc0b6034e2e6a84ec6b772fd`.
+The prior `9331722` working Community app was physically cloned and its hash and
+signature reverified before the new build.
+
+The isolated development composition is refreshed to this public code, keeping
+private `2755084`, the proposed dependency-edge-only lock reconciliation and the
+live official core pin unchanged. Its 44 frontend tests, 67 private Rust/license/
+issuer tests, Clippy, web builds and separately named/signed QA app all pass.
+Actual native interaction without a license verifies:
+
+- A fast scan changes the visible catalog from one to two models and updates the
+  source scan time without closing/reopening Library. Both generated cards appear.
+- Collection create/rename persist; invalid names stay in the dialog and Cancel
+  performs no create. A keyboard-invoked save returns focus to Library search after
+  refresh removes the old button. Mouse/AX invocation can legitimately restore the
+  still-connected Library container. No speculative focus-timing patch was added.
+- Regenerate all finishes at 2/2 and reenables controls. Staging has zero files
+  before and after this same-output regeneration. Different-output/unknown PNG
+  retirement still needs the independent proof work below.
+- A freshly created harmless local slicer is selected with the normal picker,
+  explicitly trusted and saved in the QA profile, temporarily selected as default,
+  and invoked through the normal handoff shortcut. It receives exactly one model
+  path whose bytes match the unchanged synthetic source SHA-256. The original
+  `No default slicer` selection is restored and verified. No real slicer, printer
+  or provider is contacted.
+
+The first file-picker automation attempt timed out before opening the dialog;
+observation recovered, and the full picker interaction completed without manual
+input. The isolated app is now confirmed stopped. Read-back assertions and the
+native screenshot are in `output/composition-0ffc262-native-checks.json` and
+`output/composition-0ffc262-free-library.png`; private snapshot provenance stays
+out of public source. The normal profile, installed app, Pro checkout and existing
+uncommitted work remain untouched.
+
+Windows issue #2 now embeds the complete revised Markdown plan with exact
+`0ffc262` code provenance, including fast scan and native collection cases; issue
+body equality was verified by read-back. Windows runtime/installer acceptance is
+still open. Draft PR #4 remains unmerged. Remaining local work includes independent
+PNG reproducibility/retirement proof and the two native prompt follow-ups above;
+official main/core-pin delivery, native Linux desktop, hardware and final release
+checks also remain. Full parity/release acceptance is not claimed.
+
+No further permanent build cleanup was performed: **0 additional bytes recovered**.
+The reused target and preserved working/release candidates remain. Data-volume
+free space was about 14 GiB after these builds; any future exact cleanup scope needs
+a fresh idle/open-file check, dry-run and explicit approval.
