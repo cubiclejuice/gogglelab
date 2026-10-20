@@ -13,7 +13,7 @@ pub mod parse;
 pub mod threemf;
 mod vec3;
 
-pub use error::StlError;
+pub use error::{ResourceStop, StlError};
 pub use integrity::{integrity, Integrity, IntegrityResult};
 pub use measure::{measure, Bbox, GeometryStats};
 pub use model::{

@@ -83,6 +83,9 @@ impl From<stl_core::StlError> for AppError {
                 AppError::NonFiniteCoordinate { triangle_index }
             }
             stl_core::StlError::Malformed3mf { detail } => AppError::Malformed3mf { detail },
+            stl_core::StlError::ResourceStopped(stop) => AppError::Library {
+                message: stop.to_string(),
+            },
         }
     }
 }
@@ -99,5 +102,26 @@ pub fn map_io_error(e: &std::io::Error) -> AppError {
     match e.kind() {
         std::io::ErrorKind::NotFound => AppError::NotFound,
         _ => AppError::NotReadable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_stops_keep_the_existing_native_library_error_shape() {
+        for stop in [
+            stl_core::ResourceStop::InputLimitExceeded,
+            stl_core::ResourceStop::ReadWorkExceeded,
+            stl_core::ResourceStop::EnvelopeChanged,
+        ] {
+            let mapped = AppError::from(stl_core::StlError::ResourceStopped(stop));
+            let serialized = serde_json::to_value(mapped).unwrap();
+            assert_eq!(
+                serialized,
+                serde_json::json!({ "kind": "Library", "message": stop.to_string() })
+            );
+        }
     }
 }

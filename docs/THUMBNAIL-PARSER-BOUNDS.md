@@ -31,6 +31,9 @@ is part of this prerequisite.
   output sink and explicitly finish the PNG stream. The sink refuses a write
   before it would exceed 4 MiB and retains errors through footer retries. This
   bounds encoded output, not compressor workspace or the complete producer.
+- `crates/library-runtime/src/embedded.rs`: `parse_standard_fields` is a sixth
+  production ZIP constructor. Its package and later root-model metadata reads
+  need the same bounded constructor and text/work policy.
 
 The locked ZIP implementation has no application entry-budget option and may
 reserve from the EOCD count during construction. A subsequent `archive.len()` check
@@ -130,6 +133,15 @@ allocation/fallback behavior, not regressions introduced by the unwired foundati
   including checked integer conversions and single-volume consistency. Add raw
   read/seek/candidate work limits covering footer searches, local metadata,
   constructor retries and outer hash passes, separately from inflated work.
+- Count physical central records before filename deduplication. Validate the
+  checked central range and actual/declared record count; `archive.len()` can
+  hide duplicate physical records. Bound decoded names/comments, Unicode-extra
+  replacements, retained extra-field copies and lookup-map keys as well as raw
+  metadata. A 16 MiB encoded envelope is not a 16 MiB allocation allowance.
+- Preserve fatal exhaustion through locator `.ok()`, ZIP32/ZIP64 search catches,
+  central retries and prior-error selection. Charge each signature candidate
+  inside the search. A previously malformed candidate must never mask a later
+  resource stop or cause it to become another footer fallback.
 - Validate local headers and compressed ranges against approved central metadata,
   including ZIP64 fields and data-descriptor flags. Legitimate bit-3 zero local
   sizes must use descriptor-aware rules. Refuse overlaps or offsets into central
@@ -151,10 +163,34 @@ allocation/fallback behavior, not regressions introduced by the unwired foundati
   reads. Temporary numeric coordinate strings are not permanently retained text;
   keep live storage charges distinct from bounded total processing work.
 
-Smallest next implementation slice: bounded encoder sink plus explicit finalization
-in both PNG producers, preserving normal bytes. Then close typed propagation and
-constructor binding before the package-wide parser/JSON changes and producer
-allowance. These plan findings remain open requirements until their corresponding
+The bounded encoder/finalization slice is verified at `fc23b4a`: all five new
+boundary/byte-equivalence/footer tests pass on macOS and Linux; workspace checks,
+Community packaging, Linux server build and Windows GNU compilation pass in
+hosted PR run `39372166206`. Windows execution is separate.
+
+The next foundation adds an opt-in bounded ZIP constructor and typed parser stops,
+without migrating producers yet. Prefer intrinsic checks in the locked ZIP
+implementation over an application preflight followed by unrestricted construction.
+One sticky budget must cover all retries and check the actual values used at
+allocation time, including mutable seekable sources. Proposed constructor policy
+adds 64 footer/ZIP64 candidates, 64 MiB metadata read work and a separately bounded
+allocation-work allowance to the limits above. Default ZIP APIs retain their
+existing semantics. Preserve dependency license and provenance when carrying a
+narrow local patch.
+
+Constructor bounds do not validate every later local-header read or establish
+source identity. Keep those gates open: checked local ranges and descriptor-aware
+consistency before caching data offsets; separate metadata work from compressed
+member payload; retain original source identity/hash checks. An immutable snapshot
+alternative would need to cover every reachable retry/header, not just one footer.
+
+Typed `InputLimitExceeded` and `ReadWorkExceeded` are deterministic, nonretryable
+stops; `EnvelopeChanged` is a retryable stale-source stop. Temporary runtime permit
+contention stays separate. Preserve these types through optional paths until the
+outer presentation boundary; never infer their meaning from error strings.
+
+Close typed propagation and constructor/local-header binding before package-wide
+parser/JSON changes and producer allowance. These findings remain open until their
 implementation tests pass; no unsafe producer wiring is authorized by this plan.
 
 ## Compatibility and small boundary tests
