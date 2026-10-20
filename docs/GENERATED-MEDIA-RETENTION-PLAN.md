@@ -251,3 +251,50 @@ winner, cancellation and partial counts after sync failure, active-reader exclus
 budget continuation past unprovable prefixes and safe restart. Each implementation
 slice gets independent review, affected tests and build before advancing; publication
 and actual cleanup stay unchanged until their own gates pass.
+
+### Proof foundation implementation gate (2026-10-19)
+
+`thumbnails.rs` now parses strict complete canonical v1 recipes and shares the
+existing source renderer between normal generation and independent reproduction.
+Opaque raster output binds verified source hash/length, canonical recipe, exact
+PNG bytes and computed output hash. No external raw-bytes constructor exists.
+Embedded preview copies remain a distinct protected variant and never qualify,
+even when they equal the raster result. Cache admission is not consulted by proof.
+Publication, orphan eligibility and deletion callers are unchanged.
+
+The new contract's initial tests fail to compile against the missing API (new
+feature RED, not a claimed reproduction of an existing behavior bug). All 14
+thumbnail tests and all 282 runtime tests subsequently pass. Requested package
+Clippy/all-targets, Rust formatting and diff checks pass with existing warnings.
+An additional optional `-D warnings` run stopped on pre-existing `stl-core`
+warnings; unrelated code was not changed. Independent review's only finding was
+missing source/recipe association in the initial opaque output. It is fixed by
+private bound fields/read-only accessors; final review found no remaining issue.
+Logs are `output/thumbnail-proof-foundation-*`. App build and isolated runtime
+acceptance must complete before advancing to the PNG receipt primitive.
+
+### Next PNG primitive: stage failure authority
+
+Keep created stages and independently reproduced candidates distinct. Mint an
+opaque, non-Clone created-stage owner immediately after exclusive open, before
+payload writing. Retain the original descriptor, pinned parent/entry identity and
+intended opaque raster output. Stage creation failures return the original owner
+when one exists; never discard and reopen authority through a fresh path/hash.
+For this created-stage domain only, partial output may retire after bounded exact
+comparison with the intended bytes' actual-length prefix, before and after private
+capture. Reproduced candidates require complete exact output and never accept a
+prefix. Metadata/read uncertainty preserves the owner and bytes.
+
+No Drop cleanup or source-hold fallback. Report actual removed bytes and whether
+unlink happened, including synchronization failure after unlink, without double
+counting retries. Capture mismatch preserves the private claim and replacement;
+no claim sweep or automatic adoption after restart. Later publication needs bounded
+retained-stage inventory/admission because restart loses descriptor authority and
+unknown partial stages remain protected. Test empty/partial writes, sync faults,
+public replacement, exact-byte inode replacement and truthful partial outcomes.
+
+Foundation Community production build and both web bundles pass, with deep strict
+signature verification. Executable SHA-256:
+`2f55215939e07bdc31d88c44da3fd927da86bb6492a05240edc12e7c66a207c9`.
+The previous `9f64119` signed Community and isolated QA bundles are preserved with
+verified hashes. Isolated rebuilt native rendering acceptance remains in progress.

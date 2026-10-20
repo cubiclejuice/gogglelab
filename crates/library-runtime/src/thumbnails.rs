@@ -25,6 +25,187 @@ pub struct ThumbnailArtifact {
     pub png_hash: String,
 }
 
+/// A supported recipe parsed from a complete canonical cache filename. Names
+/// supply lookup hints only: neither source nor PNG digests establish ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThumbnailRecipe {
+    source_hash: String,
+    size: u32,
+    background: String,
+    png_hash_hint: Option<String>,
+}
+impl ThumbnailRecipe {
+    pub(crate) fn parse_filename(name: &OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        let (source_hash, suffix) = name.strip_suffix(".png")?.split_once("-isometric-v1-")?;
+        let mut fields = suffix.split('-');
+        let size = match fields.next()? {
+            "128" => 128,
+            "256" => 256,
+            "512" => 512,
+            _ => return None,
+        };
+        let background = fields.next()?;
+        let png_hash_hint = fields.next();
+        let canonical_hex = |value: &str, length| {
+            value.len() == length
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        };
+        if !canonical_hex(source_hash, 64)
+            || !canonical_hex(background, 6)
+            || png_hash_hint.is_some_and(|hash| !canonical_hex(hash, 64))
+            || fields.next().is_some()
+        {
+            return None;
+        }
+        Some(Self {
+            source_hash: source_hash.to_owned(),
+            size,
+            background: background.to_owned(),
+            png_hash_hint: png_hash_hint.map(str::to_owned),
+        })
+    }
+    pub(crate) fn source_hash(&self) -> &str {
+        &self.source_hash
+    }
+    fn settings(&self) -> CatalogSettings {
+        CatalogSettings {
+            thumbnail_size: self.size,
+            thumbnail_background: format!("#{}", self.background),
+            thumbnail_concurrency: 1,
+            scan_batch_size: 128,
+        }
+    }
+}
+
+/// Constructible only by the deterministic raster renderer, never by admitting
+/// an existing cache file or copying an embedded archive preview.
+#[derive(Debug)]
+pub(crate) struct RasterGeneratedPng {
+    bytes: Vec<u8>,
+    recipe: ThumbnailRecipe,
+    source_bytes: u64,
+    png_hash: String,
+}
+impl RasterGeneratedPng {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    // Read-only bindings for the subsequent, separately gated PNG admission.
+    #[allow(dead_code)]
+    pub(crate) fn recipe(&self) -> &ThumbnailRecipe {
+        &self.recipe
+    }
+    #[allow(dead_code)]
+    pub(crate) fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+    pub(crate) fn png_hash(&self) -> &str {
+        &self.png_hash
+    }
+}
+#[derive(Debug)]
+struct EmbeddedPreviewPng {
+    bytes: Vec<u8>,
+}
+#[derive(Debug)]
+enum SourceThumbnail {
+    RasterGenerated(RasterGeneratedPng),
+    EmbeddedPreviewCopy(EmbeddedPreviewPng),
+}
+impl SourceThumbnail {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::RasterGenerated(png) => png.bytes,
+            Self::EmbeddedPreviewCopy(png) => png.bytes,
+        }
+    }
+}
+
+/// Pure bounded source rendering shared with normal generation. Callers still
+/// admit the source through catalog/root/epoch checks; a digest alone is not
+/// permission to read a source. This function accepts no cache path or catalog.
+fn render_source_thumbnail(
+    source: &[u8],
+    source_hash: &str,
+    expected_bytes: u64,
+    settings: &CatalogSettings,
+) -> Result<SourceThumbnail, String> {
+    if source.len() as u64 != expected_bytes
+        || expected_bytes > stl_core::limits::MAX_FILE_BYTES
+        || hex_digest(source) != source_hash
+    {
+        return Err("Model source changed since it was indexed".into());
+    }
+    let relative = thumbnail_relative_path(source_hash, settings);
+    let recipe = relative
+        .file_name()
+        .and_then(ThumbnailRecipe::parse_filename)
+        .ok_or_else(|| "Unsupported thumbnail recipe".to_owned())?;
+    if recipe.source_hash() != source_hash {
+        return Err("Thumbnail recipe source mismatch".into());
+    }
+    // Keep the existing parser/embedded-selection order and raster algorithm.
+    // Their existing expansion, triangle-stride and raster-sample limits apply.
+    let parsed = stl_core::parse_model(source).map_err(|error| error.to_string())?;
+    let rendered = match crate::images::embedded_3mf_thumbnail(source) {
+        Ok(Some(bytes)) => SourceThumbnail::EmbeddedPreviewCopy(EmbeddedPreviewPng { bytes }),
+        _ => {
+            let bytes = render_png(&parsed, settings)?;
+            let png_hash = hex_digest(&bytes);
+            SourceThumbnail::RasterGenerated(RasterGeneratedPng {
+                bytes,
+                recipe,
+                source_bytes: expected_bytes,
+                png_hash,
+            })
+        }
+    };
+    let bytes = match &rendered {
+        SourceThumbnail::RasterGenerated(png) => png.bytes(),
+        SourceThumbnail::EmbeddedPreviewCopy(png) => &png.bytes,
+    };
+    if bytes.len() as u64 > MAX_CACHED_PNG_BYTES {
+        return Err("Generated thumbnail exceeds its cache size limit".into());
+    }
+    Ok(rendered)
+}
+
+/// Independent raster reproduction only. Embedded previews and a mismatched
+/// content-address hint remain unproven regardless of any cache equality.
+/// Foundation only: cleanup callers are deliberately not wired before review.
+#[allow(dead_code)]
+pub(crate) fn reproduce_thumbnail(
+    recipe: &ThumbnailRecipe,
+    source: &[u8],
+    expected_bytes: u64,
+) -> Result<Option<RasterGeneratedPng>, String> {
+    match render_source_thumbnail(
+        source,
+        recipe.source_hash(),
+        expected_bytes,
+        &recipe.settings(),
+    )? {
+        SourceThumbnail::EmbeddedPreviewCopy(_) => Ok(None),
+        SourceThumbnail::RasterGenerated(mut png) => {
+            if recipe
+                .png_hash_hint
+                .as_ref()
+                .is_some_and(|hint| hint != png.png_hash())
+            {
+                Ok(None)
+            } else {
+                // Bind the exact parsed legacy/CA selector to the independently
+                // rendered bytes; callers cannot substitute a different recipe.
+                png.recipe = recipe.clone();
+                Ok(Some(png))
+            }
+        }
+    }
+}
+
 pub fn thumbnail_relative_path(content_hash: &str, settings: &CatalogSettings) -> PathBuf {
     let background = settings
         .thumbnail_background
@@ -142,14 +323,8 @@ pub(crate) fn ensure_thumbnail_from_bytes(
             None => {}
         }
     }
-    let parsed = stl_core::parse_model(source_bytes).map_err(|error| error.to_string())?;
-    let png = match crate::images::embedded_3mf_thumbnail(source_bytes) {
-        Ok(Some(png)) => png,
-        _ => render_png(&parsed, settings)?,
-    };
-    if png.len() as u64 > MAX_CACHED_PNG_BYTES {
-        return Err("Generated thumbnail exceeds its cache size limit".into());
-    }
+    let png = render_source_thumbnail(source_bytes, content_hash, expected_source_bytes, settings)?
+        .into_bytes();
     let png_hash = hex_digest(&png);
     // Regeneration can reproduce the exact cache entry. Reuse those verified
     // bytes rather than displacing them into a permanent recovery hold.
@@ -574,6 +749,142 @@ mod tests {
             positions: vec![0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 20.0, 0.0],
             stored_normals: vec![0.0, 0.0, 1.0],
         }
+    }
+
+    fn proof_recipe(source: &[u8]) -> ThumbnailRecipe {
+        let name = thumbnail_relative_path(&hex_digest(source), &settings());
+        ThumbnailRecipe::parse_filename(name.file_name().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn proof_recipe_parser_accepts_only_complete_canonical_supported_names() {
+        let hash = "a".repeat(64);
+        let png = "b".repeat(64);
+        for size in [128, 256, 512] {
+            let legacy = format!("{hash}-isometric-v1-{size}-12171f.png");
+            let recipe = ThumbnailRecipe::parse_filename(OsStr::new(&legacy)).unwrap();
+            assert_eq!(recipe.source_hash, hash);
+            assert_eq!(recipe.size, size);
+            assert_eq!(recipe.background, "12171f");
+            assert_eq!(recipe.png_hash_hint, None);
+            let ca = format!("{hash}-isometric-v1-{size}-12171f-{png}.png");
+            assert_eq!(
+                ThumbnailRecipe::parse_filename(OsStr::new(&ca))
+                    .unwrap()
+                    .png_hash_hint,
+                Some(png.clone())
+            );
+        }
+        for name in [
+            format!("../{hash}-isometric-v1-256-12171f.png"),
+            format!("thumbnails/{hash}-isometric-v1-256-12171f.png"),
+            format!("x\\{hash}-isometric-v1-256-12171f.png"),
+            format!("{hash}-isometric-v2-256-12171f.png"),
+            format!("{hash}-isometric-v01-256-12171f.png"),
+            format!("{hash}-isometric-v1-0256-12171f.png"),
+            format!("{hash}-isometric-v1-1024-12171f.png"),
+            format!("{}-isometric-v1-256-12171f.png", hash.to_uppercase()),
+            format!("{hash}-isometric-v1-256-12171F.png"),
+            format!("{hash}-isometric-v1-256-12171f-{png}.png.extra"),
+            format!("{hash}-isometric-v1-256-12171f-{}.png", "B".repeat(64)),
+            format!("{hash}-isometric-v1-256-12171f.png\0"),
+        ] {
+            assert!(
+                ThumbnailRecipe::parse_filename(OsStr::new(&name)).is_none(),
+                "accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_bypasses_adopted_cache_and_exactly_reproduces_only_raster_output() {
+        let source = binary_triangle();
+        let recipe = proof_recipe(&source);
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("thumbnails")).unwrap();
+        let mut changed = settings();
+        changed.thumbnail_background = "#ff0000".into();
+        let foreign = render_png(&one_triangle(), &changed).unwrap();
+        let relative = thumbnail_relative_path(&hex_digest(&source), &settings());
+        fs::write(root.path().join(&relative), &foreign).unwrap();
+        let adopted = ensure_thumbnail_from_bytes(
+            root.path(),
+            &source,
+            &hex_digest(&source),
+            source.len() as u64,
+            &settings(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(adopted.png_hash, hex_digest(&foreign));
+        let proof = reproduce_thumbnail(&recipe, &source, source.len() as u64)
+            .unwrap()
+            .unwrap();
+        let expected = render_png(&one_triangle(), &settings()).unwrap();
+        assert_eq!(proof.recipe(), &recipe);
+        assert_eq!(proof.source_bytes(), source.len() as u64);
+        assert_eq!(proof.png_hash(), hex_digest(&expected));
+        assert_eq!(proof.bytes, expected);
+        assert_ne!(proof.bytes, foreign);
+        assert_eq!(fs::read(root.path().join(relative)).unwrap(), foreign);
+        let mut addressed = recipe.clone();
+        addressed.png_hash_hint = Some(hex_digest(&expected));
+        assert_eq!(
+            reproduce_thumbnail(&addressed, &source, source.len() as u64)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            expected
+        );
+        addressed.png_hash_hint = Some("0".repeat(64));
+        assert!(
+            reproduce_thumbnail(&addressed, &source, source.len() as u64)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn proof_rejects_changed_source_hash_size_and_source_limit_before_rendering() {
+        let source = binary_triangle();
+        let recipe = proof_recipe(&source);
+        assert!(reproduce_thumbnail(&recipe, &source, source.len() as u64 + 1).is_err());
+        assert!(
+            reproduce_thumbnail(&recipe, &source, stl_core::limits::MAX_FILE_BYTES + 1).is_err()
+        );
+        let mut changed = source.clone();
+        changed[0] ^= 1;
+        assert!(reproduce_thumbnail(&recipe, &changed, changed.len() as u64).is_err());
+    }
+
+    #[test]
+    fn proof_never_qualifies_embedded_preview_copies_even_when_pixels_match_raster() {
+        let source = three_mf_cube();
+        let parsed = stl_core::parse_model(&source).unwrap();
+        let preview = render_png(&parsed, &settings()).unwrap();
+        let mut archive = zip::ZipWriter::new_append(Cursor::new(source)).unwrap();
+        archive
+            .start_file(
+                "Metadata/thumbnail.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&preview).unwrap();
+        let embedded_source = archive.finish().unwrap().into_inner();
+        let recipe = proof_recipe(&embedded_source);
+        let rendered = render_source_thumbnail(
+            &embedded_source,
+            &recipe.source_hash,
+            embedded_source.len() as u64,
+            &settings(),
+        )
+        .unwrap();
+        assert!(matches!(rendered, SourceThumbnail::EmbeddedPreviewCopy(_)));
+        assert!(
+            reproduce_thumbnail(&recipe, &embedded_source, embedded_source.len() as u64)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
