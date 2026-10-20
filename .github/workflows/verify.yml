@@ -49,3 +49,66 @@ jobs:
 
       - name: Build Community app
         run: bun run build
+
+  linux-headless:
+    name: Linux headless tests, Clippy and server build
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out public source only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust matching the headless container recipe
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.94.0
+          components: clippy
+
+      # These packages do not depend on the Tauri desktop application. Server
+      # tests create their own temporary web fixtures; no bundled assets are needed.
+      - name: Test public Linux headless packages
+        run: cargo test -p library-core -p library-runtime -p library-server --all-targets --locked -- --test-threads=1
+
+      - name: Lint public Linux headless packages
+        run: cargo clippy -p library-core -p library-runtime -p library-server --all-targets --locked
+
+      - name: Build public Linux server binary
+        run: cargo build -p library-server --bin gogglelab-server --locked
+
+  windows-gnu-compile:
+    name: Windows GNU core/runtime compilation (Linux host)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc-posix
+      CXX_x86_64_pc_windows_gnu: x86_64-w64-mingw32-g++-posix
+      AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc-posix
+    steps:
+      - name: Check out public source only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install the MinGW POSIX compiler toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix
+
+      - name: Set up Rust and Windows GNU target
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.94.0
+          targets: x86_64-pc-windows-gnu
+
+      # Compile test bodies too, including cfg(windows); this does not execute
+      # Windows binaries or replace the separate friend-run native acceptance gate.
+      - name: Compile public core/runtime and test targets for Windows GNU
+        run: cargo check -p library-core -p library-runtime --all-targets --target x86_64-pc-windows-gnu --locked
