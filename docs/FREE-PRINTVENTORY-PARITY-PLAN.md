@@ -1054,3 +1054,34 @@ compiler output in the same older target, covered by the exact approved command.
 The policy now requires inspecting that dependency namespace and linked outputs
 as well. No further deletion or neighboring-target/cache cleanup was performed.
 Evidence: `output/approved-runtime-cleanup-20261020/reconciliation.json`.
+
+### Shared build index and streamed plate membership (2026-10-20)
+
+Free now constructs one fallible physical build index for plate membership and
+both geometry-emission paths, preserving disabled occurrence numbering. Streamed
+membership retains only unique source indices across all plates. Unknown or
+duplicate membership drops unusable resolved output while preserving the old
+streaming structural return and EOF error order; it remains ordinary optional
+metadata fallback. A completed ordinal and fixed 256-ID stack preserve the old
+plate limit and deferred duplicate-ID checks. Deferred unclaimed-geometry checks
+retain their old source-loading phase. Diagnostic paths deduplicate borrowed
+normalized pairs before one fallible owned copy; all existing traversal-work
+debits remain. No new metadata row quota or public field shape is introduced.
+
+Two real RED cases showed three retained assignments for two build members and
+four diagnostic copies for one unique pair after output compatibility checks.
+Final frozen core verification passes 271 tests plus two doctests, with one
+existing ignored fixture. Eight local causal/fault tests cover all ten reserve
+sites and actual late typed-stop/immediate-structure boundaries. Five public
+Stored/Deflate tests preserve error priority, the 256/257 boundary, empty plates,
+disabled occurrence numbers, authored order and part IDs. The full serial
+workspace also passes 375 runtime, 209 native and 70 server tests with unchanged
+source hashes. Workspace Clippy adds no changed-area diagnostics; the previous
+four match by exact code/message/source text without suppression. Downstream and
+packaged checks are separate gates in `output/derived-maps-*`.
+
+Material and slicer-settings containers, other owned text and public snapshots,
+live metadata lifetime/capacity policy, producer memory admission, immutable
+publication and final platform/release acceptance remain in the original scope.
+This checkpoint authorizes no installed-app replacement, private pin update,
+release or additional cleanup.

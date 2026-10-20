@@ -1,5 +1,50 @@
 # Thumbnail parser resource prerequisite
 
+## Derived index and plate-retention checkpoint (2026-10-20)
+
+One fallible build index now supplies physical occurrence numbers to streamed
+plate membership, authored emission and whole-build fallback. Disabled build
+items keep their occurrence slots. Index cardinality derives from the actual
+admitted root build, rather than an XML length hint or a new metadata row quota.
+Only unique resolved source indices are retained across all plates, so retained
+assignment count cannot exceed that build's length. The first unknown or duplicate
+assignment drops the unusable resolved output and its backing; parsing continues
+only to preserve the old structural-validation boundary.
+
+Streaming structural errors still return immediately. At EOF, open/no-plate
+checks precede deferred duplicate plate IDs, which precede membership errors.
+The independent completed-plate ordinal preserves the existing 256-plate close
+check before required-ID validation. A fixed 256-ID stack preserves deferred
+ID checks without a heap set. Unclaimed geometry is checked only after structural
+and assignment validation, retaining the existing source-loading order.
+
+Diagnostic paths use the existing leading-slash normalization as a borrowed
+lookup before copying each new object/path pair. Existing component-work debits
+remain. Controlled vector, map, set and path growth is fallible; the same
+observer's typed stop remains terminal, including a stop observed while parsing
+after invalid membership. Plate output moves existing names instead of cloning
+those names into another plate vector.
+
+The genuine RED run retained three assignments for two build members and copied
+four diagnostic paths for one normalized pair, after geometry/warning assertions
+passed. Final frozen core verification passes 271 tests and two doctests, with
+one existing ignored fixture. Eight local tests cover the causal regressions,
+all ten reserve sites, post-reserve first causes and actual plate-phase tail
+handling. Five public Stored/Deflate controls preserve structural error priority,
+plate limits, disabled numbering, empty plates and authored order. Full serial
+workspace verification also passes 375 runtime, 209 native and 70 server tests,
+with frozen source hashes unchanged. Workspace Clippy has the same four
+changed-area diagnostics as the previous checkpoint, compared by exact code,
+message and primary source text; no suppression was added. Composition and
+packaged results remain separate gates under `output/derived-maps-*`.
+
+These are cardinality and controlled-growth bounds, not an exact aggregate
+allocation/RSS bound. Geometric spare capacity and map bucket layout remain
+separate contributors. Material/SlicerMetadata containers, other owned strings,
+public snapshots and clone lifetimes, the proposed live-metadata policy, producer
+admission and immutable publication remain open. No new producer allowance,
+source mutation or cleanup authority follows from this checkpoint.
+
 ## Optional part-row retention checkpoint (2026-10-20)
 
 One private accumulator now retains at most the existing 1,024 optional viewer
@@ -33,8 +78,9 @@ these local results alone do not close them.
 
 The row limit bounds retained row count and requested vector growth, not all
 String payloads, allocator capacity/overlap, public Clone lifetimes or process RSS.
-Plate assignments/occurrences/resolution, diagnostic paths, material containers,
-aggregate owned metadata, producer admission and publication remain open. No
+Derived indices and diagnostic paths are covered by the checkpoint above;
+material containers, aggregate owned metadata, producer admission and publication
+remain open. No
 source mutation, cleanup or new producer allowance follows from this change.
 
 ## Physical input-record storage checkpoint (2026-10-20)
@@ -69,8 +115,9 @@ hosted and container status must be read from `output/input-collections-*`; thes
 local results do not imply those gates passed.
 
 The physical limits do not bound all owned strings, map buckets, spare/reallocation capacity,
-simultaneously live output, SDK/decoder workspaces or process RSS. Optional part rows are covered above; remaining plate, assignment/occurrence,
-diagnostic-path and material containers remain later work. No producer allowance or
+simultaneously live output, SDK/decoder workspaces or process RSS. Optional part
+rows and derived indices/diagnostic paths are covered above; material containers
+and aggregate owned metadata remain later work. No producer allowance or
 publication authority follows from this policy selection.
 
 ## Current standard-field retention checkpoint (2026-10-20)

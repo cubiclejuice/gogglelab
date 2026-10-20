@@ -22,7 +22,9 @@ use quick_xml::XmlVersion;
 #[cfg(test)]
 use serde_json::Value;
 
+mod derived_maps;
 mod project_json;
+use derived_maps::BuildIndex;
 
 use crate::error::{ResourceStop, StlError};
 use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
@@ -543,6 +545,31 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct DerivedMapsTestProfile {
+    plate_parser_entries: std::cell::Cell<usize>,
+    retained_assignments: std::cell::Cell<usize>,
+    assignment_high_water: std::cell::Cell<usize>,
+    diagnostic_path_copies: std::cell::Cell<usize>,
+    diagnostic_unique_pairs: std::cell::Cell<usize>,
+    reserves: std::cell::Cell<usize>,
+    fail_site: std::cell::Cell<Option<derived_maps::ReserveSite>>,
+    stop_site: std::cell::Cell<Option<(derived_maps::ReserveSite, ParserTestFailure)>>,
+    after_invalid: std::cell::Cell<Option<ParserTestFailure>>,
+    membership_invalid: std::cell::Cell<usize>,
+    invalid_tail_events: std::cell::Cell<usize>,
+    invalid_stop_at: std::cell::Cell<usize>,
+    fallback_entries: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DERIVED_MAPS_TEST_PROFILE: std::cell::RefCell<Option<Rc<DerivedMapsTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// Original input cursor; its private fault seam exists only in parser tests.
 struct PackageInput<'a> {
     inner: Cursor<&'a [u8]>,
@@ -581,6 +608,8 @@ struct Package<'a, 'context> {
     input_test: Option<InputCollectionsTestSession>,
     #[cfg(test)]
     part_retention_test: Option<Rc<PartRetentionTestProfile>>,
+    #[cfg(test)]
+    derived_maps_test: Option<Rc<DerivedMapsTestProfile>>,
     collections: InputCollections,
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
@@ -622,6 +651,8 @@ impl<'a, 'context> Package<'a, 'context> {
             input_test,
             #[cfg(test)]
             part_retention_test: PART_RETENTION_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            derived_maps_test: DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.borrow().clone()),
             collections,
             parts: HashMap::new(),
             materials: Vec::new(),
@@ -812,24 +843,18 @@ struct SlicerMetadata {
 const NO_PLATE_METADATA_WARNING: &str =
     "This 3MF has no usable plate metadata; showing the whole build.";
 
-#[derive(Debug)]
-struct PlateAssignment {
-    object_id: u32,
-    instance_id: u32,
-}
-
+#[cfg(test)]
 #[derive(Debug)]
 struct PlateSpec {
     slicer_id: u32,
     name: String,
-    assignments: Vec<PlateAssignment>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct OpenPlate {
     slicer_id: Option<u32>,
     name: Option<String>,
-    assignments: Vec<PlateAssignment>,
 }
 
 #[derive(Default)]
@@ -854,6 +879,7 @@ fn parse_plate_settings(text: &str) -> Result<Vec<PlateSpec>, String> {
     parse_plate_settings_observed(text, &ZipResourceObserver::new())
 }
 
+#[cfg(test)]
 fn parse_plate_settings_observed(
     text: &str,
     observer: &ZipResourceObserver,
@@ -944,14 +970,10 @@ fn parse_plate_settings_observed(
                     let open = instance
                         .take()
                         .ok_or_else(|| "unbalanced model instance metadata".to_string())?;
-                    plate.as_mut().unwrap().assignments.push(PlateAssignment {
-                        object_id: open
-                            .object_id
-                            .ok_or_else(|| "model instance has no object_id".to_string())?,
-                        instance_id: open
-                            .instance_id
-                            .ok_or_else(|| "model instance has no instance_id".to_string())?,
-                    });
+                    open.object_id
+                        .ok_or_else(|| "model instance has no object_id".to_string())?;
+                    open.instance_id
+                        .ok_or_else(|| "model instance has no instance_id".to_string())?;
                 }
                 b"plate" => {
                     if instance.is_some() {
@@ -971,7 +993,6 @@ fn parse_plate_settings_observed(
                             .name
                             .filter(|name| !name.is_empty())
                             .unwrap_or_else(|| format!("Plate {}", plates.len() + 1)),
-                        assignments: open.assignments,
                     });
                 }
                 _ => {}
@@ -1285,35 +1306,7 @@ fn component_part_metadata_paths(
     root: &ModelPart,
     root_path: &str,
 ) -> Result<HashMap<u32, HashSet<String>>, StlError> {
-    let root_path = Package::entry_name(root_path);
-    let mut paths = HashMap::new();
-    for item in &root.build {
-        pkg.charge_component_work()?;
-        if !item.printable {
-            continue;
-        }
-        let item_path = item.path.as_deref().unwrap_or(root_path);
-        if Package::entry_name(item_path) != root_path {
-            continue;
-        }
-        let Some(Object {
-            kind: ObjectKind::Components(components),
-            ..
-        }) = root.objects.get(&item.object_id)
-        else {
-            continue;
-        };
-        for component in components {
-            pkg.charge_component_work()?;
-            let path =
-                Package::entry_name(component.path.as_deref().unwrap_or(item_path)).to_owned();
-            paths
-                .entry(component.object_id)
-                .or_insert_with(HashSet::new)
-                .insert(path);
-        }
-    }
-    Ok(paths)
+    derived_maps::diagnostic_paths(pkg, root, root_path)
 }
 
 fn component_part_metadata_ambiguous(
@@ -1325,6 +1318,7 @@ fn component_part_metadata_ambiguous(
         .is_some_and(|paths| paths.len() > 1)
 }
 
+#[derive(Debug)]
 enum PlateResolutionError {
     Metadata(String),
     Source(StlError),
@@ -1336,6 +1330,12 @@ impl From<String> for PlateResolutionError {
     }
 }
 
+impl From<&str> for PlateResolutionError {
+    fn from(detail: &str) -> Self {
+        Self::Metadata(detail.to_owned())
+    }
+}
+
 impl std::fmt::Display for PlateResolutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1343,68 +1343,6 @@ impl std::fmt::Display for PlateResolutionError {
             Self::Source(error) => std::fmt::Display::fmt(error, formatter),
         }
     }
-}
-
-fn resolve_plate_items(
-    pkg: &mut Package,
-    root_path: &str,
-    root: &ModelPart,
-    specs: &[PlateSpec],
-) -> Result<Vec<Vec<usize>>, PlateResolutionError> {
-    // Slicer instance ids are occurrence numbers for a given object id. Count
-    // every build entry, including disabled entries, before geometry filtering.
-    let mut occurrences: HashMap<u32, u32> = HashMap::new();
-    let mut items = HashMap::with_capacity(root.build.len());
-    for (index, item) in root.build.iter().enumerate() {
-        let occurrence = occurrences.entry(item.object_id).or_default();
-        items.insert((item.object_id, *occurrence), index);
-        *occurrence = occurrence
-            .checked_add(1)
-            .ok_or_else(|| "too many instances for one object".to_string())?;
-    }
-
-    let mut claimed = HashSet::with_capacity(root.build.len());
-    let mut resolved = Vec::with_capacity(specs.len());
-    for plate in specs {
-        let mut plate_items = Vec::with_capacity(plate.assignments.len());
-        for assignment in &plate.assignments {
-            let index = *items
-                .get(&(assignment.object_id, assignment.instance_id))
-                .ok_or_else(|| {
-                    format!(
-                        "plate references unknown object {} instance {}",
-                        assignment.object_id, assignment.instance_id
-                    )
-                })?;
-            if !claimed.insert(index) {
-                return Err(format!(
-                    "object {} instance {} is assigned more than once",
-                    assignment.object_id, assignment.instance_id
-                )
-                .into());
-            }
-            plate_items.push(index);
-        }
-        resolved.push(plate_items);
-    }
-
-    for (index, item) in root.build.iter().enumerate() {
-        if item.printable
-            && !claimed.contains(&index)
-            && object_has_geometry(
-                pkg,
-                item.path.as_deref().unwrap_or(root_path),
-                item.object_id,
-                0,
-            )
-            .map_err(PlateResolutionError::Source)?
-        {
-            return Err(PlateResolutionError::Metadata(
-                "plate metadata does not assign every printable build item".into(),
-            ));
-        }
-    }
-    Ok(resolved)
 }
 
 /// Membership is required only for build items that contribute printed triangles.
@@ -2411,19 +2349,6 @@ fn emit_build_item(
     Ok(())
 }
 
-fn build_item_occurrences(build: &[BuildItem]) -> Result<Vec<u32>, StlError> {
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-    let mut occurrences = Vec::with_capacity(build.len());
-    for item in build {
-        let occurrence = counts.entry(item.object_id).or_default();
-        occurrences.push(*occurrence);
-        *occurrence = (*occurrence)
-            .checked_add(1)
-            .ok_or_else(|| malformed("too many instances for one object"))?;
-    }
-    Ok(occurrences)
-}
-
 fn finish_model(out: Out) -> ParsedStl {
     ParsedStl {
         format: StlFormat::ThreeMf,
@@ -2478,22 +2403,34 @@ fn validate_parts(
         })
 }
 
+struct BuildView<'a> {
+    root_path: &'a str,
+    root: &'a ModelPart,
+    index: &'a BuildIndex,
+}
+
 fn whole_build(
     pkg: &mut Package,
-    root_path: &str,
-    root: &ModelPart,
+    build: &BuildView<'_>,
     slicer: &SlicerMetadata,
     component_paths: &HashMap<u32, HashSet<String>>,
     filaments: Vec<ParsedFilament>,
     warning: String,
 ) -> Result<ParsedModel, StlError> {
+    let root_path = build.root_path;
+    let root = build.root;
+    let index = build.index;
+    #[cfg(test)]
+    if let Some(probe) = &pkg.derived_maps_test {
+        probe.fallback_entries.set(probe.fallback_entries.get() + 1);
+    }
     #[cfg(test)]
     if let Some(probe) = &pkg.probe {
         probe.record_work();
     }
     let mut out = new_out(root.scale, &pkg.collections);
     let mut parts = PartOutput::new(pkg);
-    let occurrences = build_item_occurrences(&root.build)?;
+    let occurrences = &index.occurrences;
     for (index, item) in root.build.iter().enumerate() {
         emit_build_item(
             pkg,
@@ -2507,12 +2444,22 @@ fn whole_build(
         )?;
     }
     let triangle_count = out.triangle_count;
-    let plates = vec![Plate {
+    let mut plates = Vec::new();
+    derived_maps::reserve_vec(
+        &mut plates,
+        1,
+        MAX_VIEWER_PLATES,
+        &pkg.observer,
+        derived_maps::ReserveSite::OutputPlates,
+        #[cfg(test)]
+        pkg.derived_maps_test.as_deref(),
+    )?;
+    plates.push(Plate {
         id: 0,
         name: "Whole build".into(),
         triangle_start: 0,
         triangle_count,
-    }];
+    });
     let (parts, part_warning) = parts.finish(&plates, triangle_count)?;
     Ok(ParsedModel {
         model: finish_model(out),
@@ -2575,6 +2522,17 @@ fn parse_3mf_with_context(
     let root_path = pkg.root_model_path()?;
     let root = pkg.part(&root_path)?;
     let component_paths = component_part_metadata_paths(&mut pkg, &root, &root_path)?;
+    let build_index = BuildIndex::new(
+        &root.build,
+        &pkg.observer,
+        #[cfg(test)]
+        pkg.derived_maps_test.as_deref(),
+    )?;
+    let build_view = BuildView {
+        root_path: &root_path,
+        root: &root,
+        index: &build_index,
+    };
 
     let settings_result = pkg.optional_text(MODEL_SETTINGS_PATH, TextRole::ModelSettings);
     pkg.observer.check()?;
@@ -2597,15 +2555,23 @@ fn parse_3mf_with_context(
 
     let settings = match settings_result {
         Ok(Some(text)) => {
-            let result = parse_plate_settings_observed(&text, &pkg.observer);
+            let result = derived_maps::parse_and_resolve_plates(
+                &text,
+                &root_path,
+                &root,
+                &build_index,
+                &mut pkg,
+            );
             pkg.observer.check()?;
             match result {
                 Ok(specs) => Some(specs),
+                Err(PlateResolutionError::Source(
+                    error @ (StlError::ResourceStopped(_) | StlError::AllocationFailed),
+                )) => return Err(error),
                 Err(detail) => {
                     return whole_build(
                         &mut pkg,
-                        &root_path,
-                        &root,
+                        &build_view,
                         &slicer,
                         &component_paths,
                         filaments,
@@ -2617,8 +2583,7 @@ fn parse_3mf_with_context(
         Ok(None) => {
             return whole_build(
                 &mut pkg,
-                &root_path,
-                &root,
+                &build_view,
                 &slicer,
                 &component_paths,
                 filaments,
@@ -2631,8 +2596,7 @@ fn parse_3mf_with_context(
         Err(err) => {
             return whole_build(
                 &mut pkg,
-                &root_path,
-                &root,
+                &build_view,
                 &slicer,
                 &component_paths,
                 filaments,
@@ -2641,36 +2605,17 @@ fn parse_3mf_with_context(
         }
     };
 
-    let specs = settings.expect("all other metadata branches return");
-    let resolved = match resolve_plate_items(&mut pkg, &root_path, &root, &specs) {
-        Ok(resolved) => resolved,
-        Err(PlateResolutionError::Source(
-            error @ (StlError::ResourceStopped(_) | StlError::AllocationFailed),
-        )) => {
-            return Err(error);
-        }
-        Err(detail) => {
-            return whole_build(
-                &mut pkg,
-                &root_path,
-                &root,
-                &slicer,
-                &component_paths,
-                filaments,
-                format!("Plate metadata is unusable ({detail}); showing the whole build."),
-            );
-        }
-    };
+    let resolved = settings.expect("all other metadata branches return");
 
     // Transforms are expressed in the model's unit, so unit conversion is
     // applied last, to already-placed coordinates.
     let mut out = new_out(root.scale, &pkg.collections);
     let mut parts = PartOutput::new(&pkg);
-    let occurrences = build_item_occurrences(&root.build)?;
-    let mut plates = Vec::with_capacity(specs.len());
-    for (plate_index, (spec, item_indices)) in specs.iter().zip(&resolved).enumerate() {
+    let occurrences = &build_index.occurrences;
+    let mut plates = Vec::new();
+    for (plate_index, spec) in resolved.into_iter().enumerate() {
         let triangle_start = out.triangle_count;
-        for &item_index in item_indices {
+        for &item_index in &spec.items {
             emit_build_item(
                 &mut pkg,
                 &root_path,
@@ -2682,9 +2627,18 @@ fn parse_3mf_with_context(
                 &mut parts,
             )?;
         }
+        derived_maps::reserve_vec(
+            &mut plates,
+            1,
+            MAX_VIEWER_PLATES,
+            &pkg.observer,
+            derived_maps::ReserveSite::OutputPlates,
+            #[cfg(test)]
+            pkg.derived_maps_test.as_deref(),
+        )?;
         plates.push(Plate {
             id: u32::try_from(plate_index).map_err(|_| malformed("too many plates in metadata"))?,
-            name: spec.name.clone(),
+            name: spec.name,
             triangle_start,
             triangle_count: out.triangle_count - triangle_start,
         });
@@ -4532,6 +4486,97 @@ mod tests {
         assert!(parsed.embedded_filaments.is_empty());
     }
 
+    struct DerivedMapsProfileGuard(Option<Rc<DerivedMapsTestProfile>>);
+
+    impl DerivedMapsProfileGuard {
+        fn install(profile: Rc<DerivedMapsTestProfile>) -> Self {
+            Self(DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for DerivedMapsProfileGuard {
+        fn drop(&mut self) {
+            DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    #[test]
+    fn derived_maps_assignment_retention_never_exceeds_physical_build_membership() {
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(10, "Duplicates", &[(1, 0), (1, 1), (1, 0)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        let profile = Rc::new(DerivedMapsTestProfile::default());
+        let _guard = DerivedMapsProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&bytes).unwrap();
+        assert_eq!(parsed.model.triangle_count, 2);
+        assert_eq!(parsed.model.positions.len(), 18);
+        assert_eq!(parsed.parts.len(), 2);
+        assert!(parsed.part_warning.is_none());
+        assert!(!parsed.plate_metadata);
+        assert_eq!(parsed.plates.len(), 1);
+        assert_eq!(parsed.plates[0].triangle_count, 2);
+        assert_eq!(parsed.plate_warning.as_deref(), Some("Plate metadata is unusable (object 1 instance 0 is assigned more than once); showing the whole build."));
+        assert_eq!(
+            profile.plate_parser_entries.get(),
+            1,
+            "reached actual plate parser"
+        );
+        assert!(
+            profile.assignment_high_water.get() <= 2,
+            "retained {} assignments for only2 physical build members",
+            profile.assignment_high_water.get()
+        );
+    }
+
+    #[test]
+    fn derived_maps_diagnostic_paths_copy_each_normalized_pair_only_once() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="/3D/child.model"/><component objectid="2" path="3D/child.model"/></components></object>"#,
+            &r#"<item objectid="10"/>"#.repeat(2),
+        );
+        let child = model_xml(
+            "millimeter",
+            &part_retention_triangle().replacen("id=\"1\"", "id=\"2\"", 1),
+            "",
+        );
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        );
+        let profile = Rc::new(DerivedMapsTestProfile::default());
+        let _guard = DerivedMapsProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&bytes).unwrap();
+        assert_eq!(parsed.model.triangle_count, 4);
+        assert_eq!(parsed.model.positions.len(), 36);
+        assert_eq!(parsed.parts.len(), 4);
+        assert!(parsed
+            .parts
+            .iter()
+            .all(|part| part.name == "triangle" && part.triangle_count == 1));
+        assert!(parsed.part_warning.is_none());
+        assert_eq!(
+            parsed.plate_warning.as_deref(),
+            Some(NO_PLATE_METADATA_WARNING)
+        );
+        assert_eq!(profile.diagnostic_unique_pairs.get(), 1);
+        assert!(
+            profile.diagnostic_path_copies.get() <= profile.diagnostic_unique_pairs.get(),
+            "copied {} paths for {} unique normalized pairs",
+            profile.diagnostic_path_copies.get(),
+            profile.diagnostic_unique_pairs.get()
+        );
+    }
+
     struct PartRetentionProfileGuard(Option<Rc<PartRetentionTestProfile>>);
 
     impl PartRetentionProfileGuard {
@@ -5408,5 +5453,251 @@ mod tests {
         );
         assert!(normalized <= 3*MAX_EMBEDDED_FILAMENTS,
             "only selected positional prefixes may be retained: normalized {normalized} labels, allowed {}", 3*MAX_EMBEDDED_FILAMENTS);
+    }
+    #[test]
+    fn derived_maps_reserve_failures_are_source_terminal_not_metadata_fallback() {
+        use derived_maps::ReserveSite;
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(1, "Complete", &[(1, 0), (1, 1)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            true,
+        );
+        for site in [
+            ReserveSite::Counts,
+            ReserveSite::Occurrences,
+            ReserveSite::Items,
+            ReserveSite::Claimed,
+            ReserveSite::Plates,
+            ReserveSite::Indices,
+            ReserveSite::OutputPlates,
+        ] {
+            let profile = Rc::new(DerivedMapsTestProfile::default());
+            profile.fail_site.set(Some(site));
+            let _guard = DerivedMapsProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(StlError::AllocationFailed)
+            );
+            assert!(matches!(
+                observer.check(),
+                Err(ZipOpenError::AllocationFailed)
+            ));
+            assert!(
+                profile.fail_site.get().is_none(),
+                "actual target reserve was reached"
+            );
+            assert_eq!(profile.fallback_entries.get(), 0);
+            assert!(profile.reserves.get() > 0);
+        }
+    }
+
+    #[test]
+    fn derived_maps_post_reserve_stops_preserve_first_cause_in_public_parser() {
+        use derived_maps::ReserveSite;
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(1, "Complete", &[(1, 0), (1, 1)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        for site in [
+            ReserveSite::Counts,
+            ReserveSite::Occurrences,
+            ReserveSite::Items,
+            ReserveSite::Claimed,
+            ReserveSite::Plates,
+            ReserveSite::Indices,
+            ReserveSite::OutputPlates,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let profile = Rc::new(DerivedMapsTestProfile::default());
+                profile.stop_site.set(Some((site, failure)));
+                let _guard = DerivedMapsProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(failure.error())
+                );
+                assert!(
+                    profile.stop_site.get().is_none(),
+                    "actual successful target reserve was reached"
+                );
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+                assert_eq!(profile.fallback_entries.get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn derived_maps_actual_plate_invalidity_observes_later_terminal_event_without_fallback() {
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(1, "Duplicate", &[(1, 0), (1, 0)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            true,
+        );
+        for failure in PARSER_TEST_FAILURES {
+            let profile = Rc::new(DerivedMapsTestProfile::default());
+            profile.after_invalid.set(Some(failure));
+            let _guard = DerivedMapsProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(failure.error())
+            );
+            assert_eq!(profile.plate_parser_entries.get(), 1);
+            assert_eq!(profile.membership_invalid.get(), 1);
+            assert_eq!(profile.invalid_tail_events.get(), 1);
+            assert!(profile.after_invalid.get().is_none());
+            assert_eq!(profile.fallback_entries.get(), 0);
+            assert_eq!(
+                StlError::from(observer.check().unwrap_err()),
+                failure.error()
+            );
+        }
+    }
+
+    #[test]
+    fn derived_maps_diagnostic_allocation_boundaries_are_terminal() {
+        use derived_maps::ReserveSite;
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="/3D/child.model"/></components></object>"#,
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &part_retention_triangle().replacen("id=\"1\"", "id=\"2\"", 1),
+            "",
+        );
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            false,
+        );
+        for site in [
+            ReserveSite::DiagnosticMap,
+            ReserveSite::DiagnosticSet,
+            ReserveSite::Path,
+        ] {
+            let profile = Rc::new(DerivedMapsTestProfile::default());
+            profile.fail_site.set(Some(site));
+            let _guard = DerivedMapsProfileGuard::install(profile.clone());
+            assert_eq!(
+                crate::parse_model_with_plates(&bytes),
+                Err(StlError::AllocationFailed)
+            );
+            assert!(profile.fail_site.get().is_none());
+            assert_eq!(profile.diagnostic_path_copies.get(), 0);
+            assert_eq!(profile.fallback_entries.get(), 0);
+        }
+    }
+    #[test]
+    fn derived_maps_immediate_structural_error_does_not_scan_to_later_terminal_hook() {
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            r#"<item objectid="1"/>"#,
+        );
+        let settings = plate_settings(&format!(
+            "{}<plate><plate></plate></plate>",
+            plate_xml(1, "Unknown", &[(1, 99)])
+        ));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        let profile = Rc::new(DerivedMapsTestProfile::default());
+        profile.after_invalid.set(Some(ParserTestFailure::Stop(
+            ResourceStop::ReadWorkExceeded,
+        )));
+        // End first plate, Start second plate, nested Start are the three old
+        // observed events. The armed fourth event must never be requested.
+        profile.invalid_stop_at.set(4);
+        let _guard = DerivedMapsProfileGuard::install(profile.clone());
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+        assert_eq!(
+            parsed.plate_warning.as_deref(),
+            Some("Plate metadata is unusable (nested plate metadata); showing the whole build.")
+        );
+        assert_eq!(profile.plate_parser_entries.get(), 1);
+        assert_eq!(profile.membership_invalid.get(), 1);
+        assert_eq!(profile.invalid_tail_events.get(), 3);
+        assert!(profile.after_invalid.get().is_some());
+        assert!(observer.check().is_ok());
+        assert_eq!(profile.fallback_entries.get(), 1);
+        assert_eq!(parsed.model.triangle_count, 1);
+    }
+
+    #[test]
+    fn derived_maps_diagnostic_post_reserve_stops_prevent_path_copy() {
+        use derived_maps::ReserveSite;
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="/3D/child.model"/></components></object>"#,
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &part_retention_triangle().replacen("id=\"1\"", "id=\"2\"", 1),
+            "",
+        );
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        );
+        for site in [
+            ReserveSite::DiagnosticMap,
+            ReserveSite::DiagnosticSet,
+            ReserveSite::Path,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let profile = Rc::new(DerivedMapsTestProfile::default());
+                profile.stop_site.set(Some((site, failure)));
+                let _guard = DerivedMapsProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(failure.error())
+                );
+                assert!(profile.stop_site.get().is_none());
+                assert_eq!(profile.diagnostic_path_copies.get(), 0);
+                assert_eq!(profile.fallback_entries.get(), 0);
+            }
+        }
     }
 }
