@@ -9,6 +9,40 @@
 #[cfg(not(unix))]
 use std::path::Path;
 
+/// Geometry-only output. The original exclusively-created descriptor is already
+/// anonymous; no payload bytes may be written until construction succeeds.
+pub(crate) struct GeometryFileWriter {
+    file: std::fs::File,
+    identity: (u64, u64, u32),
+}
+/// Immutable generated packet, never admitted from a pathname or a source FD.
+pub(crate) struct SealedGeometryFile {
+    file: std::fs::File,
+    identity: (u64, u64, u32),
+    bytes: u64,
+    sha256: String,
+}
+pub(crate) const MAX_GEOMETRY_PACKET_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_GEOMETRY_SETUP_ENTRIES: usize = 256;
+
+// Covers only the dedicated geometry namespace's named-empty setup window.
+// Inventory must share this gate so it cannot inspect a cooperating writer's
+// temporary mode-000 entry. Never hold TempResourceState while acquiring it.
+static GEOMETRY_CREATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn geometry_inventory_guard() -> std::io::Result<std::sync::MutexGuard<'static, ()>> {
+    GEOMETRY_CREATION
+        .lock()
+        .map_err(|_| std::io::Error::other("geometry creation lock is unavailable"))
+}
+impl SealedGeometryFile {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
 /// Narrow namespace for generated purge/restore transaction metadata only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeneratedControlKind {
@@ -363,6 +397,93 @@ mod imp {
                 io::ErrorKind::Unsupported,
                 "handle-relative directory enumeration is unavailable on this Unix host",
             ))
+        }
+
+        /// Creates only a new, empty geometry output, then makes it anonymous.
+        /// No original/source descriptor or arbitrary filename is accepted.
+        pub(crate) fn create_anonymous_geometry_writer(
+            &self,
+        ) -> io::Result<super::GeometryFileWriter> {
+            self.create_anonymous_geometry_writer_with_hook(|_, _, _| Ok(()))
+        }
+        pub(crate) fn create_anonymous_geometry_writer_with_hook(
+            &self,
+            mut hook: impl FnMut(
+                &'static str,
+                &std::ffi::OsStr,
+                Option<&std::ffi::OsStr>,
+            ) -> io::Result<()>,
+        ) -> io::Result<super::GeometryFileWriter> {
+            if !cfg!(any(target_os = "macos", target_os = "linux")) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "anonymous geometry output is unsupported on this host",
+                ));
+            }
+            // Cooperating runtimes hold CatalogLock across processes. Serialize
+            // only the small named-empty birth window inside this process.
+            let _creation = super::geometry_inventory_guard()?;
+            if self
+                .read_entry_names(super::MAX_GEOMETRY_SETUP_ENTRIES)?
+                .len()
+                >= super::MAX_GEOMETRY_SETUP_ENTRIES
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "geometry setup namespace entry limit reached",
+                ));
+            }
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let public = OsString::from(format!("geometry-new-{id}.empty"));
+            let capture = OsString::from(format!(
+                ".geometry-empty-{id}.capture-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let name = c_name(&public)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o000,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let identity = generated_identity(&file)?;
+            hook("after_empty_create", &public, None)?;
+            verify_empty_geometry(self, &public, &file, identity)?;
+            hook("before_capture", &public, Some(&capture))?;
+            self.rename_child_exclusive_raw(&public, &capture)?;
+            hook("after_capture", &public, Some(&capture))?;
+            verify_empty_geometry(self, &capture, &file, identity)?;
+            hook("before_private_unlink", &public, Some(&capture))?;
+            // Only this private claim is unlinked. Concurrent public-name
+            // replacements survive. Non-cooperating same-UID mutation of this
+            // private claim/inode is outside the internal-file ownership boundary.
+            let capture_name = c_name(&capture)?;
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), capture_name.as_ptr(), 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            hook("after_unlink", &public, Some(&capture))?;
+            use std::os::unix::fs::MetadataExt;
+            if file.metadata()?.nlink() != 0 {
+                return Err(generated_invalid(
+                    "geometry output retained an unexpected named link",
+                ));
+            }
+            self.sync()?;
+            hook("after_parent_sync", &public, None)?;
+            if self.entry_exists(&public)? {
+                return Err(generated_invalid("geometry setup public entry reappeared"));
+            }
+            Ok(super::GeometryFileWriter { file, identity })
         }
 
         pub fn admit_created_generated(
@@ -2429,6 +2550,158 @@ mod imp {
         unsafe { *libc::__error() }
     }
 
+    fn verify_empty_geometry(
+        directory: &Directory,
+        name: &std::ffi::OsStr,
+        file: &File,
+        identity: (u64, u64, u32),
+    ) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != 0 || generated_identity(file)? != identity {
+            return Err(generated_invalid(
+                "new geometry output is not its original empty descriptor",
+            ));
+        }
+        let entry = EntryIdentity::at(directory, name)?;
+        if (entry.device, entry.inode, entry.mode) != identity {
+            return Err(generated_invalid("empty geometry output was replaced"));
+        }
+        Ok(())
+    }
+    fn geometry_shape(packet: &[u8]) -> io::Result<()> {
+        if packet.len() < 16
+            || packet.len() as u64 > super::MAX_GEOMETRY_PACKET_BYTES
+            || &packet[..4] != b"STL2"
+            || u32::from_le_bytes(packet[4..8].try_into().unwrap()) != 2
+            || packet[12..16] != [0; 4]
+        {
+            return Err(generated_invalid(
+                "generated geometry packet header or size is invalid",
+            ));
+        }
+        let triangles = u32::from_le_bytes(packet[8..12].try_into().unwrap()) as u64;
+        if triangles
+            .checked_mul(36)
+            .and_then(|value| value.checked_add(16))
+            != Some(packet.len() as u64)
+            || packet[16..]
+                .chunks_exact(4)
+                .any(|value| !f32::from_le_bytes(value.try_into().unwrap()).is_finite())
+        {
+            return Err(generated_invalid(
+                "generated geometry packet positions are invalid",
+            ));
+        }
+        Ok(())
+    }
+    fn geometry_hash(file: &File, bytes: u64) -> io::Result<String> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 0
+            || metadata.len() != bytes
+            || bytes > super::MAX_GEOMETRY_PACKET_BYTES
+        {
+            return Err(generated_invalid(
+                "anonymous geometry size or identity changed",
+            ));
+        }
+        let mut digest = Sha256::new();
+        let mut position = 0;
+        let mut buffer = [0u8; 64 * 1024];
+        while position < bytes {
+            let maximum = (bytes - position).min(buffer.len() as u64) as usize;
+            let read = file.read_at(&mut buffer[..maximum], position)?;
+            if read == 0 {
+                return Err(generated_invalid("anonymous geometry was truncated"));
+            }
+            digest.update(&buffer[..read]);
+            position += read as u64;
+        }
+        let after = file.metadata()?;
+        if after.len() != bytes || after.nlink() != 0 {
+            return Err(generated_invalid(
+                "anonymous geometry changed while reading",
+            ));
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+    impl super::GeometryFileWriter {
+        pub(crate) fn write_and_seal(self, packet: &[u8]) -> io::Result<super::SealedGeometryFile> {
+            self.write_and_seal_with_hook(packet, |_, _| Ok(()))
+        }
+        pub(super) fn write_and_seal_with_hook(
+            mut self,
+            packet: &[u8],
+            mut hook: impl FnMut(&'static str, &File) -> io::Result<()>,
+        ) -> io::Result<super::SealedGeometryFile> {
+            geometry_shape(packet)?;
+            use std::os::unix::fs::MetadataExt;
+            if self.file.metadata()?.nlink() != 0
+                || self.file.metadata()?.len() != 0
+                || generated_identity(&self.file)? != self.identity
+            {
+                return Err(generated_invalid(
+                    "geometry writer no longer owns its original anonymous empty file",
+                ));
+            }
+            let expected = format!("{:x}", Sha256::digest(packet));
+            self.file.write_all(packet)?;
+            hook("after_payload_write", &self.file)?;
+            self.file.sync_all()?;
+            hook("after_payload_sync", &self.file)?;
+            let sealed = super::SealedGeometryFile {
+                file: self.file,
+                identity: self.identity,
+                bytes: packet.len() as u64,
+                sha256: expected,
+            };
+            sealed.verify()?;
+            Ok(sealed)
+        }
+    }
+    impl super::SealedGeometryFile {
+        pub(crate) fn verify(&self) -> io::Result<()> {
+            if generated_identity(&self.file)? != self.identity
+                || geometry_hash(&self.file, self.bytes)? != self.sha256
+            {
+                return Err(generated_invalid(
+                    "sealed generated geometry no longer matches its admission",
+                ));
+            }
+            Ok(())
+        }
+        pub(crate) fn stream_to(&self, sink: &mut dyn Write) -> io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            self.verify()?;
+            let mut position = 0;
+            let mut buffer = [0u8; 64 * 1024];
+            let mut digest = Sha256::new();
+            while position < self.bytes {
+                let maximum = (self.bytes - position).min(buffer.len() as u64) as usize;
+                let read = self.file.read_at(&mut buffer[..maximum], position)?;
+                if read == 0 {
+                    return Err(generated_invalid("sealed geometry was truncated"));
+                }
+                digest.update(&buffer[..read]);
+                sink.write_all(&buffer[..read])?;
+                position += read as u64;
+            }
+            use std::os::unix::fs::MetadataExt;
+            let after = self.file.metadata()?;
+            if format!("{:x}", digest.finalize()) != self.sha256
+                || generated_identity(&self.file)? != self.identity
+                || after.len() != self.bytes
+                || after.nlink() != 0
+            {
+                return Err(generated_invalid(
+                    "sealed geometry changed during streaming",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     fn generated_supported() -> io::Result<()> {
         if cfg!(any(target_os = "macos", target_os = "linux")) {
             Ok(())
@@ -2585,6 +2858,10 @@ pub(crate) struct Directory;
 
 #[cfg(not(unix))]
 impl Directory {
+    pub(crate) fn create_anonymous_geometry_writer(&self) -> std::io::Result<GeometryFileWriter> {
+        Err(unsupported())
+    }
+
     pub fn admit_created_generated(
         &self,
         _namespace: &GeneratedControlNamespace,
@@ -2861,6 +3138,22 @@ impl Directory {
 }
 
 #[cfg(not(unix))]
+impl GeometryFileWriter {
+    pub(crate) fn write_and_seal(self, _packet: &[u8]) -> std::io::Result<SealedGeometryFile> {
+        Err(unsupported())
+    }
+}
+#[cfg(not(unix))]
+impl SealedGeometryFile {
+    pub(crate) fn verify(&self) -> std::io::Result<()> {
+        Err(unsupported())
+    }
+    pub(crate) fn stream_to(&self, _sink: &mut dyn std::io::Write) -> std::io::Result<()> {
+        Err(unsupported())
+    }
+}
+
+#[cfg(not(unix))]
 pub(crate) fn copy_verified_into_directory(
     _source_parent: &Directory,
     _source_name: &std::ffi::OsStr,
@@ -2900,6 +3193,262 @@ mod tests {
 
     use super::imp::{copy_verified_file_with, remove_verified_file_with, Directory};
 
+    fn geometry_test_packet() -> Vec<u8> {
+        let mut packet = b"STL2".to_vec();
+        packet.extend_from_slice(&2u32.to_le_bytes());
+        packet.extend_from_slice(&1u32.to_le_bytes());
+        packet.extend_from_slice(&0u32.to_le_bytes());
+        for value in [0f32, 0., 0., 1., 0., 0., 0., 1., 0.] {
+            packet.extend_from_slice(&value.to_le_bytes());
+        }
+        packet
+    }
+    #[test]
+    fn geometry_inventory_waits_for_the_named_empty_birth_window() {
+        use super::{geometry_inventory_guard, GEOMETRY_CREATION, MAX_GEOMETRY_SETUP_ENTRIES};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap();
+        let directory = Directory::open(&path).unwrap();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut inventory = None;
+        let writer = directory
+            .create_anonymous_geometry_writer_with_hook(|stage, _, _| {
+                if stage == "after_empty_create" {
+                    assert_eq!(fs::read_dir(&path).unwrap().count(), 1);
+                    let path = path.clone();
+                    let attempt_tx = attempt_tx.clone();
+                    let snapshot_tx = snapshot_tx.clone();
+                    inventory = Some(thread::spawn(move || {
+                        attempt_tx.send(()).unwrap();
+                        let _gate = geometry_inventory_guard().unwrap();
+                        let names = Directory::open(&path)
+                            .unwrap()
+                            .read_entry_names(MAX_GEOMETRY_SETUP_ENTRIES)
+                            .unwrap();
+                        snapshot_tx.send(names).unwrap();
+                    }));
+                    attempt_rx.recv().unwrap();
+                    assert!(matches!(
+                        GEOMETRY_CREATION.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    assert!(snapshot_rx.recv_timeout(Duration::from_millis(20)).is_err());
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(snapshot_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_empty());
+        inventory.unwrap().join().unwrap();
+        drop(writer);
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    }
+    #[test]
+    fn anonymous_geometry_payload_and_parallel_readers_never_have_a_named_backing() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let writer = directory.create_anonymous_geometry_writer().unwrap();
+        assert_eq!(writer.file.metadata().unwrap().nlink(), 0);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        let packet = geometry_test_packet();
+        let sealed = Arc::new(writer.write_and_seal(&packet).unwrap());
+        assert_eq!(sealed.file.metadata().unwrap().nlink(), 0);
+        assert_eq!(sealed.bytes(), packet.len() as u64);
+        assert_eq!(sealed.sha256(), format!("{:x}", Sha256::digest(&packet)));
+        let readers = (0..4)
+            .map(|_| {
+                let sealed = sealed.clone();
+                thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    sealed.stream_to(&mut bytes).unwrap();
+                    bytes
+                })
+            })
+            .collect::<Vec<_>>();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), packet);
+        }
+        drop(sealed);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn anonymous_geometry_capture_preserves_replacement_after_final_public_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let displaced = temp.path().join("original-empty-file");
+        let mut capture = None;
+        let result =
+            directory.create_anonymous_geometry_writer_with_hook(|stage, public, claim| {
+                if stage == "before_capture" {
+                    fs::rename(temp.path().join(public), &displaced).unwrap();
+                    fs::write(temp.path().join(public), b"unknown replacement bytes").unwrap();
+                    capture = claim.map(|name| name.to_owned());
+                }
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(temp.path().join(capture.unwrap())).unwrap(),
+            b"unknown replacement bytes"
+        );
+        assert_eq!(fs::metadata(displaced).unwrap().len(), 0);
+    }
+    #[test]
+    fn anonymous_geometry_preserves_recreated_public_name_before_private_unlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let mut public_name = None;
+        let result = directory.create_anonymous_geometry_writer_with_hook(|stage, public, _| {
+            if stage == "before_private_unlink" {
+                fs::write(temp.path().join(public), b"foreign public bytes").unwrap();
+                public_name = Some(public.to_owned());
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(temp.path().join(public_name.unwrap())).unwrap(),
+            b"foreign public bytes"
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn anonymous_geometry_setup_failure_never_writes_packet_bytes_or_creates_holds() {
+        for fault in [
+            "after_empty_create",
+            "after_capture",
+            "after_unlink",
+            "after_parent_sync",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            assert!(directory
+                .create_anonymous_geometry_writer_with_hook(|stage, _, _| if stage == fault {
+                    Err(std::io::Error::other(
+                        "injected setup sync/cancellation failure",
+                    ))
+                } else {
+                    Ok(())
+                })
+                .is_err());
+            for entry in fs::read_dir(temp.path()).unwrap() {
+                let entry = entry.unwrap();
+                assert_eq!(entry.metadata().unwrap().len(), 0);
+                assert!(!entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("gogglelab-held"));
+            }
+        }
+    }
+    #[test]
+    fn anonymous_geometry_write_and_sync_failures_close_unlinked_generated_output() {
+        use std::os::unix::fs::MetadataExt;
+        for fault in ["after_payload_write", "after_payload_sync"] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let writer = directory.create_anonymous_geometry_writer().unwrap();
+            assert!(writer
+                .write_and_seal_with_hook(&geometry_test_packet(), |stage, file| {
+                    assert_eq!(file.metadata().unwrap().nlink(), 0);
+                    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+                    if stage == fault {
+                        Err(std::io::Error::other("injected write/sync cancellation"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err());
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        }
+    }
+    #[test]
+    fn anonymous_geometry_empty_birth_is_pinned_when_its_parent_path_is_swapped() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let held = temp.path().join("held");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("source.stl"), b"preserve original").unwrap();
+        let directory = Directory::open(&parent.canonicalize().unwrap()).unwrap();
+        let writer = directory
+            .create_anonymous_geometry_writer_with_hook(|stage, _, _| {
+                if stage == "after_empty_create" {
+                    fs::rename(&parent, &held).unwrap();
+                    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let sealed = writer.write_and_seal(&geometry_test_packet()).unwrap();
+        sealed.verify().unwrap();
+        drop(sealed);
+        assert_eq!(
+            fs::read(outside.join("source.stl")).unwrap(),
+            b"preserve original"
+        );
+        assert_eq!(fs::read_dir(held).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
+    }
+    #[test]
+    fn anonymous_geometry_refuses_excess_residual_entries_without_deleting_unknowns() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        for index in 0..super::MAX_GEOMETRY_SETUP_ENTRIES {
+            fs::write(temp.path().join(format!("unknown-{index}")), b"").unwrap();
+        }
+        assert!(directory.create_anonymous_geometry_writer().is_err());
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            super::MAX_GEOMETRY_SETUP_ENTRIES
+        );
+    }
+    #[test]
+    fn anonymous_geometry_rejects_malformed_packets_and_detects_descriptor_mutation() {
+        use std::io::Write;
+        for malformed in [
+            b"unknown user bytes".to_vec(),
+            {
+                let mut bytes = geometry_test_packet();
+                bytes[4] = 3;
+                bytes
+            },
+            {
+                let mut bytes = geometry_test_packet();
+                bytes[16..20].copy_from_slice(&f32::NAN.to_le_bytes());
+                bytes
+            },
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            assert!(directory
+                .create_anonymous_geometry_writer()
+                .unwrap()
+                .write_and_seal(&malformed)
+                .is_err());
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Directory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let sealed = directory
+            .create_anonymous_geometry_writer()
+            .unwrap()
+            .write_and_seal(&geometry_test_packet())
+            .unwrap();
+        let mut noncooperating = &sealed.file;
+        noncooperating.write_all(b"mutated").unwrap();
+        assert!(sealed.verify().is_err());
+        let mut sink = Vec::new();
+        assert!(sealed.stream_to(&mut sink).is_err());
+        assert!(sink.is_empty());
+    }
     #[test]
     fn generated_control_publication_exchange_and_retirement_leave_no_holds() {
         use super::{

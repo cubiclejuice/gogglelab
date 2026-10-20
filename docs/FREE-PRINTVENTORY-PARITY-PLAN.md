@@ -529,3 +529,55 @@ native Linux desktop and friend-run Windows acceptance, deferred Bambu MQTT/real
 hardware checks, provenance-aware different generated-thumbnail/geometry retirement,
 and final release review. The last Carbon discovery timed out; synthetic printing
 status does not establish real hardware acceptance. Full parity is not claimed.
+
+### Isolated development composition checkpoint (2026-10-19)
+
+A mode-0700 source snapshot combines tracked private commit
+`27550843d4e06c0684c00cef86bd767cd366ae86` with public `bfbc5ae`. The live Pro
+checkout, recorded `f733c1288ec3bc72f4bdd747a4ced7b7dfae5759` core pin, unrelated
+work, installed app and profiles remain unchanged. The snapshot uses physical
+clones of dependency trees and verifies that workspace imports resolve inside
+that snapshot. No setup/submodule/pin updater or normal-profile launch was run.
+
+The original Pro lockfile fails `--locked` with the newer core. Reconciliation in
+the isolated snapshot adds 12 dependency-edge lines, with no registry version or
+checksum changes. Missing existing checksum-pinned public crates were fetched for
+local compilation/license metadata only; no source or credentials were uploaded.
+With that proposed lockfile, metadata validation, 44 frontend tests plus format,
+lint, typecheck and both web builds, 67 private Rust/license/issuer tests, and
+workspace Clippy pass. Private frontend tests include failure/revocation retaining
+Free Library and slicer handoff. A read-only reachability check finds these paths
+use public core commands, without private license admission. Legacy handoff
+admission is test-only; colorways/palette remain paid.
+
+This is development composition evidence, not official delivery acceptance.
+Packaging and actual unified-app Free-profile interaction remain pending, followed
+by the real supported main/pin integration and release checks. Local source/lock
+provenance and logs are retained under the dedicated private temp snapshot, not
+committed as private code in the public repository. The next media slice will
+require composition refresh against its own final public source.
+
+### Anonymous geometry code checkpoint (2026-10-19)
+
+Runtime geometry now writes bounded STL2 packets only through already anonymous
+owned descriptors. Arc-backed readers retain physical byte charges through their
+last close; no packet bytes receive a filename or become source holds. Unknown
+legacy geometry remains preserved and counted. Capability/owner/epoch/I/O admission,
+original source/upload/archive behavior, and native in-memory geometry remain.
+
+True RED/GREEN and independent review closed premature mesh allocation, concurrent
+empty-file inventory, unrelated thumbnail admission, and expired-token quota
+starvation findings. The final serial workspace suite passes, including 201 native,
+120 catalog-core, 277 runtime and 62 server tests. Final workspace Clippy (existing
+warnings), Rust formatting and diff checks pass. The optimized Community app builds
+and passes deep strict signature verification; executable SHA-256 `aa495584633fd3a9e33beab7cdd6e2ec7de8cbc66c60e51edef6d92a10d902fe`.
+The host Windows cross-check stopped before Rust validation because MinGW is not
+installed; native Windows acceptance remains open.
+
+Current-source Linux packet streaming/restart and refreshed unified development
+composition/native smoke checks remain for this checkpoint. Content-addressed
+thumbnail publication is intentionally held until independent orphan reproducibility
+proof is implemented; unknown/custom/legacy bytes must stay protected. See
+`docs/GENERATED-MEDIA-RETENTION-PLAN.md`. The verified prior Community build is
+preserved at `output/build-preservation/community-8ea0a4e.app`; no additional cleanup
+or installed-app replacement occurred.

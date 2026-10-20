@@ -973,12 +973,65 @@ struct CaptureCursor {
 }
 
 #[derive(Clone)]
+enum ContentBacking {
+    ExistingPath { path: PathBuf, remove_on_drop: bool },
+    Geometry(Arc<geometry::GeneratedGeometryPacket>),
+}
+impl ContentBacking {
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::ExistingPath { path, .. } => Some(path),
+            Self::Geometry(_) => None,
+        }
+    }
+    fn verify(&self, descriptor: &ContentLease) -> Result<(), RuntimeError> {
+        match self {
+            Self::ExistingPath { path, .. } => verify_leased_file(
+                path,
+                descriptor.bytes,
+                &descriptor.sha256,
+                content_limit(descriptor.kind),
+            ),
+            Self::Geometry(packet) => {
+                if descriptor.kind != ContentKind::Geometry
+                    || descriptor.bytes != packet.bytes()
+                    || descriptor.sha256 != packet.sha256()
+                    || descriptor.bytes > content_limit(ContentKind::Geometry)
+                {
+                    return Err(stale("Geometry backing changed"));
+                }
+                packet
+                    .verify()
+                    .map_err(|_| stale("Geometry backing failed verification"))
+            }
+        }
+    }
+    fn stream_to(
+        &self,
+        descriptor: &ContentLease,
+        sink: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
+        match self {
+            Self::ExistingPath { path, .. } => stream_verified_file(
+                path,
+                descriptor.bytes,
+                &descriptor.sha256,
+                content_limit(descriptor.kind),
+                sink,
+            ),
+            Self::Geometry(packet) => {
+                self.verify(descriptor)?;
+                packet.stream_to(sink).map_err(|_| io_error())
+            }
+        }
+    }
+}
+#[derive(Clone)]
 struct ContentLeaseEntry {
     descriptor: SourceLease,
-    path: PathBuf,
+    backing: ContentBacking,
     expires: SystemTime,
     principal_id: String,
-    remove_on_drop: bool,
     source_token: Option<String>,
 }
 
@@ -1016,6 +1069,8 @@ struct TempResourceState {
     staged_upload_bytes: u64,
     reserved_upload_bytes: u64,
     active_bundle_builds: usize,
+    retained_geometry_bytes: u64,
+    geometry_inventory_error: Option<RuntimeError>,
 }
 
 #[derive(Clone)]
@@ -1968,6 +2023,7 @@ impl Drop for OwnedDirectory {
 enum ReservationKind {
     Bundle,
     Owned,
+    Geometry,
     Upload,
 }
 
@@ -2001,7 +2057,7 @@ pub struct LibraryRuntime {
     scan: Arc<scanner::ScanControl>,
     bundle_previews: bundles::BundlePreviewStore,
     temp_limits: Mutex<TempResourceLimits>,
-    temp_resources: Mutex<TempResourceState>,
+    temp_resources: Arc<Mutex<TempResourceState>>,
     actions: Mutex<HashMap<String, PlannedAction>>,
     #[cfg(test)]
     before_action_dispatch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -2069,7 +2125,7 @@ impl LibraryRuntime {
             scan: Arc::new(scanner::ScanControl::new()),
             bundle_previews: bundles::BundlePreviewStore::default(),
             temp_limits: Mutex::new(TempResourceLimits::default()),
-            temp_resources: Mutex::new(TempResourceState::default()),
+            temp_resources: Arc::new(Mutex::new(TempResourceState::default())),
             actions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             before_action_dispatch: Mutex::new(None),
@@ -2077,6 +2133,7 @@ impl LibraryRuntime {
             after_guarded_catalog_open: Mutex::new(None),
             self_weak: OnceLock::new(),
         });
+        runtime.refresh_geometry_retained_accounting();
         runtime
             .self_weak
             .set(Arc::downgrade(&runtime))
@@ -2569,8 +2626,16 @@ impl LibraryRuntime {
         kind: ReservationKind,
         bytes: u64,
     ) -> Result<TempReservation<'_>, RuntimeError> {
+        if matches!(kind, ReservationKind::Owned | ReservationKind::Geometry) {
+            self.refresh_geometry_retained_accounting();
+        }
         let limits = *self.temp_limits.lock().unwrap();
         let mut state = self.temp_resources.lock().unwrap();
+        if matches!(kind, ReservationKind::Geometry) {
+            if let Some(error) = &state.geometry_inventory_error {
+                return Err(error.clone());
+            }
+        }
         match kind {
             ReservationKind::Bundle => {
                 if state.active_bundle_builds >= limits.bundle_builds
@@ -2591,7 +2656,7 @@ impl LibraryRuntime {
                 state.reserved_owned_bytes += bytes;
                 state.active_bundle_builds += 1;
             }
-            ReservationKind::Owned => {
+            ReservationKind::Owned | ReservationKind::Geometry => {
                 if state
                     .owned_bytes
                     .checked_add(state.reserved_owned_bytes)
@@ -2634,6 +2699,30 @@ impl LibraryRuntime {
         })
     }
 
+    fn refresh_geometry_retained_accounting(&self) {
+        let (bytes, mut error) = retained_geometry_inventory(&self.root);
+        let mut state = self.temp_resources.lock().unwrap();
+        // A failed inventory cannot authorize releasing previously observed
+        // storage. Its uncertainty blocks geometry, not ordinary catalog use.
+        let retained = if error.is_some() {
+            bytes.max(state.retained_geometry_bytes)
+        } else {
+            bytes
+        };
+        let owned = state
+            .owned_bytes
+            .checked_sub(state.retained_geometry_bytes)
+            .and_then(|active| active.checked_add(retained));
+        if owned.is_none() {
+            error = Some(geometry_inventory_error(
+                "Retained geometry byte accounting overflowed",
+            ));
+        }
+        state.owned_bytes = owned.unwrap_or(u64::MAX);
+        state.retained_geometry_bytes = retained;
+        state.geometry_inventory_error = error;
+    }
+
     fn release_owned_bytes(&self, bytes: u64) {
         let mut state = self.temp_resources.lock().unwrap();
         state.owned_bytes = state.owned_bytes.saturating_sub(bytes);
@@ -2665,8 +2754,12 @@ impl LibraryRuntime {
     }
 
     fn cleanup_content_lease(&self, lease: &ContentLeaseEntry) {
-        if lease.remove_on_drop {
-            let _ = hold_runtime_path(&lease.path);
+        if let ContentBacking::ExistingPath {
+            path,
+            remove_on_drop: true,
+        } = &lease.backing
+        {
+            let _ = hold_runtime_path(path);
             self.release_owned_bytes(lease.descriptor.bytes);
         }
     }
@@ -2693,7 +2786,10 @@ impl LibraryRuntime {
     pub fn active_content_lease_paths(&self) -> Vec<PathBuf> {
         let mut leases = self.leases.lock().unwrap();
         self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
-        leases.values().map(|lease| lease.path.clone()).collect()
+        leases
+            .values()
+            .filter_map(|lease| lease.backing.path().map(Path::to_path_buf))
+            .collect()
     }
 
     #[cfg(test)]
@@ -2749,7 +2845,57 @@ impl LibraryRuntime {
     }
 }
 
+pub(crate) struct GeometryByteCharge {
+    state: Arc<Mutex<TempResourceState>>,
+    bytes: u64,
+}
+impl Drop for GeometryByteCharge {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.owned_bytes = state.owned_bytes.saturating_sub(self.bytes);
+    }
+}
 impl TempReservation<'_> {
+    pub(crate) fn into_geometry_charge(
+        mut self,
+        actual_bytes: u64,
+    ) -> Result<GeometryByteCharge, RuntimeError> {
+        if !matches!(self.kind, ReservationKind::Geometry) || actual_bytes != self.bytes {
+            return Err(internal(
+                "Geometry reservation must transfer its exact byte count",
+            ));
+        }
+        let limits = *self.runtime.temp_limits.lock().unwrap();
+        let mut state = self.runtime.temp_resources.lock().unwrap();
+        let owned = state
+            .owned_bytes
+            .checked_add(actual_bytes)
+            .ok_or_else(|| internal("Geometry byte accounting overflow"))?;
+        let other_reserved = state
+            .reserved_owned_bytes
+            .checked_sub(self.bytes)
+            .ok_or_else(|| internal("Geometry reservation accounting changed"))?;
+        if owned
+            .checked_add(other_reserved)
+            .is_none_or(|value| value > limits.owned_bytes)
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Generated content temporary storage is full".into(),
+                retryable: true,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        state.reserved_owned_bytes = other_reserved;
+        state.owned_bytes = owned;
+        self.committed = true;
+        Ok(GeometryByteCharge {
+            state: Arc::clone(&self.runtime.temp_resources),
+            bytes: actual_bytes,
+        })
+    }
+
     fn commit(mut self, actual_bytes: u64) -> Result<(), RuntimeError> {
         let limits = *self.runtime.temp_limits.lock().unwrap();
         let mut state = self.runtime.temp_resources.lock().unwrap();
@@ -2791,6 +2937,11 @@ impl TempReservation<'_> {
                 }
                 state.owned_bytes += actual_bytes;
             }
+            ReservationKind::Geometry => {
+                return Err(internal(
+                    "Geometry must transfer its reservation into a byte charge",
+                ));
+            }
             ReservationKind::Upload => {
                 state.reserved_upload_bytes =
                     state.reserved_upload_bytes.saturating_sub(self.bytes);
@@ -2826,7 +2977,7 @@ impl Drop for TempReservation<'_> {
                 state.reserved_owned_bytes = state.reserved_owned_bytes.saturating_sub(self.bytes);
                 state.active_bundle_builds = state.active_bundle_builds.saturating_sub(1);
             }
-            ReservationKind::Owned => {
+            ReservationKind::Owned | ReservationKind::Geometry => {
                 state.reserved_owned_bytes = state.reserved_owned_bytes.saturating_sub(self.bytes);
             }
             ReservationKind::Upload => {
@@ -2851,11 +3002,104 @@ fn prepare_lazy_desktop_root(path: &Path) -> Result<PathBuf, RuntimeError> {
     path.canonicalize().map_err(|_| io_error())
 }
 
+fn geometry_inventory_error(message: &str) -> RuntimeError {
+    RuntimeError {
+        code: RuntimeErrorCode::Busy,
+        message: message.into(),
+        retryable: true,
+        current_version: None,
+        source_holds: Vec::new(),
+    }
+}
+/// Retained legacy/unknown files are never adopted as generated ownership.
+/// Count regular bytes without following names; uncertainty disables only new geometry.
+fn retained_geometry_inventory(root: &Path) -> (u64, Option<RuntimeError>) {
+    // The producer holds this same gate only while its empty named inode is
+    // being captured/unlinked. Release it before taking temporary-resource state.
+    let _creation = match secure_fs::geometry_inventory_guard() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return (
+                0,
+                Some(geometry_inventory_error(
+                    "Geometry storage synchronization is unavailable",
+                )),
+            )
+        }
+    };
+    retained_geometry_inventory_under_gate(root)
+}
+fn retained_geometry_inventory_under_gate(root: &Path) -> (u64, Option<RuntimeError>) {
+    let namespace = root.join("staging/geometry");
+    let metadata = match fs::symlink_metadata(&namespace) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (0, None),
+        Err(_) => {
+            return (
+                0,
+                Some(geometry_inventory_error(
+                    "Geometry storage could not be inspected",
+                )),
+            )
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || namespace.canonicalize().ok().as_deref() != Some(namespace.as_path())
+    {
+        return (
+            0,
+            Some(geometry_inventory_error(
+                "Retained geometry namespace is unsafe; its files were preserved",
+            )),
+        );
+    }
+    let directory = match secure_fs::Directory::open(&namespace) {
+        Ok(directory) => directory,
+        Err(_) => {
+            return (
+                0,
+                Some(geometry_inventory_error(
+                    "Geometry storage could not be admitted",
+                )),
+            )
+        }
+    };
+    let names = match directory.read_entry_names(256) {
+        Ok(names) => names,
+        Err(_) => {
+            return (
+                0,
+                Some(geometry_inventory_error(
+                    "Retained geometry storage exceeds its entry limit or cannot be enumerated",
+                )),
+            )
+        }
+    };
+    let mut bytes = 0u64;
+    let mut issue = None;
+    for name in names {
+        match directory.open_file(&name).and_then(|file|file.metadata()) {
+            Ok(metadata)=>match bytes.checked_add(metadata.len()) {
+                Some(total)=>bytes=total,
+                None=>return (u64::MAX,Some(geometry_inventory_error("Retained geometry storage exceeds its byte range"))),
+            },
+            Err(_)=>issue=Some(geometry_inventory_error("Retained geometry contains an unsafe or nonregular entry; all files were preserved")),
+        }
+    }
+    if !directory
+        .matches_path(&namespace)
+        .is_ok_and(|matches| matches)
+    {
+        issue = Some(geometry_inventory_error(
+            "Retained geometry namespace changed during inspection",
+        ));
+    }
+    (bytes, issue)
+}
+
 fn cleanup_runtime_orphans(root: &Path) -> Result<(), RuntimeError> {
-    for (relative, prefix, suffix) in [
-        ("staging/bundle-downloads", "bundle-", ".zip"),
-        ("staging/geometry", "geometry-", ".stl2"),
-    ] {
+    for (relative, prefix, suffix) in [("staging/bundle-downloads", "bundle-", ".zip")] {
         let directory = root.join(relative);
         let metadata = match fs::symlink_metadata(&directory) {
             Ok(metadata) => metadata,
@@ -4290,10 +4534,12 @@ impl BundleEngine for LibraryRuntime {
             id,
             ContentLeaseEntry {
                 descriptor: descriptor.clone(),
-                path: archive.path,
+                backing: ContentBacking::ExistingPath {
+                    path: archive.path,
+                    remove_on_drop: true,
+                },
                 expires,
                 principal_id: context.principal_id.clone(),
-                remove_on_drop: true,
                 source_token: Some(preview_token.to_owned()),
             },
         );
@@ -4323,7 +4569,12 @@ impl GeometryEngine for LibraryRuntime {
         if expected_hash.is_some_and(|hash| model.content_hash.as_deref() != Some(hash)) {
             return Err(stale("Model source hash changed"));
         }
-        let reservation = self.reserve_temp(ReservationKind::Owned, 128 * 1024 * 1024)?;
+        // Expired tokens must release their map-owned backing before quota is
+        // reserved. Existing readers retain their Arc and byte charge.
+        {
+            let mut leases = self.leases.lock().unwrap();
+            self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
+        }
         let prepared = geometry::prepare_model_geometry(self, &model, plate_id)?;
         let expires = SystemTime::now() + LEASE_TTL;
         let id = uuid::Uuid::new_v4().simple().to_string();
@@ -4332,20 +4583,14 @@ impl GeometryEngine for LibraryRuntime {
             kind: ContentKind::Geometry,
             file_name: format!("model-{model_id}.stl2"),
             mime: "application/vnd.gogglelab.geometry".into(),
-            bytes: prepared.bytes,
-            sha256: prepared.sha256,
+            bytes: prepared.packet.bytes(),
+            sha256: prepared.packet.sha256().to_owned(),
             library_epoch: self.library_epoch(),
             expires_at: format_system_time(expires)?,
         };
-        if let Err(error) = reservation.commit(prepared.bytes) {
-            let _ = hold_runtime_path(&prepared.path);
-            return Err(error);
-        }
         let mut leases = self.leases.lock().unwrap();
         self.prune_content_leases(&mut leases, SystemTime::now(), self.library_epoch());
         if leases.len() >= MAX_LEASES {
-            let _ = hold_runtime_path(&prepared.path);
-            self.release_owned_bytes(prepared.bytes);
             return Err(RuntimeError {
                 code: RuntimeErrorCode::Busy,
                 message: "Content lease limit reached".into(),
@@ -4358,10 +4603,9 @@ impl GeometryEngine for LibraryRuntime {
             id,
             ContentLeaseEntry {
                 descriptor: content.clone(),
-                path: prepared.path,
+                backing: ContentBacking::Geometry(prepared.packet),
                 expires,
                 principal_id: context.principal_id.clone(),
-                remove_on_drop: true,
                 source_token: None,
             },
         );
@@ -4752,10 +4996,12 @@ impl GalleryEngine for LibraryRuntime {
             id,
             ContentLeaseEntry {
                 descriptor: descriptor.clone(),
-                path,
+                backing: ContentBacking::ExistingPath {
+                    path,
+                    remove_on_drop: false,
+                },
                 expires,
                 principal_id: context.principal_id.clone(),
-                remove_on_drop: false,
                 source_token: None,
             },
         );
@@ -4999,10 +5245,12 @@ impl DownloadEngine for LibraryRuntime {
             id,
             ContentLeaseEntry {
                 descriptor: descriptor.clone(),
-                path,
+                backing: ContentBacking::ExistingPath {
+                    path,
+                    remove_on_drop: false,
+                },
                 expires,
                 principal_id: context.principal_id.clone(),
-                remove_on_drop: false,
                 source_token: None,
             },
         );
@@ -5019,12 +5267,7 @@ impl ContentEngine for LibraryRuntime {
         self.require(context, Capability::MediaRead)?;
         let _io = self.begin_borrowed_io()?;
         let entry = self.admitted_content_entry(context, lease_id)?;
-        verify_leased_file(
-            &entry.path,
-            entry.descriptor.bytes,
-            &entry.descriptor.sha256,
-            content_limit(entry.descriptor.kind),
-        )?;
+        entry.backing.verify(&entry.descriptor)?;
         Ok(entry.descriptor)
     }
 
@@ -5037,13 +5280,7 @@ impl ContentEngine for LibraryRuntime {
         self.require(context, Capability::MediaRead)?;
         let _io = self.begin_borrowed_io()?;
         let entry = self.admitted_content_entry(context, lease_id)?;
-        stream_verified_file(
-            &entry.path,
-            entry.descriptor.bytes,
-            &entry.descriptor.sha256,
-            content_limit(entry.descriptor.kind),
-            sink,
-        )?;
+        entry.backing.stream_to(&entry.descriptor, sink)?;
         Ok(())
     }
 }
@@ -5344,8 +5581,12 @@ impl Drop for LibraryRuntime {
     fn drop(&mut self) {
         if let Ok(leases) = self.leases.get_mut() {
             for lease in leases.drain().map(|(_, lease)| lease) {
-                if lease.remove_on_drop {
-                    let _ = hold_runtime_path(&lease.path);
+                if let ContentBacking::ExistingPath {
+                    path,
+                    remove_on_drop: true,
+                } = &lease.backing
+                {
+                    let _ = hold_runtime_path(path);
                 }
             }
         }
@@ -5869,7 +6110,7 @@ fn snapshot_orphan_files(
         .lock()
         .unwrap()
         .values()
-        .map(|lease| lease.path.clone())
+        .filter_map(|lease| lease.backing.path().map(Path::to_path_buf))
         .collect::<Vec<_>>();
     collect_orphan_files(
         &runtime.root,
@@ -9112,7 +9353,7 @@ fn execute_cleanup_orphans(
         .lock()
         .unwrap()
         .values()
-        .map(|lease| lease.path.clone())
+        .filter_map(|lease| lease.backing.path().map(Path::to_path_buf))
         .collect::<Vec<_>>();
     let current_orphans = collect_orphan_files(
         &root,
@@ -14834,8 +15075,10 @@ mod tests {
             .unwrap()
             .get(&lease.id)
             .unwrap()
-            .path
-            .clone();
+            .backing
+            .path()
+            .unwrap()
+            .to_path_buf();
         let mut archive_bytes = Vec::new();
         runtime
             .stream_content(&context, &lease.id, &mut archive_bytes)
@@ -14872,6 +15115,535 @@ mod tests {
     }
 
     #[test]
+    fn geometry_expiry_retires_packet_without_named_files_or_source_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        let original = triangle_stl(0.0);
+        fs::write(&source, &original).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        let lease = runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .unwrap();
+        let mut packet = Vec::new();
+        runtime
+            .stream_content(&context, &lease.content.id, &mut packet)
+            .unwrap();
+        assert_eq!(&packet[..4], b"STL2");
+        runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&lease.content.id)
+            .unwrap()
+            .expires = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            runtime
+                .describe_content(&context, &lease.content.id)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        let namespace = runtime.root.join("staging/geometry");
+        assert_eq!(
+            fs::read_dir(&namespace).unwrap().count(),
+            0,
+            "Expired geometry must leave no named packet, hold, or journal"
+        );
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+        drop(runtime);
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn geometry_reader_keeps_its_byte_charge_after_token_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        let lease = runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .unwrap();
+        let reader = runtime
+            .admitted_content_entry(&context, &lease.content.id)
+            .unwrap();
+        runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&lease.content.id)
+            .unwrap()
+            .expires = SystemTime::UNIX_EPOCH;
+        assert!(runtime
+            .describe_content(&context, &lease.content.id)
+            .is_err());
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().owned_bytes,
+            lease.content.bytes,
+            "Reader must retain backing quota after token removal"
+        );
+        drop(reader);
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+    }
+
+    #[test]
+    fn geometry_reader_outlives_runtime_without_a_runtime_cycle_or_early_quota_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        let lease = runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .unwrap();
+        let reader = runtime
+            .admitted_content_entry(&context, &lease.content.id)
+            .unwrap();
+        let state = Arc::clone(&runtime.temp_resources);
+        let weak = Arc::downgrade(&runtime);
+        drop(runtime);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(state.lock().unwrap().owned_bytes, lease.content.bytes);
+        let mut packet = Vec::new();
+        reader
+            .backing
+            .stream_to(&reader.descriptor, &mut packet)
+            .unwrap();
+        assert_eq!(&packet[..4], b"STL2");
+        drop(reader);
+        assert_eq!(state.lock().unwrap().owned_bytes, 0);
+        assert_eq!(
+            fs::read_dir(temp.path().join("library/staging/geometry"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn geometry_owner_epoch_and_active_reader_rules_remain_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        let lease = runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .unwrap();
+        let mut other = context.clone();
+        other.principal_id = "different-owner".into();
+        let mut denied = Vec::new();
+        assert_eq!(
+            runtime
+                .stream_content(&other, &lease.content.id, &mut denied)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Forbidden
+        );
+        assert!(denied.is_empty());
+        assert!(runtime.active_content_lease_paths().is_empty());
+        let reader = runtime
+            .admitted_content_entry(&context, &lease.content.id)
+            .unwrap();
+        let maintenance = runtime.begin_maintenance().unwrap();
+        maintenance.invalidate();
+        drop(maintenance);
+        assert_eq!(
+            runtime
+                .describe_content(&context, &lease.content.id)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Stale
+        );
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().owned_bytes,
+            lease.content.bytes
+        );
+        drop(reader);
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+    }
+
+    #[test]
+    fn geometry_admission_failure_releases_packet_charge_without_a_hold() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        let original = runtime
+            .issue_model_download(&context, &model.id, None)
+            .unwrap();
+        let entry = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(&original.id)
+            .unwrap()
+            .clone();
+        for index in 0..MAX_LEASES {
+            runtime
+                .leases
+                .lock()
+                .unwrap()
+                .insert(format!("fixture-{index}"), entry.clone());
+        }
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, None, None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        let state = runtime.temp_resources.lock().unwrap();
+        assert_eq!(state.owned_bytes, 0);
+        assert_eq!(state.reserved_owned_bytes, 0);
+        drop(state);
+        assert_eq!(
+            fs::read_dir(runtime.root.join("staging/geometry"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(source.is_file());
+    }
+
+    #[test]
+    fn retained_geometry_files_are_preserved_counted_and_bound_new_geometry_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let library = temp.path().join("library");
+        let runtime = LibraryRuntime::open(config(library.clone())).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        drop(runtime);
+        let namespace = library.join("staging/geometry");
+        fs::create_dir(&namespace).unwrap();
+        fs::write(namespace.join("geometry-old.stl2"), b"legacy").unwrap();
+        fs::write(namespace.join(".geometry-capture-unknown"), b"unknown").unwrap();
+        let runtime = LibraryRuntime::open(config(library.clone())).unwrap();
+        assert!(runtime
+            .read_db(|db| db.get_model(&model.id))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            runtime
+                .temp_resources
+                .lock()
+                .unwrap()
+                .retained_geometry_bytes,
+            13
+        );
+        runtime.temp_limits.lock().unwrap().owned_bytes = 13 + 51;
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, None, None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        assert_eq!(
+            fs::read(namespace.join("geometry-old.stl2")).unwrap(),
+            b"legacy"
+        );
+        assert_eq!(
+            fs::read(namespace.join(".geometry-capture-unknown")).unwrap(),
+            b"unknown"
+        );
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 2);
+        runtime.temp_limits.lock().unwrap().owned_bytes = DEFAULT_OWNED_TEMP_BYTES;
+        for index in 0..255 {
+            fs::write(namespace.join(format!("unknown-{index}")), b"").unwrap();
+        }
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, None, None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 257);
+        assert!(runtime
+            .read_db(|db| db.get_model(&model.id))
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_geometry_storage_does_not_block_explicit_thumbnail_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        let original = triangle_stl(0.0);
+        fs::write(&source, &original).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"preserve").unwrap();
+        std::os::unix::fs::symlink(&outside, runtime.root.join("staging/geometry")).unwrap();
+        let context = RequestContext {
+            principal_id: "thumbnail".into(),
+            capabilities: BTreeSet::from([
+                Capability::MediaRead,
+                Capability::MediaWrite,
+                Capability::CatalogWrite,
+            ]),
+            request_id: "thumbnail".into(),
+        };
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, None, None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        runtime
+            .start_thumbnail_job(&context, vec![model.id.clone()], true)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runtime.scan_control().status().running && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let status = runtime.scan_control().status();
+        assert!(!status.running);
+        assert!(status.errors.is_empty(), "{:?}", status.errors);
+        assert_eq!(status.thumbnails_completed, 1);
+        assert!(runtime
+            .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))
+            .unwrap()
+            .is_some());
+        assert_eq!(fs::read(source).unwrap(), original);
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"preserve");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn concurrent_geometry_inventory_waits_for_the_empty_named_birth_window() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        let namespace = runtime.root.join("staging/geometry");
+        fs::create_dir(&namespace).unwrap();
+        let (born_tx, born_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let birth = std::thread::spawn(move || {
+            let directory = secure_fs::Directory::open(&namespace).unwrap();
+            let writer = directory.create_anonymous_geometry_writer_with_hook(|stage, _, _| {
+                if stage == "after_empty_create" {
+                    born_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                Ok(())
+            });
+            writer.map(drop)
+        });
+        born_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader_runtime = Arc::clone(&runtime);
+        let reader = std::thread::spawn(move || {
+            let context = RequestContext {
+                principal_id: "parallel-geometry".into(),
+                capabilities: BTreeSet::from([Capability::MediaRead]),
+                request_id: "parallel".into(),
+            };
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(reader_runtime.issue_model_geometry(&context, &model.id, None, None))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = result_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        birth.join().unwrap().unwrap();
+        reader.join().unwrap();
+        assert!(matches!(premature,Err(mpsc::RecvTimeoutError::Timeout)),"Inventory must wait rather than interpret the creator's mode-000 file as foreign storage");
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn one_packet_budget_is_retained_until_the_last_reader_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        runtime.set_temp_limits_for_test(52, 1024);
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        let first = runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .unwrap();
+        assert_eq!(first.content.bytes, 52);
+        let reader = runtime
+            .admitted_content_entry(&context, &first.content.id)
+            .unwrap();
+        runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&first.content.id)
+            .unwrap()
+            .expires = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, None, None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        assert!(!runtime
+            .leases
+            .lock()
+            .unwrap()
+            .contains_key(&first.content.id));
+        drop(reader);
+        assert!(runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_geometry_without_readers_releases_budget_on_the_next_geometry_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        runtime.set_temp_limits_for_test(52, 1024);
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        let first = runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .unwrap();
+        runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&first.content.id)
+            .unwrap()
+            .expires = SystemTime::UNIX_EPOCH;
+        let next = runtime
+            .issue_model_geometry(&context, &model.id, None, None)
+            .unwrap();
+        assert_ne!(next.content.id, first.content.id);
+        assert_eq!(next.content.sha256, first.content.sha256);
+        assert!(!runtime
+            .leases
+            .lock()
+            .unwrap()
+            .contains_key(&first.content.id));
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 52);
+        assert_eq!(
+            fs::read_dir(runtime.root.join("staging/geometry"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_geometry_namespace_blocks_geometry_without_blocking_the_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("part.stl");
+        fs::write(&source, triangle_stl(0.0)).unwrap();
+        let library = temp.path().join("library");
+        let runtime = LibraryRuntime::open(config(library.clone())).unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|value| value.model))
+            .unwrap();
+        drop(runtime);
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"preserve").unwrap();
+        std::os::unix::fs::symlink(&outside, library.join("staging/geometry")).unwrap();
+        let runtime = LibraryRuntime::open(config(library)).unwrap();
+        assert!(runtime
+            .read_db(|db| db.get_model(&model.id))
+            .unwrap()
+            .is_some());
+        let context = RequestContext {
+            principal_id: "geometry".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "geometry".into(),
+        };
+        assert_eq!(
+            runtime
+                .issue_model_geometry(&context, &model.id, None, None)
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::Busy
+        );
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"preserve");
+    }
+
+    #[test]
     fn model_geometry_uses_stl2_lease_and_rejects_stale_hash() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("part.stl");
@@ -14895,14 +15667,6 @@ mod tests {
         let geometry = runtime
             .issue_model_geometry(&context, &model.id, model.content_hash.as_deref(), None)
             .unwrap();
-        let owned_path = runtime
-            .leases
-            .lock()
-            .unwrap()
-            .get(&geometry.content.id)
-            .unwrap()
-            .path
-            .clone();
         assert_eq!(geometry.content.kind, ContentKind::Geometry);
         assert_eq!(geometry.packet_format, "stl2");
         assert_eq!(geometry.packet_version, 2);
@@ -14915,11 +15679,16 @@ mod tests {
         assert_eq!(&packet[..4], b"STL2");
         assert_eq!(u32::from_le_bytes(packet[8..12].try_into().unwrap()), 1);
         drop(runtime);
-        assert!(!owned_path.exists());
+        assert_eq!(
+            fs::read_dir(temp.path().join("library/staging/geometry"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
-    fn first_database_use_prunes_only_known_runtime_orphans() {
+    fn first_database_use_prunes_bundle_orphans_and_preserves_unverified_geometry() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("library");
         let runtime = LibraryRuntime::open(config(root.clone())).unwrap();
@@ -14936,7 +15705,10 @@ mod tests {
         let reopened = LibraryRuntime::open(config(root)).unwrap();
         reopened.read_db(|db| db.list_models(None, None)).unwrap();
         assert!(!bundle_dir.join("bundle-orphan.zip").exists());
-        assert!(!geometry_dir.join("geometry-orphan.stl2").exists());
+        assert_eq!(
+            fs::read(geometry_dir.join("geometry-orphan.stl2")).unwrap(),
+            b"orphan"
+        );
         assert!(bundle_dir.join("operator-note.txt").exists());
     }
 
