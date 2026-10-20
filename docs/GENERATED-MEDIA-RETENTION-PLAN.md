@@ -298,3 +298,13 @@ signature verification. Executable SHA-256:
 `2f55215939e07bdc31d88c44da3fd927da86bb6492a05240edc12e7c66a207c9`.
 The previous `9f64119` signed Community and isolated QA bundles are preserved with
 verified hashes. Isolated rebuilt native rendering acceptance remains in progress.
+
+
+Proof foundation isolated native gate passes at public code `7a95cea`: rebuilt
+unlicensed composition indexes both unchanged synthetic models and finishes
+regeneration at 2/2. Each PNG exactly matches its prior verified backup entry;
+staging remains empty and source hashes are unchanged. The QA app is confirmed
+exited. Evidence: `output/thumbnail-proof-foundation-final-checks.json` and
+`output/thumbnail-proof-foundation-native.png`. This closes the foundation gate,
+not thumbnail retirement acceptance. The existing cleanup/publication paths are
+still unchanged; proceed to the separately reviewed, initially unwired PNG receipt.
