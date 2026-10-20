@@ -105,6 +105,20 @@ impl RasterGeneratedPng {
     pub(crate) fn png_hash(&self) -> &str {
         &self.png_hash
     }
+    /// Match a canonical cache selector to this independently rendered output.
+    /// The optional filename digest selects bytes; it never creates proof.
+    pub(crate) fn matches_filename(&self, name: &OsStr) -> bool {
+        let Some(candidate) = ThumbnailRecipe::parse_filename(name) else {
+            return false;
+        };
+        candidate.source_hash == self.recipe.source_hash
+            && candidate.size == self.recipe.size
+            && candidate.background == self.recipe.background
+            && candidate
+                .png_hash_hint
+                .as_deref()
+                .is_none_or(|hint| hint == self.png_hash.as_str())
+    }
 }
 #[derive(Debug)]
 struct EmbeddedPreviewPng {

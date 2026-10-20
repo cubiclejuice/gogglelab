@@ -9,6 +9,81 @@
 #[cfg(not(unix))]
 use std::path::Path;
 
+/// PNG ownership is restricted to the fixed thumbnails child of an admitted Library.
+#[allow(dead_code)]
+pub(crate) struct PngNamespace {
+    inner: std::sync::Arc<PngNamespaceInner>,
+}
+#[allow(dead_code)]
+struct PngNamespaceInner {
+    root: Directory,
+    root_path: std::path::PathBuf,
+    root_identity: (u64, u64, u32),
+    directory: Directory,
+    directory_identity: (u64, u64, u32),
+}
+#[derive(Debug)]
+enum PngLocation {
+    Public(std::ffi::OsString),
+    Claim(std::ffi::OsString),
+    Unlinked,
+}
+#[allow(dead_code)]
+pub(crate) struct PngFileReceipt {
+    file: std::fs::File,
+    namespace: std::sync::Arc<PngNamespaceInner>,
+    identity: Option<(u64, u64, u32)>,
+    rendered: std::sync::Arc<crate::thumbnails::RasterGeneratedPng>,
+    public_name: std::ffi::OsString,
+    location: PngLocation,
+    partial: bool,
+}
+impl std::fmt::Debug for PngFileReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PngFileReceipt")
+            .field("location", &self.location)
+            .field("partial", &self.partial)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug)]
+pub(crate) struct CreatedPngStage {
+    receipt: PngFileReceipt,
+}
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct PngStageFailure {
+    pub source: std::io::Error,
+    pub stage: Option<CreatedPngStage>,
+}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PngRetirementOutcome {
+    pub unlinked_now: bool,
+    pub removed_bytes: u64,
+}
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct PngRetirementFailure {
+    pub source: std::io::Error,
+    pub outcome: PngRetirementOutcome,
+}
+#[allow(dead_code)]
+impl PngFileReceipt {
+    pub(crate) fn current_name(&self) -> Option<&std::ffi::OsStr> {
+        match &self.location {
+            PngLocation::Public(n) | PngLocation::Claim(n) => Some(n),
+            PngLocation::Unlinked => None,
+        }
+    }
+}
+#[allow(dead_code)]
+impl CreatedPngStage {
+    pub(crate) fn current_name(&self) -> Option<&std::ffi::OsStr> {
+        self.receipt.current_name()
+    }
+}
+const MAX_RECEIPT_PNG_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Geometry-only output. The original exclusively-created descriptor is already
 /// anonymous; no payload bytes may be written until construction succeeds.
 pub(crate) struct GeometryFileWriter {
@@ -2702,6 +2777,270 @@ mod imp {
         }
     }
 
+    #[allow(dead_code)]
+    impl super::PngNamespace {
+        pub(crate) fn open(expected_library_root: &Path, root: &Directory) -> io::Result<Self> {
+            generated_supported()?;
+            if !expected_library_root.is_absolute() || !root.matches_path(expected_library_root)? {
+                return Err(generated_invalid(
+                    "PNG admitted root path does not match descriptor",
+                ));
+            }
+            let root_path = expected_library_root.to_path_buf();
+            let directory = root.open_child(std::ffi::OsStr::new("thumbnails"))?;
+            let value = Self {
+                inner: std::sync::Arc::new(super::PngNamespaceInner {
+                    root: root.try_clone()?,
+                    root_path,
+                    root_identity: generated_identity(&root.0)?,
+                    directory_identity: generated_identity(&directory.0)?,
+                    directory,
+                }),
+            };
+            value.verify_namespace()?;
+            Ok(value)
+        }
+        fn verify_namespace(&self) -> io::Result<()> {
+            let n = &self.inner;
+            if generated_identity(&n.root.0)? != n.root_identity
+                || !n.root.matches_path(&n.root_path)?
+                || generated_identity(&n.directory.0)? != n.directory_identity
+                || generated_identity(&n.root.open_child(std::ffi::OsStr::new("thumbnails"))?.0)?
+                    != n.directory_identity
+            {
+                return Err(generated_invalid("PNG namespace binding changed"));
+            }
+            Ok(())
+        }
+        fn verify_receipt(&self, r: &mut super::PngFileReceipt) -> io::Result<u64> {
+            use std::os::unix::fs::FileExt;
+            self.verify_namespace()?;
+            if self.inner.root_identity != r.namespace.root_identity
+                || self.inner.directory_identity != r.namespace.directory_identity
+                || self.inner.root_path != r.namespace.root_path
+            {
+                return Err(generated_invalid(
+                    "PNG receipt belongs to another namespace",
+                ));
+            }
+            let identity = generated_identity(&r.file)?;
+            if let Some(original) = r.identity {
+                if identity != original {
+                    return Err(generated_invalid("PNG descriptor identity changed"));
+                }
+            } else {
+                r.identity = Some(identity);
+            }
+            let name = r
+                .current_name()
+                .ok_or_else(|| generated_invalid("PNG receipt is unlinked"))?;
+            let named = EntryIdentity::at(&self.inner.directory, name)?;
+            if (named.device, named.inode, named.mode) != identity {
+                return Err(generated_invalid("PNG directory entry was replaced"));
+            }
+            let length = r.file.metadata()?.len();
+            let intended = r.rendered.bytes();
+            if length > super::MAX_RECEIPT_PNG_BYTES
+                || length > intended.len() as u64
+                || (!r.partial && length != intended.len() as u64)
+            {
+                return Err(generated_invalid("PNG receipt length mismatch"));
+            }
+            let mut actual = vec![0; length as usize];
+            r.file.read_exact_at(&mut actual, 0)?;
+            if actual != intended[..length as usize] || r.file.metadata()?.len() != length {
+                return Err(generated_invalid("PNG receipt bytes changed"));
+            }
+            let named = EntryIdentity::at(&self.inner.directory, name)?;
+            if (named.device, named.inode, named.mode) != identity {
+                return Err(generated_invalid(
+                    "PNG directory entry changed during verification",
+                ));
+            }
+            self.verify_namespace()?;
+            Ok(length)
+        }
+        pub(crate) fn create_png_stage(
+            &self,
+            rendered: std::sync::Arc<crate::thumbnails::RasterGeneratedPng>,
+        ) -> Result<super::PngFileReceipt, super::PngStageFailure> {
+            self.create_png_stage_with(rendered, |_, _, _| Ok(()))
+        }
+        pub(super) fn create_png_stage_with(
+            &self,
+            rendered: std::sync::Arc<crate::thumbnails::RasterGeneratedPng>,
+            mut hook: impl FnMut(&str, &File, &std::ffi::OsStr) -> io::Result<()>,
+        ) -> Result<super::PngFileReceipt, super::PngStageFailure> {
+            let setup = (|| {
+                self.verify_namespace()?;
+                if rendered.bytes().is_empty()
+                    || rendered.bytes().len() as u64 > super::MAX_RECEIPT_PNG_BYTES
+                {
+                    return Err(generated_invalid("PNG proof exceeds output bound"));
+                }
+                let name: OsString = format!(
+                    ".gogglelab-png-stage-{}.part",
+                    uuid::Uuid::new_v4().simple()
+                )
+                .into();
+                let cname = c_name(&name)?;
+                let fd = unsafe {
+                    libc::openat(
+                        self.inner.directory.0.as_raw_fd(),
+                        cname.as_ptr(),
+                        libc::O_RDWR
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_CLOEXEC
+                            | libc::O_NOFOLLOW,
+                        0o600,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok((unsafe { File::from_raw_fd(fd) }, name))
+            })()
+            .map_err(|source| super::PngStageFailure {
+                source,
+                stage: None,
+            })?;
+            let (file, name) = setup;
+            let mut stage = super::CreatedPngStage {
+                receipt: super::PngFileReceipt {
+                    file,
+                    namespace: self.inner.clone(),
+                    identity: None,
+                    rendered,
+                    public_name: name.clone(),
+                    location: super::PngLocation::Public(name.clone()),
+                    partial: true,
+                },
+            };
+            let result = (|| {
+                stage.receipt.identity = Some(generated_identity(&stage.receipt.file)?);
+                hook("before_payload_write", &stage.receipt.file, &name)?;
+                (&stage.receipt.file).write_all(stage.receipt.rendered.bytes())?;
+                hook("before_file_sync", &stage.receipt.file, &name)?;
+                stage.receipt.file.sync_all()?;
+                self.inner.directory.sync()?;
+                stage.receipt.partial = false;
+                self.verify_receipt(&mut stage.receipt)?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => Ok(stage.receipt),
+                Err(source) => Err(super::PngStageFailure {
+                    source,
+                    stage: Some(stage),
+                }),
+            }
+        }
+        pub(crate) fn admit_reproduced_png(
+            &self,
+            name: &std::ffi::OsStr,
+            rendered: std::sync::Arc<crate::thumbnails::RasterGeneratedPng>,
+        ) -> io::Result<super::PngFileReceipt> {
+            self.verify_namespace()?;
+            if !rendered.matches_filename(name)
+                || rendered.bytes().is_empty()
+                || rendered.bytes().len() as u64 > super::MAX_RECEIPT_PNG_BYTES
+            {
+                return Err(generated_invalid(
+                    "PNG candidate does not match raster recipe",
+                ));
+            }
+            let file = self.inner.directory.open_file(name)?;
+            let identity = Some(generated_identity(&file)?);
+            let mut receipt = super::PngFileReceipt {
+                file,
+                identity,
+                namespace: self.inner.clone(),
+                rendered,
+                public_name: name.into(),
+                location: super::PngLocation::Public(name.into()),
+                partial: false,
+            };
+            self.verify_receipt(&mut receipt)?;
+            Ok(receipt)
+        }
+        pub(crate) fn retire_png(
+            &self,
+            r: &mut super::PngFileReceipt,
+        ) -> Result<super::PngRetirementOutcome, super::PngRetirementFailure> {
+            self.retire_png_with(r, |_, _| Ok(()))
+        }
+        pub(crate) fn retire_created_png_stage(
+            &self,
+            r: &mut super::CreatedPngStage,
+        ) -> Result<super::PngRetirementOutcome, super::PngRetirementFailure> {
+            self.retire_png(&mut r.receipt)
+        }
+        pub(super) fn retire_png_with(
+            &self,
+            r: &mut super::PngFileReceipt,
+            mut hook: impl FnMut(&str, &super::PngFileReceipt) -> io::Result<()>,
+        ) -> Result<super::PngRetirementOutcome, super::PngRetirementFailure> {
+            let mut outcome = super::PngRetirementOutcome::default();
+            let result = (|| {
+                self.verify_namespace()?;
+                if matches!(r.location, super::PngLocation::Unlinked) {
+                    if self.inner.root_identity != r.namespace.root_identity
+                        || self.inner.directory_identity != r.namespace.directory_identity
+                        || self.inner.root_path != r.namespace.root_path
+                    {
+                        return Err(generated_invalid(
+                            "PNG receipt belongs to another namespace",
+                        ));
+                    }
+                } else {
+                    self.verify_receipt(r)?;
+                    if let super::PngLocation::Public(name) = &r.location {
+                        let name = name.clone();
+                        let claim: OsString =
+                            format!(".gogglelab-png-claim-{}", uuid::Uuid::new_v4().simple())
+                                .into();
+                        hook("before_capture", r)?;
+                        self.verify_namespace()?;
+                        self.inner
+                            .directory
+                            .rename_child_exclusive_raw(&name, &claim)?;
+                        r.location = super::PngLocation::Claim(claim);
+                        hook("after_capture", r)?;
+                        self.inner.directory.sync()?;
+                    }
+                    self.verify_receipt(r)?;
+                    hook("before_private_unlink", r)?;
+                    let length = self.verify_receipt(r)?;
+                    let name = c_name(r.current_name().unwrap())?;
+                    if unsafe {
+                        libc::unlinkat(self.inner.directory.0.as_raw_fd(), name.as_ptr(), 0)
+                    } < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    r.location = super::PngLocation::Unlinked;
+                    outcome = super::PngRetirementOutcome {
+                        unlinked_now: true,
+                        removed_bytes: length,
+                    };
+                    hook("after_unlink", r)?;
+                }
+                self.inner.directory.sync()?;
+                self.verify_namespace()?;
+                if self.inner.directory.entry_exists(&r.public_name)? {
+                    return Err(generated_invalid(
+                        "PNG public name reappeared; replacement preserved",
+                    ));
+                }
+                Ok(())
+            })();
+            result
+                .map(|()| outcome)
+                .map_err(|source| super::PngRetirementFailure { source, outcome })
+        }
+    }
+
     fn generated_supported() -> io::Result<()> {
         if cfg!(any(target_os = "macos", target_os = "linux")) {
             Ok(())
@@ -2855,6 +3194,51 @@ pub(crate) use imp::{copy_verified_into_directory, hash_file, Directory};
 
 #[cfg(not(unix))]
 pub(crate) struct Directory;
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+impl PngNamespace {
+    pub(crate) fn open(
+        _expected_library_root: &std::path::Path,
+        _root: &Directory,
+    ) -> std::io::Result<Self> {
+        Err(unsupported())
+    }
+    pub(crate) fn create_png_stage(
+        &self,
+        _rendered: std::sync::Arc<crate::thumbnails::RasterGeneratedPng>,
+    ) -> Result<PngFileReceipt, PngStageFailure> {
+        Err(PngStageFailure {
+            source: unsupported(),
+            stage: None,
+        })
+    }
+    pub(crate) fn admit_reproduced_png(
+        &self,
+        _name: &std::ffi::OsStr,
+        _rendered: std::sync::Arc<crate::thumbnails::RasterGeneratedPng>,
+    ) -> std::io::Result<PngFileReceipt> {
+        Err(unsupported())
+    }
+    pub(crate) fn retire_png(
+        &self,
+        _receipt: &mut PngFileReceipt,
+    ) -> Result<PngRetirementOutcome, PngRetirementFailure> {
+        Err(PngRetirementFailure {
+            source: unsupported(),
+            outcome: PngRetirementOutcome::default(),
+        })
+    }
+    pub(crate) fn retire_created_png_stage(
+        &self,
+        _stage: &mut CreatedPngStage,
+    ) -> Result<PngRetirementOutcome, PngRetirementFailure> {
+        Err(PngRetirementFailure {
+            source: unsupported(),
+            outcome: PngRetirementOutcome::default(),
+        })
+    }
+}
 
 #[cfg(not(unix))]
 impl Directory {
@@ -3199,6 +3583,341 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::imp::{copy_verified_file_with, remove_verified_file_with, Directory};
+
+    fn png_receipt_fixture() -> (
+        tempfile::TempDir,
+        super::PngNamespace,
+        Arc<crate::thumbnails::RasterGeneratedPng>,
+    ) {
+        use crate::thumbnails::{reproduce_thumbnail, ThumbnailRecipe};
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Library");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("thumbnails")).unwrap();
+        let directory = Directory::open(&root.canonicalize().unwrap()).unwrap();
+        let namespace =
+            super::PngNamespace::open(&root.canonicalize().unwrap(), &directory).unwrap();
+        let mut source = vec![0u8; 84];
+        source[80..84].copy_from_slice(&1u32.to_le_bytes());
+        for value in [0f32, 0., 1., 0., 0., 0., 1., 0., 0., 0., 1., 0.] {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+        source.extend_from_slice(&0u16.to_le_bytes());
+        let source_hash = format!("{:x}", Sha256::digest(&source));
+        let name = format!("{source_hash}-isometric-v1-128-12171f.png");
+        let recipe = ThumbnailRecipe::parse_filename(std::ffi::OsStr::new(&name)).unwrap();
+        let proof = Arc::new(
+            reproduce_thumbnail(&recipe, &source, source.len() as u64)
+                .unwrap()
+                .unwrap(),
+        );
+        (temp, namespace, proof)
+    }
+
+    #[test]
+    fn png_receipt_created_stage_retirement_is_private_and_idempotent() {
+        let (temp, namespace, proof) = png_receipt_fixture();
+        let mut receipt = namespace.create_png_stage(proof.clone()).unwrap();
+        let directory = temp.path().join("Library/thumbnails");
+        assert_eq!(
+            fs::read(directory.join(receipt.current_name().unwrap())).unwrap(),
+            proof.bytes()
+        );
+        let retired = namespace.retire_png(&mut receipt).unwrap();
+        assert!(retired.unlinked_now);
+        assert_eq!(retired.removed_bytes, proof.bytes().len() as u64);
+        let retry = namespace.retire_png(&mut receipt).unwrap();
+        assert!(!retry.unlinked_now);
+        assert_eq!(retry.removed_bytes, 0);
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn png_receipt_partial_stage_errors_retain_exact_owner() {
+        use std::io::Write;
+        for length in [0, 17] {
+            let (temp, ns, proof) = png_receipt_fixture();
+            let failure = ns
+                .create_png_stage_with(proof.clone(), |phase, file, _| {
+                    if phase == "before_payload_write" {
+                        (&*file).write_all(&proof.bytes()[..length])?;
+                        return Err(std::io::Error::other("injected write failure"));
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            let mut stage = failure.stage.unwrap();
+            let result = ns.retire_created_png_stage(&mut stage).unwrap();
+            assert!(result.unlinked_now);
+            assert_eq!(result.removed_bytes, length as u64);
+            assert_eq!(
+                fs::read_dir(temp.path().join("Library/thumbnails"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+    #[test]
+    fn png_receipt_candidate_requires_full_recipe_and_bytes() {
+        let (temp, ns, proof) = png_receipt_fixture();
+        let dir = temp.path().join("Library/thumbnails");
+        let name = format!(
+            "{}-isometric-v1-128-12171f.png",
+            proof.recipe().source_hash()
+        );
+        fs::write(dir.join(&name), proof.bytes()).unwrap();
+        let mut receipt = ns
+            .admit_reproduced_png(std::ffi::OsStr::new(&name), proof.clone())
+            .unwrap();
+        assert!(ns
+            .admit_reproduced_png(std::ffi::OsStr::new("custom.png"), proof.clone())
+            .is_err());
+        fs::rename(dir.join(&name), dir.join("original")).unwrap();
+        fs::write(dir.join(&name), proof.bytes()).unwrap();
+        assert!(ns.retire_png(&mut receipt).is_err());
+        assert_eq!(fs::read(dir.join(&name)).unwrap(), proof.bytes());
+        fs::write(dir.join(&name), &proof.bytes()[..17]).unwrap();
+        assert!(ns
+            .admit_reproduced_png(std::ffi::OsStr::new(&name), proof.clone())
+            .is_err());
+        fs::write(
+            dir.join(&name),
+            vec![0u8; super::MAX_RECEIPT_PNG_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(ns
+            .admit_reproduced_png(std::ffi::OsStr::new(&name), proof)
+            .is_err());
+    }
+    #[test]
+    fn png_receipt_sync_failure_reports_unlinked_once_and_public_recreation() {
+        let (temp, ns, proof) = png_receipt_fixture();
+        let mut r = ns.create_png_stage(proof.clone()).unwrap();
+        let name = r.current_name().unwrap().to_owned();
+        let error = ns
+            .retire_png_with(&mut r, |phase, _| {
+                if phase == "after_unlink" {
+                    Err(std::io::Error::other("injected sync boundary"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(error.outcome.unlinked_now);
+        assert_eq!(error.outcome.removed_bytes, proof.bytes().len() as u64);
+        assert_eq!(
+            ns.retire_png(&mut r).unwrap(),
+            super::PngRetirementOutcome::default()
+        );
+        fs::write(
+            temp.path().join("Library/thumbnails").join(name),
+            b"replacement",
+        )
+        .unwrap();
+        let error = ns.retire_png(&mut r).unwrap_err();
+        assert_eq!(error.outcome, super::PngRetirementOutcome::default());
+    }
+    #[test]
+    fn png_receipt_capture_and_private_replacements_are_preserved() {
+        for phase in ["before_capture", "before_private_unlink"] {
+            let (temp, ns, proof) = png_receipt_fixture();
+            let dir = temp.path().join("Library/thumbnails");
+            let mut r = ns.create_png_stage(proof).unwrap();
+            let error = ns
+                .retire_png_with(&mut r, |at, r| {
+                    if at == phase {
+                        let name = r.current_name().unwrap();
+                        fs::rename(dir.join(name), dir.join("displaced"))?;
+                        fs::write(dir.join(name), b"unknown")?;
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(!error.outcome.unlinked_now);
+            assert_eq!(
+                fs::read(dir.join(r.current_name().unwrap())).unwrap(),
+                b"unknown"
+            );
+            assert!(dir.join("displaced").exists());
+        }
+    }
+    #[test]
+    fn png_receipt_namespace_swaps_fail_closed() {
+        for phase in ["before_capture", "before_private_unlink"] {
+            let (temp, ns, proof) = png_receipt_fixture();
+            let root = temp.path().join("Library");
+            let mut r = ns.create_png_stage(proof).unwrap();
+            let error = ns
+                .retire_png_with(&mut r, |at, _| {
+                    if at == phase {
+                        fs::rename(root.join("thumbnails"), root.join("old-thumbnails"))?;
+                        fs::create_dir(root.join("thumbnails"))?;
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(!error.outcome.unlinked_now);
+            assert_eq!(
+                fs::read_dir(root.join("old-thumbnails")).unwrap().count(),
+                1
+            );
+        }
+        let (temp, _ns, _proof) = png_receipt_fixture();
+        let root = temp.path().join("Library");
+        let fd = Directory::open(&root.canonicalize().unwrap()).unwrap();
+        fs::rename(&root, temp.path().join("previousLibrary")).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(super::PngNamespace::open(&root, &fd).is_err());
+    }
+    #[test]
+    fn png_receipt_partial_mutation_and_capture_retry() {
+        use std::io::Write;
+        let (temp, ns, proof) = png_receipt_fixture();
+        let mut failure = ns
+            .create_png_stage_with(proof, |_, _, _| Err(std::io::Error::other("injected")))
+            .unwrap_err();
+        let mut stage = failure.stage.take().unwrap();
+        (&stage.receipt.file).write_all(b"not png prefix").unwrap();
+        assert!(ns.retire_created_png_stage(&mut stage).is_err());
+        assert!(temp
+            .path()
+            .join("Library/thumbnails")
+            .join(stage.current_name().unwrap())
+            .exists());
+        let (_temp, ns, proof) = png_receipt_fixture();
+        let mut r = ns.create_png_stage(proof).unwrap();
+        let error = ns
+            .retire_png_with(&mut r, |at, _| {
+                if at == "after_capture" {
+                    Err(std::io::Error::other("capture sync failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(!error.outcome.unlinked_now);
+        assert!(matches!(r.location, super::PngLocation::Claim(_)));
+        assert!(ns.retire_png(&mut r).unwrap().unlinked_now);
+    }
+
+    #[test]
+    fn png_receipt_root_swap_cross_namespace_and_public_reappearance() {
+        for boundary in ["before_capture", "before_private_unlink"] {
+            let (temp, ns, proof) = png_receipt_fixture();
+            let mut r = ns.create_png_stage(proof.clone()).unwrap();
+            let root = temp.path().join("Library");
+            let error = ns
+                .retire_png_with(&mut r, |phase, _| {
+                    if phase == boundary {
+                        fs::rename(&root, temp.path().join("previousLibrary"))?;
+                        fs::create_dir(&root)?;
+                        fs::create_dir(root.join("thumbnails"))?;
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(!error.outcome.unlinked_now);
+            let held = temp.path().join("previousLibrary/thumbnails");
+            assert_eq!(fs::read_dir(&held).unwrap().count(), 1);
+            assert_eq!(
+                fs::read(held.join(r.current_name().unwrap())).unwrap(),
+                proof.bytes()
+            );
+            assert!(matches!(
+                (&r.location, boundary),
+                (super::PngLocation::Public(_), "before_capture")
+                    | (super::PngLocation::Claim(_), "before_private_unlink")
+            ));
+        }
+        let (_temp, ns, proof) = png_receipt_fixture();
+        let (_other_temp, other, _) = png_receipt_fixture();
+        let mut r = ns.create_png_stage(proof).unwrap();
+        assert!(other.retire_png(&mut r).is_err());
+        assert!(r.current_name().is_some());
+        let (temp, ns, proof) = png_receipt_fixture();
+        let mut r = ns.create_png_stage(proof.clone()).unwrap();
+        let public = r.current_name().unwrap().to_owned();
+        let path = temp.path().join("Library/thumbnails").join(public);
+        let error = ns
+            .retire_png_with(&mut r, |phase, _| {
+                if phase == "before_private_unlink" {
+                    fs::write(&path, b"new public bytes")?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.outcome.unlinked_now);
+        assert_eq!(error.outcome.removed_bytes, proof.bytes().len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), b"new public bytes");
+        assert_eq!(
+            ns.retire_png(&mut r).unwrap_err().outcome,
+            super::PngRetirementOutcome::default()
+        );
+    }
+    #[test]
+    fn png_receipt_full_write_sync_failure_retains_owner() {
+        let (_temp, ns, proof) = png_receipt_fixture();
+        let failure = ns
+            .create_png_stage_with(proof.clone(), |phase, _, _| {
+                if phase == "before_file_sync" {
+                    Err(std::io::Error::other("injected file sync"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(failure.source.to_string().contains("injected"));
+        let mut stage = failure.stage.unwrap();
+        let result = ns.retire_created_png_stage(&mut stage).unwrap();
+        assert_eq!(result.removed_bytes, proof.bytes().len() as u64);
+    }
+
+    #[test]
+    fn png_receipt_content_addressed_candidate_matches_exact_output() {
+        let (temp, ns, proof) = png_receipt_fixture();
+        let dir = temp.path().join("Library/thumbnails");
+        let name = format!(
+            "{}-isometric-v1-128-12171f-{}.png",
+            proof.recipe().source_hash(),
+            proof.png_hash()
+        );
+        fs::write(dir.join(&name), proof.bytes()).unwrap();
+        let mut receipt = ns
+            .admit_reproduced_png(std::ffi::OsStr::new(&name), proof.clone())
+            .unwrap();
+        let wrong = format!(
+            "{}-isometric-v1-128-12171f-{}.png",
+            proof.recipe().source_hash(),
+            "0".repeat(64)
+        );
+        fs::write(dir.join(&wrong), proof.bytes()).unwrap();
+        assert!(ns
+            .admit_reproduced_png(std::ffi::OsStr::new(&wrong), proof.clone())
+            .is_err());
+        for rejected in [
+            format!("{}-isometric-v1-128-12171f.png", "0".repeat(64)),
+            format!(
+                "{}-isometric-v1-256-12171f.png",
+                proof.recipe().source_hash()
+            ),
+            format!(
+                "{}-isometric-v1-128-000000.png",
+                proof.recipe().source_hash()
+            ),
+            format!("../{name}"),
+        ] {
+            if !rejected.starts_with("../") {
+                fs::write(dir.join(&rejected), proof.bytes()).unwrap();
+            }
+            assert!(ns
+                .admit_reproduced_png(std::ffi::OsStr::new(&rejected), proof.clone())
+                .is_err());
+        }
+        assert!(ns.retire_png(&mut receipt).unwrap().unlinked_now);
+        assert!(dir.join(wrong).exists());
+    }
 
     fn geometry_test_packet() -> Vec<u8> {
         let mut packet = b"STL2".to_vec();

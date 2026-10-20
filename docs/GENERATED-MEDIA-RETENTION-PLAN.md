@@ -308,3 +308,45 @@ exited. Evidence: `output/thumbnail-proof-foundation-final-checks.json` and
 `output/thumbnail-proof-foundation-native.png`. This closes the foundation gate,
 not thumbnail retirement acceptance. The existing cleanup/publication paths are
 still unchanged; proceed to the separately reviewed, initially unwired PNG receipt.
+
+Primitive contract review found and closes a namespace omission before coding:
+PNG receipt factories belong to a thumbnail-only namespace opened as the fixed
+`thumbnails` child of an admitted pinned Library root. Retain and recheck both root
+and child identities. Do not add generic `Directory` factories or accept arbitrary
+parents, raw file descriptors, raw bytes or caller-chosen stage names. Candidate
+names must be complete supported recipes bound to the opaque proof. The later
+caller still must establish current root/epoch, custom/reference and lease safety.
+Retirement reports newly removed bytes/unlink for this attempt, with zero on a
+completed retry; preserve and surface a recreated public entry. Fault hooks run
+before final verification, so an observed private replacement is preserved too.
+
+
+### PNG receipt primitive gate (2026-10-19)
+
+The separate thumbnail-only retained-descriptor primitive is implemented but
+unwired. Explicit expected-root binding prevents following a renamed previous
+Library. Created-stage failures retain the original owner; only created partial
+stages allow exact-prefix verification. Reproduced candidates require complete
+source/recipe/output binding and exact bytes. Private capture precedes verification
+and unlink; root/child/public/private replacements survive. Results distinguish
+actual successful unlink from external disappearance and retain truthful counts
+after sync failure or retry. Non-Unix stubs return Unsupported before mutation.
+
+Review caught and fixed whole-recipe comparison rejecting valid content-addressed
+names because the optional output hint differed. A behavioral CA rejection test
+fails before the fix and passes afterward. Ten real-filesystem primitive tests and
+all 292 runtime tests pass; required package Clippy, formatting and diff checks
+pass with existing warnings. The Community app/both web bundles build and strict
+signature verification passes. Executable SHA-256: `a77a8dffc9f6c6b702a6655dad3a1efe5c7762a9cd57d308212abd708b19a96b`.
+Previous signed foundation Community and isolated QA builds remain preserved.
+Evidence is `output/png-receipt-final-checks.json` and `output/png-receipt-*.log`.
+No production cleanup/publication changed, so the previous isolated native renderer
+acceptance remains applicable to that path; this gate tests new filesystem APIs
+through actual synthetic system calls, not a claimed new native cleanup workflow.
+
+The next caller contract is [thumbnail cleanup](THUMBNAIL-CLEANUP-CONTRACT.md).
+Independent review closed global proof-work bounds, review I/O lifecycle and owner
+cancellation gaps. It includes honest partial/continuation reporting and preserves
+unproven indexed-cache source copies. Implement and verify shared runtime/native/
+remote adapters before enabling immutable content-addressed publication. No build
+cleanup was performed; additional recovered space remains zero.
