@@ -133,6 +133,19 @@ in Library after a successful refresh. Missing native prompts or refresh only
 after reopening are failures.
 
 
+Check **Reset default previews…** and **Review unused previews** separately.
+Cancel/Escape must preserve catalog entries and exact PNG bytes. If reset is
+supported, it must clear only default entries, retain custom previews and every
+file, and remain reset after normal catalog refresh/reopen; passive cards and
+duplicate previews must not silently generate entries. Explicit Generate/
+Regenerate remains the way to create defaults again. Review unused previews must
+show bounded per-page eligible/preserved/protected counts. Another page requires
+fresh review and explicit confirmation; Cancel must never execute cleanup.
+Guarded durable cleanup is currently Unsupported on Windows: record `BLOCKED`
+with the actual message, never enable a pathname-delete fallback. Any future
+confirmed removal requires the exact synthetic-path approval in section 6 and
+must preserve unknown/custom/embedded/source-copy bytes and original hashes.
+
 Check the catalog purge confirmation without deleting anything: choose an exact
 synthetic backup destination, confirm it is visible, enter lowercase `purge` and
 require rejection, then Cancel/Escape and verify the catalog is unchanged. Execute

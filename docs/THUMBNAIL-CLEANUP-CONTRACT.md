@@ -1,7 +1,8 @@
 # Thumbnail cleanup caller contract
 
-Implemented caller contract. Workspace, transport, frontend and static checks pass;
-packaged native and synthetic container acceptance are the current delivery gate.
+Implemented and verified caller contract. Workspace, transport, frontend, static,
+packaged native and synthetic Linux container acceptance pass. Native reader fix
+and final packaged acceptance: `431256a`; unchanged runtime/server acceptance: `dda35c8`.
 Cleanup now uses bounded independent raster proof and retained PNG receipts.
 Content-addressed producer publication remains a separate, later slice.
 
@@ -247,6 +248,7 @@ epoch/revision failures release budgets correctly; unprovable prefixes do not st
 allocation/I/O; post-unlink sync failure reports partial counts; reset keeps unknown
 files/custom fallback; both indexed-cache branches preserve source copies; proof
 performs no temporary extraction writes; DTO/OpenAPI/UI report partial/protected
-results honestly. Affected runtime/core/native/frontend gates pass. Packaged native and synthetic
-container acceptance must pass before this caller slice is declared complete.
+results honestly. Affected runtime/core/native/frontend gates and packaged native/synthetic Linux
+container acceptance pass. See the current parity-plan checkpoint for exact source,
+counts and platform limits.
 No live network or historical cleanup is part of this acceptance.

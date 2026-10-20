@@ -22,13 +22,35 @@ or original sources are swept. Durable guarded cleanup remains unsupported on
 Windows; it must fail explicitly rather than fall back to pathname deletion. See
 [the cleanup contract](THUMBNAIL-CLEANUP-CONTRACT.md) for bounds and authority.
 
-Current automated verification passed: the full Rust workspace includes 201 native,
-124 core, 311 runtime, 65 server and five server-binary tests; the frontend gate
-passed 363 tests with 1,512 assertions. Workspace Clippy and formatting also passed.
-Native packaged and container acceptance for this **caller slice remain pending**;
-earlier native/container evidence below does not satisfy those gates. No full
-Printventory parity, Windows durable-cleanup acceptance, hardware acceptance or
-final release claim follows from these results.
+Current delivery gate passes at `431256a22f277839072c511b44cab8e0158390d9`:
+202 native tests and 365 frontend tests / 1,523 assertions pass, including a real
+card-flow regression for reset entries being silently recreated. Passive native
+catalog and duplicate-preview reads now use a read-only IPC; explicit generation
+remains available. The prior full workspace gate includes 124 core, 311 runtime,
+65 server and five server-binary tests; those backends are unchanged by this fix.
+Workspace Clippy, the final affected native Clippy gate, formatting and the signed
+Community build pass.
+
+Isolated unlicensed native acceptance confirms Cancel preserves rows/files,
+reset keeps both PNGs while clearing default rows, a fresh confirmed review removes
+two independently reproduced previews (7,072 bytes), close/reopen does not
+regenerate entries, and explicit generation restores exact PNG hashes. Source
+hashes remain unchanged; staging is empty; the QA app was closed without installing
+or using the normal profile. The composed app uses private revision `2755084` plus
+the candidate public core in a disposable snapshot, not an official core-pin update.
+
+Synthetic Linux container acceptance passes at backend source `dda35c8`: separate
+reset/cancel/replay, custom fallback, explicit four-plus-one cleanup pages,
+unknown/custom/source-copy preservation, exact regeneration, restart and original
+hash checks. The native-only reader fix does not change those runtime/server
+implementations. The container is stopped; test data and images remain preserved.
+Windows GNU core/runtime compilation passes at that source; this is not Windows
+execution. No full parity, Windows durable-cleanup, hardware or release claim is made.
+
+Next: reviewed immutable producer publication under the
+[publication contract](THUMBNAIL-PUBLICATION-CONTRACT.md), followed by the remaining
+platform/composition/release gates. Historical and unknown generated media are not
+swept. Build cleanup performed in this slice: none; space recovered: zero.
 
 ### Earlier checkpoint (historical)
 

@@ -12,8 +12,9 @@ indexed-cache source/archive-member copies, custom and embedded previews, unknow
 files and historical holds are preserved. Default-preview reset clears only catalog
 entries and keeps every file. Windows durable cleanup remains explicitly
 unsupported; no pathname-delete fallback exists. Automated workspace/frontend
-gates and the Community build/signature pass; packaged native and container
-acceptance for this caller slice are still pending. Earlier acceptance numbers
+gates and the Community build/signature pass. Packaged native acceptance passes
+at `431256a`, with the passive-read reset fix; synthetic Linux container acceptance
+passes at unchanged runtime/server source `dda35c8`. Earlier acceptance numbers
 and platform claims remain historical evidence, not current release closure.
 
 ## Pinned primary baseline
