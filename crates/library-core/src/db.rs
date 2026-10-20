@@ -15411,6 +15411,24 @@ mod tests {
     }
 
     #[test]
+    fn native_printer_endpoint_fixtures_create_core_printers() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/native-printer-endpoints.json"
+        ))
+        .unwrap();
+        let db = LibraryDb::open_in_memory().unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let mut input = printer_input(fixture["name"].as_str().unwrap());
+            input.host = Some(fixture["host"].as_str().unwrap().to_owned());
+            input.web_url = Some(fixture["webUrl"].as_str().unwrap().to_owned());
+            let created = db.create_printer(&input, false).unwrap();
+            assert_eq!(created.host, input.host);
+            assert_eq!(created.web_url, input.web_url);
+            assert!(!created.endpoint_approved);
+        }
+    }
+
+    #[test]
     fn printer_crud_checks_versions_and_bounded_fields() {
         let db = LibraryDb::open_in_memory().unwrap();
         let printer = db

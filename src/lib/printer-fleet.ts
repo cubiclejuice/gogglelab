@@ -117,7 +117,18 @@ export interface MaintenanceReminderDraft {
 }
 
 export function mapLibraryPrinter(printer: LibraryPrinter): ManagedPrinter {
-  const safeHost = printer.host ?? printer.webUrl ?? "";
+  let safeHost = printer.host ?? printer.webUrl ?? "";
+  if (printer.webUrl && validNetworkAddress(printer.webUrl)) {
+    try {
+      const web = new URL(printer.webUrl);
+      const host = new URL(safeHost.includes("://") ? safeHost : `${web.protocol}//${safeHost}`);
+      // The saved host remains authoritative. A matching safe web origin
+      // supplies its scheme, including HTTPS, for untouched edit round trips.
+      if (!host.username && !host.password && host.host === web.host) safeHost = web.origin;
+    } catch {
+      // Legacy/imported hints stay inert and retain the existing host fallback.
+    }
+  }
   const connection: PrinterConnection = safeHost
     ? { kind: "network", address: redactAddressCredentials(safeHost) }
     : { kind: "local" };
@@ -147,20 +158,26 @@ export function mapLibraryPrinter(printer: LibraryPrinter): ManagedPrinter {
 }
 
 export function mapPrinterDraftToInput(draft: PrinterDraft): IpcPrinterInput {
+  let endpoint: URL | null = null;
+  if (draft.connection.kind === "network") {
+    try {
+      const value = draft.connection.address.trim();
+      endpoint = new URL(value.includes("://") ? value : `http://${value}`);
+      if (!endpoint.hostname || !["http:", "https:"].includes(endpoint.protocol)) {
+        throw new Error("Unsupported printer endpoint");
+      }
+    } catch {
+      throw new Error("Enter a valid HTTP or HTTPS printer address.");
+    }
+  }
   return {
     nickname: draft.name.trim(),
     make: cleanOptional(draft.make),
     model: cleanOptional(draft.model),
     printerType: cleanOptional(draft.printerType),
     firmware: cleanOptional(draft.firmware),
-    host:
-      draft.connection.kind === "network"
-        ? redactAddressCredentials(draft.connection.address).trim()
-        : null,
-    webUrl:
-      draft.connection.kind === "network"
-        ? redactAddressCredentials(draft.connection.address).trim()
-        : null,
+    host: endpoint?.host ?? null,
+    webUrl: endpoint?.origin ?? null,
     bedMm: [...draft.bedMm],
     notes: draft.notes.slice(0, MAX_NOTES_LENGTH),
   };
@@ -2347,7 +2364,17 @@ function upsertById<T extends { id: string }>(items: T[], updated: T): T[] {
 }
 
 function errorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : error !== null &&
+            typeof error === "object" &&
+            "message" in error &&
+            typeof error.message === "string"
+          ? error.message
+          : "Operation failed.";
   return message
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]*@/gi, "$1[redacted]@")
     .replace(

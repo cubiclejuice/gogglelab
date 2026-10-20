@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Synthetic IPv4",
+    "address": "http://192.0.2.10:3030",
+    "host": "192.0.2.10:3030",
+    "webUrl": "http://192.0.2.10:3030"
+  },
+  {
+    "name": "Synthetic hostname",
+    "address": "printer-fixture.invalid:8080",
+    "host": "printer-fixture.invalid:8080",
+    "webUrl": "http://printer-fixture.invalid:8080"
+  },
+  {
+    "name": "Synthetic HTTPS",
+    "address": "https://printer-fixture.invalid:8443",
+    "host": "printer-fixture.invalid:8443",
+    "webUrl": "https://printer-fixture.invalid:8443"
+  }
+]

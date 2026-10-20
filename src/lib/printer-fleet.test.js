@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import nativeEndpoints from "../../tests/fixtures/native-printer-endpoints.json";
 import {
   GENERIC_PRINTER_ID,
   MAX_DISCOVERY_ADDRESSES,
@@ -193,7 +194,7 @@ test("printer input mapping keeps only endpoint locations and no URL credentials
     model: "A1 Mini",
     printerType: "fdm",
     firmware: null,
-    host: "http://192.168.50.20:8080",
+    host: "192.168.50.20:8080",
     webUrl: "http://192.168.50.20:8080",
     bedMm: [180, 180, 180],
     notes: "",
@@ -952,4 +953,87 @@ test("deferred connection results preserve newer edited or revoked profiles and 
       expect(state.busyTests.has(printer.id)).toBe(false);
     }
   }
+});
+
+test("native printer endpoint fixtures map to the exact core-accepted host and origin", () => {
+  for (const fixture of nativeEndpoints) {
+    const draft = createPrinterDraft(printer);
+    draft.connection = { kind: "network", address: fixture.address };
+    expect(validatePrinterDraft(draft)).toBeNull();
+    const input = mapPrinterDraftToInput(draft);
+    expect(input.host).toBe(fixture.host);
+    expect(input.webUrl).toBe(fixture.webUrl);
+  }
+  const draft = createPrinterDraft(printer);
+  draft.connection = {
+    kind: "network",
+    address: "https://user:secret@printer-fixture.invalid:8443/private?token=secret#private",
+  };
+  expect(validatePrinterDraft(draft)).not.toBeNull();
+  const input = mapPrinterDraftToInput(draft);
+  expect(input.host).toBe("printer-fixture.invalid:8443");
+  expect(input.webUrl).toBe("https://printer-fixture.invalid:8443");
+  expect(JSON.stringify(input)).not.toMatch(/secret|private|user/);
+});
+
+test("serialized native AppError displays its bounded redacted message without object stringification", async () => {
+  const state = new PrinterFleetState(
+    baseModel,
+    callbacks({
+      savePrinter: async () => {
+        throw {
+          kind: "Library",
+          message:
+            "Printer rejected password=synthetic-secret https://user:synthetic-secret@printer-fixture.invalid " +
+            "x".repeat(400),
+        };
+      },
+    }),
+  );
+  expect(await state.savePrinter(createPrinterDraft(printer))).toBe(false);
+  expect(state.error).toContain("Printer rejected");
+  expect(state.error).not.toContain("synthetic-secret");
+  expect(state.error).not.toContain("[object Object]");
+  expect(state.error.length).toBeLessThan(350);
+  const arbitrary = new PrinterFleetState(
+    baseModel,
+    callbacks({
+      savePrinter: async () => {
+        throw { message: { token: "secret" }, toString: () => "secret" };
+      },
+    }),
+  );
+  expect(await arbitrary.savePrinter(createPrinterDraft(printer))).toBe(false);
+  expect(arbitrary.error).not.toContain("secret");
+});
+
+test("native endpoint fixtures survive saved printer read and untouched edit without changing scheme", () => {
+  for (const fixture of nativeEndpoints) {
+    const saved = {
+      ...printer,
+      nickname: fixture.name,
+      host: fixture.host,
+      webUrl: fixture.webUrl,
+    };
+    const mapped = mapLibraryPrinter(saved);
+    const edited = mapPrinterDraftToInput(createPrinterDraft(mapped));
+    expect(mapped.connection.address).toBe(fixture.webUrl);
+    expect(edited.host).toBe(fixture.host);
+    expect(edited.webUrl).toBe(fixture.webUrl);
+  }
+  const mismatched = mapLibraryPrinter({
+    ...printer,
+    nickname: printer.name,
+    host: "printer-fixture.invalid:8080",
+    webUrl: "https://other-fixture.invalid:8443",
+  });
+  expect(mismatched.connection.address).toBe("printer-fixture.invalid:8080");
+  const credentialed = mapLibraryPrinter({
+    ...printer,
+    nickname: printer.name,
+    host: "printer-fixture.invalid:8443",
+    webUrl: "https://user:secret@printer-fixture.invalid:8443",
+  });
+  expect(credentialed.connection.address).toBe("printer-fixture.invalid:8443");
+  expect(JSON.stringify(credentialed)).not.toContain("secret");
 });
