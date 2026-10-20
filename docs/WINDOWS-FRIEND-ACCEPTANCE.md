@@ -14,7 +14,7 @@ Stop the affected test on unexpected original-file loss, authentication bypass, 
 
 The owner may have local uncommitted changes absent from GitHub. Require the exact owner-supplied installer artifact or exact source snapshot/commit containing the intended changes. Do not assume the default branch or newest release contains this work. Missing provenance is `BLOCKED`.
 
-The manually dispatched `.github/workflows/windows-community-test.yml` produces `gogglelab-community-windows-<commit>` containing one NSIS EXE, one MSI, `BUILD-INFO.txt`, `SHA256SUMS.txt`, and this plan. Confirm the workflow ran on the intended revision. Record Windows edition/version/build, CPU architecture, VM/account isolation, PowerShell version, and WebView2 runtime version. The workflow targets `x86_64-pc-windows-msvc`; ARM emulation does not prove native x64 coverage.
+The candidate branch contains `.github/workflows/windows-community-test.yml`, designed for manual dispatch. It is not currently registered in the repository workflow list, so do not assume it can be dispatched or that artifacts exist. If matching artifacts are unavailable, use the approved source-build lane below or mark the installer lane `BLOCKED`; do not merge or change repository settings to enable it. When available, it produces `gogglelab-community-windows-<commit>` containing one NSIS EXE, one MSI, `BUILD-INFO.txt`, `SHA256SUMS.txt`, and this plan. Confirm the workflow ran on the intended revision. Record Windows edition/version/build, CPU architecture, VM/account isolation, PowerShell version, and WebView2 runtime version. The workflow targets `x86_64-pc-windows-msvc`; ARM emulation does not prove native x64 coverage.
 
 ## 2. Optional matching source-build lane
 
@@ -132,6 +132,21 @@ labelled in-app dialog, test Cancel/invalid names, and verify keyboard focus sta
 in Library after a successful refresh. Missing native prompts or refresh only
 after reopening are failures.
 
+
+Check the catalog purge confirmation without deleting anything: choose an exact
+synthetic backup destination, confirm it is visible, enter lowercase `purge` and
+require rejection, then Cancel/Escape and verify the catalog is unchanged. Execute
+exact uppercase `PURGE` only after the separate exact synthetic-operation approval
+in section 7. Require a verified backup, retained previous Library and unchanged
+original-source hashes.
+
+Check the manual original-Centauri ID dialog only with networking disabled or an
+owner-supplied fake backend that cannot contact a LAN. Verify the disclosure,
+invalid-input rejection, Cancel/Escape, cleared input after reopening, readable
+layout and keyboard focus. Do not submit an ID or test a real endpoint in this
+Windows checklist. Missing isolation is `BLOCKED` for this case; live printer
+validation is separate. Network profile metadata save/edit must retain its scheme
+and authority; metadata persistence does not prove protocol compatibility.
 
 Test valid owner-supplied synthetic 3MF/ZIP fixtures separately, including grouping and safe extraction. Do not rename arbitrary bytes to those extensions. Missing fixtures are `BLOCKED`. Malformed input must give a safe error without crashing or writing outside the test area.
 

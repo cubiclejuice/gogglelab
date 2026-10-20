@@ -192,3 +192,14 @@ Same-output native regeneration leaves staging empty. The isolated app is stoppe
 normal profile/install and official pin are unchanged. This closes the geometry/UI
 checkpoint; the separate thumbnail/orphan provenance design is the next media
 implementation gate. Known native purge/MainboardID prompt follow-ups remain.
+
+
+### Native prerequisites closed at `9f64119`
+
+Visible purge and ephemeral manual printer-ID dialogs pass actual isolated native
+acceptance, including exact-token rejection/cancellation, verified synthetic backup
+and previous Library, unchanged original sources, ID clearing and QA network denial.
+Dialog styling and host/origin mapping defects discovered during testing are fixed.
+See the parity plan for exact source, test/build evidence and transport limits.
+The next media slice remains independent thumbnail publication/retirement proof;
+these UI results do not authorize orphan deletion from flags or filenames.

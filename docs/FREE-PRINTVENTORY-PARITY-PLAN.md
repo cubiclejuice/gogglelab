@@ -713,3 +713,57 @@ Parallel ownership is limited to management/confirmation UI and fleet/manual-ID
 UI respectively. Require behavior regressions, independent review, one final
 current-worktree frontend gate, build, and actual isolated dialog acceptance
 before advancing to thumbnail/orphan proof implementation.
+
+
+### Native prompt acceptance at `9f64119` (2026-10-19)
+
+Exact tested code: `9f64119c634dd062eb3f31c7b3a1d829149b9b6c`.
+This completes the native prompt slice above. Catalog purge now uses an in-app
+confirmation with the exact case-sensitive token and selected backup destination.
+Actual isolated native QA rejects lowercase input, cancels without mutation, then
+completes an explicitly confirmed synthetic purge. The verified backup and previous
+Library each retain both indexed models; both original STL hashes remain unchanged.
+Purge code was tested at `2275a8a` and is unchanged in `9f64119`.
+
+The manual Centauri ID dialog validates input, clears it on cancel/reopen/submit,
+and discloses its unsaved, unencrypted, no-discovery behavior. Stale connection
+results cannot update a changed, revoked or removed printer. Native QA at the exact
+code above saves a fake approved endpoint, rejects an invalid ID locally, then
+submits a synthetic ID into the compiled QA network-denial guard. The expected
+rejection leaves connection/job state and last-check time unchanged; the ID is
+absent from the database and settings. No real printer or LAN discovery is used.
+The shared fleet dialogs are opaque, labelled and readable at 1000- and 482-pixel
+window widths. The unlicensed isolated app is confirmed stopped.
+
+Actual native testing also found a boundary mismatch: the UI submitted a full URL
+in the backend's bare-host field. The adapter now separates authority and origin,
+preserves an HTTPS origin through untouched edits, and decodes bounded structured
+errors. Shared TS/Rust fixtures prove persistence for HTTP, HTTPS and host/port
+metadata. These fixtures do not extend status transport compatibility: existing
+private-IPv4 admission and fixed protocol ports remain unchanged.
+
+Validation: 349 frontend tests / 1,463 assertions across 40 current-worktree files,
+format/lint/typecheck and both web builds pass; 121 catalog-core tests, affected
+Clippy and Rust formatting pass. Windows GNU compilation of catalog-core and
+runtime with all test targets passes, without executing Windows tests. The exact
+Community production build passes strict signature verification; executable
+SHA-256 is `298ddba17d7176be18f076524264a377f6ab8f888b6cfc402fa764005f889463`.
+The isolated private composition passes 44 frontend tests and packaging at this
+source; its 67 Rust tests/Clippy passed at `0ffc262`, with equivalent production
+Rust. The new Rust change is test-only. Earlier Linux live geometry acceptance
+remains at `9331722`; production Rust equivalence is recorded separately from the
+later Windows portability change. Docker Engine availability is rechecked.
+
+Evidence: `output/native-prompt-purge-checks.json`,
+`output/native-prompt-final-checks.json`, and the native screenshots they identify.
+The normal profile/install, official private core pin and original sources are
+unchanged. PNG retirement proof, Windows execution/installers, native Linux
+desktop, deferred Bambu hardware/MQTT, official integration and release acceptance
+remain open. Full parity is not claimed.
+
+Build storage audit: about 13 GiB free on the Data volume, repository debug output
+14 GiB and older generated targets about 1.1 GiB. Working target, release bundles,
+provenance, licenses and assets remain protected. Inactivity of cleanup candidates
+has not been established; no new cleanup is authorized or performed, so additional
+space recovered is **0 bytes**. Any deletion needs a fresh exact dry-run, idle check
+and approval.
