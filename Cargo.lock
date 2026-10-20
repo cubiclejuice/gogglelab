@@ -3994,6 +3994,7 @@ name = "stl-core"
 version = "0.1.0"
 dependencies = [
  "quick-xml",
+ "serde",
  "serde_json",
  "stl_io",
  "thiserror 2.0.20",

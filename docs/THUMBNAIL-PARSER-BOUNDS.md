@@ -1,6 +1,43 @@
 # Thumbnail parser resource prerequisite
 
-## Current checkpoint (2026-10-20)
+## Current JSON checkpoint (2026-10-20)
+
+Project metadata is parsed by a private streaming visitor after an allocation-free
+scan of its already retained input. The existing 8 MiB project role bounds wire
+and decoded token spans; a fixed 127-frame container stack preserves the default
+Serde recursion boundary. Malformed/deep optional metadata still falls back.
+Decoded duplicate keys remain last-wins, wrong-type replacements clear earlier
+values, invalid colors retain their positional holes, and all ignored/tail values
+and trailing document bytes undergo normal semantic validation. `IgnoredAny` is
+not used because its number/depth behavior differs from the former DOM.
+
+Each of four field prefixes has at most 256 positions. Color slots store seven
+ASCII bytes; auxiliary labels retain at most 256 Unicode scalars / 1,024 UTF-8
+payload bytes. Prefix/result vectors reserve at most 256 entries; controlled
+strings allocate once for their clipped payload. Final labels move where possible;
+joined names preserve trim-before-clipping without a full concatenation. Known
+controlled reserve failures latch the same observer. The actual caller propagates
+terminal failures before cached-root fallback and does not recharge input or
+inflation for this in-memory parse. The DOM and full auxiliary arrays remain only
+in the test oracle.
+
+The test-first prefix regression and all 223 core tests pass (one existing ignored
+fixture), including 18 new JSON controls. Actual public package tests cover Stored
+and Deflate, UTF-8 failure, duplicate keys, recursion, positional boundaries and
+exact accounting across two passes. Verification status beyond core is recorded
+in `output/project-json-implementation-gates.json`; it must not be inferred from
+these results.
+
+Pinned serde_json 1.0.151 uses one reused escaped-string scratch buffer. Under the
+reviewed default-number features and versioned Vec growth rule, admitted 8 MiB
+input gives logical scratch <=8 MiB, requested steady capacity <16 MiB and possible
+moving old/new backing overlap <24 MiB. Those conditional profile estimates exclude
+retained input, outputs, stack and allocator overhead; they are not hard RAM/RSS
+limits or a recoverable SDK allocation promise. Actual normal-unit features must
+be correlated for each checked profile. Whole-owned metadata, mesh/map storage,
+producer allowance and publication remain open.
+
+## Earlier STL/runtime checkpoints (2026-10-20)
 
 The STL correction follows shared-runtime checkpoint `743c863`. Both binary and
 ASCII parsing now enforce the existing 2,000,000-triangle policy before output
@@ -59,8 +96,9 @@ fallible SDK-allocation guarantee, RSS bound or completed Owned permit.
   before growth, settings are retained once/reparsed without another inflation
   debit, and ordinary EINTR is retried. Its 16 MiB counter is cumulative collected
   **INPUT**, not every owned name/path/normalized metadata copy. Input mesh/object/
-  component/build collections, JSON Value/auxiliary arrays and their controlled
-  capacities remain OPEN; the flattened output cap alone does not close them.
+  component/build collections and aggregate owned metadata remain OPEN. The JSON
+  DOM/auxiliary-array correction is described above; its local bounds do not close
+  whole-parser capacity or the flattened-output overlap.
 - `parse.rs` binary/ASCII output admission and checked/fallible growth are active.
   Their two vectors retain the existing 9/3 floats per accepted triangle. This is
   not a whole-parser/producer memory cap or an immediate pure-decode cancellation
@@ -93,6 +131,7 @@ Use a private test-limit override to exercise boundaries without large fixtures.
 | ZIP central records / metadata envelope | 10,000 / 16 MiB | Active model facade: intrinsic constructor checks across retries, including local metadata |
 | Aggregate referenced-part input vertices / triangles | 6,000,000 / 2,000,000 proposed | OPEN: before vector growth across the package |
 | Aggregate objects / components / build items | 10,000 / 100,000 / 100,000 proposed | OPEN: before insertion/push across the package |
+| Project JSON selected fields | 256 positions per field / 256 Unicode scalars per label | Active private visitor; 8 MiB pre-SDK input guard, fixed default recursion boundary, full semantic tail validation |
 | Collected INPUT text | 16 MiB cumulative | Active core/runtime context, before append; no refund on dropped/invalid UTF-8 input |
 | All owned metadata copies | 16 MiB proposed | OPEN: names/paths/normalized strings/JSON are not covered by input collection |
 | XML token / attribute value | 64 KiB / 4 KiB | Active four core and runtime image/metadata XML paths; 128 items, depth 128, live raw names 256 KiB |
@@ -115,7 +154,7 @@ ZIP64 remain supported. Checked cached offsets do not establish payload/source
 identity or verify descriptor gaps. A consumer workspace must select the same
 reviewed vendor patch at its own root.
 
-Next, enforce package-wide input storage/metadata/JSON counts and controlled
+Next, enforce package-wide input storage/aggregate metadata counts and controlled
 fallible growth before every remaining copy/push/insertion. Cached reuse must not
 charge stored input twice; actual re-reads still spend work. Do not replace these
 remaining bounds with the already active XML acquisition or collected-input caps.

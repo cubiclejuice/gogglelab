@@ -2,7 +2,35 @@
 
 Date: 2026-10-15 (updated 2026-10-20)
 
-## Current checkpoint: STL output admission (2026-10-20)
+## Current checkpoint: bounded project JSON (2026-10-20)
+
+Project filament metadata now uses a streaming visitor instead of a production
+JSON DOM and whole auxiliary-array copies. An allocation-free scan precedes Serde,
+using the existing 8 MiB project input limit and default 127-container boundary.
+Only the first 256 positions per recognized field are retained. Labels keep the
+existing trim-then-256-Unicode-scalar behavior; the entire document, including
+ignored values and later array positions, is still validated. No smaller JSON
+string/token limit or new supported-input policy is introduced.
+
+Controlled prefix, label, joined-name and result growth is bounded and fallible.
+Terminal causes use the same operation observer and propagate through the actual
+cached-root parser before whole-build fallback. Parsing retained project text
+adds no inflation or collected-input charge. The old DOM is a test-only oracle.
+
+The original regression failed at 771 auxiliary normalizations against a 768-slot
+bound; it now passes. All 223 core tests pass, with one existing ignored fixture,
+including 18 new private/public JSON tests. Broader workspace, composed and hosted
+verification is tracked in `output/project-json-implementation-gates.json` and
+[PR #4](https://github.com/cubiclejuice/gogglelab/pull/4); core success alone does
+not establish those gates. SDK scratch is a separate versioned profile estimate,
+not recoverable SDK OOM, a hard RAM ceiling or producer Owned admission.
+
+Aggregate owned metadata/capacity, 3MF input collections, producer admission and
+immutable publication remain open. Current-source container acceptance, native
+composition/release and the previously documented platform/hardware gates remain
+separate. No cleanup or installed-app replacement is implied.
+
+## STL output checkpoint `e2ed018` (2026-10-20)
 
 Following shared-runtime checkpoint `743c863`, both STL formats now enforce the
 existing two-million-triangle policy before output allocation/append. This closes
@@ -17,7 +45,7 @@ ignored fixture, including 15 new focused admission/allocation checks. The full
 workspace regression suite passes. See `output/stl-before-growth-implementation-gates.json`
 and [PR #4](https://github.com/cubiclejuice/gogglelab/pull/4) for current verification.
 This does not finish 3MF input collections, JSON/owned metadata, producer admission
-or immutable publication. JSON migration follows this small correction.
+or immutable publication. The JSON migration above follows this correction.
 
 ## Runtime context checkpoint `743c863` (2026-10-20)
 

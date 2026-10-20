@@ -19,7 +19,10 @@ use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::XmlVersion;
+#[cfg(test)]
 use serde_json::Value;
+
+mod project_json;
 
 use crate::error::{ResourceStop, StlError};
 use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
@@ -841,6 +844,21 @@ fn normalize_label(value: &str) -> Option<String> {
     Some(value.chars().take(256).collect())
 }
 
+#[cfg(test)]
+thread_local! {
+    static PROJECT_AUX_NORMALIZATION_PROBE: std::cell::RefCell<Option<Rc<std::cell::Cell<usize>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_project_aux_normalization() {
+    // Copy the handle, releasing the TLS borrow before normalization/work.
+    let probe = PROJECT_AUX_NORMALIZATION_PROBE.with(|slot| slot.borrow().clone());
+    if let Some(probe) = probe {
+        probe.set(probe.get() + 1);
+    }
+}
+
+#[cfg(test)]
 fn json_string_array(value: Option<&Value>) -> Option<Vec<Option<String>>> {
     let Value::Array(values) = value? else {
         return None;
@@ -848,12 +866,19 @@ fn json_string_array(value: Option<&Value>) -> Option<Vec<Option<String>>> {
     Some(
         values
             .iter()
-            .map(|value| value.as_str().and_then(normalize_label))
+            .map(|value| {
+                value.as_str().and_then(|value| {
+                    #[cfg(test)]
+                    record_project_aux_normalization();
+                    normalize_label(value)
+                })
+            })
             .collect(),
     )
 }
 
-fn parse_project_filaments(text: &str) -> Option<Vec<ParsedFilament>> {
+#[cfg(test)]
+fn parse_project_filaments_reference(text: &str) -> Option<Vec<ParsedFilament>> {
     let value: Value = serde_json::from_str(text).ok()?;
     let colors = value.get("filament_colour")?.as_array()?;
     let settings = json_string_array(value.get("filament_settings_id"));
@@ -901,6 +926,11 @@ fn parse_project_filaments(text: &str) -> Option<Vec<ParsedFilament>> {
         });
     }
     Some(filaments)
+}
+
+#[cfg(test)]
+fn parse_project_filaments(text: &str) -> Option<Vec<ParsedFilament>> {
+    project_json::parse(text, &ZipResourceObserver::new()).expect("bounded fixture must not stop")
 }
 
 fn setting_name(record: Option<&SettingsRecord>) -> Option<&str> {
@@ -1940,11 +1970,10 @@ fn parse_3mf_with_context(
         pkg.optional_bounded_text(PROJECT_SETTINGS_PATH, MAX_APPEARANCE_METADATA_BYTES);
     pkg.observer.check()?;
     preserve_terminal(&project_result)?;
-    let filaments = project_result
-        .ok()
-        .flatten()
-        .and_then(|text| parse_project_filaments(&text))
-        .unwrap_or_default();
+    let filaments = match project_result {
+        Ok(Some(text)) => project_json::parse(&text, &pkg.observer)?.unwrap_or_default(),
+        Ok(None) | Err(_) => Vec::new(), // terminal errors were preserved above
+    };
 
     let settings = match settings_result {
         Ok(Some(text)) => {
@@ -3840,5 +3869,50 @@ mod tests {
         );
         assert!(!probe.state.borrow().armed);
         assert!(!probe.state.borrow().fired);
+    }
+    struct ProjectAuxProbeGuard(Option<Rc<std::cell::Cell<usize>>>);
+    impl ProjectAuxProbeGuard {
+        fn install() -> (Self, Rc<std::cell::Cell<usize>>) {
+            let probe = Rc::new(std::cell::Cell::new(0));
+            let previous =
+                PROJECT_AUX_NORMALIZATION_PROBE.with(|slot| slot.replace(Some(probe.clone())));
+            (Self(previous), probe)
+        }
+    }
+    impl Drop for ProjectAuxProbeGuard {
+        fn drop(&mut self) {
+            PROJECT_AUX_NORMALIZATION_PROBE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    #[test]
+    fn project_json_auxiliary_retention_stops_at_selected_256_position_prefix() {
+        let array = |label: &str| {
+            std::iter::repeat_n(format!("\"{label}\""), 257)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let text = format!(
+            r##"{{"filament_colour":["#123456"],"filament_settings_id":[{}],"filament_type":[{}],"filament_vendor":[{}]}}"##,
+            array(" Basic "),
+            array(" PLA "),
+            array(" Acme ")
+        );
+        let (_guard, probe) = ProjectAuxProbeGuard::install();
+        let parsed = parse_project_filaments(&text).unwrap();
+        // Preserve actual output while separately measuring the unwanted copy
+        // work. Output-only checks already passed before this correction.
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].slot, 1);
+        assert_eq!(parsed[0].color, "#123456");
+        assert_eq!(parsed[0].name.as_deref(), Some("Acme Basic"));
+        assert_eq!(parsed[0].material.as_deref(), Some("PLA"));
+        let normalized = probe.get();
+        assert!(
+            normalized >= 3,
+            "probe must observe actual auxiliary normalization"
+        );
+        assert!(normalized <= 3*MAX_EMBEDDED_FILAMENTS,
+            "only selected positional prefixes may be retained: normalized {normalized} labels, allowed {}", 3*MAX_EMBEDDED_FILAMENTS);
     }
 }
