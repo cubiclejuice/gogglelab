@@ -919,3 +919,37 @@ test("managed-printer creation supports the catalog beyond the former 100-printe
   ).toBe(true);
   expect(state.model.managedPrinters).toHaveLength(102);
 });
+
+test("deferred connection results preserve newer edited or revoked profiles and status", async () => {
+  for (const replacement of [
+    { ...printer, metadataVersion: printer.metadataVersion + 1 },
+    { ...printer, endpointApproved: false },
+    { ...printer, connection: { kind: "network", address: "http://192.0.2.42" } },
+    null,
+  ]) {
+    for (const failed of [false, true]) {
+      let finish;
+      let fail;
+      const deferred = new Promise((resolve, reject) => {
+        finish = resolve;
+        fail = reject;
+      });
+      const state = new PrinterFleetState(baseModel, callbacks({ testConnection: () => deferred }));
+      const checking = state.testConnection(printer.id, "fixture-id", false);
+      state.updateModel({ ...baseModel, managedPrinters: replacement ? [replacement] : [] });
+      state.status = "Newer profile loaded.";
+      if (failed) fail(new Error("old request failed"));
+      else
+        finish({
+          result: "connected",
+          printer: { ...printer, jobStatus: "printing" },
+          statusEventObserved: true,
+        });
+      expect(await checking).toBe(false);
+      expect(state.model.managedPrinters).toEqual(replacement ? [replacement] : []);
+      expect(state.status).toBe("Newer profile loaded.");
+      expect(state.connectionTests.has(printer.id)).toBe(false);
+      expect(state.busyTests.has(printer.id)).toBe(false);
+    }
+  }
+});

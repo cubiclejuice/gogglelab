@@ -691,3 +691,25 @@ No further permanent build cleanup was performed: **0 additional bytes recovered
 The reused target and preserved working/release candidates remain. Data-volume
 free space was about 14 GiB after these builds; any future exact cleanup scope needs
 a fresh idle/open-file check, dry-run and explicit approval.
+
+### Next native prompt slice: implementation contract
+
+Replace the two remaining `window.prompt` dependencies without changing backend
+authority. Catalog purge gets a labelled in-app confirmation with the exact
+case-sensitive `PURGE` token and chosen backup destination, Cancel/Escape no-op,
+one pending mutation, stale pick/dialog invalidation, inline errors and focus
+restoration. Keep verified backup, maintenance, previous-Library and recovery
+requirements; do not change orphan/thumbnail deletion.
+
+The original Centauri Carbon's manual MainboardID dialog reuses fleet modal
+helpers. Keep the approved endpoint/current-profile checks, explicit one-time
+unencrypted-LAN/unsaved-ID disclosure and trimmed `[A-Za-z0-9._-]{1,128}` validation.
+Only explicit submit invokes the existing status transport without discovery;
+never persist/log the ID. Close/reopen/profile/endpoint changes invalidate pending
+UI work. QA uses synthetic/fake services and the native QA network-denial guard;
+previous one-shot printer checks are consumed and no new live call is authorized.
+
+Parallel ownership is limited to management/confirmation UI and fleet/manual-ID
+UI respectively. Require behavior regressions, independent review, one final
+current-worktree frontend gate, build, and actual isolated dialog acceptance
+before advancing to thumbnail/orphan proof implementation.

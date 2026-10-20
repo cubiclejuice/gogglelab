@@ -1,8 +1,13 @@
 import type { RemovedModel } from "./ipc";
+import { LibraryPurgeConfirmationDialog } from "./library-purge-confirmation-dialog";
 
 export class LibraryManagementDialog {
   private readonly dialog: HTMLDialogElement;
   private invoker: HTMLElement | null = null;
+  private readonly purgeConfirmation: LibraryPurgeConfirmationDialog;
+  private revision = 0;
+  private choosingPurgeDestination = false;
+  private purgePending = false;
   onRestoreRemoved: (snapshotId: string) => Promise<void> = async () => {};
   onBackup: () => Promise<void> = async () => {};
   onRestoreBackup: () => Promise<void> = async () => {};
@@ -18,9 +23,14 @@ export class LibraryManagementDialog {
       this.close();
     });
     container.append(this.dialog);
+    this.purgeConfirmation = new LibraryPurgeConfirmationDialog(container, () => {
+      if (this.dialog.open) this.dialog.querySelector<HTMLButtonElement>("button")?.focus();
+    });
   }
 
   show(removedModels: RemovedModel[], invoker?: HTMLElement): void {
+    this.revision += 1;
+    this.purgeConfirmation.dismiss();
     this.invoker =
       invoker ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     this.dialog.replaceChildren();
@@ -72,19 +82,38 @@ export class LibraryManagementDialog {
   }
 
   private async confirmPurge(status: HTMLElement): Promise<void> {
-    const destination = await this.onChoosePurgeBackupDestination();
-    if (!destination) {
-      status.textContent = "Catalog purge canceled before choosing a backup destination.";
-      return;
+    if (this.choosingPurgeDestination || this.purgePending) return;
+    const revision = this.revision;
+    const current = () => revision === this.revision && this.dialog.open && this.dialog.isConnected;
+    this.choosingPurgeDestination = true;
+    try {
+      const destination = await this.onChoosePurgeBackupDestination();
+      if (!current()) return;
+      if (!destination) {
+        status.textContent = "Catalog purge canceled before choosing a backup destination.";
+        return;
+      }
+      const operation = this.onPurge;
+      this.purgeConfirmation.show(
+        destination,
+        async (confirmation, destinationPath) => {
+          if (!current() || this.purgePending) return;
+          this.purgePending = true;
+          try {
+            await operation(confirmation, destinationPath);
+          } finally {
+            this.purgePending = false;
+          }
+        },
+        () => {
+          if (current()) status.textContent = "Catalog purge canceled.";
+        },
+      );
+    } catch (error) {
+      if (current()) status.textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.choosingPurgeDestination = false;
     }
-    const confirmation = window.prompt(
-      `A restorable backup will be written to ${destination}. External sources stay untouched. Type PURGE to continue.`,
-    );
-    if (confirmation !== "PURGE") {
-      status.textContent = "Catalog purge canceled.";
-      return;
-    }
-    await this.run(status, () => this.onPurge(confirmation, destination));
   }
 
   private button(label: string, action: () => void): HTMLButtonElement {
@@ -110,9 +139,11 @@ export class LibraryManagementDialog {
   }
 
   private close(): void {
+    this.revision += 1;
+    this.purgeConfirmation.dismiss();
     if (this.dialog.open) this.dialog.close();
     const invoker = this.invoker;
     this.invoker = null;
-    invoker?.focus();
+    if (invoker?.isConnected) invoker.focus();
   }
 }

@@ -763,11 +763,24 @@ export class PrinterFleetState {
   ): Promise<boolean> {
     const printer = this.model.managedPrinters.find((item) => item.id === id);
     if (!printer || this.busyTests.has(id)) return false;
+    const snapshot = cloneManagedPrinter(printer);
+    const requestIsCurrent = () =>
+      printerMatchesConnectionSnapshot(
+        this.model.managedPrinters.find((item) => item.id === id),
+        snapshot,
+      );
+    const ignoreStaleResult = () => {
+      if (this.status === "Testing printer connection…") {
+        this.status = "Printer details changed; the previous connection test result was ignored.";
+      }
+      return false;
+    };
     this.error = "";
     this.status = "Testing printer connection…";
     this.busyTests.add(id);
     try {
       const response = await this.callbacks.testConnection(id, mainboardId, discoverMainboardId);
+      if (!requestIsCurrent()) return ignoreStaleResult();
       const result = sanitizeConnectionTestStatus(response?.result);
       if (result === "cancelled") {
         this.status = connectionTestCopy(result);
@@ -787,6 +800,7 @@ export class PrinterFleetState {
           : connectionTestCopy(result);
       return result === "connected";
     } catch {
+      if (!requestIsCurrent()) return ignoreStaleResult();
       this.connectionTests.set(id, "failed");
       this.status = connectionTestCopy("failed");
       return false;
@@ -939,6 +953,7 @@ export class PrinterFleetManager {
   private discoveryRange = "";
   private dialogInvoker: HTMLElement | null = null;
   private nextDialogId = 0;
+  private dialogRevision = 0;
 
   constructor(container: HTMLElement, model: PrinterFleetModel, callbacks: PrinterFleetCallbacks) {
     this.state = new PrinterFleetState(model, callbacks);
@@ -1444,27 +1459,94 @@ export class PrinterFleetManager {
 
   private async testConnection(id: string, button: HTMLButtonElement): Promise<void> {
     const printer = this.state.model.managedPrinters.find((item) => item.id === id);
-    let mainboardId: string | undefined;
-    if (printer && requiresElegooMainboardId(printer)) {
-      const entered = window.prompt(
-        "Enter the printer MainboardID for this one-time SDCP check. It will be sent over an unencrypted local-network connection to the printer and will not be saved by GoggleLab.",
-      );
-      if (entered === null) return;
-      mainboardId = entered.trim();
-      if (!/^[A-Za-z0-9._-]{1,128}$/.test(mainboardId)) {
-        this.state.error =
-          "Enter a MainboardID with 1–128 letters, numbers, dots, underscores, or hyphens.";
-        this.renderLiveRegions();
-        button.focus();
-        return;
-      }
+    if (
+      !printer ||
+      button.disabled ||
+      this.state.busyTests.has(id) ||
+      printer.connection.kind !== "network" ||
+      !printer.endpointApproved
+    )
+      return;
+    if (requiresElegooMainboardId(printer)) {
+      this.openMainboardIdDialog(printer, button);
+      return;
     }
     button.disabled = true;
     button.setAttribute("aria-busy", "true");
-    const test = this.state.testConnection(id, mainboardId);
+    const test = this.state.testConnection(id);
     this.renderLiveRegions();
     await test;
     this.render();
+  }
+
+  private openMainboardIdDialog(printer: ManagedPrinter, invoker: HTMLElement): void {
+    const snapshot = cloneManagedPrinter(printer);
+    const formId = `printer-mainboard-${++this.nextDialogId}`;
+    const { form, error } = this.beginDialog("Test Centauri Carbon connection", formId, invoker);
+    const revision = this.dialogRevision;
+    const disclosure = document.createElement("p");
+    disclosure.textContent = `Enter the MainboardID for ${snapshot.name} (${snapshot.connection.kind === "network" ? snapshot.connection.address : ""}). This one-time read-only SDCP check sends it over an unencrypted local-network connection to this printer. GoggleLab will not save it. No discovery broadcast is sent.`;
+    form.append(disclosure);
+    const input = this.textField(form, formId, "mainboard-id", "MainboardID", "", 128);
+    input.autocomplete = "off";
+    input.autocapitalize = "off";
+    input.spellcheck = false;
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "btn primary";
+    submit.textContent = "Test connection";
+    form.append(submit);
+    let pending = false;
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (pending || !this.dialog.open || revision !== this.dialogRevision) return;
+      const current = this.state.model.managedPrinters.find((item) => item.id === snapshot.id);
+      if (
+        !current ||
+        current.metadataVersion !== snapshot.metadataVersion ||
+        current.connection.kind !== "network" ||
+        snapshot.connection.kind !== "network" ||
+        current.connection.address !== snapshot.connection.address ||
+        !current.endpointApproved ||
+        current.make !== snapshot.make ||
+        current.model !== snapshot.model ||
+        !requiresElegooMainboardId(current) ||
+        this.state.busyTests.has(snapshot.id)
+      ) {
+        input.value = "";
+        error.textContent =
+          "Printer details changed. Close this dialog, review the printer, and try again.";
+        return;
+      }
+      const mainboardId = input.value.trim();
+      if (!/^[A-Za-z0-9._-]{1,128}$/.test(mainboardId)) {
+        error.textContent =
+          "Enter a MainboardID with 1–128 letters, numbers, dots, underscores, or hyphens.";
+        input.focus();
+        return;
+      }
+      pending = true;
+      input.value = "";
+      input.disabled = true;
+      submit.disabled = true;
+      error.textContent = "";
+      const checking = this.state.testConnection(snapshot.id, mainboardId, false);
+      this.renderLiveRegions();
+      void (async () => {
+        const success = await checking;
+        if (revision !== this.dialogRevision || !this.dialog.open) return;
+        this.render();
+        if (success) this.closeDialog();
+        else {
+          error.textContent = this.state.error || this.state.status;
+          pending = false;
+          input.disabled = false;
+          submit.disabled = false;
+          input.focus();
+        }
+      })();
+    });
+    this.showDialog();
   }
 
   private async findAndTestElegoo(id: string, button: HTMLButtonElement): Promise<void> {
@@ -1802,6 +1884,8 @@ export class PrinterFleetManager {
     formId: string,
     invoker?: HTMLElement,
   ): { form: HTMLFormElement; error: HTMLElement } {
+    this.dialogRevision += 1;
+    for (const input of this.dialog.querySelectorAll("input")) input.value = "";
     this.dialog.replaceChildren();
     this.dialog.setAttribute("aria-labelledby", `${formId}-title`);
     this.dialogInvoker =
@@ -1830,10 +1914,18 @@ export class PrinterFleetManager {
   }
 
   private closeDialog(): void {
+    this.dialogRevision += 1;
+    for (const input of this.dialog.querySelectorAll("input")) input.value = "";
     if (this.dialog.open) this.dialog.close();
+    this.dialog.replaceChildren();
     const invoker = this.dialogInvoker;
     this.dialogInvoker = null;
-    if (invoker?.isConnected) invoker.focus();
+    const focusTarget = invoker?.isConnected
+      ? invoker
+      : invoker?.dataset.fleetFocus
+        ? findFleetFocusControl(this.content, invoker.dataset.fleetFocus)
+        : null;
+    focusTarget?.focus();
   }
 
   private textField(
@@ -1971,6 +2063,24 @@ function cloneFleetModel(model: PrinterFleetModel): PrinterFleetModel {
     maintenanceLogs: model.maintenanceLogs.map((log) => ({ ...log })),
     maintenanceReminders: model.maintenanceReminders.map((reminder) => ({ ...reminder })),
   };
+}
+
+function printerMatchesConnectionSnapshot(
+  current: ManagedPrinter | undefined,
+  expected: ManagedPrinter,
+): boolean {
+  return (
+    current !== undefined &&
+    current.id === expected.id &&
+    current.metadataVersion === expected.metadataVersion &&
+    current.endpointApproved === expected.endpointApproved &&
+    current.make === expected.make &&
+    current.model === expected.model &&
+    current.connection.kind === expected.connection.kind &&
+    (current.connection.kind !== "network" ||
+      (expected.connection.kind === "network" &&
+        current.connection.address === expected.connection.address))
+  );
 }
 
 function cloneManagedPrinter(printer: ManagedPrinter): ManagedPrinter {
