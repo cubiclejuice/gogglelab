@@ -29,8 +29,8 @@ use crate::models::{
     PrinterReminderInput, PrinterReminderStatus, PrinterSourceKind, RemovalResult, RemovedModel,
     ResolvedModelSource, ReviewedTagStrategy, ReviewedTagTarget, ScanReconcile, ScannedModel,
     SortDirection, SourceRef, SpoolmanFilamentRecord, SpoolmanSource, SpoolmanSpoolRecord, Tag,
-    TagMode, ThumbnailCacheEntry, ThumbnailGalleryItem, VersionedModelUpdate, VersionedTarget,
-    MAX_MODEL_PAGE_OFFSET,
+    TagMode, ThumbnailCacheEntry, ThumbnailGalleryItem, ThumbnailReadSnapshot,
+    VersionedModelUpdate, VersionedTarget, MAX_MODEL_PAGE_OFFSET,
 };
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 11;
@@ -3254,6 +3254,104 @@ impl LibraryDb {
                 })
             })
             .transpose()
+    }
+
+    /// Pure catalog read: never resolves or opens a source/cache file.
+    /// Selection matches thumbnail_cache_entry_for_model, including legacy NULL bindings.
+    pub fn thumbnail_read_snapshot(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<ThumbnailReadSnapshot>, LibraryError> {
+        type ReadRow = (
+            String,
+            String,
+            Option<String>,
+            bool,
+            Option<String>,
+            i64,
+            String,
+            i64,
+            i64,
+        );
+        let row: Option<ReadRow> = self
+            .conn
+            .query_row(
+                "SELECT t.relative_path,t.content_hash,t.source_content_hash,t.is_custom,
+                    COALESCE(r.blob_hash,d.content_hash),c.thumbnail_size,
+                    c.thumbnail_background,c.thumbnail_concurrency,c.scan_batch_size,
+                    length(CAST(t.relative_path AS BLOB))<=4096
+                    AND length(CAST(t.content_hash AS BLOB))<=64
+                    AND COALESCE(length(CAST(t.source_content_hash AS BLOB))<=64,1)
+                    AND COALESCE(length(CAST(COALESCE(r.blob_hash,d.content_hash) AS BLOB))<=64,1)
+                    AND length(CAST(c.thumbnail_background AS BLOB))<=7
+             FROM thumbnails t
+             LEFT JOIN revisions r ON r.id=(SELECT current_revision_id FROM models WHERE id=?1)
+             LEFT JOIN indexed_model_data d ON d.model_id=?1
+             LEFT JOIN catalog_settings c ON c.id='local'
+             WHERE t.model_id=?1
+               AND (t.is_custom=1 OR t.source_content_hash IS NULL
+                    OR t.source_content_hash=COALESCE(r.blob_hash,d.content_hash))
+             ORDER BY t.is_custom DESC,t.id LIMIT 1",
+                [model_id],
+                |r| {
+                    if !r.get::<_, bool>(9)? {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(
+                path,
+                png_hash,
+                source_content_hash,
+                is_custom,
+                current_content_hash,
+                size,
+                background,
+                concurrency,
+                batch,
+            )| {
+                let relative =
+                    crate::models::normalize_thumbnail_catalog_path(&path, cfg!(windows))
+                        .ok_or_else(|| {
+                            LibraryError::InvalidInput(
+                                "thumbnail catalog path is outside its safe relative namespace"
+                                    .into(),
+                            )
+                        })?;
+                let relative_path = PathBuf::from(relative);
+                let corrupt =
+                    || LibraryError::InvalidInput("catalog settings row is corrupt".into());
+                let settings = CatalogSettings {
+                    thumbnail_size: u32::try_from(size).map_err(|_| corrupt())?,
+                    thumbnail_background: background,
+                    thumbnail_concurrency: u32::try_from(concurrency).map_err(|_| corrupt())?,
+                    scan_batch_size: u32::try_from(batch).map_err(|_| corrupt())?,
+                };
+                validate_catalog_settings(&settings)?;
+                Ok(ThumbnailReadSnapshot {
+                    relative_path,
+                    png_hash,
+                    source_content_hash,
+                    is_custom,
+                    current_content_hash,
+                    settings,
+                })
+            },
+        )
+        .transpose()
     }
 
     /// One current source only; historical hashes are deliberately not resolved.
@@ -16962,5 +17060,107 @@ mod tests {
         assert_eq!(after_delete.printer_id, None);
         assert_eq!(after_delete.printer_name.as_deref(), Some("Snapshot P-1"));
         assert_eq!(linked_again.printer_name.as_deref(), Some("Snapshot P-1"));
+    }
+    #[test]
+    fn catalog_thumbnail_snapshot_preserves_selection_and_is_read_only_offline() {
+        let temp = temp_root("thumbnail-read-offline");
+        fs::create_dir_all(&temp).unwrap();
+        let db = LibraryDb::open(&temp.join("library")).unwrap();
+        let model = db.create_model("Offline", None).unwrap();
+        for (id, custom, path) in [
+            ("0-default", false, "thumbnails/default.png"),
+            ("b-custom", true, "thumbnails/other.png"),
+            ("a-custom", true, "thumbnails/nested/selected.png"),
+        ] {
+            db.conn.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom) VALUES(?1,?2,?3,?4,?5)",params![id,model.id,path,hash(1),custom]).unwrap();
+        }
+        let sentinel = db.root().join("untouched");
+        fs::write(&sentinel, b"keep").unwrap();
+        let changes = db.conn.total_changes();
+        let revision: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        let row = db.thumbnail_read_snapshot(&model.id).unwrap().unwrap();
+        assert_eq!(
+            row.relative_path,
+            PathBuf::from("thumbnails/nested/selected.png")
+        );
+        assert!(row.is_custom);
+        assert_eq!(row.source_content_hash, None);
+        assert_eq!(row.current_content_hash, None);
+        assert_eq!(row.settings, db.get_catalog_settings().unwrap());
+        assert_eq!(db.conn.total_changes(), changes);
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            revision
+        );
+        assert_eq!(fs::read(sentinel).unwrap(), b"keep");
+        assert!(!db.root().join("thumbnails/nested").exists());
+        assert!(db.thumbnail_read_snapshot("absent").unwrap().is_none());
+        drop(db);
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    fn catalog_thumbnail_snapshot_carries_source_binding_and_rejects_unsafe_paths() {
+        let temp = temp_root("thumbnail-read-bound");
+        fs::create_dir_all(&temp).unwrap();
+        let root = temp.join("library");
+        let source = temp.join("part.stl");
+        fs::write(&source, stl_fixture()).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        db.conn.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash) VALUES('bound',?1,'thumbnails/safe.png',?2,0,?3)",params![model.id,hash(1),model.content_hash]).unwrap();
+        let row = db.thumbnail_read_snapshot(&model.id).unwrap().unwrap();
+        assert_eq!(row.source_content_hash, model.content_hash);
+        assert_eq!(row.current_content_hash, model.content_hash);
+        db.conn
+            .execute("UPDATE thumbnails SET source_content_hash=?1", [hash(9)])
+            .unwrap();
+        assert!(db.thumbnail_read_snapshot(&model.id).unwrap().is_none());
+        db.conn
+            .execute(
+                "UPDATE thumbnails SET source_content_hash=NULL,relative_path='../outside.png'",
+                [],
+            )
+            .unwrap();
+        assert!(db.thumbnail_read_snapshot(&model.id).is_err());
+        drop(db);
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn catalog_thumbnail_snapshot_accepts_stored_native_windows_joined_path() {
+        let temp = temp_root("thumbnail-read-windows");
+        fs::create_dir_all(&temp).unwrap();
+        let db = LibraryDb::open(&temp.join("library")).unwrap();
+        let model = db.create_model("Offline", None).unwrap();
+        let native = PathBuf::from("thumbnails")
+            .join("nested")
+            .join("selected.png");
+        assert!(native.to_str().unwrap().contains('\\'));
+        db.conn.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom) VALUES('native',?1,?2,?3,1)",params![model.id,native.to_str().unwrap(),hash(1)]).unwrap();
+        let changes = db.conn.total_changes();
+        let snapshot = db.thumbnail_read_snapshot(&model.id).unwrap().unwrap();
+        assert_eq!(db.conn.total_changes(), changes);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT relative_path FROM thumbnails WHERE id='native'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            native.to_str().unwrap()
+        );
+        assert_eq!(
+            snapshot.relative_path.to_str(),
+            Some("thumbnails/nested/selected.png")
+        );
+        assert_eq!(snapshot.source_content_hash, None);
+        drop(db);
+        let _ = fs::remove_dir_all(temp);
     }
 }

@@ -974,41 +974,26 @@ mod imp {
             source: &std::ffi::OsStr,
             destination: &std::ffi::OsStr,
         ) -> io::Result<()> {
-            let source = c_name(source)?;
-            let destination = c_name(destination)?;
-            #[cfg(target_os = "macos")]
-            let result = unsafe {
-                libc::renameatx_np(
-                    self.0.as_raw_fd(),
-                    source.as_ptr(),
-                    self.0.as_raw_fd(),
-                    destination.as_ptr(),
-                    libc::RENAME_EXCL,
-                )
-            };
-            #[cfg(target_os = "linux")]
-            let result = unsafe {
-                libc::renameat2(
-                    self.0.as_raw_fd(),
-                    source.as_ptr(),
-                    self.0.as_raw_fd(),
-                    destination.as_ptr(),
-                    libc::RENAME_NOREPLACE,
-                )
-            };
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let result = return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "exclusive directory rename is unavailable on this Unix host",
-            ));
-            if result < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+            self.rename_child_exclusive_to_raw(source, self, destination)
         }
 
         pub fn rename_child_exclusive_to(
+            &self,
+            source: &std::ffi::OsStr,
+            destination_directory: &Directory,
+            destination: &std::ffi::OsStr,
+        ) -> io::Result<()> {
+            self.rename_child_exclusive_to_raw(source, destination_directory, destination)?;
+            self.sync()?;
+            if !std::ptr::eq(self, destination_directory) {
+                destination_directory.sync()?;
+            }
+            Ok(())
+        }
+
+        // Success means only that the rename syscall completed. Callers that
+        // retain ownership state can update it before fallible synchronization.
+        pub(super) fn rename_child_exclusive_to_raw(
             &self,
             source: &std::ffi::OsStr,
             destination_directory: &Directory,
@@ -1044,10 +1029,6 @@ mod imp {
             if result < 0 {
                 Err(io::Error::last_os_error())
             } else {
-                self.sync()?;
-                if !std::ptr::eq(self, destination_directory) {
-                    destination_directory.sync()?;
-                }
                 Ok(())
             }
         }
@@ -3583,6 +3564,124 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::imp::{copy_verified_file_with, remove_verified_file_with, Directory};
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn raw_cross_directory_rename_moves_without_replacing_existing_bytes() {
+        use std::ffi::OsStr;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let source_directory = Directory::open(&source).unwrap();
+        let destination_directory = Directory::open(&destination).unwrap();
+        fs::write(source.join("stage"), b"created bytes").unwrap();
+        source_directory
+            .rename_child_exclusive_to_raw(
+                OsStr::new("stage"),
+                &destination_directory,
+                OsStr::new("published"),
+            )
+            .unwrap();
+        assert!(!source.join("stage").exists());
+        assert_eq!(
+            fs::read(destination.join("published")).unwrap(),
+            b"created bytes"
+        );
+
+        fs::write(source.join("stage"), b"another owner").unwrap();
+        assert!(source_directory
+            .rename_child_exclusive_to_raw(
+                OsStr::new("stage"),
+                &destination_directory,
+                OsStr::new("published"),
+            )
+            .is_err());
+        assert_eq!(fs::read(source.join("stage")).unwrap(), b"another owner");
+        assert_eq!(
+            fs::read(destination.join("published")).unwrap(),
+            b"created bytes"
+        );
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn raw_cross_directory_rename_rejects_traversal_without_moving_files() {
+        use std::ffi::OsStr;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("stage"), b"preserve stage").unwrap();
+        fs::write(temp.path().join("outside"), b"preserve outside").unwrap();
+        let source_directory = Directory::open(&source).unwrap();
+        let destination_directory = Directory::open(&destination).unwrap();
+        for (from, to) in [("../outside", "published"), ("stage", "../outside")] {
+            assert!(source_directory
+                .rename_child_exclusive_to_raw(
+                    OsStr::new(from),
+                    &destination_directory,
+                    OsStr::new(to),
+                )
+                .is_err());
+        }
+        assert_eq!(fs::read(source.join("stage")).unwrap(), b"preserve stage");
+        assert_eq!(
+            fs::read(temp.path().join("outside")).unwrap(),
+            b"preserve outside"
+        );
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn raw_cross_directory_rename_uses_pinned_directory_handles() {
+        use std::ffi::OsStr;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("stage"), b"admitted bytes").unwrap();
+        let source_directory = Directory::open(&source).unwrap();
+        let destination_directory = Directory::open(&destination).unwrap();
+        let admitted_source = temp.path().join("admitted-source");
+        let admitted_destination = temp.path().join("admitted-destination");
+        fs::rename(&source, &admitted_source).unwrap();
+        fs::rename(&destination, &admitted_destination).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("stage"), b"replacement source").unwrap();
+        fs::write(destination.join("published"), b"replacement destination").unwrap();
+
+        source_directory
+            .rename_child_exclusive_to_raw(
+                OsStr::new("stage"),
+                &destination_directory,
+                OsStr::new("published"),
+            )
+            .unwrap();
+        assert!(!admitted_source.join("stage").exists());
+        assert_eq!(
+            fs::read(admitted_destination.join("published")).unwrap(),
+            b"admitted bytes"
+        );
+        assert_eq!(
+            fs::read(source.join("stage")).unwrap(),
+            b"replacement source"
+        );
+        assert_eq!(
+            fs::read(destination.join("published")).unwrap(),
+            b"replacement destination"
+        );
+    }
 
     fn png_receipt_fixture() -> (
         tempfile::TempDir,

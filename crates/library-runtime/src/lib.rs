@@ -61,6 +61,7 @@ use sha2::{Digest, Sha256};
 pub mod archives;
 pub mod bundles;
 pub mod catalog_jobs;
+pub mod catalog_thumbnails;
 pub mod embedded;
 pub mod geometry;
 pub mod images;
@@ -2832,6 +2833,31 @@ impl LibraryRuntime {
     }
 }
 
+/// Unwired producer foundation: owns an existing Owned reservation without
+/// retaining Runtime or changing its configured accounting category. Payloads
+/// must drop their buffers/descriptors before this owner releases the charge.
+#[allow(dead_code)]
+pub(crate) struct OwnedTempReservation {
+    state: Arc<Mutex<TempResourceState>>,
+    bytes: u64,
+}
+impl std::fmt::Debug for OwnedTempReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedTempReservation")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for OwnedTempReservation {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.reserved_owned_bytes = state
+            .reserved_owned_bytes
+            .checked_sub(self.bytes)
+            .expect("Owned reservation accounting underflow");
+    }
+}
+
 pub(crate) struct GeometryByteCharge {
     state: Arc<Mutex<TempResourceState>>,
     bytes: u64,
@@ -2843,6 +2869,40 @@ impl Drop for GeometryByteCharge {
     }
 }
 impl TempReservation<'_> {
+    /// Consume exactly this already-admitted reservation. No bytes are added,
+    /// committed as generated files, or transferred from another category.
+    #[allow(dead_code)]
+    pub(crate) fn into_owned_reservation(mut self) -> Result<OwnedTempReservation, RuntimeError> {
+        if !matches!(self.kind, ReservationKind::Owned) {
+            return Err(internal("Only an Owned reservation can transfer ownership"));
+        }
+        let limits = *self.runtime.temp_limits.lock().unwrap();
+        {
+            let state = self.runtime.temp_resources.lock().unwrap();
+            if state.reserved_owned_bytes < self.bytes {
+                return Err(internal("Owned reservation accounting changed"));
+            }
+            if state
+                .owned_bytes
+                .checked_add(state.reserved_owned_bytes)
+                .is_none_or(|bytes| bytes > limits.owned_bytes)
+            {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Busy,
+                    message: "Generated content temporary storage is full".into(),
+                    retryable: true,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+        }
+        self.committed = true;
+        Ok(OwnedTempReservation {
+            state: Arc::clone(&self.runtime.temp_resources),
+            bytes: self.bytes,
+        })
+    }
+
     pub(crate) fn into_geometry_charge(
         mut self,
         actual_bytes: u64,
@@ -14863,6 +14923,187 @@ mod tests {
         );
         drop(reader);
         assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+    }
+
+    #[test]
+    fn owned_temp_reservation_full_cap_refuses_before_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        runtime.set_temp_limits_for_test(8, 8);
+        let owner = runtime
+            .reserve_temp(ReservationKind::Owned, 8)
+            .unwrap()
+            .into_owned_reservation()
+            .unwrap();
+        let output = runtime.root.join("must-not-be-created");
+        let result = (|| -> Result<(), RuntimeError> {
+            let _reservation = runtime
+                .reserve_temp(ReservationKind::Owned, 1)?
+                .into_owned_reservation()?;
+            fs::write(&output, b"unadmitted output").map_err(|_| io_error())?;
+            Ok(())
+        })();
+        assert_eq!(result.unwrap_err().code, RuntimeErrorCode::Busy);
+        assert!(!output.exists());
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            8
+        );
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+        drop(owner);
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn owned_temp_reservation_wrong_kind_rolls_back_original_category() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        runtime.set_temp_limits_for_test(8, 8);
+        for kind in [
+            ReservationKind::Upload,
+            ReservationKind::Bundle,
+            ReservationKind::Geometry,
+        ] {
+            assert!(runtime
+                .reserve_temp(kind, 4)
+                .unwrap()
+                .into_owned_reservation()
+                .is_err());
+            let state = runtime.temp_resources.lock().unwrap();
+            assert_eq!(state.reserved_owned_bytes, 0);
+            assert_eq!(state.reserved_upload_bytes, 0);
+            assert_eq!(state.active_bundle_builds, 0);
+            assert_eq!(state.owned_bytes, 0);
+            assert_eq!(state.staged_upload_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn owned_temp_reservation_outlives_runtime_until_last_arc_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        runtime.set_temp_limits_for_test(8, 8);
+        let owner = Arc::new(
+            runtime
+                .reserve_temp(ReservationKind::Owned, 8)
+                .unwrap()
+                .into_owned_reservation()
+                .unwrap(),
+        );
+        let last = Arc::clone(&owner);
+        let state = Arc::clone(&runtime.temp_resources);
+        let weak = Arc::downgrade(&runtime);
+        drop(owner);
+        drop(runtime);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(state.lock().unwrap().reserved_owned_bytes, 8);
+        assert_eq!(state.lock().unwrap().owned_bytes, 0);
+        drop(last);
+        assert_eq!(state.lock().unwrap().reserved_owned_bytes, 0);
+    }
+
+    #[test]
+    fn owned_temp_reservation_contends_with_shared_owned_and_bundle_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        runtime.set_temp_limits_for_test(12, 8);
+        let owner = runtime
+            .reserve_temp(ReservationKind::Owned, 8)
+            .unwrap()
+            .into_owned_reservation()
+            .unwrap();
+        let bundle = runtime.reserve_temp(ReservationKind::Bundle, 4).unwrap();
+        assert!(runtime.reserve_temp(ReservationKind::Owned, 1).is_err());
+        assert!(runtime.reserve_temp(ReservationKind::Geometry, 1).is_err());
+        drop(bundle);
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            8
+        );
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().active_bundle_builds,
+            0
+        );
+        drop(owner);
+        assert!(runtime.reserve_temp(ReservationKind::Owned, 12).is_ok());
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn owned_temp_reservation_shared_threads_cannot_exceed_one_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        runtime.set_temp_limits_for_test(8, 8);
+        let attempted = std::sync::Barrier::new(3);
+        let release = std::sync::Barrier::new(3);
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        let observed = std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let runtime = &runtime;
+                let attempted = &attempted;
+                let release = &release;
+                let winners = &winners;
+                scope.spawn(move || {
+                    let owner = runtime
+                        .reserve_temp(ReservationKind::Owned, 8)
+                        .and_then(TempReservation::into_owned_reservation);
+                    if owner.is_ok() {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                    attempted.wait();
+                    release.wait();
+                    drop(owner);
+                });
+            }
+            attempted.wait();
+            let observed = (
+                winners.load(Ordering::SeqCst),
+                runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            );
+            release.wait();
+            observed
+        });
+        assert_eq!(observed, (1, 8));
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn owned_temp_reservation_transfer_rechecks_limit_and_errors_do_not_leak() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        runtime.set_temp_limits_for_test(8, 8);
+        let reservation = runtime.reserve_temp(ReservationKind::Owned, 8).unwrap();
+        runtime.temp_limits.lock().unwrap().owned_bytes = 7;
+        assert_eq!(
+            reservation.into_owned_reservation().unwrap_err().code,
+            RuntimeErrorCode::Busy
+        );
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            0
+        );
+        let result = (|| -> Result<(), RuntimeError> {
+            let _owner = runtime
+                .reserve_temp(ReservationKind::Owned, 7)?
+                .into_owned_reservation()?;
+            Err(invalid("Synthetic failure after admission"))
+        })();
+        assert!(result.is_err());
+        assert_eq!(
+            runtime.temp_resources.lock().unwrap().reserved_owned_bytes,
+            0
+        );
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+        assert!(runtime.reserve_temp(ReservationKind::Owned, 8).is_err());
     }
 
     #[test]

@@ -1,22 +1,25 @@
 # Immutable thumbnail publication contract
 
-Reviewed next phase; implementation remains pending. The preceding cleanup caller
-slice passed automated, packaged native and synthetic container gates. This
-contract records the next implementation/review gate and does not enable new
-publication or deletion by itself.
+The cleanup caller slice passed automated, packaged native and synthetic container
+gates. The first **unwired** publication foundation now passes its workspace,
+final affected catalog, Clippy, formatting and Community package/signature gates:
+selected-row catalog snapshots/pure PNG validation, Owned reservation ownership,
+and raw NoReplace ordering. Producer admission, parser hardening, stage lifecycle,
+immutable publication and caller migration remain pending. This contract enables
+no new publication or deletion by itself.
 
 ## Cache contract and migration sites
 
 Normal reuse starts from a catalog reference, not a directory or guessed filename.
-Validate its bounded PNG bytes against the stored PNG hash. For generated entries,
-validate the supported key against current source hash/settings and, for CA names,
-the output hash. Existing valid legacy catalog references may still be displayed;
-they confer no deletion or creator ownership. Catalog `png_hash` is a nonnullable
-String; only `source_content_hash` may be null. For a legacy generated row with a
-null source hash, require a supported filename recipe matching the current model
-hash/settings plus its stored PNG hash; do not synthesize/adopt a new hash on read.
-Custom selection behavior stays intact.
-A missing/corrupt/stale row or explicit regeneration goes through verified rendering.
+All display reads require bounded valid PNG bytes and the mandatory stored PNG
+hash. Custom and source-hash-NULL legacy rows may display offline from safe nested
+catalog paths; this display-only result never qualifies as current producer reuse,
+creator ownership or deletion proof. Source-bound generated rows require the
+supported key to match current catalog source/settings and, for CA names, the
+output hash. Custom selection behavior stays intact. Only a compatible source-bound
+current-recipe result may avoid verified production; a missing/corrupt/stale row or
+explicit regeneration goes through verified rendering when generation is requested.
+Passive display itself remains read-only.
 
 Remove both shared semantic adoption paths in `thumbnails.rs`: the first
 `ensure_thumbnail` cache check before source verification, and the valid-PNG
@@ -140,6 +143,29 @@ releasing its byte/slot charge. Use accounting-state Arcs without Runtime cycles
 Tests can lower these limits; defaults are implementation-gated until allocation
 accounting and cross-producer refusal tests pass.
 
+## Parser prerequisite before producer wiring
+
+See [the parser-bound plan](THUMBNAIL-PARSER-BOUNDS.md) for exact allocation sites,
+proposed limits and compatibility gates.
+
+The proposed work allowances above are not established parser peaks. Current 3MF
+parsing can retain input mesh/object vectors before the flattened-triangle cap,
+copy large attributes/model-settings text, and allocate ZIP central-directory
+metadata before application-level entry checks. A source-byte reservation alone
+cannot justify enabling the new producer budget.
+
+The first unwired checkpoint adds only an Owned reservation transfer, a dedicated
+catalog-read snapshot/pure stored-digest validator, and raw NoReplace ordering.
+No source reader, parser, producer, cache adoption or publication caller is migrated
+by that checkpoint. Review and verify finite preallocation limits next: bounded
+ZIP entry count/central metadata before ZipArchive construction; aggregate input
+vertices/triangles/objects/components/build items; retained text/token/attribute
+sizes; actual inflated bytes; and archive outer-input/hash/extraction passes.
+Use small test overrides for boundary tests and retain ordinary multipart,
+materials, archive-member and embedded-preview fixtures. Do not silently disable
+normal 3MF generation to ship immutable publication. Parser estimates must remain
+labelled as estimates until allocation bounds are demonstrated.
+
 ## Fixed staging namespace and limits
 
 Use pinned `thumbnails/.gogglelab-png-staging`, not an inventory cap over published
@@ -160,7 +186,15 @@ an exact-winner miss and precedes stage creation/writing; it must not block an e
 winner reuse. Payload rendering/write work stays outside that short gate. Include in-flight stages,
 retained partials and claims; do not create a check/create race between producers.
 Use a fresh bounded inventory when admitting stages rather than trusting stale
-counters after unknown replacements. No historical stage/claim sweep or adoption.
+counters after unknown replacements. Inventory alone undercounts empty/partial
+in-flight writes: all namespace instances must share the Runtime's stage ledger.
+Under the same short gate, conservatively charge fresh actual child bytes plus
+each in-flight owner's full intended reservation before exclusive creation. This
+may double-count visible owned bytes, but cannot undercount pending writes. Keep
+that reservation through publication/retirement and handle closure; transfer and
+release it under the gate. A separately opened namespace cannot create a fresh
+ledger to evade limits. The retained CatalogLock excludes cooperating other
+processes for the entire Runtime/stage-owner lifetime. No historical stage/claim sweep or adoption.
 Bound descriptor and memory charges; owners drop handles before releasing permits.
 Normal cache hits avoid this inventory entirely, regardless of published catalog size.
 
@@ -179,7 +213,12 @@ only retire their verified intended prefix; publication cannot accept them.
 Immediately before final rename, revalidate complete bytes and all bindings again.
 Derive the final name from the sealed payload, then use cross-directory atomic
 NoReplace rename into thumbnails. Update Published state immediately after syscall
-success; verify/sync the file and both source/destination directories afterward. Never use
+success; verify/sync the file and both source/destination directories afterward.
+The existing cross-directory rename helper syncs internally and can return an
+error after a successful rename, so the publisher must use a narrow raw NoReplace
+syscall helper, transition state immediately, then perform explicit durability
+steps. Preserve the generic source caller helper's existing behavior. Test each
+post-rename failure without misreporting an unpublished stage. Never use
 `replace_child`, generic public-path unlink, or hold fallbacks.
 
 An existing exact final winner may be verified/reused directly, including after a

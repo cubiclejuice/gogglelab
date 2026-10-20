@@ -14,7 +14,7 @@ use crate::secure_fs::Directory;
 const RENDER_VERSION: u32 = 1;
 const MAX_RENDER_TRIANGLES: usize = 200_000;
 const BASE_MAX_RASTER_SAMPLES: usize = 8_000_000;
-const MAX_CACHED_PNG_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_CACHED_PNG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PNG_DIMENSION: u32 = 1024;
 const MAX_DECODED_PNG_BYTES: usize = 4 * 1024 * 1024;
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +66,25 @@ impl ThumbnailRecipe {
             background: background.to_owned(),
             png_hash_hint: png_hash_hint.map(str::to_owned),
         })
+    }
+    pub(crate) fn matches_catalog(
+        &self,
+        source_hash: &str,
+        settings: &CatalogSettings,
+        png_hash: &str,
+    ) -> bool {
+        self.source_hash.eq_ignore_ascii_case(source_hash)
+            && self.size == settings.thumbnail_size
+            && self.background.eq_ignore_ascii_case(
+                settings
+                    .thumbnail_background
+                    .strip_prefix('#')
+                    .unwrap_or(""),
+            )
+            && self
+                .png_hash_hint
+                .as_ref()
+                .is_none_or(|hint| hint.eq_ignore_ascii_case(png_hash))
     }
     pub(crate) fn raster_sample_budget(&self) -> u64 {
         BASE_MAX_RASTER_SAMPLES as u64 * u64::from(self.size) * u64::from(self.size) / (256 * 256)
@@ -421,7 +440,7 @@ fn png_data_uri_validated(path: &Path, expected_hash: Option<&str>) -> Result<St
     Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)))
 }
 
-fn validate_png_bytes(bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_png_bytes(bytes: &[u8]) -> Result<(), String> {
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("Cached thumbnail is not a PNG".into());
     }

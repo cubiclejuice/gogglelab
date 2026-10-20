@@ -47,9 +47,22 @@ implementations. The container is stopped; test data and images remain preserved
 Windows GNU core/runtime compilation passes at that source; this is not Windows
 execution. No full parity, Windows durable-cleanup, hardware or release claim is made.
 
-Next: reviewed immutable producer publication under the
-[publication contract](THUMBNAIL-PUBLICATION-CONTRACT.md), followed by the remaining
-platform/composition/release gates. Historical and unknown generated media are not
+The next publication foundation is now implemented but remains **unwired**:
+a selected-row snapshot and pure stored-digest PNG validator; an Owned-only quota
+owner that retains the existing shared reservation through its last owner; and a
+raw cross-directory NoReplace helper, with synchronized caller behavior preserved.
+Independent review found and corrected Windows-native path normalization; portable
+Windows-mode tests cover the whole validator, unsafe aliases and device names.
+The full workspace passed before that final normalization correction (202 native,
+126 core, 327 runtime, 65 server and five binary tests); all 12 affected catalog
+tests pass afterward. Workspace Clippy, formatting and the signed Community build
+pass. This adds no producer/file-reader wiring, schema change or new deletion.
+
+Next: enforce the reviewed [parser resource bounds](THUMBNAIL-PARSER-BOUNDS.md),
+then derive a defensible shared producer allowance before immutable publication
+and caller migration under the
+[publication contract](THUMBNAIL-PUBLICATION-CONTRACT.md). Remaining platform,
+composition and release gates still apply. Historical and unknown generated media are not
 swept. Build cleanup performed in this slice: none; space recovered: zero.
 
 ### Earlier checkpoint (historical)

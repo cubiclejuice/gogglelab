@@ -759,6 +759,69 @@ pub struct ThumbnailCacheEntry {
     pub is_custom: bool,
 }
 
+/// Canonical relative thumbnail text without platform-dependent PathBuf pushes.
+/// Windows accepts either native separator; Unix never treats a literal backslash
+/// as a delimiter. This is lexical read validation, not filesystem authority.
+pub fn normalize_thumbnail_catalog_path(value: &str, windows_separators: bool) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains([':', '\0'])
+        || (!windows_separators && value.contains('\\'))
+    {
+        return None;
+    }
+    let parts = value
+        .split(|c| c == '/' || (windows_separators && c == '\\'))
+        .collect::<Vec<_>>();
+    if parts.len() < 2
+        || parts[0] != "thumbnails"
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || matches!(*part, "." | "..")
+                || (windows_separators
+                    && (part.ends_with('.')
+                        || part.ends_with(' ')
+                        || windows_thumbnail_device_component(part)))
+        })
+    {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+fn windows_thumbnail_device_component(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) || stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|port| {
+            matches!(
+                port,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
+/// Read-only catalog selection and settings from one database snapshot.
+/// This descriptor conveys neither generated-file provenance nor deletion authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThumbnailReadSnapshot {
+    pub relative_path: PathBuf,
+    pub png_hash: String,
+    pub source_content_hash: Option<String>,
+    pub is_custom: bool,
+    pub current_content_hash: Option<String>,
+    pub settings: CatalogSettings,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThumbnailGalleryItem {
     pub id: String,
@@ -908,4 +971,94 @@ pub struct ScanReconcile {
 pub struct ImportResult {
     pub model: Model,
     pub reused_blob: bool,
+}
+
+#[cfg(test)]
+mod thumbnail_path_tests {
+    use super::normalize_thumbnail_catalog_path;
+    #[test]
+    fn catalog_thumbnail_path_modes_normalize_native_windows_delimiters_safely() {
+        for path in [
+            r"thumbnails\nested\preview.png",
+            r"thumbnails\nested/preview.png",
+            "thumbnails/nested/preview.png",
+        ] {
+            assert_eq!(
+                normalize_thumbnail_catalog_path(path, true).as_deref(),
+                Some("thumbnails/nested/preview.png")
+            );
+        }
+        assert!(
+            normalize_thumbnail_catalog_path(r"thumbnails\nested\preview.png", false).is_none()
+        );
+        assert_eq!(
+            normalize_thumbnail_catalog_path("thumbnails/nested/preview.png", false).as_deref(),
+            Some("thumbnails/nested/preview.png")
+        );
+        for path in [
+            r"\thumbnails\a.png",
+            r"\\server\thumbnails\a.png",
+            r"C:\thumbnails\a.png",
+            r"thumbnails\..\a.png",
+            r"thumbnails/..\a.png",
+            r"thumbnails\.. \a.png",
+            r"thumbnails\nested.\a.png",
+            r"thumbnails\a.png:stream",
+            r"thumbnails\\a.png",
+            r"thumbnails\.\a.png",
+            r"thumbnails\a.png\",
+            "/thumbnails/a.png",
+            "thumbnails/a\0.png",
+        ] {
+            assert!(
+                normalize_thumbnail_catalog_path(path, true).is_none(),
+                "{path}"
+            );
+        }
+    }
+    #[test]
+    fn catalog_thumbnail_windows_mode_rejects_device_stems_without_restricting_unicode() {
+        for name in [
+            "CON",
+            "con.png",
+            "NUL",
+            "aux.PNG",
+            "PRN.zip",
+            "COM1",
+            "COM9.png",
+            "LPT1",
+            "lpt9.PNG",
+            "CONIN$.png",
+            "CONOUT$",
+            "CLOCK$",
+            "COM¹.png",
+            "LPT².png",
+            "NUL .png",
+        ] {
+            let path = format!("thumbnails/{name}");
+            assert!(
+                normalize_thumbnail_catalog_path(&path, true).is_none(),
+                "{name}"
+            );
+            assert!(
+                normalize_thumbnail_catalog_path(&path, false).is_some(),
+                "Unix literal {name}"
+            );
+            assert!(
+                normalize_thumbnail_catalog_path(&format!("thumbnails/{name}/preview.png"), true)
+                    .is_none(),
+                "nested {name}"
+            );
+        }
+        for path in [
+            "thumbnails/模型/café.png",
+            "thumbnails/COM10.png",
+            "thumbnails/conifer.png",
+        ] {
+            assert_eq!(
+                normalize_thumbnail_catalog_path(path, true).as_deref(),
+                Some(path)
+            );
+        }
+    }
 }
