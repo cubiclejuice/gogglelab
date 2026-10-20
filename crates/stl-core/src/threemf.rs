@@ -18,17 +18,18 @@ use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
 use quick_xml::XmlVersion;
 use serde_json::Value;
 
 use crate::error::{ResourceStop, StlError};
-use crate::limits::{MAX_3MF_INFLATED_BYTES, MAX_TRIANGLES};
+use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
 use crate::model::{
     MaterialSource, ParsedFilament, ParsedMaterial, ParsedModel, ParsedPart, Plate,
 };
+use crate::package_bounds::{ModelPartReader, PackageProcessingContext, TextRole};
 use crate::parse::{ParsedStl, StlFormat};
 use crate::vec3::{cross, dot, sub, V3};
+use crate::xml_bounds::XmlEventReader;
 use crate::zip_bounds::{BoundedZipArchive, BoundedZipMember, ZipOpenError, ZipResourceObserver};
 
 /// Zip local-file-header signature. Every 3MF (and every other OPC package)
@@ -199,6 +200,7 @@ struct ParserTestState {
     fired: bool,
     after_io: usize,
     work_after_stop: usize,
+    total_work: usize,
     root_cached: bool,
 }
 
@@ -207,13 +209,19 @@ struct ParserTestProbe {
     member: &'static str,
     failure: ParserTestFailure,
     state: std::cell::RefCell<ParserTestState>,
+    guard_observer: Option<ZipResourceObserver>,
 }
 
 #[cfg(test)]
 impl ParserTestProbe {
     fn before_io(&self, read: bool) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        if state.fired {
+        if state.fired
+            || self
+                .guard_observer
+                .as_ref()
+                .is_some_and(|observer| observer.check().is_err())
+        {
             state.after_io += 1;
         } else if state.armed && read {
             state.fired = true;
@@ -224,7 +232,13 @@ impl ParserTestProbe {
 
     fn record_work(&self) {
         let mut state = self.state.borrow_mut();
-        if state.fired {
+        state.total_work += 1;
+        if state.fired
+            || self
+                .guard_observer
+                .as_ref()
+                .is_some_and(|observer| observer.check().is_err())
+        {
             state.work_after_stop += 1;
         }
     }
@@ -266,19 +280,23 @@ impl Seek for PackageInput<'_> {
 
 /// The open package plus a cache of parsed parts, so a part referenced by
 /// several components is parsed once.
-struct Package<'a> {
+struct Package<'a, 'context> {
     archive: BoundedZipArchive<PackageInput<'a>>,
     observer: ZipResourceObserver,
     #[cfg(test)]
     probe: Option<Rc<ParserTestProbe>>,
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
-    inflated: u64,
+    context: &'context mut PackageProcessingContext,
     component_visits_remaining: u64,
 }
 
-impl<'a> Package<'a> {
-    fn open(bytes: &'a [u8], observer: ZipResourceObserver) -> Result<Self, StlError> {
+impl<'a, 'context> Package<'a, 'context> {
+    fn open(
+        bytes: &'a [u8],
+        context: &'context mut PackageProcessingContext,
+    ) -> Result<Self, StlError> {
+        let observer = context.observer();
         #[cfg(test)]
         let probe = PARSER_TEST_PROBE.with(|probe| probe.borrow().clone());
         let input = PackageInput {
@@ -298,7 +316,7 @@ impl<'a> Package<'a> {
             probe,
             parts: HashMap::new(),
             materials: Vec::new(),
-            inflated: 0,
+            context,
             component_visits_remaining: MAX_COMPONENT_VISITS,
         })
     }
@@ -321,12 +339,14 @@ impl<'a> Package<'a> {
         self.archive.file_names().any(|n| n == name)
     }
 
-    /// Opens a part for streaming, charging its declared inflated size
-    /// against the package-wide cap first.
-    fn reader(
-        &mut self,
+    /// Stream one model part through the same actual package and part limits.
+    fn reader<'read>(
+        &'read mut self,
         path: &str,
-    ) -> Result<BufReader<BoundedZipMember<'_, PackageInput<'a>>>, StlError> {
+    ) -> Result<
+        BufReader<ModelPartReader<'read, BoundedZipMember<'read, PackageInput<'a>>>>,
+        StlError,
+    > {
         let name = Self::entry_name(path).to_string();
         #[cfg(test)]
         if let Some(probe) = &self.probe {
@@ -338,14 +358,42 @@ impl<'a> Package<'a> {
             .archive
             .by_name(&name)
             .map_err(|error| missing_part_error(error, path))?;
-        self.inflated = self.inflated.saturating_add(file.size());
-        if self.inflated > MAX_3MF_INFLATED_BYTES {
-            return Err(malformed(format!(
-                "model parts expand to more than {} MB",
-                MAX_3MF_INFLATED_BYTES / (1024 * 1024)
-            )));
+        if file.size() > MAX_FILE_BYTES {
+            let _ = self.observer.stop_io(ResourceStop::InputLimitExceeded);
+            self.observer.check()?;
         }
-        Ok(BufReader::new(file))
+        Ok(BufReader::new(self.context.model_reader(file)))
+    }
+
+    fn collect_text(&mut self, path: &str, role: TextRole) -> Result<String, StlError> {
+        let name = Self::entry_name(path).to_string();
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            if probe.member == name {
+                probe.state.borrow_mut().armed = true;
+            }
+        }
+        let file = self
+            .archive
+            .by_name(&name)
+            .map_err(|error| missing_part_error(error, path))?;
+        if file.size() > role.byte_limit() as u64 {
+            let error = self.observer.stop_io(ResourceStop::InputLimitExceeded);
+            self.observer.observe_io(&error);
+            self.observer.check()?;
+        }
+        let ordinary_message = match role {
+            TextRole::Relationships => "_rels/.rels is not valid text".to_owned(),
+            TextRole::ModelSettings | TextRole::ProjectSettings => {
+                format!("{path} is not valid UTF-8 text")
+            }
+        };
+        self.context
+            .collect_text(file, role)
+            .map_err(|error| match error {
+                error @ (StlError::ResourceStopped(_) | StlError::AllocationFailed) => error,
+                _ => malformed(ordinary_message),
+            })
     }
 
     fn part(&mut self, path: &str) -> Result<Rc<ModelPart>, StlError> {
@@ -357,7 +405,7 @@ impl<'a> Package<'a> {
         let observer = self.observer.clone();
         let parsed = {
             let reader = self.reader(path)?;
-            parse_model_part(reader, path)
+            parse_model_part(reader, path, &observer)
         };
         observer.check()?;
         let parsed = parsed?;
@@ -379,17 +427,12 @@ impl<'a> Package<'a> {
         Ok(rc)
     }
 
-    fn optional_text(&mut self, path: &str) -> Result<Option<String>, StlError> {
+    fn optional_text(&mut self, path: &str, role: TextRole) -> Result<Option<String>, StlError> {
         self.observer.check()?;
         if !self.has(path) {
             return Ok(None);
         }
-        let mut text = String::new();
-        let observer = self.observer.clone();
-        let read = self.reader(path)?.read_to_string(&mut text);
-        observer.check()?;
-        read.map_err(|_| malformed(format!("{path} is not valid UTF-8 text")))?;
-        Ok(Some(text))
+        self.collect_text(path, role).map(Some)
     }
 
     fn optional_bounded_text(
@@ -410,7 +453,7 @@ impl<'a> Package<'a> {
         if size > max_bytes {
             return Ok(None);
         }
-        self.optional_text(path)
+        self.optional_text(path, TextRole::ProjectSettings)
     }
 
     /// The root model part per `_rels/.rels`; falls back to the conventional
@@ -418,12 +461,8 @@ impl<'a> Package<'a> {
     fn root_model_path(&mut self) -> Result<String, StlError> {
         self.observer.check()?;
         if self.has("_rels/.rels") {
-            let mut text = String::new();
-            let observer = self.observer.clone();
-            let read = self.reader("_rels/.rels")?.read_to_string(&mut text);
-            observer.check()?;
-            read.map_err(|_| malformed("_rels/.rels is not valid text"))?;
-            if let Some(target) = model_relationship_target(&text) {
+            let text = self.collect_text("_rels/.rels", TextRole::Relationships)?;
+            if let Some(target) = model_relationship_target(&text, &self.observer)? {
                 return Ok(target);
             }
         }
@@ -500,16 +539,25 @@ fn set_once<T: PartialEq>(slot: &mut Option<T>, value: T, what: &str) -> Result<
     }
 }
 
+#[cfg(test)]
 fn parse_plate_settings(text: &str) -> Result<Vec<PlateSpec>, String> {
-    let mut xml = Reader::from_str(text);
-    xml.config_mut().trim_text(true);
+    parse_plate_settings_observed(text, &ZipResourceObserver::new())
+}
+
+fn parse_plate_settings_observed(
+    text: &str,
+    observer: &ZipResourceObserver,
+) -> Result<Vec<PlateSpec>, String> {
+    let mut xml = XmlEventReader::new(text.as_bytes(), observer.clone())
+        .map_err(|error| error.to_string())?;
+    xml.set_trim_text(true);
     let mut plates = Vec::new();
     let mut plate: Option<OpenPlate> = None;
     let mut instance: Option<OpenInstance> = None;
 
     loop {
         let event = xml
-            .read_event()
+            .next_event()
             .map_err(|e| format!("invalid plate metadata XML ({e})"))?;
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
@@ -693,16 +741,20 @@ fn merge_settings_record(
     }
 }
 
-fn parse_slicer_metadata(text: &str) -> Result<SlicerMetadata, String> {
-    let mut xml = Reader::from_str(text);
-    xml.config_mut().trim_text(true);
+fn parse_slicer_metadata(
+    text: &str,
+    observer: &ZipResourceObserver,
+) -> Result<SlicerMetadata, String> {
+    let mut xml = XmlEventReader::new(text.as_bytes(), observer.clone())
+        .map_err(|error| error.to_string())?;
+    xml.set_trim_text(true);
     let mut metadata = SlicerMetadata::default();
     let mut object: Option<(u32, SettingsRecord)> = None;
     let mut part: Option<(u32, SettingsRecord)> = None;
     let mut ignored_part_depth = 0u32;
     loop {
         match xml
-            .read_event()
+            .next_event()
             .map_err(|e| format!("invalid slicer metadata XML ({e})"))?
         {
             Event::Start(e) => match e.local_name().as_ref() {
@@ -887,7 +939,7 @@ fn boundary_name(
 }
 
 fn component_part_metadata_paths(
-    pkg: &mut Package<'_>,
+    pkg: &mut Package<'_, '_>,
     root: &ModelPart,
     root_path: &str,
 ) -> Result<HashMap<u32, HashSet<String>>, StlError> {
@@ -1052,10 +1104,13 @@ fn object_has_geometry(
 
 /// Finds the `Relationship` whose `Type` is the 3dmodel relationship and
 /// returns its `Target`. Small file, so a DOM-free attribute scan is enough.
-fn model_relationship_target(rels: &str) -> Option<String> {
-    let mut reader = Reader::from_str(rels);
-    loop {
-        match reader.read_event() {
+fn model_relationship_target(
+    rels: &str,
+    observer: &ZipResourceObserver,
+) -> Result<Option<String>, StlError> {
+    let mut reader = XmlEventReader::new(rels.as_bytes(), observer.clone())?;
+    let target = (|| loop {
+        match reader.next_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 if e.local_name().as_ref() != b"Relationship" {
                     continue;
@@ -1077,7 +1132,8 @@ fn model_relationship_target(rels: &str) -> Option<String> {
             Ok(Event::Eof) | Err(_) => return None,
             _ => {}
         }
-    }
+    })();
+    observer.finish(Ok(target))
 }
 
 fn attr_str(e: &BytesStart, name: &[u8]) -> Result<Option<String>, StlError> {
@@ -1176,10 +1232,13 @@ struct OpenObject {
 }
 
 /// Streams one `.model` part into its objects and build items.
-fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelPart, StlError> {
-    let mut xml = Reader::from_reader(reader);
-    xml.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+fn parse_model_part<R: Read>(
+    reader: R,
+    path: &str,
+    observer: &ZipResourceObserver,
+) -> Result<ModelPart, StlError> {
+    let mut xml = XmlEventReader::new(reader, observer.clone())?;
+    xml.set_trim_text(true);
 
     let mut part = ModelPart {
         path: Package::entry_name(path).to_string(),
@@ -1194,9 +1253,9 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
     let mut in_build = false;
 
     loop {
-        let event = xml
-            .read_event_into(&mut buf)
-            .map_err(|e| malformed(format!("{path}: invalid XML ({e})")))?;
+        let event = xml.next_event();
+        observer.check()?;
+        let event = event.map_err(|e| malformed(format!("{path}: invalid XML ({e})")))?;
         match &event {
             Event::Start(e) | Event::Empty(e) => {
                 let is_empty = matches!(&event, Event::Empty(_));
@@ -1413,7 +1472,6 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
             Event::Eof => break,
             _ => {}
         }
-        buf.clear();
     }
     Ok(part)
 }
@@ -1495,7 +1553,7 @@ impl StandardAppearance {
 }
 
 fn standard_material_id<'a>(
-    pkg: &Package<'_>,
+    pkg: &Package<'_, '_>,
     part: &'a ModelPart,
     object: &Object,
 ) -> Option<&'a str> {
@@ -1822,41 +1880,62 @@ fn whole_build(
 /// Geometry is emitted once, grouped in display order so each plate is a
 /// contiguous range of the aggregate model.
 pub fn parse_3mf_with_plates(bytes: &[u8]) -> Result<ParsedModel, StlError> {
-    parse_3mf_with_component_visit_limit(bytes, MAX_COMPONENT_VISITS)
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    parse_3mf_with_plates_in_context(bytes, &mut context)
 }
 
+#[doc(hidden)]
+pub fn parse_3mf_with_plates_in_context(
+    bytes: &[u8],
+    context: &mut PackageProcessingContext,
+) -> Result<ParsedModel, StlError> {
+    parse_3mf_in_context_with_component_visit_limit(bytes, MAX_COMPONENT_VISITS, context)
+}
+
+#[cfg(test)]
 fn parse_3mf_with_component_visit_limit(
     bytes: &[u8],
     component_visit_limit: u64,
 ) -> Result<ParsedModel, StlError> {
-    let observer = ZipResourceObserver::new();
-    let result = parse_3mf_with_observer(bytes, component_visit_limit, observer.clone());
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    parse_3mf_in_context_with_component_visit_limit(bytes, component_visit_limit, &mut context)
+}
+
+fn parse_3mf_in_context_with_component_visit_limit(
+    bytes: &[u8],
+    component_visit_limit: u64,
+    context: &mut PackageProcessingContext,
+) -> Result<ParsedModel, StlError> {
+    let observer = context.observer();
+    observer.check()?;
+    let result = parse_3mf_with_context(bytes, component_visit_limit, context);
     observer.finish(result)
 }
 
-fn parse_3mf_with_observer(
+fn parse_3mf_with_context(
     bytes: &[u8],
     component_visit_limit: u64,
-    observer: ZipResourceObserver,
+    context: &mut PackageProcessingContext,
 ) -> Result<ParsedModel, StlError> {
     if bytes.is_empty() {
         return Err(StlError::EmptyFile);
     }
-    let mut pkg = Package::open(bytes, observer)?;
+    let mut pkg = Package::open(bytes, context)?;
     pkg.component_visits_remaining = component_visit_limit;
     let root_path = pkg.root_model_path()?;
     let root = pkg.part(&root_path)?;
     let component_paths = component_part_metadata_paths(&mut pkg, &root, &root_path)?;
 
-    let settings_result = pkg.optional_text(MODEL_SETTINGS_PATH);
+    let settings_result = pkg.optional_text(MODEL_SETTINGS_PATH, TextRole::ModelSettings);
     pkg.observer.check()?;
     preserve_terminal(&settings_result)?;
-    let slicer = settings_result
+    let slicer_result = settings_result
         .as_ref()
         .ok()
         .and_then(|text| text.as_deref())
-        .and_then(|text| parse_slicer_metadata(text).ok())
-        .unwrap_or_default();
+        .map(|text| parse_slicer_metadata(text, &pkg.observer));
+    pkg.observer.check()?;
+    let slicer = slicer_result.and_then(Result::ok).unwrap_or_default();
     let project_result =
         pkg.optional_bounded_text(PROJECT_SETTINGS_PATH, MAX_APPEARANCE_METADATA_BYTES);
     pkg.observer.check()?;
@@ -1868,20 +1947,24 @@ fn parse_3mf_with_observer(
         .unwrap_or_default();
 
     let settings = match settings_result {
-        Ok(Some(text)) => match parse_plate_settings(&text) {
-            Ok(specs) => Some(specs),
-            Err(detail) => {
-                return whole_build(
-                    &mut pkg,
-                    &root_path,
-                    &root,
-                    &slicer,
-                    &component_paths,
-                    filaments,
-                    format!("Plate metadata is unusable ({detail}); showing the whole build."),
-                );
+        Ok(Some(text)) => {
+            let result = parse_plate_settings_observed(&text, &pkg.observer);
+            pkg.observer.check()?;
+            match result {
+                Ok(specs) => Some(specs),
+                Err(detail) => {
+                    return whole_build(
+                        &mut pkg,
+                        &root_path,
+                        &root,
+                        &slicer,
+                        &component_paths,
+                        filaments,
+                        format!("Plate metadata is unusable ({detail}); showing the whole build."),
+                    );
+                }
             }
-        },
+        }
         Ok(None) => {
             return whole_build(
                 &mut pkg,
@@ -2020,6 +2103,7 @@ mod tests {
             member,
             failure,
             state: std::cell::RefCell::new(ParserTestState::default()),
+            guard_observer: None,
         });
         let _guard = ParserProbeGuard::install(probe.clone());
         let result = if aggregate {
@@ -2411,7 +2495,8 @@ mod tests {
             &r#"<item objectid="1"/>"#.repeat(4),
         );
         let bytes = package(&[("3D/3dmodel.model", &root)], false);
-        let mut pkg = Package::open(&bytes, ZipResourceObserver::new()).unwrap();
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
         let root = pkg.part("3D/3dmodel.model").unwrap();
         // Four build roots plus sixteen diagnostic edge iterations. Repeated
         // paths still cost work even though the resulting set contains one path.
@@ -2434,7 +2519,8 @@ mod tests {
     fn component_visit_budget_direct_walk_exact_boundary_is_127() {
         let root = model_xml("millimeter", &shared_binary_dag(6, false), "");
         let bytes = package(&[("3D/3dmodel.model", &root)], false);
-        let mut pkg = Package::open(&bytes, ZipResourceObserver::new()).unwrap();
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
         pkg.component_visits_remaining = 127;
         assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());
         assert_eq!(pkg.component_visits_remaining, 0);
@@ -2465,7 +2551,8 @@ mod tests {
             "",
         );
         let bytes = package(&[("3D/3dmodel.model", &root)], false);
-        let mut pkg = Package::open(&bytes, ZipResourceObserver::new()).unwrap();
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
         pkg.part("3D/3dmodel.model").unwrap();
         pkg.component_visits_remaining = 1;
         assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());
@@ -3533,5 +3620,225 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(4), Some(5)]
         );
+    }
+    fn guard_probe(observer: ZipResourceObserver) -> (Rc<ParserTestProbe>, ParserProbeGuard) {
+        let probe = Rc::new(ParserTestProbe {
+            member: "never-inject-a-source-fault",
+            failure: ParserTestFailure::Stop(ResourceStop::EnvelopeChanged),
+            state: std::cell::RefCell::new(ParserTestState::default()),
+            guard_observer: Some(observer),
+        });
+        let guard = ParserProbeGuard::install(probe.clone());
+        (probe, guard)
+    }
+
+    #[test]
+    fn guarded_core_public_settings_xml_stop_preserves_cached_root_without_fallback() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = format!(
+            "<config><metadata key='unused' value='{}'/></config>",
+            "x".repeat(4097)
+        );
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, &settings),
+                ],
+                deflate,
+            );
+            for aggregate in [false, true] {
+                let (probe, _guard) = guard_probe(ZipResourceObserver::new());
+                let result = if aggregate {
+                    crate::parse_model(&bytes).map(|_| ())
+                } else {
+                    crate::parse_model_with_plates(&bytes).map(|_| ())
+                };
+                assert_eq!(
+                    result,
+                    Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+                );
+                let state = probe.state.borrow();
+                assert!(state.root_cached);
+                assert_eq!(
+                    state.total_work, 0,
+                    "must not call cached whole-build fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_core_context_actual_inflation_and_retained_text_are_not_double_debited() {
+        use crate::package_bounds::PackageTestLimits;
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = "<config/>";
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    ("_rels/.rels", RELS),
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            );
+            let observer = ZipResourceObserver::new();
+            let (probe, _guard) = guard_probe(observer.clone());
+            let mut context = PackageProcessingContext::with_test_limits(
+                observer.clone(),
+                PackageTestLimits {
+                    inflation: (RELS.len() + root.len() + settings.len()) as u64,
+                    text_total: RELS.len() + settings.len(),
+                    ..Default::default()
+                },
+            );
+            let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert!(!parsed.plate_metadata);
+            assert!(observer.check().is_ok());
+            // A new parse really reinflates, so the same context is exhausted.
+            assert_eq!(
+                crate::parse_model_in_context(&bytes, &mut context),
+                Err(StlError::ResourceStopped(ResourceStop::ReadWorkExceeded))
+            );
+            assert_eq!(probe.state.borrow().after_io, 0);
+        }
+    }
+
+    #[test]
+    fn guarded_core_context_actual_model_part_and_last_text_limits_are_terminal() {
+        use crate::package_bounds::PackageTestLimits;
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = "<config/>";
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &root),
+                (MODEL_SETTINGS_PATH, settings),
+            ],
+            true,
+        );
+        for (limits, cached) in [
+            (
+                PackageTestLimits {
+                    model: root.len() as u64 - 1,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                PackageTestLimits {
+                    model_settings: settings.len() - 1,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                PackageTestLimits {
+                    text_total: settings.len() - 1,
+                    ..Default::default()
+                },
+                true,
+            ),
+        ] {
+            let observer = ZipResourceObserver::new();
+            let (probe, _guard) = guard_probe(observer.clone());
+            let mut context = PackageProcessingContext::with_test_limits(observer, limits);
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+            );
+            let state = probe.state.borrow();
+            assert_eq!(state.root_cached, cached);
+            assert_eq!(state.total_work, 0);
+            assert_eq!(state.after_io, 0);
+            assert_eq!(state.work_after_stop, 0);
+        }
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::with_test_limits(
+            observer,
+            PackageTestLimits {
+                model: root.len() as u64,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::parse_model_in_context(&bytes, &mut context)
+                .unwrap()
+                .triangle_count,
+            12
+        );
+    }
+
+    #[test]
+    fn guarded_core_relationship_xml_limit_never_becomes_conventional_root_fallback() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let rels = format!(
+            "<Relationships><Unknown ignored='{}'/></Relationships>",
+            "x".repeat(4097)
+        );
+        let bytes = package(
+            &[("_rels/.rels", &rels), (ROOT_MODEL_FALLBACK, &root)],
+            false,
+        );
+        let observer = ZipResourceObserver::new();
+        let (probe, _guard) = guard_probe(observer.clone());
+        let mut context = PackageProcessingContext::new(observer);
+        assert_eq!(
+            crate::parse_model_with_plates_in_context(&bytes, &mut context),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        );
+        let state = probe.state.borrow();
+        assert!(!state.root_cached);
+        assert_eq!(state.total_work, 0);
+        assert_eq!(state.after_io, 0);
+    }
+
+    #[test]
+    fn guarded_core_retained_reserve_failure_is_terminal_not_optional_metadata() {
+        use crate::package_bounds::PackageTestLimits;
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &root),
+                (MODEL_SETTINGS_PATH, "<config/>"),
+            ],
+            false,
+        );
+        let observer = ZipResourceObserver::new();
+        let (probe, _guard) = guard_probe(observer.clone());
+        let mut context = PackageProcessingContext::with_test_limits(
+            observer,
+            PackageTestLimits {
+                fail_reserve: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::parse_model_with_plates_in_context(&bytes, &mut context),
+            Err(StlError::AllocationFailed)
+        );
+        let state = probe.state.borrow();
+        assert!(state.root_cached);
+        assert_eq!(state.total_work, 0);
+        assert_eq!(state.after_io, 0);
+    }
+    #[test]
+    fn guarded_core_declared_optional_project_oversize_stays_a_no_read_skip() {
+        let bytes = package(&[(PROJECT_SETTINGS_PATH, "{}")], false);
+        let probe = Rc::new(ParserTestProbe {
+            member: PROJECT_SETTINGS_PATH,
+            failure: ParserTestFailure::Stop(ResourceStop::EnvelopeChanged),
+            state: std::cell::RefCell::new(ParserTestState::default()),
+            guard_observer: None,
+        });
+        let _guard = ParserProbeGuard::install(probe.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        assert_eq!(
+            pkg.optional_bounded_text(PROJECT_SETTINGS_PATH, 1).unwrap(),
+            None
+        );
+        assert!(!probe.state.borrow().armed);
+        assert!(!probe.state.borrow().fired);
     }
 }

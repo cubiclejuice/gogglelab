@@ -99,27 +99,44 @@ impl ParsedModel {
 }
 
 pub fn parse_model_with_plates(bytes: &[u8]) -> Result<ParsedModel, StlError> {
-    if crate::threemf::is_zip(bytes) {
-        crate::threemf::parse_3mf_with_plates(bytes)
-    } else {
-        let model = crate::parse::parse(bytes)?;
-        let triangle_count = model.triangle_count;
-        Ok(ParsedModel {
-            model,
-            plates: vec![Plate {
-                id: 0,
-                name: "Model".into(),
-                triangle_start: 0,
-                triangle_count,
-            }],
-            parts: Vec::new(),
-            materials: Vec::new(),
-            embedded_filaments: Vec::new(),
-            part_warning: None,
-            plate_metadata: false,
-            plate_warning: None,
-        })
-    }
+    let mut context = crate::package_bounds::PackageProcessingContext::new(
+        crate::zip_bounds::ZipResourceObserver::new(),
+    );
+    parse_model_with_plates_in_context(bytes, &mut context)
+}
+
+#[doc(hidden)]
+pub fn parse_model_with_plates_in_context(
+    bytes: &[u8],
+    context: &mut crate::package_bounds::PackageProcessingContext,
+) -> Result<ParsedModel, StlError> {
+    let observer = context.observer();
+    observer.check()?;
+    let result = (|| {
+        if crate::threemf::is_zip(bytes) {
+            crate::threemf::parse_3mf_with_plates_in_context(bytes, context)
+        } else {
+            let model = crate::parse::parse(bytes)?;
+            observer.check()?;
+            let triangle_count = model.triangle_count;
+            Ok(ParsedModel {
+                model,
+                plates: vec![Plate {
+                    id: 0,
+                    name: "Model".into(),
+                    triangle_start: 0,
+                    triangle_count,
+                }],
+                parts: Vec::new(),
+                materials: Vec::new(),
+                embedded_filaments: Vec::new(),
+                part_warning: None,
+                plate_metadata: false,
+                plate_warning: None,
+            })
+        }
+    })();
+    observer.finish(result)
 }
 
 #[cfg(test)]
@@ -222,5 +239,44 @@ endsolid t
         assert!(model.materials.is_empty());
         assert!(model.embedded_filaments.is_empty());
         assert_eq!(model.part_warning, None);
+    }
+    #[test]
+    fn model_context_stl_dispatch_preserves_existing_errors_and_preexisting_terminal_causes() {
+        use crate::package_bounds::PackageProcessingContext;
+        use crate::zip_bounds::ZipResourceObserver;
+        use crate::{ResourceStop, StlError};
+        let bytes = b"ordinary invalid STL";
+        let mut ordinary = PackageProcessingContext::new(ZipResourceObserver::new());
+        assert_eq!(
+            super::parse_model_with_plates_in_context(bytes, &mut ordinary).unwrap_err(),
+            super::parse_model_with_plates(bytes).unwrap_err()
+        );
+        for stop in [
+            Some(ResourceStop::InputLimitExceeded),
+            Some(ResourceStop::ReadWorkExceeded),
+            Some(ResourceStop::EnvelopeChanged),
+            None,
+        ] {
+            let observer = ZipResourceObserver::new();
+            let expected = match stop {
+                Some(reason) => {
+                    let _ = observer.stop_io(reason);
+                    StlError::ResourceStopped(reason)
+                }
+                None => {
+                    let _ = observer.allocation_failed_io();
+                    StlError::AllocationFailed
+                }
+            };
+            let mut context = PackageProcessingContext::new(observer);
+            assert_eq!(
+                super::parse_model_with_plates_in_context(bytes, &mut context).unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                crate::parse_model_in_context(bytes, &mut context).unwrap_err(),
+                expected
+            );
+        }
     }
 }
