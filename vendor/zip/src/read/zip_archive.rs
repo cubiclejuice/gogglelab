@@ -263,6 +263,14 @@ impl<R: Read + Seek> ZipArchive<R> {
         } else {
             Vec::with_capacity(file_capacity)
         };
+        // Preserve every physical interval until overlap admission, before name deduplication.
+        let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
+        if budget.bounded() {
+            budget.allocate(budget.cost(dir_info.number_of_files, 3 * 8)?)?;
+            ranges
+                .try_reserve_exact(dir_info.number_of_files)
+                .map_err(|_| budget.allocation_failure())?;
+        }
         reader.seek(SeekFrom::Start(dir_info.directory_start))?;
         for _ in 0..dir_info.number_of_files {
             if let Some(end) = directory_end {
@@ -277,6 +285,15 @@ impl<R: Read + Seek> ZipArchive<R> {
                 }
             }
             let file = central_header_to_zip_file(reader, dir_info, budget, directory_end)?;
+            if budget.bounded() {
+                let start = *file.data_start.get().ok_or(crate::result::invalid_archive(
+                    "Local header was not admitted",
+                ))?;
+                let end = start.checked_add(file.compressed_size).ok_or(
+                    crate::result::invalid_archive("Compressed member range overflow"),
+                )?;
+                ranges.push((file.header_start, start, end));
+            }
             files.push(file);
         }
         if let Some(end) = directory_end {
@@ -287,6 +304,23 @@ impl<R: Read + Seek> ZipArchive<R> {
             }
         }
 
+        if budget.bounded() {
+            ranges.sort_unstable_by_key(|range| range.0);
+            let mut previous_end = dir_info.archive_offset;
+            for (header, start, end) in ranges {
+                if header < previous_end
+                    || header < dir_info.archive_offset
+                    || header >= start
+                    || start > end
+                    || end > dir_info.directory_start
+                {
+                    return Err(crate::result::invalid_archive(
+                        "Physical local header or payload ranges overlap",
+                    ));
+                }
+                previous_end = end;
+            }
+        }
         Ok(SharedBuilder {
             files,
             offset: dir_info.archive_offset,
@@ -390,8 +424,10 @@ impl<R: Read + Seek> ZipArchive<R> {
         }
     }
 
-    /// Opt-in bounded metadata construction. Limits cover constructor metadata
-    /// only; they do not validate source identity or bound later payload reads.
+    /// Opt-in bounded construction including central and eager local-header metadata.
+    /// Physical header and compressed-payload intervals are checked before name
+    /// deduplication. Data descriptors in intervening gaps are not verified.
+    /// Limits do not validate source identity or bound later payload reads.
     pub fn with_metadata_limits(
         config: Config,
         mut reader: R,

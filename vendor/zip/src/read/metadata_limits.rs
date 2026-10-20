@@ -11,7 +11,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 pub struct MetadataLimits {
     /// Maximum physical central-directory records processed across attempts.
     pub max_entries: u64,
-    /// Maximum encoded footer and central-directory metadata bytes processed.
+    /// Maximum encoded footer, central-directory and local-header metadata bytes processed.
     pub max_encoded_bytes: u64,
     /// Maximum combined ZIP32 and ZIP64 footer candidates examined.
     pub max_candidates: u64,
@@ -40,7 +40,7 @@ impl Default for MetadataLimits {
 pub enum MetadataLimitKind {
     /// Physical central-directory record count.
     Entries,
-    /// Encoded footer and central-directory metadata bytes.
+    /// Encoded footer, central-directory and local-header metadata bytes.
     EncodedBytes,
     /// Combined ZIP32 and ZIP64 footer candidate attempts.
     Candidates,

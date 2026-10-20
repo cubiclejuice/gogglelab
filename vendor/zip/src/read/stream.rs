@@ -32,7 +32,7 @@ impl<R: Read> ZipStreamReader<R> {
 
         // Parse central header
         let block = ZipCentralEntryBlock::parse(&mut self.0)?;
-        let file = central_header_to_zip_file_inner(
+        let (file, _) = central_header_to_zip_file_inner(
             &mut self.0,
             archive_offset,
             central_header_start,

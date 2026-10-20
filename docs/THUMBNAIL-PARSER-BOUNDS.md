@@ -215,8 +215,15 @@ actual metadata reads and read/seek calls across retries. Actual allocator failu
 remains a separate sticky operational error. The source records its upstream
 revision and original license in `vendor/zip/GOGGLELAB-PROVENANCE.md`.
 
-No production ZIP caller uses this API yet. Later local-header checks, payload
-limits, source consistency and complete typed fallback propagation remain gates.
+No production ZIP caller uses this API yet. Payload limits, source consistency and
+complete typed fallback propagation remain gates. The local-header candidate is
+recorded separately below.
+Cargo patches belong to the resolving workspace root. A downstream app using the
+public crates by path must supply the same reviewed ZIP patch in its own root;
+adding a separate direct dependency alone can leave two ZIP copies. Before caller
+migration, verify dependency edges resolve to the reviewed vendor source, reconcile
+each composition's lockfile, and build/test its disposable candidate. Official
+private core-pin integration remains a separate release gate.
 The component work guard is active in parsing, including the preliminary metadata
 walk; its exhaustion is terminal through plate resolution. It preserves normal
 instance multiplicity and the existing depth/triangle limits.
@@ -229,6 +236,27 @@ An actual offline notice audit includes ZIP's original MIT text and upstream URL
 Docker source-copy rules and Linux/Windows parser-test selectors include the local
 dependency. Full hosted platform/build acceptance is the next gate for this
 checkpoint; no publication or complete parser-memory guarantee is claimed.
+
+### Eager local-header candidate
+
+The bounded constructor now admits each physical local header under the same
+metadata budget, preserving the original encoded name and method before Unicode
+or AES metadata overrides. It checks lengths, flags, concrete CRC/sizes and ZIP64
+fields, then caches the checked data offset and restores the central cursor.
+Legal descriptor-mode unknown size values remain supported. Header and compressed
+payload intervals are checked and sorted before filename deduplication, including
+entries that would otherwise disappear from the final map.
+
+Descriptors between intervals remain unverified gaps. This does not establish
+payload identity, full-record nonoverlap or source immutability. Default ZIP
+constructors retain their prior behavior; production migration remains gated.
+
+Independent review is clear. Focused offline validation passes 109 parser tests,
+including 28 ZIP regressions, with the existing ignored fixture retained. Tests
+cover actual local-field mutation, cached offsets after later header mutation,
+budget/OOM failures during admission or cursor restoration, physical aliases,
+bit-3 placeholders, local ZIP64, Unicode and AES metadata. Parser Clippy and
+formatting pass. Hosted platform/build verification follows this checkpoint.
 
 ## Compatibility and small boundary tests
 

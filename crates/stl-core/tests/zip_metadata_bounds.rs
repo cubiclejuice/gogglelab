@@ -147,7 +147,8 @@ fn zip64(mut bytes: Vec<u8>, extension: &[u8]) -> Vec<u8> {
 #[test]
 fn zip_metadata_bounds_encoded_exact_and_one_over() {
     let bytes = package(&[entry(b"a")], b"abc");
-    let exact = 22 + 3 + 46 + 1;
+    // Footer, central record, then eagerly admitted local fixed header/name.
+    let exact = 22 + 3 + 46 + 1 + 30 + 1;
     assert!(bounded(
         bytes.clone(),
         MetadataLimits {
@@ -703,4 +704,426 @@ fn zip_metadata_bounds_mutated_central_lengths_fail_before_variable_buffer_reads
             );
         }
     }
+}
+
+fn add_local_extra(mut bytes: Vec<u8>, extra: &[u8]) -> Vec<u8> {
+    let name = usize::from(u16::from_le_bytes(bytes[26..28].try_into().unwrap()));
+    bytes.splice(30 + name..30 + name, extra.iter().copied());
+    set16(&mut bytes, 28, extra.len() as u16);
+    let footer = end(&bytes);
+    let central = get32(&bytes, footer + 16);
+    set32(&mut bytes, footer + 16, central + extra.len() as u32);
+    bytes
+}
+#[test]
+fn zip_metadata_bounds_local_identity_fields_and_ranges_are_checked() {
+    let original = package(&[entry(b"a")], b"");
+    for (offset, value) in [(6, 8), (8, 8), (26, 2), (28, u16::MAX)] {
+        let mut bytes = original.clone();
+        set16(&mut bytes, offset, value);
+        assert!(
+            bounded(bytes, MetadataLimits::default()).is_err(),
+            "field {offset}"
+        );
+    }
+    for offset in [14, 18, 22] {
+        let mut bytes = original.clone();
+        set32(&mut bytes, offset, 9);
+        assert!(
+            bounded(bytes, MetadataLimits::default()).is_err(),
+            "field {offset}"
+        );
+    }
+    let mut bytes = original.clone();
+    bytes[30] = b'b';
+    assert!(bounded(bytes, MetadataLimits::default()).is_err());
+    let footer = end(&original);
+    let central = get32(&original, footer + 16) as usize;
+    for header in [central as u32, u32::MAX - 10] {
+        let mut bytes = original.clone();
+        set32(&mut bytes, central + 42, header);
+        assert!(bounded(bytes, MetadataLimits::default()).is_err());
+    }
+    let mut bytes = original;
+    set32(&mut bytes, central + 20, u32::MAX - 1);
+    assert!(bounded(bytes, MetadataLimits::default()).is_err());
+}
+#[test]
+fn zip_metadata_bounds_local_zip64_descriptor_placeholders_and_empty_members() {
+    let mut empty = entry(b"folder/");
+    empty.data.clear();
+    assert!(bounded(package(&[empty], b""), MetadataLimits::default()).is_ok());
+    for descriptor in [false, true] {
+        let mut e = entry(b"a");
+        e.flags = if descriptor { 8 } else { 0 };
+        let base = package(&[e], b"");
+        for value in [0, 4, u64::MAX] {
+            let mut extra = vec![1, 0, 16, 0];
+            u64le(&mut extra, value);
+            u64le(&mut extra, value);
+            let mut bytes = add_local_extra(base.clone(), &extra);
+            set32(&mut bytes, 18, u32::MAX);
+            set32(&mut bytes, 22, u32::MAX);
+            if descriptor {
+                set32(&mut bytes, 14, 0);
+            }
+            assert_eq!(
+                bounded(bytes, MetadataLimits::default()).is_ok(),
+                descriptor || value == 4
+            );
+        }
+        let mut bytes = base.clone();
+        set32(&mut bytes, 18, u32::MAX);
+        set32(&mut bytes, 22, u32::MAX);
+        assert_eq!(
+            bounded(bytes, MetadataLimits::default()).is_ok(),
+            descriptor
+        );
+        let mut bytes = base.clone();
+        set32(&mut bytes, 18, 0);
+        set32(&mut bytes, 22, 0);
+        assert_eq!(
+            bounded(bytes, MetadataLimits::default()).is_ok(),
+            descriptor
+        );
+        let mut bytes = base;
+        set32(&mut bytes, 18, 3);
+        assert!(bounded(bytes, MetadataLimits::default()).is_err());
+    }
+    for extra in [
+        vec![1, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![2, 0, 255, 255],
+        vec![1, 0, 0, 0, 1, 0, 0, 0],
+    ] {
+        let mut bytes = add_local_extra(package(&[entry(b"a")], b""), &extra);
+        set32(&mut bytes, 18, u32::MAX);
+        assert!(bounded(bytes, MetadataLimits::default()).is_err());
+    }
+}
+#[test]
+fn zip_metadata_bounds_local_ranges_are_admitted_before_duplicate_dedup() {
+    let original = package(&[entry(b"a"), entry(b"a")], b"");
+    assert_eq!(
+        bounded(original.clone(), MetadataLimits::default())
+            .unwrap()
+            .len(),
+        1
+    );
+    let footer = end(&original);
+    let central = get32(&original, footer + 16) as usize;
+    let second = central + 47;
+    let mut alias = original.clone();
+    set32(&mut alias, second + 42, 0);
+    assert!(bounded(alias.clone(), MetadataLimits::default()).is_err());
+    assert_eq!(ZipArchive::new(Cursor::new(alias)).unwrap().len(), 1);
+    // A concrete central/local size can overlap the next physical header even
+    // when each individual member still ends before the central directory.
+    let mut overlapping = original;
+    set32(&mut overlapping, 18, 10);
+    set32(&mut overlapping, 22, 10);
+    set32(&mut overlapping, central + 20, 10);
+    set32(&mut overlapping, central + 24, 10);
+    assert!(bounded(overlapping, MetadataLimits::default()).is_err());
+}
+
+struct LocalMutation {
+    inner: Cursor<Vec<u8>>,
+    local_seen: bool,
+    footer_seen: bool,
+    field: usize,
+    variable_read: std::rc::Rc<std::cell::Cell<bool>>,
+}
+impl Read for LocalMutation {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let footer = end(self.inner.get_ref()) as u64;
+        if self.inner.position() == footer {
+            self.footer_seen = true;
+        }
+        if self.footer_seen && self.inner.position() == 0 {
+            self.local_seen = true;
+            set16(self.inner.get_mut(), self.field, u16::MAX);
+        }
+        if self.local_seen && self.inner.position() == 30 {
+            self.variable_read.set(true);
+        }
+        self.inner.read(output)
+    }
+}
+impl Seek for LocalMutation {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(from)
+    }
+}
+#[test]
+fn zip_metadata_bounds_actual_local_lengths_are_checked_before_variable_reads() {
+    for field in [26, 28] {
+        let variable_read = std::rc::Rc::new(std::cell::Cell::new(false));
+        let source = LocalMutation {
+            inner: Cursor::new(package(&[entry(b"a")], b"")),
+            local_seen: false,
+            footer_seen: false,
+            field,
+            variable_read: variable_read.clone(),
+        };
+        assert!(ZipArchive::with_metadata_limits(
+            Config::default(),
+            source,
+            MetadataLimits::default()
+        )
+        .is_err());
+        assert!(!variable_read.get());
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SharedChangingSource {
+    bytes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    position: u64,
+    local_reads: std::rc::Rc<std::cell::Cell<usize>>,
+}
+impl Read for SharedChangingSource {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.position == 0 {
+            self.local_reads.set(self.local_reads.get() + 1);
+        }
+        let bytes = self.bytes.borrow();
+        let start = usize::try_from(self.position)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let count = output.len().min(bytes.len() - start);
+        output[..count].copy_from_slice(&bytes[start..start + count]);
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+impl Seek for SharedChangingSource {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let next = match from {
+            SeekFrom::Start(value) => i128::from(value),
+            SeekFrom::End(value) => self.bytes.borrow().len() as i128 + i128::from(value),
+            SeekFrom::Current(value) => i128::from(self.position) + i128::from(value),
+        };
+        self.position =
+            u64::try_from(next).map_err(|_| io::Error::other("invalid synthetic seek"))?;
+        Ok(self.position)
+    }
+}
+#[test]
+fn zip_metadata_bounds_cached_local_ranges_do_not_grow_after_source_mutation() {
+    let bytes = std::rc::Rc::new(std::cell::RefCell::new(package(&[entry(b"a")], b"")));
+    let local_reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let source = SharedChangingSource {
+        bytes: bytes.clone(),
+        position: 0,
+        local_reads: local_reads.clone(),
+    };
+    let mut archive =
+        ZipArchive::with_metadata_limits(Config::default(), source, MetadataLimits::default())
+            .unwrap();
+    let admitted_reads = local_reads.get();
+    set16(&mut bytes.borrow_mut(), 26, u16::MAX);
+    set16(&mut bytes.borrow_mut(), 28, u16::MAX);
+    for _ in 0..2 {
+        let mut normal = Vec::new();
+        archive
+            .by_index(0)
+            .unwrap()
+            .read_to_end(&mut normal)
+            .unwrap();
+        assert_eq!(normal, b"mesh");
+        let mut raw = Vec::new();
+        archive
+            .by_index_raw(0)
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(raw, b"mesh");
+        let mut seek = Vec::new();
+        archive
+            .by_index_seek(0)
+            .unwrap()
+            .read_to_end(&mut seek)
+            .unwrap();
+        assert_eq!(seek, b"mesh");
+    }
+    assert_eq!(local_reads.get(), admitted_reads);
+}
+
+#[test]
+fn zip_metadata_bounds_descriptor_gaps_are_not_required_or_interpreted() {
+    for gap in [
+        vec![],
+        vec![0; 12],
+        vec![0x50, 0x4b, 0x07, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    ] {
+        let mut e = entry(b"a");
+        e.flags = 8;
+        let mut bytes = package(&[e], b"");
+        set32(&mut bytes, 14, 0);
+        set32(&mut bytes, 18, 0);
+        set32(&mut bytes, 22, 0);
+        let footer = end(&bytes);
+        let central = get32(&bytes, footer + 16) as usize;
+        bytes.splice(central..central, gap.iter().copied());
+        let footer = end(&bytes);
+        set32(&mut bytes, footer + 16, (central + gap.len()) as u32);
+        let mut archive = bounded(bytes, MetadataLimits::default()).unwrap();
+        let mut payload = Vec::new();
+        archive
+            .by_index(0)
+            .unwrap()
+            .read_to_end(&mut payload)
+            .unwrap();
+        assert_eq!(payload, b"mesh");
+    }
+}
+#[derive(Clone, Copy)]
+enum LocalFault {
+    None,
+    ReadOom,
+    RestoreOom,
+    RestoreIo,
+}
+struct LocalWork {
+    inner: Cursor<Vec<u8>>,
+    footer_seen: bool,
+    local_started: bool,
+    read_bytes: u64,
+    local_prefix: std::rc::Rc<std::cell::Cell<u64>>,
+    fault: LocalFault,
+}
+impl Read for LocalWork {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.inner.position() == end(self.inner.get_ref()) as u64 {
+            self.footer_seen = true;
+        }
+        if self.footer_seen && self.inner.position() == 0 {
+            self.local_started = true;
+            self.local_prefix.set(self.read_bytes);
+            if matches!(self.fault, LocalFault::ReadOom) {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "private local read detail",
+                ));
+            }
+        }
+        let count = self.inner.read(output)?;
+        self.read_bytes += count as u64;
+        Ok(count)
+    }
+}
+impl Seek for LocalWork {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let footer = end(self.inner.get_ref()) as u64;
+        if self.local_started && matches!(from, SeekFrom::Start(value) if value==footer) {
+            match self.fault {
+                LocalFault::RestoreOom => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "private restore detail",
+                    ))
+                }
+                LocalFault::RestoreIo => {
+                    return Err(io::Error::other("synthetic central restore failed"))
+                }
+                _ => {}
+            }
+        }
+        self.inner.seek(from)
+    }
+}
+fn local_work(
+    bytes: Vec<u8>,
+    fault: LocalFault,
+    prefix: std::rc::Rc<std::cell::Cell<u64>>,
+) -> LocalWork {
+    LocalWork {
+        inner: Cursor::new(bytes),
+        footer_seen: false,
+        local_started: false,
+        read_bytes: 0,
+        local_prefix: prefix,
+        fault,
+    }
+}
+#[test]
+fn zip_metadata_bounds_local_work_uses_shared_limits_and_restoration_failures_are_fatal() {
+    let bytes = package(&[entry(b"a")], b"");
+    let prefix = std::rc::Rc::new(std::cell::Cell::new(0));
+    assert!(ZipArchive::with_metadata_limits(
+        Config::default(),
+        local_work(bytes.clone(), LocalFault::None, prefix.clone()),
+        MetadataLimits::default()
+    )
+    .is_ok());
+    assert!(prefix.get() > 0);
+    let error = ZipArchive::with_metadata_limits(
+        Config::default(),
+        local_work(bytes.clone(), LocalFault::None, prefix.clone()),
+        MetadataLimits {
+            max_read_bytes: prefix.get() + 30,
+            ..MetadataLimits::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.metadata_limit().unwrap().kind,
+        MetadataLimitKind::ReadBytes
+    );
+    for fault in [LocalFault::ReadOom, LocalFault::RestoreOom] {
+        let error = ZipArchive::with_metadata_limits(
+            Config::default(),
+            local_work(bytes.clone(), fault, prefix.clone()),
+            MetadataLimits::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.metadata_allocation_failure().is_some());
+        assert!(error.metadata_limit().is_none());
+        assert!(!error.to_string().contains("private"));
+    }
+    let error = ZipArchive::with_metadata_limits(
+        Config::default(),
+        local_work(bytes, LocalFault::RestoreIo, prefix),
+        MetadataLimits::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(error
+        .to_string()
+        .contains("synthetic central restore failed"));
+}
+
+#[test]
+fn zip_metadata_bounds_zip64_physical_arithmetic_is_checked_without_large_fixture() {
+    for (compressed, offset) in [(4, u64::MAX - 10), (u64::MAX, 0)] {
+        let mut e = entry(b"a");
+        e.extra = vec![1, 0, 24, 0];
+        u64le(&mut e.extra, 4);
+        u64le(&mut e.extra, compressed);
+        u64le(&mut e.extra, offset);
+        let mut bytes = package(&[e], b"");
+        let footer = end(&bytes);
+        let central = get32(&bytes, footer + 16) as usize;
+        set32(&mut bytes, central + 20, u32::MAX);
+        set32(&mut bytes, central + 24, u32::MAX);
+        set32(&mut bytes, central + 42, u32::MAX);
+        assert!(bounded(bytes, MetadataLimits::default()).is_err());
+    }
+}
+#[test]
+fn zip_metadata_bounds_aes_wire_method_is_compared_before_effective_method_override() {
+    let mut e = entry(b"a");
+    e.flags = 1;
+    // AE-2 AES extra field: vendor AE, 128-bit strength, underlying Stored.
+    e.extra = vec![1, 0x99, 7, 0, 2, 0, b'A', b'E', 1, 0, 0];
+    let mut bytes = package(&[e], b"");
+    let footer = end(&bytes);
+    let central = get32(&bytes, footer + 16) as usize;
+    set16(&mut bytes, 8, 99);
+    set16(&mut bytes, central + 10, 99);
+    assert!(bounded(bytes.clone(), MetadataLimits::default()).is_ok());
+    set16(&mut bytes, 8, 0);
+    assert!(bounded(bytes, MetadataLimits::default()).is_err());
 }

@@ -25,6 +25,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 mod config;
+mod local_headers;
+use local_headers::admit_local_header;
 pub(crate) mod metadata_limits;
 pub use config::{ArchiveOffset, Config};
 use metadata_limits::ConstructorBudget;
@@ -480,7 +482,7 @@ pub(crate) fn central_header_to_zip_file<R: Read + Seek>(
     // Parse central header
     let block = ZipCentralEntryBlock::parse(reader)?;
 
-    let file = central_header_to_zip_file_inner(
+    let (file, wire_name) = central_header_to_zip_file_inner(
         reader,
         central_directory.archive_offset,
         central_header_start,
@@ -491,7 +493,24 @@ pub(crate) fn central_header_to_zip_file<R: Read + Seek>(
 
     let central_header_end = reader.stream_position()?;
 
-    reader.seek(SeekFrom::Start(central_header_end))?;
+    if let Some(wire_name) = wire_name {
+        let admission = admit_local_header(
+            reader,
+            &file,
+            &wire_name,
+            block.compression_method,
+            central_directory,
+            budget,
+        );
+        // Restore the exact central cursor even after an ordinary local error.
+        // A fatal budget/allocator stop from restoration must never be masked.
+        let restored = reader.seek(SeekFrom::Start(central_header_end));
+        budget.check()?;
+        admission?;
+        restored?;
+    } else {
+        reader.seek(SeekFrom::Start(central_header_end))?;
+    }
     Ok(file)
 }
 
@@ -521,7 +540,7 @@ fn central_header_to_zip_file_inner<R: Read>(
     block: ZipCentralEntryBlock,
     budget: &ConstructorBudget,
     directory_end: Option<u64>,
-) -> ZipResult<ZipFileData> {
+) -> ZipResult<(ZipFileData, Option<Box<[u8]>>)> {
     let ZipCentralEntryBlock {
         // magic,
         version_made_by,
@@ -630,6 +649,11 @@ fn central_header_to_zip_file_inner<R: Read>(
         aes_extra_data_start: 0,
         extra_fields: Vec::new(),
     };
+    let wire_name = if budget.bounded() {
+        Some(budget.copied(&result.file_name_raw)?)
+    } else {
+        None
+    };
     parse_extra_field(&mut result)?;
 
     let aes_enabled = result.compression_method == CompressionMethod::AES;
@@ -643,7 +667,7 @@ fn central_header_to_zip_file_inner<R: Read>(
         .checked_add(archive_offset)
         .ok_or(invalid!("Archive header is too large"))?;
 
-    Ok(result)
+    Ok((result, wire_name))
 }
 
 pub(crate) fn parse_extra_field(file: &mut ZipFileData) -> ZipResult<()> {
