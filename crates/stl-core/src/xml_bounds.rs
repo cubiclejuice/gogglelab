@@ -280,6 +280,40 @@ impl Lex {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FixedXmlReason {
+    Lexical,
+    Attributes,
+}
+#[derive(Clone, Copy)]
+enum FixedDisposition {
+    Immediate,
+    Deferred,
+}
+
+pub(crate) struct FixedXmlViolation {
+    reason: FixedXmlReason,
+    parent: ZipResourceObserver,
+}
+impl FixedXmlViolation {
+    pub(crate) fn activate(self) -> StlError {
+        let _reason = self.reason;
+        if let Err(error) = self.parent.check() {
+            return error.into();
+        }
+        let _ = self.parent.stop_io(ResourceStop::InputLimitExceeded);
+        self.parent
+            .check()
+            .expect_err("fixed validation activated")
+            .into()
+    }
+}
+pub(crate) enum DeferredXmlReadError {
+    Fixed(FixedXmlViolation),
+    Xml(quick_xml::Error),
+    Terminal(StlError),
+}
+
 struct LexicalReader<R> {
     inner: R,
     observer: ZipResourceObserver,
@@ -291,6 +325,8 @@ struct LexicalReader<R> {
     event_bytes: usize,
     initial: bool,
     bom_remaining: usize,
+    fixed_disposition: FixedDisposition,
+    fixed_failure: Option<FixedXmlReason>,
 }
 impl<R: Read> LexicalReader<R> {
     fn new(inner: R, observer: ZipResourceObserver, limits: Limits) -> Self {
@@ -305,6 +341,17 @@ impl<R: Read> LexicalReader<R> {
             event_bytes: 0,
             initial: true,
             bom_remaining: 0,
+            fixed_disposition: FixedDisposition::Immediate,
+            fixed_failure: None,
+        }
+    }
+}
+impl<R: Read> LexicalReader<R> {
+    fn reject_fixed(&mut self, reason: FixedXmlReason) -> io::Error {
+        self.fixed_failure.get_or_insert(reason);
+        match self.fixed_disposition {
+            FixedDisposition::Immediate => self.observer.stop_io(ResourceStop::InputLimitExceeded),
+            FixedDisposition::Deferred => io::ErrorKind::InvalidData.into(),
         }
     }
 }
@@ -356,7 +403,7 @@ impl<R: Read> BufRead for LexicalReader<R> {
             allowed += 1;
         }
         if allowed == 0 && self.start != self.end {
-            return Err(self.observer.stop_io(ResourceStop::InputLimitExceeded));
+            return Err(self.reject_fixed(FixedXmlReason::Lexical));
         }
         self.observer.check_io()?;
         Ok(&self.buffer[self.start..self.start + allowed])
@@ -443,20 +490,60 @@ impl<R: Read> XmlEventReader<R> {
         limits: Limits,
         fail_reserve: bool,
     ) -> Result<Self, StlError> {
+        Self::with_fixed_disposition(
+            reader,
+            observer,
+            limits,
+            fail_reserve,
+            FixedDisposition::Immediate,
+        )
+    }
+    fn with_fixed_disposition(
+        reader: R,
+        observer: ZipResourceObserver,
+        limits: Limits,
+        fail_reserve: bool,
+        fixed_disposition: FixedDisposition,
+    ) -> Result<Self, StlError> {
+        Self::with_workspace_hooks(
+            reader,
+            observer,
+            limits,
+            fail_reserve,
+            fixed_disposition,
+            |_| {},
+            |_| {},
+        )
+    }
+    fn with_workspace_hooks(
+        reader: R,
+        observer: ZipResourceObserver,
+        limits: Limits,
+        fail_reserve: bool,
+        fixed_disposition: FixedDisposition,
+        before_reserve: impl FnOnce(&ZipResourceObserver),
+        after_reserve: impl FnOnce(&ZipResourceObserver),
+    ) -> Result<Self, StlError> {
         observer.check()?;
         let mut scratch = Vec::new();
         let capacity = limits
             .token
             .checked_add(2)
             .ok_or(ResourceStop::InputLimitExceeded)?;
+        before_reserve(&observer);
+        observer.check()?;
         if fail_reserve || scratch.try_reserve_exact(capacity).is_err() {
             let error = observer.allocation_failed_io();
             observer.observe_io(&error);
             observer.check()?;
             return Err(StlError::AllocationFailed);
         }
+        after_reserve(&observer);
+        observer.check()?;
+        let mut lexical = LexicalReader::new(reader, observer.clone(), limits);
+        lexical.fixed_disposition = fixed_disposition;
         Ok(Self {
-            xml: Reader::from_reader(LexicalReader::new(reader, observer.clone(), limits)),
+            xml: Reader::from_reader(lexical),
             scratch,
             observer,
             failed: false,
@@ -476,26 +563,45 @@ impl<R: Read> XmlEventReader<R> {
         &mut self,
         after_inspection: impl FnOnce(&ZipResourceObserver),
     ) -> quick_xml::Result<Event<'_>> {
-        self.observer.check_io()?;
-        if self.failed {
+        Self::read_event_parts(
+            &mut self.xml,
+            &mut self.scratch,
+            &self.observer,
+            &mut self.failed,
+            after_inspection,
+        )
+    }
+    fn read_event_parts<'buffer>(
+        xml: &mut Reader<LexicalReader<R>>,
+        scratch: &'buffer mut Vec<u8>,
+        observer: &ZipResourceObserver,
+        failed: &mut bool,
+        after_inspection: impl FnOnce(&ZipResourceObserver),
+    ) -> quick_xml::Result<Event<'buffer>> {
+        observer.check_io()?;
+        if *failed {
             return Err(io::Error::other("XML reader stopped after an error").into());
         }
-        self.scratch.clear();
-        self.xml.get_mut().event_bytes = 0;
-        let event = self.xml.read_event_into(&mut self.scratch);
+        scratch.clear();
+        xml.get_mut().event_bytes = 0;
+        let event = xml.read_event_into(scratch);
         if let Err(error) = &event {
             if let quick_xml::Error::Io(error) = error {
-                self.observer.observe_io(error);
+                observer.observe_io(error);
             }
-            self.failed = true;
+            *failed = true;
         }
-        self.observer.check_io()?;
+        observer.check_io()?;
+        if xml.get_ref().fixed_failure.is_some() {
+            *failed = true;
+            return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+        }
         if let Ok(Event::Start(start) | Event::Empty(start)) = &event {
-            if !attributes_fit(start, self.xml.get_ref().limits) {
-                self.failed = true;
-                return Err(self
-                    .observer
-                    .stop_io(ResourceStop::InputLimitExceeded)
+            if !attributes_fit(start, xml.get_ref().limits) {
+                *failed = true;
+                return Err(xml
+                    .get_mut()
+                    .reject_fixed(FixedXmlReason::Attributes)
                     .into());
             }
         }
@@ -509,20 +615,93 @@ impl<R: Read> XmlEventReader<R> {
                 | Event::Decl(_)
                 | Event::PI(_)
                 | Event::DocType(_))
-        ) && !matches!(self.xml.get_ref().lex.mode, Mode::Text)
+        ) && !matches!(xml.get_ref().lex.mode, Mode::Text)
         {
-            self.failed = true;
+            *failed = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "XML lexical boundary does not match parser boundary",
             )
             .into());
         }
-        after_inspection(&self.observer);
+        after_inspection(observer);
         // Another observer owner may latch while bounded metadata inspection
         // runs. Never return the tentative borrowed Event after that stop.
-        self.observer.check_io()?;
+        observer.check_io()?;
         event
+    }
+}
+
+// Only immutable, already collected text may defer fixed validation. Parent
+// checks and actual workspace failure remain immediate on the original observer.
+pub(crate) struct DeferredXmlEventReader<'a> {
+    reader: XmlEventReader<&'a [u8]>,
+}
+impl<'a> DeferredXmlEventReader<'a> {
+    pub(crate) fn new(bytes: &'a [u8], parent: ZipResourceObserver) -> Result<Self, StlError> {
+        Ok(Self {
+            reader: XmlEventReader::with_fixed_disposition(
+                bytes,
+                parent,
+                Limits::default(),
+                false,
+                FixedDisposition::Deferred,
+            )?,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn new_with_workspace_hooks(
+        bytes: &'a [u8],
+        parent: ZipResourceObserver,
+        before: impl FnOnce(&ZipResourceObserver),
+        after: impl FnOnce(&ZipResourceObserver),
+    ) -> Result<Self, StlError> {
+        Ok(Self {
+            reader: XmlEventReader::with_workspace_hooks(
+                bytes,
+                parent,
+                Limits::default(),
+                false,
+                FixedDisposition::Deferred,
+                before,
+                after,
+            )?,
+        })
+    }
+    pub(crate) fn set_trim_text(&mut self, trim: bool) {
+        self.reader.set_trim_text(trim);
+    }
+    pub(crate) fn next_event(&mut self) -> Result<Event<'_>, DeferredXmlReadError> {
+        self.acquire_event(|_| {})
+    }
+    fn acquire_event(
+        &mut self,
+        after_inspection: impl FnOnce(&ZipResourceObserver),
+    ) -> Result<Event<'_>, DeferredXmlReadError> {
+        let parent = self.reader.observer.clone();
+        parent
+            .check()
+            .map_err(|error| DeferredXmlReadError::Terminal(error.into()))?;
+        let result = XmlEventReader::read_event_parts(
+            &mut self.reader.xml,
+            &mut self.reader.scratch,
+            &self.reader.observer,
+            &mut self.reader.failed,
+            after_inspection,
+        );
+        parent
+            .check()
+            .map_err(|error| DeferredXmlReadError::Terminal(error.into()))?;
+        match result {
+            Ok(event) => Ok(event),
+            Err(error) => match self.reader.xml.get_mut().fixed_failure.take() {
+                Some(reason) => Err(DeferredXmlReadError::Fixed(FixedXmlViolation {
+                    reason,
+                    parent,
+                })),
+                None => Err(DeferredXmlReadError::Xml(error)),
+            },
+        }
     }
 }
 
@@ -1147,6 +1326,166 @@ mod tests {
                 assert!(guarded.next_event().is_err());
             }
             assert_eq!(calls.get(), reads, "no source IO after final-gate stop");
+        }
+    }
+    fn deferred_fixed(
+        bytes: &[u8],
+        limits: Limits,
+        parent: &ZipResourceObserver,
+    ) -> FixedXmlViolation {
+        let mut reader = DeferredXmlEventReader {
+            reader: XmlEventReader::with_fixed_disposition(
+                bytes,
+                parent.clone(),
+                limits,
+                false,
+                FixedDisposition::Deferred,
+            )
+            .unwrap(),
+        };
+        loop {
+            match reader.next_event() {
+                Ok(Event::Eof) => panic!("fixed predicate not reached"),
+                Ok(_) => {}
+                Err(DeferredXmlReadError::Fixed(fixed)) => {
+                    assert!(parent.check().is_ok());
+                    return fixed;
+                }
+                Err(DeferredXmlReadError::Xml(error)) => panic!("unexpected ordinary XML {error}"),
+                Err(DeferredXmlReadError::Terminal(error)) => {
+                    panic!("unexpected parent stop {error}")
+                }
+            }
+        }
+    }
+    #[test]
+    fn deferred_fixed_predicates_are_local_until_consumed_activation() {
+        let mut token = limits();
+        token.token = 8;
+        let mut attribute = limits();
+        attribute.attribute = 2;
+        let mut attributes = limits();
+        attributes.attributes = 1;
+        let mut depth = limits();
+        depth.depth = 1;
+        let mut names = limits();
+        names.names = 2;
+        for (bytes, limits) in [
+            (&b"<a>123456789</a>"[..], token),
+            (&b"<a x='abc'/>"[..], attribute),
+            (&b"<a x='1' y='2'/>"[..], attributes),
+            (&b"<aa><b></b></aa>"[..], names),
+            (&b"<a><b></b></a>"[..], depth),
+        ] {
+            let parent = ZipResourceObserver::new();
+            let fixed = deferred_fixed(bytes, limits, &parent);
+            assert!(matches!(
+                fixed.activate(),
+                StlError::ResourceStopped(ResourceStop::InputLimitExceeded)
+            ));
+            assert!(matches!(
+                parent.check(),
+                Err(crate::zip_bounds::ZipOpenError::ResourceStopped(
+                    ResourceStop::InputLimitExceeded
+                ))
+            ));
+        }
+    }
+    #[test]
+    fn deferred_fixed_error_observation_has_no_concrete_resource_payload() {
+        let parent = ZipResourceObserver::new();
+        let mut limit = limits();
+        limit.attribute = 2;
+        let mut reader = XmlEventReader::with_fixed_disposition(
+            &b"<a x='abc'/>"[..],
+            parent.clone(),
+            limit,
+            false,
+            FixedDisposition::Deferred,
+        )
+        .unwrap();
+        let error = reader.next_event().unwrap_err();
+        let quick_xml::Error::Io(error) = error else {
+            panic!("expected lexical IO boundary");
+        };
+        assert_eq!(ResourceStop::from_io_error(&error), None);
+        assert_eq!(
+            crate::zip_bounds::ZipAllocationFailed::from_io_error(&error),
+            None
+        );
+        parent.observe_io(&error);
+        assert!(parent.check().is_ok());
+        assert!(reader.xml.get_ref().fixed_failure.is_some());
+    }
+    #[test]
+    fn deferred_activation_never_overwrites_real_parent_first_cause() {
+        for stop in [
+            Some(ResourceStop::InputLimitExceeded),
+            Some(ResourceStop::ReadWorkExceeded),
+            Some(ResourceStop::EnvelopeChanged),
+            None,
+        ] {
+            let parent = ZipResourceObserver::new();
+            let mut limit = limits();
+            limit.attribute = 2;
+            let fixed = deferred_fixed(b"<a x='abc'/>", limit, &parent);
+            let expected = match stop {
+                Some(stop) => {
+                    let _ = parent.stop_io(stop);
+                    StlError::ResourceStopped(stop)
+                }
+                None => {
+                    let _ = parent.allocation_failed_io();
+                    StlError::AllocationFailed
+                }
+            };
+            assert_eq!(fixed.activate(), expected);
+        }
+    }
+    #[test]
+    fn deferred_workspace_failure_and_real_inspection_stop_remain_immediate() {
+        let parent = ZipResourceObserver::new();
+        let result = XmlEventReader::with_fixed_disposition(
+            &b"<a/>"[..],
+            parent.clone(),
+            limits(),
+            true,
+            FixedDisposition::Deferred,
+        );
+        assert!(matches!(result, Err(StlError::AllocationFailed)));
+        assert!(matches!(
+            parent.check(),
+            Err(crate::zip_bounds::ZipOpenError::AllocationFailed)
+        ));
+        for stop in [
+            Some(ResourceStop::InputLimitExceeded),
+            Some(ResourceStop::ReadWorkExceeded),
+            Some(ResourceStop::EnvelopeChanged),
+            None,
+        ] {
+            let parent = ZipResourceObserver::new();
+            let mut reader = DeferredXmlEventReader::new(b"<a/>", parent.clone()).unwrap();
+            let expected = match stop {
+                Some(stop) => StlError::ResourceStopped(stop),
+                None => StlError::AllocationFailed,
+            };
+            let result = reader.acquire_event(|observer| {
+                if let Some(stop) = stop {
+                    let _ = observer.stop_io(stop);
+                } else {
+                    let _ = observer.allocation_failed_io();
+                }
+            });
+            match result {
+                Err(DeferredXmlReadError::Terminal(error)) => assert_eq!(error, expected),
+                _ => panic!("tentative event escaped real stop"),
+            }
+            let remaining = reader.reader.xml.get_ref().inner.len();
+            assert!(matches!(
+                reader.next_event(),
+                Err(DeferredXmlReadError::Terminal(_))
+            ));
+            assert_eq!(reader.reader.xml.get_ref().inner.len(), remaining);
         }
     }
 }

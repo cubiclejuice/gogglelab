@@ -14,6 +14,7 @@ pub(super) enum ReserveSite {
     DiagnosticSet,
     Path,
     OutputPlates,
+    PlateName,
 }
 
 struct Control<'a> {
@@ -27,6 +28,13 @@ impl Control<'_> {
         #[cfg(test)]
         if let Some(probe) = self.probe {
             probe.reserves.set(probe.reserves.get() + 1);
+            if let Some((site, failure)) = probe.before_stop_site.get() {
+                if site == _site {
+                    probe.before_stop_site.set(None);
+                    latch(self.observer, failure);
+                }
+            }
+            self.observer.check()?;
             if probe.fail_site.get() == Some(_site) {
                 probe.fail_site.set(None);
                 return Err(self.allocation());
@@ -82,19 +90,48 @@ impl Control<'_> {
         self.after(site)
     }
     fn text(&self, text: &str) -> Result<String, StlError> {
+        self.text_at(text, ReserveSite::Path)
+    }
+    fn text_at(&self, text: &str, site: ReserveSite) -> Result<String, StlError> {
         if text.len() > isize::MAX as usize {
             return input_stop(self.observer);
         }
         let mut owned = String::new();
         if !text.is_empty() {
-            self.before(ReserveSite::Path)?;
+            self.before(site)?;
             owned
                 .try_reserve_exact(text.len())
                 .map_err(|_| self.allocation())?;
-            self.after(ReserveSite::Path)?;
+            self.after(site)?;
             owned.push_str(text);
         }
         Ok(owned)
+    }
+    fn plate_name(&self, value: &str) -> Result<String, StlError> {
+        let value = value.trim();
+        let end = value
+            .char_indices()
+            .nth(256)
+            .map_or(value.len(), |(index, _)| index);
+        self.text_at(&value[..end], ReserveSite::PlateName)
+    }
+    fn default_plate_name(&self, ordinal: usize) -> Result<String, StlError> {
+        use std::fmt::Write;
+        let mut digits = 1;
+        let mut value = ordinal;
+        while value >= 10 {
+            value /= 10;
+            digits += 1;
+        }
+        let length = 6usize.checked_add(digits).ok_or_else(|| self.input())?;
+        let mut output = String::new();
+        self.before(ReserveSite::PlateName)?;
+        output
+            .try_reserve_exact(length)
+            .map_err(|_| self.allocation())?;
+        self.after(ReserveSite::PlateName)?;
+        write!(&mut output, "Plate {ordinal}").expect("admitted plate name");
+        Ok(output)
     }
 }
 
@@ -217,45 +254,141 @@ fn attr(
     result.map_err(|error| PlateResolutionError::Metadata(error.to_string()))
 }
 
-pub(super) fn parse_and_resolve_plates(
+pub(super) struct PreparedPlates {
+    plates: Vec<ResolvedPlate>,
+    claimed: HashSet<usize>,
+}
+pub(super) enum PreparedPlateOutcome {
+    Ready(PreparedPlates),
+    Metadata(String),
+    Fixed(crate::xml_bounds::FixedXmlViolation),
+}
+enum PreparationError {
+    Standard(PlateResolutionError),
+    Fixed(crate::xml_bounds::FixedXmlViolation),
+}
+impl From<PlateResolutionError> for PreparationError {
+    fn from(error: PlateResolutionError) -> Self {
+        Self::Standard(error)
+    }
+}
+impl From<String> for PreparationError {
+    fn from(error: String) -> Self {
+        Self::Standard(PlateResolutionError::Metadata(error))
+    }
+}
+impl From<&str> for PreparationError {
+    fn from(error: &str) -> Self {
+        error.to_owned().into()
+    }
+}
+
+pub(super) fn prepare_plates(
     text: &str,
-    root_path: &str,
     root: &ModelPart,
     index: &BuildIndex,
-    pkg: &mut Package<'_, '_>,
-) -> Result<Vec<ResolvedPlate>, PlateResolutionError> {
-    let observer = pkg.observer.clone();
-    #[cfg(test)]
-    let probe = pkg.derived_maps_test.clone();
+    observer: &ZipResourceObserver,
+    #[cfg(test)] probe: Option<&DerivedMapsTestProfile>,
+    #[cfg(test)] sidecar: Option<&SidecarTestProfile>,
+) -> Result<PreparedPlateOutcome, StlError> {
+    observer.check()?;
     let control = Control {
-        observer: &observer,
+        observer,
         #[cfg(test)]
-        probe: probe.as_deref(),
+        probe,
     };
-    observer.check().map_err(source)?;
     #[cfg(test)]
-    if let Some(probe) = &probe {
+    if let Some(probe) = probe {
         probe
             .plate_parser_entries
             .set(probe.plate_parser_entries.get() + 1);
     }
-    let result = parse_inner(text, root_path, root, index, pkg, &control);
-    observer.check().map_err(source)?;
-    result
+    let result = prepare_inner(
+        text,
+        root,
+        index,
+        &control,
+        #[cfg(test)]
+        sidecar,
+    );
+    #[cfg(test)]
+    if let Some(probe) = sidecar {
+        if matches!(&result, Err(PreparationError::Fixed(_))) {
+            probe.fixed_prepared.set(probe.fixed_prepared.get() + 1);
+        }
+        sidecar_latch(observer, probe.after_prepare.take());
+    }
+    observer.check()?;
+    match result {
+        Ok(ready) => Ok(PreparedPlateOutcome::Ready(ready)),
+        Err(PreparationError::Fixed(fixed)) => Ok(PreparedPlateOutcome::Fixed(fixed)),
+        Err(PreparationError::Standard(PlateResolutionError::Metadata(detail))) => {
+            Ok(PreparedPlateOutcome::Metadata(detail))
+        }
+        Err(PreparationError::Standard(PlateResolutionError::Source(error))) => Err(error),
+    }
+}
+impl PreparedPlateOutcome {
+    pub(super) fn finish(
+        self,
+        root_path: &str,
+        root: &ModelPart,
+        pkg: &mut Package<'_, '_>,
+    ) -> Result<Vec<ResolvedPlate>, PlateResolutionError> {
+        pkg.observer.check().map_err(source)?;
+        let ready = match self {
+            Self::Ready(ready) => ready,
+            Self::Metadata(detail) => return Err(PlateResolutionError::Metadata(detail)),
+            Self::Fixed(fixed) => return Err(source(fixed.activate())),
+        };
+        for (item_index, item) in root.build.iter().enumerate() {
+            if item.printable
+                && !ready.claimed.contains(&item_index)
+                && object_has_geometry(
+                    pkg,
+                    item.path.as_deref().unwrap_or(root_path),
+                    item.object_id,
+                    0,
+                )
+                .map_err(PlateResolutionError::Source)?
+            {
+                return Err("plate metadata does not assign every printable build item".into());
+            }
+        }
+        Ok(ready.plates)
+    }
 }
 
-fn parse_inner(
+fn prepare_inner(
     text: &str,
-    root_path: &str,
     root: &ModelPart,
     index: &BuildIndex,
-    pkg: &mut Package<'_, '_>,
     control: &Control<'_>,
-) -> Result<Vec<ResolvedPlate>, PlateResolutionError> {
+    #[cfg(test)] sidecar: Option<&SidecarTestProfile>,
+) -> Result<PreparedPlates, PreparationError> {
     let observer = control.observer;
-    let reader = XmlEventReader::new(text.as_bytes(), observer.clone());
+    #[cfg(not(test))]
+    let reader = crate::xml_bounds::DeferredXmlEventReader::new(text.as_bytes(), observer.clone());
+    #[cfg(test)]
+    let reader = crate::xml_bounds::DeferredXmlEventReader::new_with_workspace_hooks(
+        text.as_bytes(),
+        observer.clone(),
+        |parent| {
+            if let Some(probe) = sidecar {
+                probe
+                    .workspace_entered
+                    .set(probe.workspace_entered.get() + 1);
+                sidecar_latch(parent, probe.workspace_before.take());
+            }
+        },
+        |parent| {
+            if let Some(probe) = sidecar {
+                sidecar_latch(parent, probe.workspace_after.take());
+            }
+        },
+    );
     observer.check().map_err(source)?;
-    let mut xml = reader.map_err(|error| error.to_string())?;
+    let mut xml = reader.map_err(source)?;
     xml.set_trim_text(true);
     let mut plates: Vec<ResolvedPlate> = Vec::new();
     let mut plate: Option<OpenResolvedPlate> = None;
@@ -285,7 +418,18 @@ fn parse_inner(
                 observer.check().map_err(source)?;
             }
         }
-        let event = event.map_err(|error| format!("invalid plate metadata XML ({error})"))?;
+        let event = match event {
+            Ok(event) => event,
+            Err(crate::xml_bounds::DeferredXmlReadError::Fixed(fixed)) => {
+                return Err(PreparationError::Fixed(fixed))
+            }
+            Err(crate::xml_bounds::DeferredXmlReadError::Terminal(error)) => {
+                return Err(source(error).into())
+            }
+            Err(crate::xml_bounds::DeferredXmlReadError::Xml(error)) => {
+                return Err(format!("invalid plate metadata XML ({error})").into())
+            }
+        };
         match event {
             Event::Start(ref node) | Event::Empty(ref node) => {
                 let empty = matches!(&event, Event::Empty(_));
@@ -346,7 +490,7 @@ fn parse_inner(
                                     set_once(&mut open.slicer_id, id, "plate plater_id")?;
                                 }
                                 "plater_name" | "name" => {
-                                    let name = normalize_label(&value).unwrap_or_default();
+                                    let name = control.plate_name(&value).map_err(source)?;
                                     set_once(&mut open.name, name, "plate name")?;
                                 }
                                 _ => {}
@@ -415,10 +559,10 @@ fn parse_inner(
                     ids[completed] = id;
                     completed += 1;
                     if membership_error.is_none() {
-                        let name = open
-                            .name
-                            .filter(|name| !name.is_empty())
-                            .unwrap_or_else(|| format!("Plate {completed}"));
+                        let name = match open.name.filter(|name| !name.is_empty()) {
+                            Some(name) => name,
+                            None => control.default_plate_name(completed).map_err(source)?,
+                        };
                         reserve_vec(
                             &mut plates,
                             1,
@@ -453,21 +597,7 @@ fn parse_inner(
     if let Some(error) = membership_error {
         return Err(error.into());
     }
-    for (item_index, item) in root.build.iter().enumerate() {
-        if item.printable
-            && !claimed.contains(&item_index)
-            && object_has_geometry(
-                pkg,
-                item.path.as_deref().unwrap_or(root_path),
-                item.object_id,
-                0,
-            )
-            .map_err(PlateResolutionError::Source)?
-        {
-            return Err("plate metadata does not assign every printable build item".into());
-        }
-    }
-    Ok(plates)
+    Ok(PreparedPlates { plates, claimed })
 }
 
 pub(super) fn diagnostic_paths(

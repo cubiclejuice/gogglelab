@@ -1,5 +1,50 @@
 # Thumbnail parser resource prerequisite
 
+## Current checkpoint: settings sidecar lifetime (2026-10-20)
+
+Model-settings text is released after the existing slicer scan and compact plate
+preparation, before project-settings text is collected. Plate preparation retains
+owned names/indexes and a mandatory pending result. Final source-dependent child
+checks and plate emission remain after project handling. Each settings sidecar is
+collected once per parser invocation; inflation and cumulative collected-input
+accounting remain unchanged.
+
+A private reader over the collected immutable slice separates fixed XML validation
+from actual operation failures. Fixed plate-validation results activate at the
+original plate phase, preserving project/plate diagnostic priority. Actual source,
+workspace, cancellation and fallible acquisition failures use the original
+observer immediately. Newly earlier acquisition failure is an explicit effect of
+preparing plate data earlier. Retained plate/default names reserve fallibly;
+ordinary structural short circuits, duplicate/membership priority, names, geometry
+and palette behavior remain covered. SDK normalization/error-allocation residuals
+remain separate.
+
+The original Stored regression preserved fields and usage before failing because
+the actual model-settings String was still live when project collection began.
+Both compression methods now pass. Seventy-one focused tests cover the revised
+sidecar family, XML behavior, existing derived controls and public settings/maps;
+the three default-name tests are included in the thirteen-test sidecar family.
+Final serial workspace verification passes, including 324 core tests and two
+doctests (one existing ignored fixture), 375 runtime, 209 native and 70 server
+checks. Workspace all-target Clippy retains the three existing diagnostics across
+the changed files with no new warning or suppression. Complete source/log hashes
+and the preserved first failures are under `output/sidecar-sequencing/`.
+
+The first workspace attempt used the shared macOS temporary parent and lacked
+native event access. Controlled same-binary comparisons identified the existing
+4,096-entry recovery guard and native watcher access as the two causes; verification
+uses the established isolated temporary directory and confirmed native access.
+Product guards, assertions and deadlines were preserved. Composed, hosted and
+immutable server acceptance have their own source-bound records and remain required
+before this unit is accepted.
+
+This removes simultaneous raw model/project sidecar backing. Full live metadata
+ownership, internal snapshots/response lifetimes, SDK/control layouts, producer
+admission and immutable preview publication remain open. The proposed 16 MiB
+metadata target remains unselected; existing input collection is a separate metric.
+No source mutation, networking, cache cleanup or new allowance follows from this
+prerequisite.
+
 ## Slicer settings retention checkpoint (2026-10-20)
 
 Settings maps retain records only for root object IDs and the diagnostic map's
