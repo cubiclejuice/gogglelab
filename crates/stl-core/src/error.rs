@@ -54,6 +54,9 @@ pub enum StlError {
     /// so on. `detail` names the specific problem for the error overlay.
     #[error("malformed 3MF: {detail}")]
     Malformed3mf { detail: String },
+    /// Operational allocator failure, separate from deterministic parsing limits.
+    #[error("Model processing could not allocate memory")]
+    AllocationFailed,
     #[error(transparent)]
     ResourceStopped(#[from] ResourceStop),
 }

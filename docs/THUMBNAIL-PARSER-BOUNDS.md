@@ -300,3 +300,24 @@ Implement parser/ZIP bounds first (`stl-core`, runtime archives/images), then de
 and review the producer allowance, then wire the existing Owned permit into all
 producer callers. Stage publication and catalog migration remain separate gates.
 No Windows production support is implied by these parser changes.
+
+## Unwired terminal-error boundary
+
+`stl_core::zip_bounds` provides a project-owned bounded archive/member facade.
+An operation creates one `ZipResourceObserver` before optional opens, shares it
+across all of them, and calls `finish` on the entire result before presentation
+or publication. Reader and member operations check the first terminal cause
+before and after delegation, including successful buffered results. The observer
+records concrete input stops before ZIP recovery can swallow them and records
+SDK metadata-limit/allocation errors before returning failed opens. It never
+recognizes a stop by matching error text or a bare IO kind. Operational allocation
+failure has its own fixed-message category and keeps the existing native Library
+error shape.
+
+This foundation changes no production constructor. The next migration includes
+six indexing/thumbnail ZIP readers and the separate native manual extractor;
+optional settings/image fallbacks and pre-side-effect gates must move together.
+Consumer workspace roots must resolve the same vendored ZIP package before using
+this API, because a dependency's Cargo patch does not propagate to its consumer.
+No inflation, XML/JSON, whole-producer memory, source-identity or publication
+bound is implied by this error-preservation facade.

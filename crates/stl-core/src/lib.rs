@@ -12,6 +12,7 @@ pub mod model;
 pub mod parse;
 pub mod threemf;
 mod vec3;
+pub mod zip_bounds;
 
 pub use error::{ResourceStop, StlError};
 pub use integrity::{integrity, Integrity, IntegrityResult};

@@ -86,6 +86,9 @@ impl From<stl_core::StlError> for AppError {
             stl_core::StlError::ResourceStopped(stop) => AppError::Library {
                 message: stop.to_string(),
             },
+            stl_core::StlError::AllocationFailed => AppError::Library {
+                message: "Model processing could not allocate memory".into(),
+            },
         }
     }
 }
@@ -108,6 +111,18 @@ pub fn map_io_error(e: &std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_failure_keeps_the_existing_native_library_error_shape() {
+        let mapped = AppError::from(stl_core::StlError::AllocationFailed);
+        assert_eq!(
+            serde_json::to_value(mapped).unwrap(),
+            serde_json::json!({
+                "kind": "Library",
+                "message": "Model processing could not allocate memory"
+            })
+        );
+    }
 
     #[test]
     fn resource_stops_keep_the_existing_native_library_error_shape() {
