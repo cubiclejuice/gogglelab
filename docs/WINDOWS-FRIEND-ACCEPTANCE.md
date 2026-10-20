@@ -137,7 +137,7 @@ Check the catalog purge confirmation without deleting anything: choose an exact
 synthetic backup destination, confirm it is visible, enter lowercase `purge` and
 require rejection, then Cancel/Escape and verify the catalog is unchanged. Execute
 exact uppercase `PURGE` only after the separate exact synthetic-operation approval
-in section 7. Require a verified backup, retained previous Library and unchanged
+in section 6. Require a verified backup, retained previous Library and unchanged
 original-source hashes.
 
 Check the manual original-Centauri ID dialog only with networking disabled or an

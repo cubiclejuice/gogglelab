@@ -203,3 +203,51 @@ Dialog styling and host/origin mapping defects discovered during testing are fix
 See the parity plan for exact source, test/build evidence and transport limits.
 The next media slice remains independent thumbnail publication/retirement proof;
 these UI results do not authorize orphan deletion from flags or filenames.
+
+## Next thumbnail slice: proof foundation contract
+
+Implement the proof foundation before changing publication or authorizing cleanup.
+Use one strict canonical recipe for renderer version 1, source SHA-256, size
+128/256/512 and six lowercase background hex digits. Parse only complete single
+filenames in the supported legacy or content-addressed shape; reject malformed,
+unsupported, traversal and noncanonical inputs. A content hash in a name is only a
+lookup hint, never independent ownership.
+
+The producer and proof path must share deterministic rendering from bounded,
+hash-verified admitted source bytes. Represent raster-generated PNG separately
+from protected embedded 3MF preview copies. A proof renderer must not consult the
+cache, adopt catalog flags, or fall back to copied embedded image bytes. If the
+source selects an embedded preview, preserve the candidate regardless of equality.
+The first slice exposes these typed contracts and behavioral tests; it does not
+change PNG publication, collector eligibility or delete files.
+
+A separate PNG receipt primitive may retain a pinned directory, original descriptor
+and exact bounded bytes, without widening geometry or 8 KiB control receipts. Its
+retirement contract requires exclusive private atomic capture, identity and byte
+verification on the captured entry, then unlink of that private claim only. A
+replacement/mismatch is preserved and reported; sync failure must report that the
+unlink already happened. Unknown private leftovers are never swept. Initial
+primitive work is test-only/unwired until independent review and caller admission.
+
+Subsequent caller integration must replace both native/runtime orphan eligibility
+and native purge pathname deletion before enabling content-addressed publication.
+Resolve current admitted sources; exclude all references/custom/active readers;
+recheck root/epoch/revision/reference state immediately before capture. No database
+mutex may be held through rendering. Missing or changed source, unsupported recipe,
+embedded preview, mismatch or uncertain authority means preserve/skip.
+
+Bound each proof batch independently from enumeration/hash limits: one worker,
+at most four uncached source/recipe renders, 400 MiB admitted source bytes total
+(with existing per-source limits), 128 million reserved raster samples, 4 MiB PNG,
+and existing archive/parser expansion caps. A two-second deadline is cooperative,
+not a hard cancellation guarantee for synchronous parsing/encoding. Reserve before
+allocation and stop without changing the rendering algorithm. Opaque in-memory
+continuation must be bound to principal/root/epoch/revision and advance past every
+inspected entry, including unprovable ones; restart discards proof authority.
+
+Required later gates include embedded/custom/foreign protection, cache bypass,
+changed sources, same-size replacement around capture, concurrent exact/different
+winner, cancellation and partial counts after sync failure, active-reader exclusion,
+budget continuation past unprovable prefixes and safe restart. Each implementation
+slice gets independent review, affected tests and build before advancing; publication
+and actual cleanup stay unchanged until their own gates pass.
