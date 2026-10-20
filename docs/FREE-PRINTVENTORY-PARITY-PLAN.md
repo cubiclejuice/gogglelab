@@ -2,7 +2,30 @@
 
 Date: 2026-10-15 (updated 2026-10-20)
 
-## Current checkpoint: bounded project JSON (2026-10-20)
+## Current checkpoint: standard metadata retention (2026-10-20)
+
+Following verified JSON checkpoint `490d2a1`, the runtime's five standard embedded
+metadata fields use a fixed selector and allocate retained values only for empty
+recognized destinations. Unknown and already-filled fields still undergo their
+previous text decoding/validation. Matching aliases, first-nonempty-event behavior
+and public strings remain unchanged. Each selected value uses a checked/fallible
+exact reserve with the same observer before copying.
+
+Nine focused tests pass, including a regression that previously copied 1,205
+values while returning five, plus actual read-only proposal checks for loose and
+archived Stored/Deflate models and terminal failure injection. Clippy introduces
+no new diagnostics. Remaining verification for this unit is tracked in
+`output/standard-fields-implementation-gates.json`; focused success alone does not
+establish the broader workspace, combined app or packaged acceptance.
+
+The five slots and existing 64 KiB XML text acquisition bound imply at most five
+controlled retained field-value allocations and 320 KiB logical returned payload
+per scan. SDK workspaces, core model data, catalog metadata, later clones and total
+allocator/RAM use are separate. This adds no 16 MiB copy counter, new quota or
+producer admission. Aggregate owned metadata/model storage and immutable
+publication remain open.
+
+## Bounded project JSON checkpoint `490d2a1` (2026-10-20)
 
 Project filament metadata now uses a streaming visitor instead of a production
 JSON DOM and whole auxiliary-array copies. An allocation-free scan precedes Serde,

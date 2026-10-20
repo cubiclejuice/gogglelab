@@ -131,7 +131,238 @@ fn parse_standard_fields_reader_in_context<R: Read + Seek>(
     observer.finish(result)
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum StandardMetadataTestStop {
+    Resource(stl_core::ResourceStop),
+    Allocation,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct StandardValueCopyProbe {
+    copies: std::cell::Cell<usize>,
+    copied_bytes: std::cell::Cell<usize>,
+    reserves: std::cell::Cell<usize>,
+    requested: std::cell::RefCell<Vec<usize>>,
+    fail_at: std::cell::Cell<Option<usize>>,
+    after_reserve: std::cell::Cell<Option<StandardMetadataTestStop>>,
+    at_finish: std::cell::Cell<Option<StandardMetadataTestStop>>,
+    decoded: std::cell::Cell<usize>,
+    borrowed: std::cell::Cell<usize>,
+}
+#[cfg(test)]
+thread_local! {
+    static STANDARD_VALUE_COPY_PROBE: std::cell::RefCell<Option<std::rc::Rc<StandardValueCopyProbe>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn standard_probe() -> Option<std::rc::Rc<StandardValueCopyProbe>> {
+    STANDARD_VALUE_COPY_PROBE.with(|slot| slot.borrow().clone())
+}
+#[cfg(test)]
+pub(super) struct StandardMetadataProbeGuard {
+    previous: Option<std::rc::Rc<StandardValueCopyProbe>>,
+    probe: std::rc::Rc<StandardValueCopyProbe>,
+}
+#[cfg(test)]
+impl StandardMetadataProbeGuard {
+    pub(super) fn install() -> Self {
+        let probe = std::rc::Rc::new(StandardValueCopyProbe::default());
+        let previous = STANDARD_VALUE_COPY_PROBE.with(|slot| slot.replace(Some(probe.clone())));
+        Self { previous, probe }
+    }
+    pub(super) fn fail_reserve_at(&self, attempt: usize) {
+        self.probe.fail_at.set(Some(attempt));
+    }
+    pub(super) fn stop_after_reserve(&self, stop: StandardMetadataTestStop) {
+        self.probe.after_reserve.set(Some(stop));
+    }
+    pub(super) fn stop_at_finish(&self, stop: StandardMetadataTestStop) {
+        self.probe.at_finish.set(Some(stop));
+    }
+    pub(super) fn copies(&self) -> usize {
+        self.probe.copies.get()
+    }
+    pub(super) fn reserve_attempts(&self) -> usize {
+        self.probe.reserves.get()
+    }
+    pub(super) fn requested_lengths(&self) -> Vec<usize> {
+        self.probe.requested.borrow().clone()
+    }
+    fn copied_bytes(&self) -> usize {
+        self.probe.copied_bytes.get()
+    }
+}
+#[cfg(test)]
+impl Drop for StandardMetadataProbeGuard {
+    fn drop(&mut self) {
+        STANDARD_VALUE_COPY_PROBE.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+#[cfg(test)]
+fn latch_test_stop(observer: &ZipResourceObserver, stop: StandardMetadataTestStop) {
+    match stop {
+        StandardMetadataTestStop::Resource(stop) => {
+            let _ = observer.stop_io(stop);
+        }
+        StandardMetadataTestStop::Allocation => {
+            let _ = observer.allocation_failed_io();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StandardField {
+    Designer,
+    SourceUrl,
+    Notes,
+    ModelLicense,
+    ParentModel,
+    Unknown,
+}
+impl StandardField {
+    fn classify(name: &str) -> Self {
+        if name.eq_ignore_ascii_case("designer") || name.eq_ignore_ascii_case("author") {
+            Self::Designer
+        } else if name.eq_ignore_ascii_case("source") || name.eq_ignore_ascii_case("url") {
+            Self::SourceUrl
+        } else if name.eq_ignore_ascii_case("description") || name.eq_ignore_ascii_case("notes") {
+            Self::Notes
+        } else if name.eq_ignore_ascii_case("license") || name.eq_ignore_ascii_case("terms") {
+            Self::ModelLicense
+        } else if name.eq_ignore_ascii_case("parentmodel")
+            || name.eq_ignore_ascii_case("parent_model")
+        {
+            Self::ParentModel
+        } else {
+            Self::Unknown
+        }
+    }
+    fn destination(self, fields: &mut EmbeddedMetadataFields) -> Option<&mut Option<String>> {
+        match self {
+            Self::Designer => Some(&mut fields.designer),
+            Self::SourceUrl => Some(&mut fields.source_url),
+            Self::Notes => Some(&mut fields.notes),
+            Self::ModelLicense => Some(&mut fields.model_license),
+            Self::ParentModel => Some(&mut fields.parent_model),
+            Self::Unknown => None,
+        }
+    }
+}
+
+// The input is borrowed trim of one admitted XML Text event. This owns only
+// the selected field backing; SDK normalization/decoding are separate workspaces.
+fn retain_standard_value(
+    value: &str,
+    observer: &ZipResourceObserver,
+) -> Result<String, ProcessingError> {
+    observer.check()?;
+    #[cfg(test)]
+    if let Some(probe) = standard_probe() {
+        let attempt = probe.reserves.get() + 1;
+        probe.reserves.set(attempt);
+        probe.requested.borrow_mut().push(value.len());
+        if probe.fail_at.get() == Some(attempt) {
+            return Err(ProcessingError::from_io(observer.allocation_failed_io()));
+        }
+    }
+    let mut retained = String::new();
+    retained
+        .try_reserve_exact(value.len())
+        .map_err(|_| ProcessingError::from_io(observer.allocation_failed_io()))?;
+    #[cfg(test)]
+    if let Some(probe) = standard_probe() {
+        if let Some(stop) = probe.after_reserve.take() {
+            latch_test_stop(observer, stop);
+        }
+    }
+    observer.check()?;
+    retained.push_str(value);
+    #[cfg(test)]
+    if let Some(probe) = standard_probe() {
+        probe.copies.set(probe.copies.get() + 1);
+        probe
+            .copied_bytes
+            .set(probe.copied_bytes.get() + value.len());
+    }
+    Ok(retained)
+}
+
 fn scan_standard_fields<R: Read>(
+    input: R,
+    observer: &ZipResourceObserver,
+) -> Result<EmbeddedMetadataFields, ProcessingError> {
+    observer.check()?;
+    let result = (|| {
+        let mut reader =
+            XmlEventReader::new(input, observer.clone()).map_err(ProcessingError::from)?;
+        reader.set_trim_text(true);
+        let mut fields = EmbeddedMetadataFields::default();
+        // Some(Unknown) still decodes Text; absence of a name does not.
+        let mut current = None;
+        loop {
+            let event = reader.next_event();
+            observer.check()?;
+            match event.map_err(|_| invalid_processing("3MF model metadata XML is invalid"))? {
+                Event::Start(node) if node.local_name().as_ref() == b"metadata" => {
+                    current = None;
+                    for attribute in node.attributes().with_checks(true) {
+                        let attribute = attribute
+                            .map_err(|_| invalid_processing("3MF metadata attribute is invalid"))?;
+                        if attribute.key.local_name().as_ref() == b"name" {
+                            let name = attribute
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .map_err(|_| invalid_processing("3MF metadata name is invalid"))?;
+                            current = Some(StandardField::classify(&name));
+                        }
+                    }
+                }
+                Event::Text(text) if current.is_some() => {
+                    // Validate even Unknown/occupied selections exactly as before.
+                    let decoded = text
+                        .decode()
+                        .map_err(|_| invalid_processing("3MF metadata text is invalid"))?;
+                    #[cfg(test)]
+                    if let Some(probe) = standard_probe() {
+                        probe.decoded.set(probe.decoded.get() + 1);
+                        if matches!(&decoded, std::borrow::Cow::Borrowed(_)) {
+                            probe.borrowed.set(probe.borrowed.get() + 1);
+                        }
+                    }
+                    let value = decoded.trim();
+                    if value.is_empty() {
+                        continue;
+                    }
+                    let Some(destination) = current.unwrap().destination(&mut fields) else {
+                        continue;
+                    };
+                    if destination.is_none() {
+                        *destination = Some(retain_standard_value(value, observer)?);
+                    }
+                }
+                Event::End(node) if node.local_name().as_ref() == b"metadata" => {
+                    current = None;
+                }
+                Event::DocType(_) => {
+                    return Err(invalid_processing("3MF metadata XML cannot contain a DTD"))
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        Ok(fields)
+    })();
+    #[cfg(test)]
+    if let Some(probe) = standard_probe() {
+        if let Some(stop) = probe.at_finish.take() {
+            latch_test_stop(observer, stop);
+        }
+    }
+    observer.finish(result)
+}
+
+#[cfg(test)]
+fn scan_standard_fields_reference<R: Read>(
     input: R,
     observer: &ZipResourceObserver,
 ) -> Result<EmbeddedMetadataFields, ProcessingError> {
@@ -159,11 +390,13 @@ fn scan_standard_fields<R: Read>(
                 }
             }
             Event::Text(text) if current_name.is_some() => {
-                let value = text
-                    .decode()
-                    .map_err(|_| invalid_processing("3MF metadata text is invalid"))?
-                    .trim()
-                    .to_owned();
+                let value = {
+                    let decoded = text
+                        .decode()
+                        .map_err(|_| invalid_processing("3MF metadata text is invalid"))?;
+                    let value = decoded.trim();
+                    value.to_owned()
+                };
                 if !value.is_empty() {
                     match current_name
                         .as_deref()
@@ -584,5 +817,273 @@ mod tests {
             "binary image must not spend text counter"
         );
         assert_eq!(std::fs::read(&source).unwrap(), outer);
+    }
+    #[test]
+    fn standard_metadata_value_copies_do_not_exceed_five_retained_destinations() {
+        let mut xml = String::from("<model>");
+        for (name, value) in [
+            ("Designer", " First Designer "),
+            ("Source", "https://example.test/source"),
+            ("Description", " First Notes "),
+            ("License", " CC0 "),
+            ("ParentModel", " First Parent "),
+        ] {
+            xml.push_str(&format!("<metadata name=\"{name}\">{value}</metadata>"));
+        }
+        for index in 0..200 {
+            xml.push_str(&format!(
+                "<metadata name=\"Unknown{index}\">ignored value</metadata>"
+            ));
+            for alias in ["AUTHOR", "URL", "notes", "TERMS", "parent_model"] {
+                xml.push_str(&format!(
+                    "<metadata name=\"{alias}\">discarded duplicate</metadata>"
+                ));
+            }
+        }
+        xml.push_str("</model>");
+        let probe = super::StandardMetadataProbeGuard::install();
+        let observer = stl_core::zip_bounds::ZipResourceObserver::new();
+        let fields = super::scan_standard_fields(xml.as_bytes(), &observer).unwrap();
+        assert_eq!(fields.designer.as_deref(), Some("First Designer"));
+        assert_eq!(
+            fields.source_url.as_deref(),
+            Some("https://example.test/source")
+        );
+        assert_eq!(fields.notes.as_deref(), Some("First Notes"));
+        assert_eq!(fields.model_license.as_deref(), Some("CC0"));
+        assert_eq!(fields.parent_model.as_deref(), Some("First Parent"));
+        assert!(observer.check().is_ok());
+        let copies = probe.copies();
+        assert!(
+            copies >= 5,
+            "actual nonempty value copy path must be observed"
+        );
+        assert!(probe.copied_bytes() > 0);
+        assert!(copies <= 5,
+            "only five retained field values need backing copies; actual explicit nonempty copies: {copies}");
+    }
+    fn compare_standard_scan(xml: &[u8]) {
+        let expected = super::scan_standard_fields_reference(
+            xml,
+            &stl_core::zip_bounds::ZipResourceObserver::new(),
+        );
+        let actual =
+            super::scan_standard_fields(xml, &stl_core::zip_bounds::ZipResourceObserver::new());
+        match (actual, expected) {
+            (Ok(actual), Ok(expected)) => assert_eq!(actual, expected),
+            (Err(actual), Err(expected)) => assert_eq!(actual.to_string(), expected.to_string()),
+            _ => panic!("new retention path changed scanner success/error"),
+        }
+    }
+
+    #[test]
+    fn standard_metadata_selectors_and_event_order_match_reference() {
+        for xml in [
+            "<model><metadata name='dEsIgNeR'>A</metadata><metadata name='AUTHOR'>B</metadata></model>",
+            "<model><metadata name='URL'>U</metadata><metadata name='NOTES'>N</metadata><metadata name='TERMS'>T</metadata><metadata name='PARENT_MODEL'>P</metadata></model>",
+            "<model><metadata>none</metadata><metadata name=''>empty name</metadata><metadata name=' designer '>padded</metadata><metadata name='dèsigner'>nonascii</metadata></model>",
+            "<model><metadata name='Designer' q:name='Unknown'>discard</metadata><metadata name='Unknown' q:name='Notes'>notes</metadata></model>",
+            "<model><metadata name='De&#115;igner'>é🙂</metadata></model>",
+            "<model><metadata name='Designer'> <![CDATA[not text]]> A&amp;B </metadata></model>",
+            "<model><metadata name='Designer'><metadata name='Notes'/>A</metadata></model>",
+            "<model><metadata name='Designer'>A<metadata name='Notes'>N</metadata>after</metadata></model>",
+            "<model><metadata name='Designer'> </metadata><metadata name='author'>later</metadata></model>",
+            "<model><metadata name='Designer' bad>value</metadata></model>",
+            "<model><metadata name='Designer' q:name='&invalid;'>value</metadata></model>",
+            "<model><metadata name='Designer' bad='x' bad='y'>value</metadata></model>",
+        ] { compare_standard_scan(xml.as_bytes()); }
+    }
+
+    #[test]
+    fn standard_metadata_unknown_and_occupied_still_decode_but_missing_name_does_not() {
+        for prefix in [
+            "<model><metadata name='Unknown'>",
+            "<model><metadata name=''>",
+            "<model><metadata name='Designer'>first</metadata><metadata name='Author'>",
+        ] {
+            let mut xml = prefix.as_bytes().to_vec();
+            xml.push(0xff);
+            xml.extend_from_slice(b"</metadata></model>");
+            compare_standard_scan(&xml);
+            let error = super::scan_standard_fields(
+                &xml[..],
+                &stl_core::zip_bounds::ZipResourceObserver::new(),
+            )
+            .unwrap_err();
+            assert!(!error.is_terminal());
+            assert_eq!(
+                metadata_processing_error(error).code,
+                RuntimeErrorCode::InvalidInput
+            );
+        }
+        let mut xml = b"<model><metadata>".to_vec();
+        xml.push(0xff);
+        xml.extend_from_slice(b"</metadata></model>");
+        compare_standard_scan(&xml);
+        assert!(super::scan_standard_fields(
+            &xml[..],
+            &stl_core::zip_bounds::ZipResourceObserver::new()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn standard_metadata_value_requests_are_exact_and_text_decode_is_borrowed() {
+        let probe = super::StandardMetadataProbeGuard::install();
+        let xml = "<model><metadata name='Designer'> é🙂 </metadata><metadata name='Unknown'>unknown</metadata><metadata name='Author'>occupied</metadata></model>";
+        let fields = super::scan_standard_fields(
+            xml.as_bytes(),
+            &stl_core::zip_bounds::ZipResourceObserver::new(),
+        )
+        .unwrap();
+        assert_eq!(fields.designer.as_deref(), Some("é🙂"));
+        assert_eq!(probe.copies(), 1);
+        assert_eq!(probe.reserve_attempts(), 1);
+        assert_eq!(probe.requested_lengths(), ["é🙂".len()]);
+        assert_eq!(probe.probe.decoded.get(), 3);
+        assert_eq!(
+            probe.probe.borrowed.get(),
+            3,
+            "actual borrowed Text/normal UTF-8 path; attribute Cow remains separate"
+        );
+    }
+
+    #[test]
+    fn standard_metadata_five_admitted_text_events_bound_selected_payload() {
+        let mut xml = String::from("<model>");
+        for name in ["Designer", "Source", "Notes", "License", "ParentModel"] {
+            xml.push_str(&format!(
+                "<metadata name='{name}'>{}</metadata>",
+                "x".repeat(65536)
+            ));
+        }
+        xml.push_str("</model>");
+        let probe = super::StandardMetadataProbeGuard::install();
+        let fields = super::scan_standard_fields(
+            xml.as_bytes(),
+            &stl_core::zip_bounds::ZipResourceObserver::new(),
+        )
+        .unwrap();
+        assert_eq!(probe.copies(), 5);
+        assert_eq!(probe.requested_lengths(), [65536; 5]);
+        assert_eq!(probe.copied_bytes(), 5 * 65536);
+        assert_eq!(fields.designer.as_ref().unwrap().len(), 65536);
+        drop(probe);
+        let probe = super::StandardMetadataProbeGuard::install();
+        let too_large = format!(
+            "<model><metadata name='Unknown'>{}</metadata></model>",
+            "x".repeat(65537)
+        );
+        let error = super::scan_standard_fields(
+            too_large.as_bytes(),
+            &stl_core::zip_bounds::ZipResourceObserver::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProcessingError::ResourceStopped(ResourceStop::InputLimitExceeded)
+        ));
+        assert_eq!(probe.copies(), 0);
+        assert_eq!(probe.reserve_attempts(), 0);
+    }
+
+    #[test]
+    fn standard_metadata_selected_reserve_failure_and_stops_keep_first_cause() {
+        use super::StandardMetadataTestStop;
+        let bytes = package(&[(
+            "3D/3dmodel.model",
+            b"<model><metadata name='Designer'>Value</metadata></model>",
+        )]);
+        let probe = super::StandardMetadataProbeGuard::install();
+        probe.fail_reserve_at(1);
+        probe.stop_at_finish(StandardMetadataTestStop::Resource(
+            ResourceStop::EnvelopeChanged,
+        ));
+        let observer = stl_core::zip_bounds::ZipResourceObserver::new();
+        let mut context = stl_core::package_bounds::PackageProcessingContext::new(observer.clone());
+        assert!(matches!(
+            super::parse_standard_fields_in_context(&bytes, &mut context),
+            Err(ProcessingError::AllocationFailed)
+        ));
+        assert!(matches!(
+            observer.check(),
+            Err(stl_core::zip_bounds::ZipOpenError::AllocationFailed)
+        ));
+        assert_eq!(probe.reserve_attempts(), 1);
+        assert_eq!(probe.copies(), 0);
+        drop(probe);
+        for stop in [
+            StandardMetadataTestStop::Resource(ResourceStop::InputLimitExceeded),
+            StandardMetadataTestStop::Resource(ResourceStop::ReadWorkExceeded),
+            StandardMetadataTestStop::Resource(ResourceStop::EnvelopeChanged),
+            StandardMetadataTestStop::Allocation,
+        ] {
+            let probe = super::StandardMetadataProbeGuard::install();
+            probe.stop_after_reserve(stop);
+            let observer = stl_core::zip_bounds::ZipResourceObserver::new();
+            let mut context =
+                stl_core::package_bounds::PackageProcessingContext::new(observer.clone());
+            let error = super::parse_standard_fields_in_context(&bytes, &mut context).unwrap_err();
+            match stop {
+                StandardMetadataTestStop::Resource(expected) => assert!(
+                    matches!(error, ProcessingError::ResourceStopped(actual) if actual == expected)
+                ),
+                StandardMetadataTestStop::Allocation => {
+                    assert!(matches!(error, ProcessingError::AllocationFailed))
+                }
+            }
+            assert_eq!(probe.reserve_attempts(), 1);
+            assert_eq!(probe.copies(), 0);
+        }
+    }
+
+    #[test]
+    fn standard_metadata_prior_and_final_stops_never_return_fields() {
+        use super::StandardMetadataTestStop;
+        let xml = b"<model><metadata name='Designer'>Value</metadata></model>";
+        for stop in [
+            StandardMetadataTestStop::Resource(ResourceStop::InputLimitExceeded),
+            StandardMetadataTestStop::Resource(ResourceStop::ReadWorkExceeded),
+            StandardMetadataTestStop::Resource(ResourceStop::EnvelopeChanged),
+            StandardMetadataTestStop::Allocation,
+        ] {
+            let probe = super::StandardMetadataProbeGuard::install();
+            let observer = stl_core::zip_bounds::ZipResourceObserver::new();
+            super::latch_test_stop(&observer, stop);
+            assert!(super::scan_standard_fields(&xml[..], &observer).is_err());
+            assert_eq!(probe.reserve_attempts(), 0);
+            assert_eq!(probe.copies(), 0);
+            drop(probe);
+            let probe = super::StandardMetadataProbeGuard::install();
+            probe.stop_at_finish(stop);
+            let observer = stl_core::zip_bounds::ZipResourceObserver::new();
+            assert!(super::scan_standard_fields(&xml[..], &observer).is_err());
+            assert_eq!(probe.copies(), 1);
+        }
+    }
+
+    #[test]
+    fn standard_metadata_probe_scopes_restore_after_nesting_and_panic() {
+        assert!(super::standard_probe().is_none());
+        let outer = super::StandardMetadataProbeGuard::install();
+        let original = super::standard_probe().unwrap();
+        {
+            let _inner = super::StandardMetadataProbeGuard::install();
+        }
+        assert!(std::rc::Rc::ptr_eq(
+            &super::standard_probe().unwrap(),
+            &original
+        ));
+        let panic = std::panic::catch_unwind(|| {
+            let _inner = super::StandardMetadataProbeGuard::install();
+            panic!("synthetic metadata probe unwind");
+        });
+        assert!(panic.is_err());
+        assert!(std::rc::Rc::ptr_eq(
+            &super::standard_probe().unwrap(),
+            &original
+        ));
+        drop(outer);
+        assert!(super::standard_probe().is_none());
     }
 }

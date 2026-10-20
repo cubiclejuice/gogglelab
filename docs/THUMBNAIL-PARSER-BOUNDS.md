@@ -1,6 +1,32 @@
 # Thumbnail parser resource prerequisite
 
-## Current JSON checkpoint (2026-10-20)
+## Current standard-field retention checkpoint (2026-10-20)
+
+Runtime standard embedded metadata retains at most one value for each of five
+fields. A fixed borrowed-name selector replaces owned name/lowercase intermediates;
+unknown or occupied selections still decode text before declining retention.
+Selected nonempty values reserve their admitted byte length fallibly, recheck the
+same observer, copy once and move into the empty destination. A final observer
+check dominates tentative output and ordinary errors. Public strings, aliases,
+XML event order, strict malformed handling and source/context accounting remain
+compatible.
+
+This gives at most five controlled retained-value backing allocations and
+5 × 65,536 = 327,680 logical payload bytes per returned source-field set, derived
+from existing XML acquisition bounds. It does not bound all SDK allocations,
+allocator capacity/RSS, catalog/current metadata or other simultaneously live
+outputs. Borrowed UTF-8 text decoding is tested for the checked normal quick-xml
+profile; attribute normalization may still own a bounded SDK string. No proposed
+16 MiB live-metadata target is reinterpreted as cumulative copying, and no context
+return refunds a new ledger because this unit creates none.
+
+The original 1,205-copy regression now passes, with nine focused compatibility,
+allocation, first-cause and real proposal tests. Workspace Clippy has no new
+changed-code diagnostics. Broader unit status is recorded in
+`output/standard-fields-implementation-gates.json`. Global owned metadata/model
+capacity, producer admission and publication remain separate open gates.
+
+## JSON checkpoint `490d2a1` (2026-10-20)
 
 Project metadata is parsed by a private streaming visitor after an allocation-free
 scan of its already retained input. The existing 8 MiB project role bounds wire

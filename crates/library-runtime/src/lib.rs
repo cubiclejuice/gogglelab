@@ -16031,6 +16031,201 @@ mod tests {
         assert_eq!(resources.active_bundle_builds, 0);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn standard_metadata_proposal_reads_five_fields_without_applying_or_source_writes() {
+        fn package(name: &str, bytes: &[u8], method: zip::CompressionMethod) -> Vec<u8> {
+            let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            archive
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default().compression_method(method),
+                )
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+            archive.finish().unwrap().into_inner()
+        }
+        let root = r#"<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+<metadata name="AuThOr"> Embedded Designer </metadata>
+<metadata name="URL"> https://example.test/source </metadata>
+<metadata name="Notes"> Embedded notes </metadata>
+<metadata name="TERMS"> CC0 </metadata>
+<metadata name="Parent_Model"> Parent Family </metadata>
+<metadata name="Unknown">Ignored value</metadata>
+<metadata name="Designer">Must not replace first value</metadata>
+<resources><object id="1" type="model"><mesh><vertices>
+<vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>
+</vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources>
+<build><item objectid="1"/></build></model>"#;
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let inner = package("3D/3dmodel.model", root.as_bytes(), method);
+            for archived in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let base = temp.path().canonicalize().unwrap();
+                let sources = base.join("sources");
+                fs::create_dir(&sources).unwrap();
+                let (name, original) = if archived {
+                    ("models.zip", package("nested.3mf", &inner, method))
+                } else {
+                    ("loose.3mf", inner.clone())
+                };
+                let source = sources.join(name);
+                fs::write(&source, &original).unwrap();
+                let runtime = LibraryRuntime::open(RuntimeConfig {
+                    library_root: base.join("library"),
+                    integration_settings_path: base.join("integrations.json"),
+                    roots: vec![RuntimeRootPolicy {
+                        id: "metadata-fixture".into(),
+                        label: "Synthetic metadata".into(),
+                        path: sources,
+                        access: RootAccess::ReadOnly,
+                        catalog_root_id: None,
+                    }],
+                    capabilities: BTreeSet::from([
+                        Capability::CatalogRead,
+                        Capability::CatalogWrite,
+                        Capability::MediaRead,
+                        Capability::MediaWrite,
+                        Capability::Scan,
+                    ]),
+                    local_catalog_root_access: false,
+                })
+                .unwrap();
+                let mut index = runtime
+                    .read_db(|db| db.list_index_roots())
+                    .unwrap()
+                    .remove(0);
+                index.scan_zip = archived;
+                let index = runtime
+                    .mutate_db(|db| db.update_index_root(&index))
+                    .unwrap();
+                crate::scanner::scan_root(&runtime, &index).unwrap();
+                let model = runtime
+                    .read_db(|db| db.list_models(None, None))
+                    .unwrap()
+                    .into_iter()
+                    .find(|model| {
+                        if archived {
+                            model.source_archive_member.as_deref() == Some("nested.3mf")
+                        } else {
+                            model.display_name == "loose"
+                        }
+                    })
+                    .unwrap();
+                let context = RequestContext {
+                    principal_id: "metadata-reader".into(),
+                    capabilities: BTreeSet::from([Capability::CatalogRead]),
+                    request_id: "metadata-reader".into(),
+                };
+                let proposal = {
+                    let probe = embedded::StandardMetadataProbeGuard::install();
+                    let proposal = runtime
+                        .read_embedded_metadata(&context, &model.id, model.content_hash.as_deref())
+                        .unwrap();
+                    assert_eq!(probe.copies(), 5);
+                    assert_eq!(probe.reserve_attempts(), 5);
+                    assert_eq!(
+                        probe.requested_lengths(),
+                        vec![
+                            "Embedded Designer".len(),
+                            "https://example.test/source".len(),
+                            "Embedded notes".len(),
+                            "CC0".len(),
+                            "Parent Family".len(),
+                        ]
+                    );
+                    proposal
+                };
+                assert_eq!(
+                    proposal.embedded.designer.as_deref(),
+                    Some("Embedded Designer")
+                );
+                assert_eq!(
+                    proposal.embedded.source_url.as_deref(),
+                    Some("https://example.test/source")
+                );
+                assert_eq!(proposal.embedded.notes.as_deref(), Some("Embedded notes"));
+                assert_eq!(proposal.embedded.model_license.as_deref(), Some("CC0"));
+                assert_eq!(
+                    proposal.embedded.parent_model.as_deref(),
+                    Some("Parent Family")
+                );
+                assert!(proposal.current.designer.is_none());
+                assert!(proposal.current.source_url.is_none());
+                assert!(proposal.current.notes.is_none());
+                assert!(proposal.current.model_license.is_none());
+                assert!(proposal.current.parent_model.is_none());
+                {
+                    let probe = embedded::StandardMetadataProbeGuard::install();
+                    probe.fail_reserve_at(1);
+                    probe.stop_at_finish(embedded::StandardMetadataTestStop::Resource(
+                        stl_core::ResourceStop::EnvelopeChanged,
+                    ));
+                    let error = runtime
+                        .read_embedded_metadata(&context, &model.id, model.content_hash.as_deref())
+                        .unwrap_err();
+                    assert_eq!(error.code, RuntimeErrorCode::Internal);
+                    assert!(!error.retryable);
+                    assert_eq!(probe.copies(), 0);
+                    assert_eq!(probe.reserve_attempts(), 1);
+                }
+                for (stop, code, retryable) in [
+                    (
+                        stl_core::ResourceStop::InputLimitExceeded,
+                        RuntimeErrorCode::Unsupported,
+                        false,
+                    ),
+                    (
+                        stl_core::ResourceStop::ReadWorkExceeded,
+                        RuntimeErrorCode::Unsupported,
+                        false,
+                    ),
+                    (
+                        stl_core::ResourceStop::EnvelopeChanged,
+                        RuntimeErrorCode::Stale,
+                        true,
+                    ),
+                ] {
+                    let probe = embedded::StandardMetadataProbeGuard::install();
+                    probe.stop_after_reserve(embedded::StandardMetadataTestStop::Resource(stop));
+                    let error = runtime
+                        .read_embedded_metadata(&context, &model.id, model.content_hash.as_deref())
+                        .unwrap_err();
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.retryable, retryable);
+                    assert_eq!(probe.copies(), 0);
+                    assert_eq!(probe.reserve_attempts(), 1);
+                }
+                {
+                    let probe = embedded::StandardMetadataProbeGuard::install();
+                    probe.stop_at_finish(embedded::StandardMetadataTestStop::Resource(
+                        stl_core::ResourceStop::ReadWorkExceeded,
+                    ));
+                    let error = runtime
+                        .read_embedded_metadata(&context, &model.id, model.content_hash.as_deref())
+                        .unwrap_err();
+                    assert_eq!(error.code, RuntimeErrorCode::Unsupported);
+                    assert!(!error.retryable);
+                    assert_eq!(probe.copies(), 5);
+                }
+                let stored = runtime
+                    .read_db(|db| db.get_model(&model.id))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.metadata_version, model.metadata_version);
+                assert!(stored.metadata.designer.is_none());
+                assert!(stored.metadata.source_url.is_none());
+                assert!(stored.metadata.notes.is_none());
+                assert!(stored.metadata.model_license.is_none());
+                assert!(stored.metadata.parent_model_id.is_none());
+                assert_eq!(fs::read(&source).unwrap(), original);
+            }
+        }
+    }
+
     #[test]
     fn embedded_3mf_metadata_requires_explicit_field_selection_and_source_hash() {
         let temp = tempfile::tempdir().unwrap();
