@@ -984,3 +984,32 @@ compiles against the exact reviewed public source and vendored dependency.
 Hosted verification follows this checkpoint; compilation does not close Windows
 runtime acceptance. Inflation, XML/JSON allocation and whole-producer admission
 still precede immutable publication. See the [parser bounds contract](THUMBNAIL-PARSER-BOUNDS.md).
+
+### Physical 3MF input-storage checkpoint (2026-10-20)
+
+The Free parser admits physical records before caller attribute extraction and
+storage growth, using one private counter owner per parsed Package: 6,000,000
+vertices, 2,000,000 source triangles, 10,000 objects, 100,000 components and
+100,000 build items. Root and actually reached child parts share these counts;
+cached references reuse parsed data. Unused, disabled, duplicate and discarded
+records count, while otherwise-unreferenced ZIP entries remain unread. This is
+a new supported-input policy, separate from the existing flattened-output limit.
+
+Source vectors and new-key object/part maps reserve fallibly. Flattened positions
+and normals reserve before either append. Transform parsing retains twelve stack
+values while validating all tokens, preserving malformed-input priority. A fresh
+Package resets only its physical counters; shared context inflation/read work
+remains cumulative. Ordinary structural errors precede admission; over-limit
+records stop before malformed scalar fields, while under-limit behavior remains.
+
+Five causal tests failed on the old parser's accepted over-limit records before
+implementation. Final frozen-source workspace verification passes 247 core tests plus one existing
+ignored fixture, including eighteen local admission/fault tests and six public
+Stored/Deflate compatibility tests. The same run passes 375 runtime, 209 native
+and 70 server tests. Downstream composition, Clippy, hosted and container results
+are separate gates recorded under `output/input-collections-*`.
+
+Derived part/plate/material containers and owned string lifetimes, allocator
+capacity/overlap, global metadata/producer admission, immutable publication and
+final platform/package gates remain open. These physical counts do not establish
+a hard RAM bound, authorize cleanup or enable the proposed producer allowance.

@@ -1,5 +1,41 @@
 # Thumbnail parser resource prerequisite
 
+## Physical input-record storage checkpoint (2026-10-20)
+
+The parser enforces fixed per-Package limits of 6,000,000 vertices,
+2,000,000 source triangles, 10,000 objects, 100,000 components and 100,000 build
+items. These are new supported-input restrictions: records in unused, unprinted,
+duplicate or discarded definitions count within every actually parsed model part.
+Root and reached children share the counters; a cached child counts once. This
+policy does not read otherwise-unreferenced ZIP entries or disabled targets.
+
+Existing structural prerequisites precede admission. Admission then precedes
+caller attribute extraction and destination growth; an over-limit record is an Input resource
+failure even if its scalar fields are also malformed. Under-limit malformed and
+transform behavior, mesh/component selection and deferred emitted-coordinate
+finiteness remain unchanged. A fresh Package starts fresh physical counters;
+shared context read/inflation work remains cumulative across independent parses.
+
+Source vectors use checked, capped geometric reservations before appending, and
+object/part maps reserve fallibly for new keys. Positions and normals both reserve
+before either output vector appends. Transform parsing uses twelve stack values
+while validating every tail token, preserving ordinary error priority. Concrete
+reserve failures and deterministic admission stops preserve the same observer's
+first cause. HashMap bucket layout and fixed Rc control-block allocation remain
+allocator residuals; this does not promise universal allocation recovery.
+
+Five causal regressions failed on the previous accepting branch. Final workspace
+verification passes 247 core tests (one existing ignored), including 18 local
+admission/fault tests and six independent public Stored/Deflate compatibility
+tests; 375 runtime, 209 native and 70 server tests also pass. Exact downstream,
+hosted and container status must be read from `output/input-collections-*`; these
+local results do not imply those gates passed.
+
+The physical limits do not bound all owned strings, map buckets, spare/reallocation capacity,
+simultaneously live output, SDK/decoder workspaces or process RSS. Derived part,
+plate and material containers remain a later unit. No producer allowance or
+publication authority follows from this policy selection.
+
 ## Current standard-field retention checkpoint (2026-10-20)
 
 Runtime standard embedded metadata retains at most one value for each of five
@@ -121,8 +157,9 @@ fallible SDK-allocation guarantee, RSS bound or completed Owned permit.
   context; it no longer sums declared entry sizes. Context collection is bounded
   before growth, settings are retained once/reparsed without another inflation
   debit, and ordinary EINTR is retried. Its 16 MiB counter is cumulative collected
-  **INPUT**, not every owned name/path/normalized metadata copy. Input mesh/object/
-  component/build collections and aggregate owned metadata remain OPEN. The JSON
+  **INPUT**, not every owned name/path/normalized metadata copy. Physical input mesh/object/
+  component/build collections now use the per-Package limits above. Derived
+  containers and aggregate owned metadata remain OPEN. The JSON
   DOM/auxiliary-array correction is described above; its local bounds do not close
   whole-parser capacity or the flattened-output overlap.
 - `parse.rs` binary/ASCII output admission and checked/fallible growth are active.
@@ -155,8 +192,8 @@ Use a private test-limit override to exercise boundaries without large fixtures.
 | Resource | Initial cap | Enforcement point |
 | --- | --- | --- |
 | ZIP central records / metadata envelope | 10,000 / 16 MiB | Active model facade: intrinsic constructor checks across retries, including local metadata |
-| Aggregate referenced-part input vertices / triangles | 6,000,000 / 2,000,000 proposed | OPEN: before vector growth across the package |
-| Aggregate objects / components / build items | 10,000 / 100,000 / 100,000 proposed | OPEN: before insertion/push across the package |
+| Aggregate referenced-part input vertices / triangles | 6,000,000 / 2,000,000 | Active across actually parsed parts, before caller fields/vector growth; cached parts count once |
+| Aggregate objects / components / build items | 10,000 / 100,000 / 100,000 | Active physical admission before caller fields; duplicates/discarded/disabled records count |
 | Project JSON selected fields | 256 positions per field / 256 Unicode scalars per label | Active private visitor; 8 MiB pre-SDK input guard, fixed default recursion boundary, full semantic tail validation |
 | Collected INPUT text | 16 MiB cumulative | Active core/runtime context, before append; no refund on dropped/invalid UTF-8 input |
 | All owned metadata copies | 16 MiB proposed | OPEN: names/paths/normalized strings/JSON are not covered by input collection |

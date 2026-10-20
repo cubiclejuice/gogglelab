@@ -29,11 +29,11 @@ use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
 use crate::model::{
     MaterialSource, ParsedFilament, ParsedMaterial, ParsedModel, ParsedPart, Plate,
 };
-use crate::package_bounds::{ModelPartReader, PackageProcessingContext, TextRole};
+use crate::package_bounds::{PackageProcessingContext, TextRole};
 use crate::parse::{ParsedStl, StlFormat};
 use crate::vec3::{cross, dot, sub, V3};
 use crate::xml_bounds::XmlEventReader;
-use crate::zip_bounds::{BoundedZipArchive, BoundedZipMember, ZipOpenError, ZipResourceObserver};
+use crate::zip_bounds::{BoundedZipArchive, ZipOpenError, ZipResourceObserver};
 
 /// Zip local-file-header signature. Every 3MF (and every other OPC package)
 /// starts with it; no STL can, so this is the format discriminator.
@@ -254,6 +254,251 @@ thread_local! {
     };
 }
 
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum InputKind {
+    Vertex,
+    Triangle,
+    Object,
+    Component,
+    BuildItem,
+}
+
+const INPUT_LIMITS: [usize; 5] = [6_000_000, 2_000_000, 10_000, 100_000, 100_000];
+
+// Physical source records belong to one Package, not the shared read context.
+struct InputCollections {
+    counts: [usize; 5],
+    limits: [usize; 5],
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    test: Option<InputCollectionsTestSession>,
+}
+
+impl InputCollections {
+    fn new(
+        observer: ZipResourceObserver,
+        #[cfg(test)] test: Option<InputCollectionsTestSession>,
+    ) -> Self {
+        #[cfg(not(test))]
+        let limits = INPUT_LIMITS;
+        #[cfg(test)]
+        let limits = test
+            .as_ref()
+            .map_or(INPUT_LIMITS, |test| test.profile.limits);
+        Self {
+            counts: [0; 5],
+            limits,
+            observer,
+            #[cfg(test)]
+            test,
+        }
+    }
+
+    fn admit(&mut self, kind: InputKind) -> Result<(), StlError> {
+        let index = kind as usize;
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.record(index);
+        }
+        let next = self.counts[index]
+            .checked_add(1)
+            .filter(|&next| next <= self.limits[index]);
+        let Some(next) = next else {
+            return input_stop(&self.observer);
+        };
+        self.counts[index] = next;
+        Ok(())
+    }
+
+    fn ceiling(&self, kind: InputKind, prospective: usize) -> Result<usize, StlError> {
+        prospective
+            .checked_add(self.limits[kind as usize] - self.counts[kind as usize])
+            .ok_or_else(|| input_error(&self.observer))
+    }
+}
+
+fn input_error(observer: &ZipResourceObserver) -> StlError {
+    let _ = observer.stop_io(ResourceStop::InputLimitExceeded);
+    observer.check().expect_err("terminal input stop").into()
+}
+fn input_stop<T>(observer: &ZipResourceObserver) -> Result<T, StlError> {
+    Err(input_error(observer))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum InputReserveSite {
+    Vertices,
+    Triangles,
+    Components,
+    Build,
+    Objects,
+    Parts,
+    Positions,
+    Normals,
+}
+
+fn reserve_input(
+    observer: &ZipResourceObserver,
+    _site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+    reserve: impl FnOnce() -> Result<(), std::collections::TryReserveError>,
+) -> Result<(), StlError> {
+    observer.check()?;
+    #[cfg(test)]
+    let attempt = test.map(|test| {
+        let mut attempts = test.profile.reserves.borrow_mut();
+        attempts[_site as usize] += 1;
+        attempts[_site as usize]
+    });
+    #[cfg(test)]
+    if let Some(test) = test {
+        if test.profile.fail_reserve == Some((_site, attempt.unwrap())) {
+            let _ = observer.allocation_failed_io();
+            observer.check()?;
+        }
+    }
+    if reserve().is_err() {
+        let _ = observer.allocation_failed_io();
+        observer.check()?;
+    }
+    #[cfg(test)]
+    if let Some(test) = test {
+        if let Some((site, at, failure)) = test.profile.stop_after_reserve {
+            if site == _site && Some(at) == attempt {
+                observer.observe_io(&failure.io_error());
+            }
+        }
+    }
+    observer.check()?;
+    Ok(())
+}
+
+fn reserve_input_vec<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    ceiling: usize,
+    observer: &ZipResourceObserver,
+    site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+) -> Result<(), StlError> {
+    let prospective = values
+        .len()
+        .checked_add(additional)
+        .filter(|&n| n <= ceiling)
+        .ok_or_else(|| input_error(observer))?;
+    if prospective <= values.capacity() {
+        return Ok(());
+    }
+    let target = values
+        .capacity()
+        .checked_mul(2)
+        .unwrap_or(ceiling)
+        .max(prospective)
+        .min(ceiling);
+    let _bytes = target
+        .checked_mul(std::mem::size_of::<T>())
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or_else(|| input_error(observer))?;
+    reserve_input(
+        observer,
+        site,
+        #[cfg(test)]
+        test,
+        || values.try_reserve_exact(target - values.len()),
+    )
+}
+
+fn reserve_input_map<K: std::hash::Hash + Eq, V>(
+    values: &mut HashMap<K, V>,
+    key: &K,
+    observer: &ZipResourceObserver,
+    site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+) -> Result<(), StlError> {
+    if values.contains_key(key) || values.len() < values.capacity() {
+        return Ok(());
+    }
+    values
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(std::mem::size_of::<(K, V)>()))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| input_error(observer))?;
+    reserve_input(
+        observer,
+        site,
+        #[cfg(test)]
+        test,
+        || values.try_reserve(1),
+    )
+}
+
+// Private scoped test policy captured once at Package entry, with causal record
+// and reserve observations. Production always uses the fixed supported-input caps.
+#[cfg(test)]
+struct InputCollectionsTestProfile {
+    limits: [usize; 5],
+    packages: std::cell::RefCell<Vec<[usize; 5]>>,
+    reserves: std::cell::RefCell<[usize; 8]>,
+    fail_reserve: Option<(InputReserveSite, usize)>,
+    stop_after_reserve: Option<(InputReserveSite, usize, ParserTestFailure)>,
+    appended: std::cell::RefCell<[usize; 8]>,
+}
+
+#[cfg(test)]
+impl InputCollectionsTestProfile {
+    fn new(limits: [usize; 5]) -> Self {
+        Self {
+            limits,
+            packages: std::cell::RefCell::new(Vec::new()),
+            reserves: std::cell::RefCell::new([0; 8]),
+            fail_reserve: None,
+            stop_after_reserve: None,
+            appended: std::cell::RefCell::new([0; 8]),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InputCollectionsTestSession {
+    profile: Rc<InputCollectionsTestProfile>,
+    package: usize,
+}
+
+#[cfg(test)]
+impl InputCollectionsTestSession {
+    fn capture() -> Option<Self> {
+        INPUT_COLLECTIONS_TEST_PROFILE.with(|slot| {
+            let profile = slot.borrow().clone()?;
+            let package = {
+                let mut packages = profile.packages.borrow_mut();
+                let package = packages.len();
+                packages.push([0; 5]);
+                package
+            };
+            Some(Self { profile, package })
+        })
+    }
+
+    fn record(&self, kind: usize) {
+        self.profile.packages.borrow_mut()[self.package][kind] += 1;
+    }
+    fn appended(&self, site: InputReserveSite, count: usize) {
+        self.profile.appended.borrow_mut()[site as usize] += count;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPUT_COLLECTIONS_TEST_PROFILE:
+        std::cell::RefCell<Option<Rc<InputCollectionsTestProfile>>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
 /// Original input cursor; its private fault seam exists only in parser tests.
 struct PackageInput<'a> {
     inner: Cursor<&'a [u8]>,
@@ -288,6 +533,9 @@ struct Package<'a, 'context> {
     observer: ZipResourceObserver,
     #[cfg(test)]
     probe: Option<Rc<ParserTestProbe>>,
+    #[cfg(test)]
+    input_test: Option<InputCollectionsTestSession>,
+    collections: InputCollections,
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
     context: &'context mut PackageProcessingContext,
@@ -312,11 +560,21 @@ impl<'a, 'context> Package<'a, 'context> {
         if let Some(probe) = &probe {
             probe.state.borrow_mut().constructor_completed = true;
         }
+        #[cfg(test)]
+        let input_test = InputCollectionsTestSession::capture();
+        let collections = InputCollections::new(
+            observer.clone(),
+            #[cfg(test)]
+            input_test.clone(),
+        );
         Ok(Package {
             archive,
             observer,
             #[cfg(test)]
             probe,
+            #[cfg(test)]
+            input_test,
+            collections,
             parts: HashMap::new(),
             materials: Vec::new(),
             context,
@@ -340,32 +598,6 @@ impl<'a, 'context> Package<'a, 'context> {
     fn has(&self, path: &str) -> bool {
         let name = Self::entry_name(path);
         self.archive.file_names().any(|n| n == name)
-    }
-
-    /// Stream one model part through the same actual package and part limits.
-    fn reader<'read>(
-        &'read mut self,
-        path: &str,
-    ) -> Result<
-        BufReader<ModelPartReader<'read, BoundedZipMember<'read, PackageInput<'a>>>>,
-        StlError,
-    > {
-        let name = Self::entry_name(path).to_string();
-        #[cfg(test)]
-        if let Some(probe) = &self.probe {
-            if probe.member == name {
-                probe.state.borrow_mut().armed = true;
-            }
-        }
-        let file = self
-            .archive
-            .by_name(&name)
-            .map_err(|error| missing_part_error(error, path))?;
-        if file.size() > MAX_FILE_BYTES {
-            let _ = self.observer.stop_io(ResourceStop::InputLimitExceeded);
-            self.observer.check()?;
-        }
-        Ok(BufReader::new(self.context.model_reader(file)))
     }
 
     fn collect_text(&mut self, path: &str, role: TextRole) -> Result<String, StlError> {
@@ -401,14 +633,27 @@ impl<'a, 'context> Package<'a, 'context> {
 
     fn part(&mut self, path: &str) -> Result<Rc<ModelPart>, StlError> {
         self.observer.check()?;
-        let key = Self::entry_name(path).to_string();
-        if let Some(p) = self.parts.get(&key) {
+        let key = Self::entry_name(path);
+        if let Some(p) = self.parts.get(key) {
             return Ok(p.clone());
         }
         let observer = self.observer.clone();
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            if probe.member == key {
+                probe.state.borrow_mut().armed = true;
+            }
+        }
         let parsed = {
-            let reader = self.reader(path)?;
-            parse_model_part(reader, path, &observer)
+            let member = self
+                .archive
+                .by_name(key)
+                .map_err(|error| missing_part_error(error, path))?;
+            if member.size() > MAX_FILE_BYTES {
+                return input_stop(&observer);
+            }
+            let reader = BufReader::new(self.context.model_reader(member));
+            parse_model_part(reader, path, &observer, &mut self.collections)
         };
         observer.check()?;
         let parsed = parsed?;
@@ -419,8 +664,22 @@ impl<'a, 'context> Package<'a, 'context> {
                 .take(MAX_STANDARD_MATERIALS.saturating_sub(self.materials.len()))
                 .cloned(),
         );
+        // Cache keys are owned only on misses; bucket growth is fallible.
+        let key = key.to_string();
+        reserve_input_map(
+            &mut self.parts,
+            &key,
+            &observer,
+            InputReserveSite::Parts,
+            #[cfg(test)]
+            self.input_test.as_ref(),
+        )?;
         let rc = Rc::new(parsed);
         self.parts.insert(key, rc.clone());
+        #[cfg(test)]
+        if let Some(test) = &self.input_test {
+            test.appended(InputReserveSite::Parts, 1);
+        }
         #[cfg(test)]
         if path == ROOT_MODEL_FALLBACK {
             if let Some(probe) = &self.probe {
@@ -1223,14 +1482,20 @@ fn attr_transform(e: &BytesStart) -> Result<Mat, StlError> {
     let Some(s) = attr_str(e, b"transform")? else {
         return Ok(IDENTITY);
     };
-    let values: Vec<f32> = s
-        .split_ascii_whitespace()
-        .map(|t| t.parse::<f32>())
-        .collect::<Result<_, _>>()
-        .map_err(|_| malformed("transform has a non-numeric entry"))?;
-    let m: Mat = values
-        .try_into()
-        .map_err(|_| malformed("transform must have 12 entries"))?;
+    let mut m = [0.0; 12];
+    let mut count = 0usize;
+    for token in s.split_ascii_whitespace() {
+        let value = token
+            .parse::<f32>()
+            .map_err(|_| malformed("transform has a non-numeric entry"))?;
+        if count < m.len() {
+            m[count] = value;
+        }
+        count += 1;
+    }
+    if count != m.len() {
+        return Err(malformed("transform must have 12 entries"));
+    }
     if m.iter().any(|v| !v.is_finite()) {
         return Err(malformed("transform has a non-finite entry"));
     }
@@ -1266,6 +1531,7 @@ fn parse_model_part<R: Read>(
     reader: R,
     path: &str,
     observer: &ZipResourceObserver,
+    collections: &mut InputCollections,
 ) -> Result<ModelPart, StlError> {
     let mut xml = XmlEventReader::new(reader, observer.clone())?;
     xml.set_trim_text(true);
@@ -1371,6 +1637,7 @@ fn parse_model_part<R: Read>(
                         }
                     }
                     b"object" => {
+                        collections.admit(InputKind::Object)?;
                         let id = attr_u32(e, "id", "object")?;
                         let kind = attr_str(e, b"type")?.unwrap_or_else(|| "model".into());
                         let printed = matches!(kind.as_str(), "model" | "solidsupport");
@@ -1381,6 +1648,14 @@ fn parse_model_part<R: Read>(
                         let material = optional_appearance_u32(e, b"pid")
                             .zip(optional_appearance_u32(e, b"pindex"));
                         if is_empty {
+                            reserve_input_map(
+                                &mut part.objects,
+                                &id,
+                                observer,
+                                InputReserveSite::Objects,
+                                #[cfg(test)]
+                                collections.test.as_ref(),
+                            )?;
                             part.objects.insert(
                                 id,
                                 Object {
@@ -1394,6 +1669,10 @@ fn parse_model_part<R: Read>(
                                     has_triangle_properties: false,
                                 },
                             );
+                            #[cfg(test)]
+                            if let Some(test) = &collections.test {
+                                test.appended(InputReserveSite::Objects, 1);
+                            }
                         } else {
                             current = Some(OpenObject {
                                 id,
@@ -1411,46 +1690,113 @@ fn parse_model_part<R: Read>(
                         let Some(cur) = current.as_mut() else {
                             return Err(malformed("vertex outside of an object"));
                         };
+                        collections.admit(InputKind::Vertex)?;
                         let v = [
                             attr_f32(e, "x", "vertex")?,
                             attr_f32(e, "y", "vertex")?,
                             attr_f32(e, "z", "vertex")?,
                         ];
+                        let ceiling =
+                            collections.ceiling(InputKind::Vertex, cur.vertices.len() + 1)?;
+                        reserve_input_vec(
+                            &mut cur.vertices,
+                            1,
+                            ceiling,
+                            observer,
+                            InputReserveSite::Vertices,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
                         cur.vertices.push(v);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Vertices, 1);
+                        }
                     }
                     b"triangle" => {
                         let Some(cur) = current.as_mut() else {
                             return Err(malformed("triangle outside of an object"));
                         };
+                        collections.admit(InputKind::Triangle)?;
                         cur.has_triangle_properties |=
                             has_any_attr(e, &[b"pid", b"p1", b"p2", b"p3"]);
-                        cur.triangles.push([
+                        let triangle = [
                             attr_u32(e, "v1", "triangle")?,
                             attr_u32(e, "v2", "triangle")?,
                             attr_u32(e, "v3", "triangle")?,
-                        ]);
+                        ];
+                        let ceiling =
+                            collections.ceiling(InputKind::Triangle, cur.triangles.len() + 1)?;
+                        reserve_input_vec(
+                            &mut cur.triangles,
+                            1,
+                            ceiling,
+                            observer,
+                            InputReserveSite::Triangles,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
+                        cur.triangles.push(triangle);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Triangles, 1);
+                        }
                     }
                     b"component" => {
                         let Some(cur) = current.as_mut() else {
                             return Err(malformed("component outside of an object"));
                         };
-                        cur.components.push(Component {
+                        collections.admit(InputKind::Component)?;
+                        let component = Component {
                             path: attr_str(e, b"path")?,
                             object_id: attr_u32(e, "objectid", "component")?,
                             transform: attr_transform(e)?,
-                        });
+                        };
+                        let ceiling =
+                            collections.ceiling(InputKind::Component, cur.components.len() + 1)?;
+                        reserve_input_vec(
+                            &mut cur.components,
+                            1,
+                            ceiling,
+                            observer,
+                            InputReserveSite::Components,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
+                        cur.components.push(component);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Components, 1);
+                        }
                     }
                     b"build" => in_build = true,
                     b"item" if in_build => {
+                        collections.admit(InputKind::BuildItem)?;
                         let printable = attr_str(e, b"printable")?
                             .map(|p| p.trim() != "0" && !p.trim().eq_ignore_ascii_case("false"))
                             .unwrap_or(true);
-                        part.build.push(BuildItem {
+                        let item = BuildItem {
                             path: attr_str(e, b"path")?,
                             object_id: attr_u32(e, "objectid", "build item")?,
                             transform: attr_transform(e)?,
                             printable,
-                        });
+                        };
+                        let ceiling =
+                            collections.ceiling(InputKind::BuildItem, part.build.len() + 1)?;
+                        reserve_input_vec(
+                            &mut part.build,
+                            1,
+                            ceiling,
+                            observer,
+                            InputReserveSite::Build,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
+                        part.build.push(item);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Build, 1);
+                        }
                     }
                     _ => {}
                 }
@@ -1484,6 +1830,14 @@ fn parse_model_part<R: Read>(
                             triangles,
                         }
                     };
+                    reserve_input_map(
+                        &mut part.objects,
+                        &id,
+                        observer,
+                        InputReserveSite::Objects,
+                        #[cfg(test)]
+                        collections.test.as_ref(),
+                    )?;
                     part.objects.insert(
                         id,
                         Object {
@@ -1494,6 +1848,10 @@ fn parse_model_part<R: Read>(
                             has_triangle_properties,
                         },
                     );
+                    #[cfg(test)]
+                    if let Some(test) = &collections.test {
+                        test.appended(InputReserveSite::Objects, 1);
+                    }
                 }
                 b"basematerials" | b"colorgroup" => material_group = None,
                 b"build" => in_build = false,
@@ -1508,6 +1866,9 @@ fn parse_model_part<R: Read>(
 
 /// Flattened output accumulated across the whole build.
 struct Out {
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    test: Option<InputCollectionsTestSession>,
     positions: Vec<f32>,
     normals: Vec<f32>,
     triangle_count: u32,
@@ -1531,6 +1892,24 @@ impl Out {
                 }
             }
         }
+        reserve_input_vec(
+            &mut self.positions,
+            9,
+            MAX_TRIANGLES as usize * 9,
+            &self.observer,
+            InputReserveSite::Positions,
+            #[cfg(test)]
+            self.test.as_ref(),
+        )?;
+        reserve_input_vec(
+            &mut self.normals,
+            3,
+            MAX_TRIANGLES as usize * 3,
+            &self.observer,
+            InputReserveSite::Normals,
+            #[cfg(test)]
+            self.test.as_ref(),
+        )?;
         for v in &verts {
             self.positions.extend_from_slice(v);
         }
@@ -1546,6 +1925,11 @@ impl Out {
             self.normals.extend_from_slice(&[0.0, 0.0, 0.0]);
         }
         self.triangle_count += 1;
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.appended(InputReserveSite::Positions, 9);
+            test.appended(InputReserveSite::Normals, 3);
+        }
         Ok(())
     }
 }
@@ -1667,8 +2051,11 @@ fn emit_object(
     Ok(())
 }
 
-fn new_out(scale: f32) -> Out {
+fn new_out(scale: f32, collections: &InputCollections) -> Out {
     Out {
+        observer: collections.observer.clone(),
+        #[cfg(test)]
+        test: collections.test.clone(),
         positions: Vec::new(),
         normals: Vec::new(),
         triangle_count: 0,
@@ -1866,7 +2253,7 @@ fn whole_build(
     if let Some(probe) = &pkg.probe {
         probe.record_work();
     }
-    let mut out = new_out(root.scale);
+    let mut out = new_out(root.scale, &pkg.collections);
     let mut parts = Vec::new();
     let occurrences = build_item_occurrences(&root.build)?;
     for (index, item) in root.build.iter().enumerate() {
@@ -2044,7 +2431,7 @@ fn parse_3mf_with_context(
 
     // Transforms are expressed in the model's unit, so unit conversion is
     // applied last, to already-placed coordinates.
-    let mut out = new_out(root.scale);
+    let mut out = new_out(root.scale, &pkg.collections);
     let mut parts = Vec::new();
     let occurrences = build_item_occurrences(&root.build)?;
     let mut plates = Vec::with_capacity(specs.len());
@@ -2298,6 +2685,557 @@ mod tests {
  <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
  <Relationship Target="/Metadata/thumb.png" Id="rel-2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"/>
 </Relationships>"#;
+
+    struct InputCollectionsProfileGuard(Option<Rc<InputCollectionsTestProfile>>);
+
+    impl InputCollectionsProfileGuard {
+        fn install(profile: Rc<InputCollectionsTestProfile>) -> Self {
+            Self(INPUT_COLLECTIONS_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+
+    impl Drop for InputCollectionsProfileGuard {
+        fn drop(&mut self) {
+            INPUT_COLLECTIONS_TEST_PROFILE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    fn input_collection_fixture(kind: usize, count: usize) -> Vec<u8> {
+        let (resources, build) = match kind {
+            0 => (format!("<object id=\"1\" type=\"support\"><mesh><vertices>{}</vertices></mesh></object>",
+                "<vertex x=\"0\" y=\"0\" z=\"0\"/>".repeat(count)), String::new()),
+            1 => (format!("<object id=\"1\" type=\"support\"><mesh><vertices><vertex x=\"0\" y=\"0\" z=\"0\"/></vertices><triangles>{}</triangles></mesh></object>",
+                "<triangle v1=\"0\" v2=\"0\" v3=\"0\"/>".repeat(count)), String::new()),
+            2 => ((0..count).map(|id| format!("<object id=\"{}\"/>", id + 1)).collect::<String>(), String::new()),
+            3 => (format!("<object id=\"2\"/><object id=\"1\"><components>{}</components></object>",
+                "<component objectid=\"2\"/>".repeat(count)), String::new()),
+            4 => ("<object id=\"1\"/>".into(), "<item objectid=\"1\" printable=\"0\"/>".repeat(count)),
+            _ => unreachable!(),
+        };
+        let model = model_xml("millimeter", &resources, &build);
+        package(&[(ROOT_MODEL_FALLBACK, &model)], false)
+    }
+
+    fn assert_input_collection_boundary(kind: usize) {
+        let mut limits = [100; 5];
+        limits[kind] = 2;
+        let profile = Rc::new(InputCollectionsTestProfile::new(limits));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let exact = parse_3mf(&input_collection_fixture(kind, 2)).unwrap();
+        assert_eq!(exact.triangle_count, 0, "records are unused or disabled");
+        assert_eq!(profile.packages.borrow()[0][kind], profile.limits[kind]);
+        let exact_reserves = *profile.reserves.borrow();
+        let exact_appended = *profile.appended.borrow();
+        let excess = parse_3mf(&input_collection_fixture(kind, 3));
+        assert_eq!(profile.packages.borrow().len(), 2, "fresh Package snapshot");
+        assert_eq!(
+            profile.packages.borrow()[1][kind],
+            3,
+            "physical branch reached"
+        );
+        assert!(
+            matches!(
+                excess,
+                Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+            ),
+            "physical input category {kind} must stop at its captured limit; got {excess:?}"
+        );
+        let site = [
+            InputReserveSite::Vertices,
+            InputReserveSite::Triangles,
+            InputReserveSite::Objects,
+            InputReserveSite::Components,
+            InputReserveSite::Build,
+        ][kind] as usize;
+        assert_eq!(
+            profile.reserves.borrow()[site] - exact_reserves[site],
+            exact_reserves[site],
+            "rejected third record must not start another category reserve"
+        );
+        assert_eq!(
+            profile.appended.borrow()[site] - exact_appended[site],
+            exact_appended[site],
+            "rejected third record must not append"
+        );
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            exact_appended[InputReserveSite::Parts as usize],
+            "failed parse must not commit its part"
+        );
+        assert_eq!(
+            profile.reserves.borrow()[InputReserveSite::Parts as usize],
+            exact_reserves[InputReserveSite::Parts as usize],
+            "failed parse must not reserve a cache slot"
+        );
+    }
+
+    #[test]
+    fn input_collections_vertices_exact_and_one_over() {
+        assert_input_collection_boundary(0);
+    }
+    #[test]
+    fn input_collections_triangles_exact_and_one_over() {
+        assert_input_collection_boundary(1);
+    }
+    #[test]
+    fn input_collections_objects_exact_and_one_over() {
+        assert_input_collection_boundary(2);
+    }
+    #[test]
+    fn input_collections_components_exact_and_one_over() {
+        assert_input_collection_boundary(3);
+    }
+    #[test]
+    fn input_collections_build_items_exact_and_one_over() {
+        assert_input_collection_boundary(4);
+    }
+
+    fn assert_input_failure(result: Result<ParsedStl, StlError>, failure: ParserTestFailure) {
+        match (result, failure) {
+            (Err(StlError::ResourceStopped(actual)), ParserTestFailure::Stop(expected)) => {
+                assert_eq!(actual, expected)
+            }
+            (Err(StlError::AllocationFailed), ParserTestFailure::Allocation) => {}
+            (actual, _) => panic!("wrong terminal result: {actual:?}"),
+        }
+    }
+
+    fn input_fault_fixture(site: InputReserveSite) -> Vec<u8> {
+        match site {
+            InputReserveSite::Vertices => input_collection_fixture(0, 3),
+            InputReserveSite::Triangles => input_collection_fixture(1, 3),
+            InputReserveSite::Components => input_collection_fixture(3, 3),
+            InputReserveSite::Build => input_collection_fixture(4, 3),
+            InputReserveSite::Objects | InputReserveSite::Parts => input_collection_fixture(2, 4),
+            InputReserveSite::Positions | InputReserveSite::Normals => {
+                simple_cube("millimeter", false)
+            }
+        }
+    }
+
+    const INPUT_RESERVE_SITES: [InputReserveSite; 8] = [
+        InputReserveSite::Vertices,
+        InputReserveSite::Triangles,
+        InputReserveSite::Components,
+        InputReserveSite::Build,
+        InputReserveSite::Objects,
+        InputReserveSite::Parts,
+        InputReserveSite::Positions,
+        InputReserveSite::Normals,
+    ];
+
+    #[test]
+    fn input_collections_all_reserve_sites_fail_before_commit() {
+        for site in INPUT_RESERVE_SITES {
+            let mut profile = InputCollectionsTestProfile::new([100; 5]);
+            profile.fail_reserve = Some((site, 1));
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert_input_failure(
+                parse_3mf(&input_fault_fixture(site)),
+                ParserTestFailure::Allocation,
+            );
+            assert_eq!(profile.reserves.borrow()[site as usize], 1, "{site:?}");
+            assert_eq!(profile.appended.borrow()[site as usize], 0, "{site:?}");
+            if matches!(site, InputReserveSite::Normals) {
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Positions as usize],
+                    0
+                );
+            }
+            if !matches!(
+                site,
+                InputReserveSite::Positions | InputReserveSite::Normals
+            ) {
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Parts as usize],
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_collections_post_reserve_first_cause_stops_before_append() {
+        for site in INPUT_RESERVE_SITES {
+            for failure in PARSER_TEST_FAILURES {
+                let mut profile = InputCollectionsTestProfile::new([100; 5]);
+                profile.stop_after_reserve = Some((site, 1, failure));
+                let profile = Rc::new(profile);
+                let _guard = InputCollectionsProfileGuard::install(profile.clone());
+                assert_input_failure(parse_3mf(&input_fault_fixture(site)), failure);
+                assert_eq!(profile.reserves.borrow()[site as usize], 1);
+                assert_eq!(profile.appended.borrow()[site as usize], 0);
+                if site == InputReserveSite::Positions {
+                    assert_eq!(
+                        profile.reserves.borrow()[InputReserveSite::Normals as usize],
+                        0
+                    );
+                }
+                if site == InputReserveSite::Normals {
+                    assert_eq!(
+                        profile.appended.borrow()[InputReserveSite::Positions as usize],
+                        0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_collections_second_source_growth_keeps_only_previous_records() {
+        for (site, previous) in [
+            (InputReserveSite::Vertices, 1),
+            (InputReserveSite::Triangles, 1),
+            (InputReserveSite::Components, 1),
+            (InputReserveSite::Build, 1),
+        ] {
+            let mut profile = InputCollectionsTestProfile::new([100; 5]);
+            profile.fail_reserve = Some((site, 2));
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert_input_failure(
+                parse_3mf(&input_fault_fixture(site)),
+                ParserTestFailure::Allocation,
+            );
+            assert_eq!(profile.reserves.borrow()[site as usize], 2);
+            assert_eq!(profile.appended.borrow()[site as usize], previous);
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Parts as usize],
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn input_collections_cross_part_cache_and_fresh_package_share_read_context_only() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1"><components><component objectid="2" path="/3D/child.model"/><component objectid="2" path="3D/child.model"/></components></object>"#,
+            r#"<item objectid="1"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        );
+        let profile = Rc::new(InputCollectionsTestProfile::new([8, 12, 2, 2, 1]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let first = parse_3mf_with_plates_in_context(&bytes, &mut context).unwrap();
+        let first_usage = context.usage();
+        assert_eq!(first.model.triangle_count, 24);
+        let second = parse_3mf_with_plates_in_context(&bytes, &mut context).unwrap();
+        assert_eq!(second.model.triangle_count, 24);
+        assert_eq!(
+            context.usage().inflation_bytes,
+            first_usage.inflation_bytes * 2
+        );
+        assert_eq!(*profile.packages.borrow(), vec![[8, 12, 2, 2, 1]; 2]);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            4
+        );
+    }
+
+    #[test]
+    fn input_collections_distinct_parts_cumulate_before_geometry() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1"><mesh><vertices><vertex x="0" y="0" z="0"/></vertices></mesh><components><component objectid="2" path="/3D/child.model"/></components></object>"#,
+            r#"<item objectid="1"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            false,
+        );
+        let profile = Rc::new(InputCollectionsTestProfile::new([8, 100, 100, 100, 100]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        assert_input_failure(
+            parse_3mf(&bytes),
+            ParserTestFailure::Stop(ResourceStop::InputLimitExceeded),
+        );
+        assert_eq!(profile.packages.borrow()[0][0], 9);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Positions as usize],
+            0
+        );
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn input_collections_discarded_mesh_duplicates_and_disabled_records_still_count() {
+        let xml = model_xml(
+            "millimeter",
+            r#"<object id="1"><mesh><vertices><vertex x="NaN" y="0" z="0"/></vertices><triangles><triangle v1="99" v2="99" v3="99"/></triangles></mesh><components><component objectid="2"/></components></object><object id="1"/><object id="2"/>"#,
+            r#"<item objectid="1" printable="0" path="missing.model"/>"#,
+        );
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+        let profile = Rc::new(InputCollectionsTestProfile::new([1, 1, 3, 1, 1]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        assert_eq!(parse_3mf(&bytes).unwrap().triangle_count, 0);
+        assert_eq!(profile.packages.borrow()[0], [1, 1, 3, 1, 1]);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn input_collections_nested_open_object_overwrite_does_not_refund_physical_records() {
+        let xml = model_xml(
+            "millimeter",
+            r#"<object id="1"><mesh><vertices><vertex x="0" y="0" z="0"/></vertices></mesh><object id="2"><mesh><vertices><vertex x="1" y="0" z="0"/></vertices></mesh></object></object>"#,
+            "",
+        );
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+        let profile = Rc::new(InputCollectionsTestProfile::new([2, 0, 2, 0, 0]));
+        {
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            // Existing permissive opening behavior overwrites OpenObject; the
+            // final outer close still reports its existing unbalanced error.
+            let result = parse_3mf(&bytes);
+            assert!(
+                matches!(result, Err(StlError::Malformed3mf { ref detail }) if detail == "unbalanced </object>")
+            );
+            assert_eq!(profile.packages.borrow()[0], [2, 0, 2, 0, 0]);
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Vertices as usize],
+                2
+            );
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Objects as usize],
+                1
+            );
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Parts as usize],
+                0
+            );
+        }
+        let profile = Rc::new(InputCollectionsTestProfile::new([2, 0, 1, 0, 0]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        assert_input_failure(
+            parse_3mf(&bytes),
+            ParserTestFailure::Stop(ResourceStop::InputLimitExceeded),
+        );
+        assert_eq!(profile.packages.borrow()[0], [1, 0, 2, 0, 0]);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Vertices as usize],
+            1
+        );
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Objects as usize],
+            0
+        );
+    }
+
+    #[test]
+    fn input_collections_overcap_attributes_stop_but_structural_errors_keep_priority() {
+        for (kind, resources, build) in [
+            (0, "<object id=\"1\"><mesh><vertices><vertex x=\"bad\"/></vertices></mesh></object>", ""),
+            (1, "<object id=\"1\"><mesh><triangles><triangle v1=\"bad\"/></triangles></mesh></object>", ""),
+            (2, "<object id=\"bad\"/>", ""),
+            (3, "<object id=\"1\"><components><component objectid=\"bad\"/></components></object>", ""),
+            (4, "<object id=\"1\"/>", "<item objectid=\"bad\"/>"),
+        ] {
+            let xml = model_xml("millimeter", resources, build);
+            let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+            assert!(matches!(parse_3mf(&bytes), Err(StlError::Malformed3mf { .. })));
+            let mut limits = [100; 5]; limits[kind] = 0;
+            let profile = Rc::new(InputCollectionsTestProfile::new(limits));
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert_input_failure(parse_3mf(&bytes), ParserTestFailure::Stop(ResourceStop::InputLimitExceeded));
+            assert_eq!(profile.packages.borrow()[0][kind], 1);
+        }
+        for record in ["<vertex/>", "<triangle/>", "<component/>"] {
+            let xml = model_xml("millimeter", record, "");
+            let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+            let profile = Rc::new(InputCollectionsTestProfile::new([0; 5]));
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert!(matches!(
+                parse_3mf(&bytes),
+                Err(StlError::Malformed3mf { .. })
+            ));
+            assert_eq!(profile.packages.borrow()[0], [0; 5]);
+        }
+    }
+
+    #[test]
+    fn input_collections_second_map_growth_is_fallible_without_committing_pending_key() {
+        for site in [InputReserveSite::Objects, InputReserveSite::Parts] {
+            // Discover the current standard library layout using the actual map
+            // types. Bucket capacity is not part of the supported-input policy.
+            let initial_capacity = if site == InputReserveSite::Objects {
+                let mut map = HashMap::<u32, Object>::new();
+                map.try_reserve(1).unwrap();
+                map.capacity()
+            } else {
+                let mut map = HashMap::<String, Rc<ModelPart>>::new();
+                map.try_reserve(1).unwrap();
+                map.capacity()
+            };
+            assert!(
+                (1..=32).contains(&initial_capacity),
+                "keep this a tiny fixture"
+            );
+            let mut profile = InputCollectionsTestProfile::new([100; 5]);
+            profile.fail_reserve = Some((site, 2));
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            if site == InputReserveSite::Objects {
+                assert_input_failure(
+                    parse_3mf(&input_collection_fixture(2, initial_capacity + 1)),
+                    ParserTestFailure::Allocation,
+                );
+                assert_eq!(profile.appended.borrow()[site as usize], initial_capacity);
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Parts as usize],
+                    0
+                );
+            } else {
+                let model = model_xml("millimeter", "<object id=\"1\"/>", "");
+                let names = (0..=initial_capacity)
+                    .map(|index| format!("part-{index}.model"))
+                    .collect::<Vec<_>>();
+                let entries = names
+                    .iter()
+                    .map(|name| (name.as_str(), model.as_str()))
+                    .collect::<Vec<_>>();
+                let bytes = package(&entries, false);
+                let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+                let mut pkg = Package::open(&bytes, &mut context).unwrap();
+                for path in &names[..initial_capacity] {
+                    pkg.part(path).unwrap();
+                }
+                let pending = &names[initial_capacity];
+                assert!(matches!(pkg.part(pending), Err(StlError::AllocationFailed)));
+                assert_eq!(pkg.parts.len(), initial_capacity);
+                assert!(!pkg.parts.contains_key(pending));
+            }
+            assert_eq!(profile.reserves.borrow()[site as usize], 2);
+        }
+    }
+
+    #[test]
+    fn input_collections_output_pair_never_partially_appends_on_first_or_second_reserve() {
+        for site in [InputReserveSite::Positions, InputReserveSite::Normals] {
+            for failure in PARSER_TEST_FAILURES {
+                let mut profile = InputCollectionsTestProfile::new([100; 5]);
+                profile.stop_after_reserve = Some((site, 1, failure));
+                let profile = Rc::new(profile);
+                let _guard = InputCollectionsProfileGuard::install(profile.clone());
+                let collections = InputCollections::new(
+                    ZipResourceObserver::new(),
+                    InputCollectionsTestSession::capture(),
+                );
+                let mut out = new_out(1.0, &collections);
+                let result = out.push_triangle([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
+                assert!(out.positions.is_empty());
+                assert!(out.normals.is_empty());
+                assert_eq!(out.triangle_count, 0);
+                assert_input_failure(result.map(|()| finish_model(out)), failure);
+                // Probe lengths reflect the actual append sites, not capacity changes.
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Positions as usize],
+                    0
+                );
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Normals as usize],
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_collections_prior_stop_starts_no_package_or_reserve_work() {
+        for failure in PARSER_TEST_FAILURES {
+            let observer = ZipResourceObserver::new();
+            observer.observe_io(&failure.io_error());
+            let profile = Rc::new(InputCollectionsTestProfile::new([100; 5]));
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            let mut context = PackageProcessingContext::new(observer);
+            assert_input_failure(
+                parse_3mf_with_plates_in_context(&simple_cube("millimeter", false), &mut context)
+                    .map(|model| model.model),
+                failure,
+            );
+            assert_eq!(*profile.reserves.borrow(), [0; 8]);
+            assert!(profile.packages.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn input_collections_failed_part_keeps_admissions_and_cache_hits_charge_nothing() {
+        let invalid = model_xml(
+            "millimeter",
+            "<object id=\"1\"><mesh><vertices><vertex x=\"bad\"/></vertices></mesh></object>",
+            "",
+        );
+        let valid = model_xml("millimeter", "<object id=\"1\"><mesh><vertices><vertex x=\"0\" y=\"0\" z=\"0\"/></vertices></mesh></object>", "");
+        let bytes = package(&[("bad.model", &invalid), ("good.model", &valid)], false);
+        let profile = Rc::new(InputCollectionsTestProfile::new([1, 10, 10, 10, 10]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        assert!(matches!(
+            pkg.part("bad.model"),
+            Err(StlError::Malformed3mf { .. })
+        ));
+        assert_eq!(pkg.collections.counts[0], 1);
+        assert!(pkg.parts.is_empty());
+        assert!(matches!(
+            pkg.part("good.model"),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        assert!(pkg.parts.is_empty());
+        assert_eq!(profile.packages.borrow()[0][0], 2);
+
+        let profile = Rc::new(InputCollectionsTestProfile::new([1, 10, 10, 10, 10]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        let first = pkg.part("good.model").unwrap();
+        let usage = pkg.context.usage();
+        let second = pkg.part("/good.model").unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(pkg.context.usage().inflation_bytes, usage.inflation_bytes);
+        assert_eq!(profile.packages.borrow()[0][0], 1);
+    }
+
+    #[test]
+    fn input_collections_local_growth_ceiling_includes_pending_and_remaining() {
+        let observer = ZipResourceObserver::new();
+        let mut collections = InputCollections::new(observer.clone(), None);
+        collections.limits[InputKind::Vertex as usize] = 3;
+        let mut vertices = Vec::<[f32; 3]>::new();
+        for _ in 0..3 {
+            collections.admit(InputKind::Vertex).unwrap();
+            let ceiling = collections
+                .ceiling(InputKind::Vertex, vertices.len() + 1)
+                .unwrap();
+            assert_eq!(ceiling, 3);
+            reserve_input_vec(
+                &mut vertices,
+                1,
+                ceiling,
+                &observer,
+                InputReserveSite::Vertices,
+                None,
+            )
+            .unwrap();
+            vertices.push([0.0; 3]);
+        }
+        assert_eq!(vertices.len(), 3);
+        assert!(matches!(
+            collections.admit(InputKind::Vertex),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+    }
 
     /// Axis-aligned 10 mm cube with outward-consistent winding, as a 3MF mesh.
     fn cube_mesh_xml(id: u32) -> String {
@@ -2565,7 +3503,10 @@ mod tests {
             1,
             &IDENTITY,
             0,
-            &mut new_out(1.0),
+            &mut new_out(
+                1.0,
+                &InputCollections::new(ZipResourceObserver::new(), None),
+            ),
             &mut StandardAppearance::Empty,
         )
         .unwrap();
@@ -2597,7 +3538,10 @@ mod tests {
                 999,
                 &IDENTITY,
                 0,
-                &mut new_out(1.0),
+                &mut new_out(
+                    1.0,
+                    &InputCollections::new(ZipResourceObserver::new(), None)
+                ),
                 &mut StandardAppearance::Empty,
             ),
             Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
