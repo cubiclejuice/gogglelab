@@ -22,7 +22,7 @@ use quick_xml::Reader;
 use quick_xml::XmlVersion;
 use serde_json::Value;
 
-use crate::error::StlError;
+use crate::error::{ResourceStop, StlError};
 use crate::limits::{MAX_3MF_INFLATED_BYTES, MAX_TRIANGLES};
 use crate::model::{
     MaterialSource, ParsedFilament, ParsedMaterial, ParsedModel, ParsedPart, Plate,
@@ -41,6 +41,9 @@ const ROOT_MODEL_FALLBACK: &str = "3D/3dmodel.model";
 /// deeper than this is a cycle or a hostile file, and is refused rather than
 /// recursed into.
 const MAX_COMPONENT_DEPTH: u32 = 32;
+// Bounds traversal work, including shared subgraphs with no output triangles.
+// This is not a bound on parser memory or process RSS.
+const MAX_COMPONENT_VISITS: u64 = 10_000_000;
 
 /// Row-major 4x3 affine matrix in the order 3MF writes it:
 /// `m00 m01 m02 m10 m11 m12 m20 m21 m22 m30 m31 m32`, applied to row vectors
@@ -155,6 +158,7 @@ struct Package<'a> {
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
     inflated: u64,
+    component_visits_remaining: u64,
 }
 
 impl<'a> Package<'a> {
@@ -166,7 +170,16 @@ impl<'a> Package<'a> {
             parts: HashMap::new(),
             materials: Vec::new(),
             inflated: 0,
+            component_visits_remaining: MAX_COMPONENT_VISITS,
         })
+    }
+
+    fn charge_component_work(&mut self) -> Result<(), StlError> {
+        self.component_visits_remaining = self
+            .component_visits_remaining
+            .checked_sub(1)
+            .ok_or(ResourceStop::InputLimitExceeded)?;
+        Ok(())
     }
 
     /// Zip entry names never carry the leading slash that OPC part URIs do.
@@ -724,12 +737,14 @@ fn boundary_name(
 }
 
 fn component_part_metadata_paths(
+    pkg: &mut Package<'_>,
     root: &ModelPart,
     root_path: &str,
-) -> HashMap<u32, HashSet<String>> {
+) -> Result<HashMap<u32, HashSet<String>>, StlError> {
     let root_path = Package::entry_name(root_path);
     let mut paths = HashMap::new();
     for item in &root.build {
+        pkg.charge_component_work()?;
         if !item.printable {
             continue;
         }
@@ -745,6 +760,7 @@ fn component_part_metadata_paths(
             continue;
         };
         for component in components {
+            pkg.charge_component_work()?;
             let path =
                 Package::entry_name(component.path.as_deref().unwrap_or(item_path)).to_owned();
             paths
@@ -753,7 +769,7 @@ fn component_part_metadata_paths(
                 .insert(path);
         }
     }
-    paths
+    Ok(paths)
 }
 
 fn component_part_metadata_ambiguous(
@@ -765,12 +781,32 @@ fn component_part_metadata_ambiguous(
         .is_some_and(|paths| paths.len() > 1)
 }
 
+enum PlateResolutionError {
+    Metadata(String),
+    Source(StlError),
+}
+
+impl From<String> for PlateResolutionError {
+    fn from(detail: String) -> Self {
+        Self::Metadata(detail)
+    }
+}
+
+impl std::fmt::Display for PlateResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Metadata(detail) => formatter.write_str(detail),
+            Self::Source(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
 fn resolve_plate_items(
     pkg: &mut Package,
     root_path: &str,
     root: &ModelPart,
     specs: &[PlateSpec],
-) -> Result<Vec<Vec<usize>>, String> {
+) -> Result<Vec<Vec<usize>>, PlateResolutionError> {
     // Slicer instance ids are occurrence numbers for a given object id. Count
     // every build entry, including disabled entries, before geometry filtering.
     let mut occurrences: HashMap<u32, u32> = HashMap::new();
@@ -800,7 +836,8 @@ fn resolve_plate_items(
                 return Err(format!(
                     "object {} instance {} is assigned more than once",
                     assignment.object_id, assignment.instance_id
-                ));
+                )
+                .into());
             }
             plate_items.push(index);
         }
@@ -816,9 +853,11 @@ fn resolve_plate_items(
                 item.object_id,
                 0,
             )
-            .map_err(|e| e.to_string())?
+            .map_err(PlateResolutionError::Source)?
         {
-            return Err("plate metadata does not assign every printable build item".into());
+            return Err(PlateResolutionError::Metadata(
+                "plate metadata does not assign every printable build item".into(),
+            ));
         }
     }
     Ok(resolved)
@@ -831,6 +870,7 @@ fn object_has_geometry(
     id: u32,
     depth: u32,
 ) -> Result<bool, StlError> {
+    pkg.charge_component_work()?;
     if depth > MAX_COMPONENT_DEPTH {
         return Err(malformed("component nesting is too deep or cyclic"));
     }
@@ -1327,6 +1367,7 @@ fn emit_object(
     out: &mut Out,
     appearance: &mut StandardAppearance,
 ) -> Result<(), StlError> {
+    pkg.charge_component_work()?;
     if depth > MAX_COMPONENT_DEPTH {
         return Err(malformed("component nesting is too deep or cyclic"));
     }
@@ -1410,6 +1451,9 @@ fn emit_build_item(
     if !item.printable {
         return Ok(());
     }
+    // Build-item emission handles a component root directly instead of calling
+    // emit_object for it. Charge that lookup against the same package budget.
+    pkg.charge_component_work()?;
     let path = item.path.as_deref().unwrap_or(root_path);
     let source_part = pkg.part(path)?;
     let object = source_part
@@ -1620,13 +1664,21 @@ fn whole_build(
 /// Geometry is emitted once, grouped in display order so each plate is a
 /// contiguous range of the aggregate model.
 pub fn parse_3mf_with_plates(bytes: &[u8]) -> Result<ParsedModel, StlError> {
+    parse_3mf_with_component_visit_limit(bytes, MAX_COMPONENT_VISITS)
+}
+
+fn parse_3mf_with_component_visit_limit(
+    bytes: &[u8],
+    component_visit_limit: u64,
+) -> Result<ParsedModel, StlError> {
     if bytes.is_empty() {
         return Err(StlError::EmptyFile);
     }
     let mut pkg = Package::open(bytes)?;
+    pkg.component_visits_remaining = component_visit_limit;
     let root_path = pkg.root_model_path()?;
     let root = pkg.part(&root_path)?;
-    let component_paths = component_part_metadata_paths(&root, &root_path);
+    let component_paths = component_part_metadata_paths(&mut pkg, &root, &root_path)?;
 
     let settings_result = pkg.optional_text(MODEL_SETTINGS_PATH);
     let slicer = settings_result
@@ -1684,6 +1736,9 @@ pub fn parse_3mf_with_plates(bytes: &[u8]) -> Result<ParsedModel, StlError> {
     let specs = settings.expect("all other metadata branches return");
     let resolved = match resolve_plate_items(&mut pkg, &root_path, &root, &specs) {
         Ok(resolved) => resolved,
+        Err(PlateResolutionError::Source(error @ StlError::ResourceStopped(_))) => {
+            return Err(error);
+        }
         Err(detail) => {
             return whole_build(
                 &mut pkg,
@@ -1830,6 +1885,237 @@ mod tests {
         format!(
             r#"<plate><metadata key="plater_id" value="{id}"/><metadata key="plater_name" value="{name}"/>{instances}</plate>"#
         )
+    }
+
+    // Seven stored objects/twelve edges, but 127 visits when expanded. Keep
+    // this small; never exercise a depth-32 exponential fixture.
+    fn shared_binary_dag(depth: u32, geometry: bool) -> String {
+        let mut resources = String::new();
+        for id in 1..=depth {
+            let child = id + 1;
+            resources.push_str(&format!(
+                r#"<object id="{id}" type="model"><components><component objectid="{child}"/><component objectid="{child}"/></components></object>"#
+            ));
+        }
+        let leaf = depth + 1;
+        if geometry {
+            resources.push_str(&cube_mesh_xml(leaf));
+        } else {
+            resources.push_str(&format!(
+                r#"<object id="{leaf}" type="model"><mesh><vertices/><triangles/></mesh></object>"#
+            ));
+        }
+        resources
+    }
+
+    fn assert_visit_stop(result: Result<ParsedModel, StlError>) {
+        assert!(matches!(
+            result,
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+    }
+
+    #[test]
+    fn component_visit_budget_bounds_empty_dag_whole_build_and_plate_emission() {
+        let root = model_xml(
+            "millimeter",
+            &shared_binary_dag(6, false),
+            r#"<item objectid="1"/>"#,
+        );
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let parsed = parse_3mf_with_component_visit_limit(&bytes, 130).unwrap();
+        assert!(!parsed.plate_metadata);
+        assert_eq!(parsed.model.triangle_count, 0);
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 64));
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 129));
+
+        let settings = plate_settings(&plate_xml(1, "Assigned", &[(1, 0)]));
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &root),
+                (MODEL_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        assert!(
+            parse_3mf_with_component_visit_limit(&bytes, 130)
+                .unwrap()
+                .plate_metadata
+        );
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 64));
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 129));
+    }
+
+    #[test]
+    fn component_visit_budget_membership_stop_is_terminal_not_plate_fallback() {
+        let root = model_xml(
+            "millimeter",
+            &shared_binary_dag(6, false),
+            r#"<item objectid="1"/>"#,
+        );
+        let settings = plate_settings(&plate_xml(1, "Empty", &[]));
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &root),
+                (MODEL_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        let parsed = parse_3mf_with_component_visit_limit(&bytes, 130).unwrap();
+        assert!(parsed.plate_metadata);
+        assert_eq!(parsed.model.triangle_count, 0);
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 64));
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 129));
+    }
+
+    #[test]
+    fn component_visit_budget_is_shared_across_parts_build_items_and_plates() {
+        let child = model_xml("millimeter", &shared_binary_dag(4, false), "");
+        let item = r#"<item p:path="/3D/Objects/child.model" objectid="1"/>"#;
+        let single = model_xml("millimeter", "", item);
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &single),
+                ("3D/Objects/child.model", &child),
+            ],
+            false,
+        );
+        parse_3mf_with_component_visit_limit(&bytes, 32).unwrap();
+        let root = model_xml("millimeter", "", &item.repeat(2));
+        let settings = plate_settings(&format!(
+            "{}{}",
+            plate_xml(1, "First", &[(1, 0)]),
+            plate_xml(2, "Second", &[(1, 1)])
+        ));
+        for with_plates in [false, true] {
+            let mut entries = vec![
+                ("3D/3dmodel.model", root.as_str()),
+                ("3D/Objects/child.model", child.as_str()),
+            ];
+            if with_plates {
+                entries.push((MODEL_SETTINGS_PATH, settings.as_str()));
+            }
+            let bytes = package(&entries, false);
+            let parsed = parse_3mf_with_component_visit_limit(&bytes, 64).unwrap();
+            assert_eq!(parsed.plate_metadata, with_plates);
+            assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 50));
+            assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 63));
+        }
+    }
+
+    #[test]
+    fn component_visit_budget_is_not_reset_between_membership_and_fallback() {
+        let root = model_xml(
+            "millimeter",
+            &shared_binary_dag(6, true),
+            r#"<item objectid="1"/>"#,
+        );
+        let settings = plate_settings(&plate_xml(1, "Unassigned", &[]));
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &root),
+                (MODEL_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        // Diagnostics charge three units; membership visits seven; fallback emits 127.
+        let parsed = parse_3mf_with_component_visit_limit(&bytes, 137).unwrap();
+        assert!(!parsed.plate_metadata);
+        assert_eq!(parsed.model.triangle_count, 64 * 12);
+        assert_eq!(
+            parsed.plate_warning.as_deref(),
+            Some("Plate metadata is unusable (plate metadata does not assign every printable build item); showing the whole build.")
+        );
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 136));
+    }
+
+    #[test]
+    fn component_visit_budget_bounds_repeated_diagnostic_component_edges() {
+        let components = r#"<component objectid="2"/>"#.repeat(4);
+        let resources = format!(
+            r#"<object id="1" type="model"><components>{components}</components></object><object id="2" type="model"><mesh><vertices/><triangles/></mesh></object>"#
+        );
+        let root = model_xml(
+            "millimeter",
+            &resources,
+            &r#"<item objectid="1"/>"#.repeat(4),
+        );
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let mut pkg = Package::open(&bytes).unwrap();
+        let root = pkg.part("3D/3dmodel.model").unwrap();
+        // Four build roots plus sixteen diagnostic edge iterations. Repeated
+        // paths still cost work even though the resulting set contains one path.
+        pkg.component_visits_remaining = 19;
+        assert!(matches!(
+            component_part_metadata_paths(&mut pkg, &root, "3D/3dmodel.model"),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        pkg.component_visits_remaining = 20;
+        let paths = component_part_metadata_paths(&mut pkg, &root, "3D/3dmodel.model").unwrap();
+        assert_eq!(paths[&2].len(), 1);
+        assert_eq!(pkg.component_visits_remaining, 0);
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 19));
+        // The same budget must also fund four five-visit emissions afterward.
+        parse_3mf_with_component_visit_limit(&bytes, 40).unwrap();
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 39));
+    }
+
+    #[test]
+    fn component_visit_budget_direct_walk_exact_boundary_is_127() {
+        let root = model_xml("millimeter", &shared_binary_dag(6, false), "");
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let mut pkg = Package::open(&bytes).unwrap();
+        pkg.component_visits_remaining = 127;
+        assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());
+        assert_eq!(pkg.component_visits_remaining, 0);
+        pkg.component_visits_remaining = 126;
+        assert!(matches!(
+            object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        pkg.component_visits_remaining = 127;
+        emit_object(
+            &mut pkg,
+            "3D/3dmodel.model",
+            1,
+            &IDENTITY,
+            0,
+            &mut new_out(1.0),
+            &mut StandardAppearance::Empty,
+        )
+        .unwrap();
+        assert_eq!(pkg.component_visits_remaining, 0);
+    }
+
+    #[test]
+    fn component_visit_budget_debits_before_lookup_and_counts_cached_empty_objects() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1" type="support"><mesh><vertices/><triangles/></mesh></object>"#,
+            "",
+        );
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let mut pkg = Package::open(&bytes).unwrap();
+        pkg.part("3D/3dmodel.model").unwrap();
+        pkg.component_visits_remaining = 1;
+        assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());
+        assert_eq!(pkg.component_visits_remaining, 0);
+        assert!(matches!(
+            object_has_geometry(&mut pkg, "missing.model", 999, 0),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        assert!(matches!(
+            emit_object(
+                &mut pkg,
+                "missing.model",
+                999,
+                &IDENTITY,
+                0,
+                &mut new_out(1.0),
+                &mut StandardAppearance::Empty,
+            ),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
     }
 
     fn cube_mesh_with_object_attrs_xml(id: u32, attrs: &str) -> String {

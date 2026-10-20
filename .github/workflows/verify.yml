@@ -71,11 +71,14 @@ jobs:
 
       # These packages do not depend on the Tauri desktop application. Server
       # tests create their own temporary web fixtures; no bundled assets are needed.
+      - name: Test vendored dependency license collection
+        run: python3 -m unittest discover -s scripts -p test_prepare_licenses.py
+
       - name: Test public Linux headless packages
-        run: cargo test -p library-core -p library-runtime -p library-server --all-targets --locked -- --test-threads=1
+        run: cargo test -p stl-core -p library-core -p library-runtime -p library-server --all-targets --locked -- --test-threads=1
 
       - name: Lint public Linux headless packages
-        run: cargo clippy -p library-core -p library-runtime -p library-server --all-targets --locked
+        run: cargo clippy -p stl-core -p library-core -p library-runtime -p library-server --all-targets --locked
 
       - name: Build public Linux server binary
         run: cargo build -p library-server --bin gogglelab-server --locked
@@ -111,4 +114,4 @@ jobs:
       # Compile test bodies too, including cfg(windows); this does not execute
       # Windows binaries or replace the separate friend-run native acceptance gate.
       - name: Compile public core/runtime and test targets for Windows GNU
-        run: cargo check -p library-core -p library-runtime --all-targets --target x86_64-pc-windows-gnu --locked
+        run: cargo check -p stl-core -p library-core -p library-runtime --all-targets --target x86_64-pc-windows-gnu --locked

@@ -54,6 +54,7 @@ Use a private test-limit override to exercise boundaries without large fixtures.
 | Model settings / project metadata / root relationships | 8 MiB / 8 MiB / 64 KiB | Declared check plus actual bounded read |
 | Actual inflated read work | 512 MiB per package parse | Shared counter on bytes delivered, including repeated real reads |
 | Encoded PNG | 4 MiB | Sink refuses the next write before exceeding the limit |
+| Component processing work | 10,000,000 visits | Shared by diagnostic scans, membership checks and emission; checked before work |
 
 Retain existing 100 MiB model input, 2,000,000 flattened triangles, component depth
 32, viewer plates 256, viewer parts 1,024, standard materials 1,024 and embedded
@@ -162,6 +163,18 @@ allocation/fallback behavior, not regressions introduced by the unwired foundati
   preflight copy. Parsing one retained settings string twice is not two inflated
   reads. Temporary numeric coordinate strings are not permanently retained text;
   keep live storage charges distinct from bounded total processing work.
+- **High — component traversal work:** declared component counts, depth 32 and the
+  flattened triangle cap do not bound repeated walks through a shared component
+  graph. A binary DAG with 33 objects and 64 edges ending in a printed empty mesh
+  can require billions of visits while emitting no triangles. Both
+  `object_has_geometry` and `emit_object` need one package-wide traversal-work
+  allowance, checked on every visit across metadata validation and emission.
+  Include the preliminary `component_part_metadata_paths` walk: repeated build
+  roots otherwise multiply its component scans and path allocations before either
+  recursive function runs. Charge before lookup/iteration/allocation there too.
+  Preserve repeated-instance semantics; memoizing empty geometry alone does not
+  bound all instance walks. This is an existing parser gap, not a regression from
+  the unwired foundations.
 
 The bounded encoder/finalization slice is verified at `fc23b4a`: all five new
 boundary/byte-equivalence/footer tests pass on macOS and Linux; workspace checks,
@@ -193,6 +206,30 @@ Close typed propagation and constructor/local-header binding before package-wide
 parser/JSON changes and producer allowance. These findings remain open until their
 implementation tests pass; no unsafe producer wiring is authorized by this plan.
 
+### Constructor and traversal foundation checkpoint
+
+The local candidate includes a narrow ZIP 8.6 patch with an opt-in bounded
+constructor; the original constructor and `Config` retain their behavior. The
+constructor tracks physical records, encoded metadata, allocation work, candidates,
+actual metadata reads and read/seek calls across retries. Actual allocator failure
+remains a separate sticky operational error. The source records its upstream
+revision and original license in `vendor/zip/GOGGLELAB-PROVENANCE.md`.
+
+No production ZIP caller uses this API yet. Later local-header checks, payload
+limits, source consistency and complete typed fallback propagation remain gates.
+The component work guard is active in parsing, including the preliminary metadata
+walk; its exhaustion is terminal through plate resolution. It preserves normal
+instance multiplicity and the existing depth/triangle limits.
+
+Focused offline validation passes 100 parser tests, including 19 bounded-ZIP and
+seven component-budget regressions, with one existing ignored fixture. Parser
+Clippy and formatting pass; unchanged material/test-helper warnings remain.
+Three license-inventory regressions pass and fail against the previous collector.
+An actual offline notice audit includes ZIP's original MIT text and upstream URL.
+Docker source-copy rules and Linux/Windows parser-test selectors include the local
+dependency. Full hosted platform/build acceptance is the next gate for this
+checkpoint; no publication or complete parser-memory guarantee is claimed.
+
 ## Compatibility and small boundary tests
 
 Keep the existing 3MF tests for deflated cubes, `p:path` components, distinct-part
@@ -209,6 +246,10 @@ Add tiny exact-limit/one-over tests using private limits:
 - Two referenced parts exceed a shared mesh/text budget although each fits alone;
   unused/unprinted objects count, while repeated cached references do not duplicate
   storage charges. Flattened output remains independently bounded.
+- A small repeated-component DAG with empty leaves exceeds a tiny shared traversal
+  allowance in both membership validation and emission before expensive expansion.
+  Keep ordinary repeated-instance output unchanged; depth/count/triangle checks
+  remain separate. Do not execute a billions-of-visits fixture to demonstrate it.
 - Oversized token/attribute, relationships/config text and decoded attribute
   expansion fail before their destination buffer grows beyond its allowance.
 - Forged EOCD counts, inconsistent central ranges and underspecified inflated

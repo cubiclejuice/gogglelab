@@ -11,6 +11,10 @@
 !browser/**
 !crates/
 !crates/**
+!vendor/
+vendor/**
+!vendor/zip/
+!vendor/zip/**
 !src-tauri/
 !src-tauri/Cargo.toml
 !src-tauri/build.rs

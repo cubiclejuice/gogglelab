@@ -10,6 +10,7 @@ FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/zip/ vendor/zip/
 COPY src-tauri/Cargo.toml src-tauri/build.rs src-tauri/
 COPY src-tauri/src/ src-tauri/src/
 RUN --mount=type=cache,id=gogglelab-public-registry,target=/usr/local/cargo/registry \

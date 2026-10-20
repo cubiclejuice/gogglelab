@@ -127,9 +127,10 @@ def cargo_components() -> list[Component]:
     metadata = json.loads(proc.stdout)
     found: list[Component] = []
     for package in metadata["packages"]:
-        if not package.get("source"):
-            continue
         manifest = Path(package["manifest_path"])
+        vendored = manifest.resolve().is_relative_to((PROJECT / "vendor").resolve())
+        if not package.get("source") and not vendored:
+            continue
         license_expression = package.get("license") or ""
         explicit = package.get("license_file")
         files = (manifest.parent / explicit,) if explicit else package_license_files(manifest.parent)
@@ -156,7 +157,7 @@ def cargo_components() -> list[Component]:
                 package["name"],
                 package["version"],
                 license_expression,
-                package.get("repository") or str(package["source"]),
+                package.get("repository") or package.get("source") or "vendored path dependency",
                 files,
             )
         )
