@@ -3,6 +3,7 @@ import {
   canOpenLibraryModel,
   clampLibraryNavigationWidth,
   didLibraryScanComplete,
+  LibraryPanel,
   filterAndSortLibraryModels,
   LIBRARY_CATALOG_TIER,
   LIBRARY_VIEW_MODES,
@@ -363,7 +364,143 @@ test("scan state copy distinguishes idle, running, cancelling, and completed", (
   expect(
     scanStatusMessage({ ...idle, filesIndexed: 3, errors: ["unreadable"], finishedAt: "now" }),
   ).toBe("Scan finished · 3 indexed · 1 issue");
-  expect(didLibraryScanComplete(false, idle)).toBe(false);
-  expect(didLibraryScanComplete(true, { running: true })).toBe(false);
-  expect(didLibraryScanComplete(true, idle)).toBe(true);
+  expect(didLibraryScanComplete(null, idle)).toBe(false);
+  expect(didLibraryScanComplete({ ...idle, running: true }, { ...idle, running: true })).toBe(
+    false,
+  );
+  expect(didLibraryScanComplete({ ...idle, running: true }, idle)).toBe(true);
+});
+
+test("completed scans between polls invalidate Library data exactly once", () => {
+  const idle = { running: false, startedAt: null, finishedAt: null };
+  const complete = { running: false, startedAt: "1792400000", finishedAt: "1792400000" };
+  expect(didLibraryScanComplete(idle, complete)).toBe(true);
+  expect(didLibraryScanComplete(complete, complete)).toBe(false);
+  expect(
+    didLibraryScanComplete(complete, {
+      ...complete,
+      startedAt: "1792400010",
+      finishedAt: "1792400010",
+    }),
+  ).toBe(true);
+  // An explicitly successful start marks a pending completion even when both
+  // scans have the native status clock's same second-resolution timestamps.
+  expect(didLibraryScanComplete({ ...complete, running: true }, complete)).toBe(true);
+});
+
+function scanPanelFixture(onPollScanStatus) {
+  const node = () => ({ removeAttribute() {} });
+  const panel = {
+    root: { open: true },
+    scanPollRevision: 0,
+    scanPollInFlight: false,
+    previousScanStatus: null,
+    onPollScanStatus,
+    onScanCompleted() {
+      panel.completed += 1;
+    },
+    completed: 0,
+    scanStatus: node(),
+    scanButton: node(),
+    generateMissingButton: node(),
+    regenerateAllButton: node(),
+    cancelScanButton: node(),
+    onStartScan: async () => {},
+  };
+  panel.noteStartedJob = () => LibraryPanel.prototype.noteStartedJob.call(panel);
+  panel.setScanStatus = (status) => LibraryPanel.prototype.setScanStatus.call(panel, status);
+  panel.pollScanStatus = () => LibraryPanel.prototype.pollScanStatus.call(panel);
+  return panel;
+}
+const finishedScan = {
+  running: false,
+  cancelling: false,
+  currentRootId: null,
+  rootsTotal: 1,
+  rootsCompleted: 1,
+  filesVisited: 1,
+  filesIndexed: 1,
+  errors: [],
+  startedAt: "1792400000",
+  finishedAt: "1792400000",
+  jobKind: "scan",
+  thumbnailsTotal: 1,
+  thumbnailsCompleted: 1,
+};
+
+test("successful fast scan invalidates older in-flight polls and refreshes same-second completion", async () => {
+  let resolveOld;
+  let calls = 0;
+  const old = new Promise((resolve) => {
+    resolveOld = resolve;
+  });
+  const panel = scanPanelFixture(async () => (++calls === 1 ? old : finishedScan));
+  panel.previousScanStatus = finishedScan;
+  const oldPoll = panel.pollScanStatus();
+  await LibraryPanel.prototype.startScan.call(panel, "root");
+  resolveOld(finishedScan);
+  await oldPoll;
+  expect(panel.completed).toBe(0);
+  await panel.pollScanStatus();
+  expect(panel.completed).toBe(1);
+  await panel.pollScanStatus();
+  expect(panel.completed).toBe(1);
+});
+
+test("failed scan start leaves completion tracking and polling unchanged", async () => {
+  let polls = 0;
+  const panel = scanPanelFixture(async () => {
+    polls += 1;
+    return finishedScan;
+  });
+  panel.previousScanStatus = finishedScan;
+  panel.onStartScan = async () => {
+    throw new Error("Scan rejected");
+  };
+  await expect(LibraryPanel.prototype.startScan.call(panel, "root")).rejects.toThrow(
+    "Scan rejected",
+  );
+  expect(panel.previousScanStatus).toBe(finishedScan);
+  expect(panel.scanPollRevision).toBe(0);
+  expect(panel.completed).toBe(0);
+  expect(polls).toBe(0);
+});
+
+test("fast thumbnail jobs refresh same-second completion through the actual start handler", async () => {
+  const completed = { ...finishedScan, jobKind: "thumbnails" };
+  const panel = scanPanelFixture(async () => completed);
+  panel.previousScanStatus = completed;
+  panel.onStartThumbnailJob = async () => {};
+  panel.runAction = async (action) => {
+    await action();
+  };
+  panel.setStatus = () => {};
+  await LibraryPanel.prototype.startThumbnailJob.call(panel, true);
+  expect(panel.completed).toBe(1);
+  await panel.pollScanStatus();
+  expect(panel.completed).toBe(1);
+});
+
+test("Library replacement rejects a pre-replacement in-flight status reply", async () => {
+  let finish;
+  const pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const panel = scanPanelFixture(async () => pending);
+  panel.previousScanStatus = { ...finishedScan, running: true };
+  const dismiss = { dismiss() {} };
+  Object.assign(panel, {
+    metadataEditor: dismiss,
+    collectionNameDialog: dismiss,
+    tagManager: dismiss,
+    printHistory: dismiss,
+    selectedModelIds: new Set(),
+    clearThumbnailCache() {},
+  });
+  const request = panel.pollScanStatus();
+  LibraryPanel.prototype.invalidateAfterLibraryReplacement.call(panel);
+  finish(finishedScan);
+  await request;
+  expect(panel.completed).toBe(0);
+  expect(panel.previousScanStatus).toBe(null);
 });

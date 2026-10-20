@@ -581,3 +581,61 @@ proof is implemented; unknown/custom/legacy bytes must stay protected. See
 `docs/GENERATED-MEDIA-RETENTION-PLAN.md`. The verified prior Community build is
 preserved at `output/build-preservation/community-8ea0a4e.app`; no additional cleanup
 or installed-app replacement occurred.
+
+### Geometry live checks and Windows portability (2026-10-19)
+
+Code `933172238c68a809e130ce135157363795c465d9` passes the immutable
+Linux/container packet lifecycle check: authenticated STL2 v2 geometry reads while
+no staging file exists, repeat reads, stale-token rejection after restart, a new
+identical packet and unchanged model-source hash. The synthetic container is
+stopped and its dedicated volume/evidence remain preserved. No provider/printer
+request or original-file deletion was performed.
+
+Follow-up code `60e1630a7ae6a60bc2fd76ba87d117fdc901c41f` fixes real stable-Rust
+Windows compile errors found by an isolated MinGW cross-compiler container. The
+non-Unix inventory method still returns Unsupported; JSON export uses the existing
+stable pinned-handle identity checks and fingerprints only a fresh verification
+handle. Equal-byte replacement and writer-cursor preservation regression passes,
+as do all 278 runtime tests, affected Clippy and formatting. Windows runtime and
+test-target compilation passes; this does not establish MSVC/native runtime,
+installer, DACL or guarded-mutation acceptance.
+
+The development composition was refreshed to public `9331722` with the same
+private `2755084` snapshot and isolated reconciled lockfile. Private Rust tests
+and Clippy pass, and the separately named/signed debug QA app builds and launches
+with no license in the isolated profile. Native Free stock creation/read-back,
+in-place synthetic indexing and a generated preview work. Actual UI testing found
+fast-scan catalog refresh and native collection-prompt defects; these remain open
+until corrected and the actual app is rebuilt/retested. Slicer execution was not
+performed in this session. Official main/core-pin integration remains separate.
+
+Source-specific logs, hashes, signatures and native screenshots are retained under
+`output/` and the private mode-0700 composition snapshot; no private source is
+committed publicly. No additional build cleanup or installed-app replacement was
+performed. Reused debug output has grown during composition builds; preserve the
+current build and release and require fresh exact approval before any cleanup.
+
+Known native-dialog follow-ups discovered during this checkpoint: catalog purge
+uses `window.prompt` for its exact `PURGE` acknowledgement; manual Centauri
+MainboardID entry does likewise. Replace these with visible in-app dialogs before
+claiming their native workflow acceptance. Purge must retain exact token, backup
+destination, cancellation/one-pending-action guards and existing verified-backup/
+previous-Library protocol; it must not become thumbnail/orphan deletion. Manual
+MainboardID stays ephemeral, strictly validated and unsaved; explicit submission
+may call only the existing read-only status transport without discovery, after
+revalidating the approved endpoint/profile. No new live printer check is approved.
+
+### Native Library UI follow-up (2026-10-19)
+
+Fast scan/thumbnail completions now invalidate catalog data even if the entire
+job finishes between status polls or shares the previous job's timestamp second.
+Successful starts invalidate older in-flight replies, and Library replacement
+invalidates old polling/completion state. Collection create/rename use visible
+labelled in-app dialogs, with validation, pending/error/cancel handling and Library
+search focus fallback after a refresh removes the invoking button. True failing
+regressions cover these timing/focus cases before the fixes.
+
+The corrected frontend command uses explicit `./src` and build-argument test paths
+so Bun cannot count archived source snapshots. All 334 tests / 1,322 assertions
+across 38 current-worktree files pass, along with format, lint and typecheck
+(existing warning only). Actual rebuilt combined-app QA remains the next gate.

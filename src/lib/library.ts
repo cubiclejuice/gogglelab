@@ -1,3 +1,4 @@
+import { LibraryCollectionNameDialog } from "./library-collection-dialog";
 import type {
   CatalogSettings,
   Filament,
@@ -522,11 +523,19 @@ export function matchesLibraryMetadataFilters(
   return true;
 }
 
+type LibraryScanObservation = Pick<LibraryScanStatus, "running" | "startedAt" | "finishedAt">;
 export function didLibraryScanComplete(
-  wasRunning: boolean,
-  status: Pick<LibraryScanStatus, "running">,
+  previous: LibraryScanObservation | null,
+  status: LibraryScanObservation,
 ): boolean {
-  return wasRunning && !status.running;
+  if (status.running) return false;
+  return (
+    previous?.running === true ||
+    (status.finishedAt !== null &&
+      (previous === null ||
+        previous.startedAt !== status.startedAt ||
+        previous.finishedAt !== status.finishedAt))
+  );
 }
 
 export function thumbnailCacheInvalidations(
@@ -616,6 +625,7 @@ export class LibraryPanel {
   private readonly tagManager: LibraryTagManager;
   private readonly printHistory: LibraryPrintHistory;
   private readonly partStockManager: LibraryPartStockManager;
+  private readonly collectionNameDialog: LibraryCollectionNameDialog;
   private invoker: HTMLElement | null = null;
   private allFolders: LibraryFolder[] = [];
   private allModels: LibraryModel[] = [];
@@ -635,7 +645,7 @@ export class LibraryPanel {
   private catalogSettings = DEFAULT_CATALOG_SETTINGS;
   private page = 1;
   private renderRevision = 0;
-  private scanWasRunning = false;
+  private previousScanStatus: LibraryScanObservation | null = null;
   private pollTimer: number | undefined;
   private scanPollRevision = 0;
   private scanPollInFlight = false;
@@ -718,6 +728,9 @@ export class LibraryPanel {
     this.tagManager = new LibraryTagManager(container);
     this.printHistory = new LibraryPrintHistory(container);
     this.partStockManager = new LibraryPartStockManager(container);
+    this.collectionNameDialog = new LibraryCollectionNameDialog(container, () => {
+      if (this.root.open) this.searchInput.focus();
+    });
     this.metadataEditor.onSave = async (targets, patch) => {
       await this.onSaveMetadata(targets, patch);
     };
@@ -1011,8 +1024,7 @@ export class LibraryPanel {
       "",
       () =>
         void this.runAction(async () => {
-          await this.onStartScan(null);
-          await this.pollScanStatus();
+          await this.startScan(null);
         }),
     );
     this.cancelScanButton = this.actionButton(
@@ -1048,6 +1060,7 @@ export class LibraryPanel {
   }
 
   hide(): void {
+    this.collectionNameDialog.dismiss();
     this.stopPolling();
     this.observer?.disconnect();
     if (this.root.open) this.root.close();
@@ -1057,6 +1070,7 @@ export class LibraryPanel {
   }
 
   dispose(): void {
+    this.collectionNameDialog.dispose();
     this.stopPolling();
     this.observer?.disconnect();
   }
@@ -1115,6 +1129,19 @@ export class LibraryPanel {
     this.renderContent();
   }
 
+  async startScan(rootId: string | null = null): Promise<void> {
+    await this.onStartScan(rootId);
+    // A fast scan may finish before the next poll, even in the same clock second
+    // as the preceding scan. Invalidate older in-flight observations first.
+    this.noteStartedJob();
+    await this.pollScanStatus();
+  }
+
+  private noteStartedJob(): void {
+    this.scanPollRevision += 1;
+    this.previousScanStatus = { running: true, startedAt: null, finishedAt: null };
+  }
+
   setScanStatus(value: LibraryScanStatus): void {
     this.scanStatus.textContent = scanStatusMessage(value);
     this.scanButton.disabled = value.running;
@@ -1126,8 +1153,13 @@ export class LibraryPanel {
       value.jobKind === "thumbnails" ? "Cancel previews" : "Cancel scan";
     if (value.errors.length) this.scanStatus.title = value.errors.join("\n");
     else this.scanStatus.removeAttribute("title");
-    if (didLibraryScanComplete(this.scanWasRunning, value)) this.onScanCompleted();
-    this.scanWasRunning = value.running;
+    const completed = didLibraryScanComplete(this.previousScanStatus, value);
+    this.previousScanStatus = {
+      running: value.running,
+      startedAt: value.startedAt,
+      finishedAt: value.finishedAt,
+    };
+    if (completed) this.onScanCompleted();
   }
 
   clearThumbnailCache(): void {
@@ -1136,7 +1168,10 @@ export class LibraryPanel {
   }
 
   invalidateAfterLibraryReplacement(): void {
+    this.scanPollRevision += 1;
+    this.previousScanStatus = null;
     this.metadataEditor.dismiss();
+    this.collectionNameDialog.dismiss();
     this.tagManager.dismiss();
     this.printHistory.dismiss();
     this.selectedModelIds.clear();
@@ -1287,6 +1322,7 @@ export class LibraryPanel {
       this.regenerateAllButton.disabled = true;
       try {
         await this.onStartThumbnailJob(regenerate);
+        this.noteStartedJob();
         this.setStatus(
           regenerate ? "Regenerating every catalog preview…" : "Generating missing previews…",
         );
@@ -1551,9 +1587,7 @@ export class LibraryPanel {
     folderHeading.className = "library-section-label";
     folderHeading.textContent = "Collections";
     const createCollection = this.actionButton("New collection", "", () => {
-      const name = window.prompt("Collection name");
-      if (!name?.trim()) return;
-      void this.runAction(() => this.onCreateCollection(name.trim()));
+      this.collectionNameDialog.show("New collection", "", (name) => this.onCreateCollection(name));
     });
     folders.append(
       folderHeading,
@@ -1581,9 +1615,9 @@ export class LibraryPanel {
       if (folder.id !== "root") {
         row.append(
           this.actionButton("Rename", "", () => {
-            const name = window.prompt("Rename collection", folder.name);
-            if (!name?.trim()) return;
-            void this.runAction(() => this.onRenameCollection(folder.id, name.trim()));
+            this.collectionNameDialog.show("Rename collection", folder.name, (name) =>
+              this.onRenameCollection(folder.id, name),
+            );
           }),
           this.actionButton("Delete", "danger", () => {
             if (!window.confirm(`Delete the empty collection “${folder.name}”?`)) return;
@@ -1667,7 +1701,7 @@ export class LibraryPanel {
     const scan = this.actionButton(
       "Scan",
       "",
-      () => void this.runAction(() => this.onStartScan(root.id)),
+      () => void this.runAction(() => this.startScan(root.id)),
     );
     const remove = this.actionButton("Remove", "danger", () => {
       if (

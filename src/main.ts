@@ -1369,7 +1369,7 @@ export function startApp(extensions: AppExtensions): void {
     const root = await libraryService.addRoot(path);
     await refreshLibrary();
     libraryPanel.setStatus(`Indexed source added. Files remain read-only in ${root.path}.`);
-    await libraryService.startScan(root.id);
+    await libraryPanel.startScan(root.id);
   };
   libraryPanel.onUpdateRoot = async (root) => {
     await libraryService.updateRoot(root);
