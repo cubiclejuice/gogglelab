@@ -12,7 +12,10 @@ use tower::ServiceExt;
 
 use super::*;
 
-struct FakeEngine;
+#[derive(Default)]
+struct FakeEngine {
+    slow_probe: Option<Arc<SlowProducerProbe>>,
+}
 
 #[test]
 fn printer_network_openapi_exposes_the_reviewed_interface() {
@@ -79,11 +82,52 @@ impl HostSlicerAdapter for FakeHostSlicerAdapter {
     }
 }
 
-static SLOW_PRODUCERS: AtomicUsize = AtomicUsize::new(0);
-struct ProducerGuard;
+#[derive(Debug, PartialEq, Eq)]
+enum SlowProducerEvent {
+    WaitingToStart,
+    Started,
+    Finished,
+}
+
+struct SlowProducerProbe {
+    active: AtomicUsize,
+    events: tokio::sync::mpsc::UnboundedSender<SlowProducerEvent>,
+    start_allowed: Mutex<bool>,
+    start_changed: std::sync::Condvar,
+}
+
+impl SlowProducerProbe {
+    fn release_start(&self) {
+        *self.start_allowed.lock().unwrap() = true;
+        self.start_changed.notify_all();
+    }
+
+    fn start(self: &Arc<Self>) -> ProducerGuard {
+        let _ = self.events.send(SlowProducerEvent::WaitingToStart);
+        let mut allowed = self.start_allowed.lock().unwrap();
+        while !*allowed {
+            allowed = self.start_changed.wait(allowed).unwrap();
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _ = self.events.send(SlowProducerEvent::Started);
+        ProducerGuard(Arc::clone(self))
+    }
+}
+
+// Release gated blocking workers even if an assertion fails before explicit
+// release; otherwise Tokio runtime shutdown could wait forever for the fixture.
+struct ReleaseProducerStartOnDrop(Arc<SlowProducerProbe>);
+impl Drop for ReleaseProducerStartOnDrop {
+    fn drop(&mut self) {
+        self.0.release_start();
+    }
+}
+
+struct ProducerGuard(Arc<SlowProducerProbe>);
 impl Drop for ProducerGuard {
     fn drop(&mut self) {
-        SLOW_PRODUCERS.fetch_sub(1, Ordering::SeqCst);
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        let _ = self.0.events.send(SlowProducerEvent::Finished);
     }
 }
 
@@ -759,8 +803,7 @@ impl LibraryEngine for FakeEngine {
         sink: &mut dyn std::io::Write,
     ) -> Result<(), EngineError> {
         if lease == "slow" {
-            SLOW_PRODUCERS.fetch_add(1, Ordering::SeqCst);
-            let _guard = ProducerGuard;
+            let _guard = self.slow_probe.as_ref().map(SlowProducerProbe::start);
             for _ in 0..32 {
                 sink.write_all(&vec![7_u8; 64 * 1024])
                     .map_err(|_| EngineError {
@@ -818,11 +861,11 @@ impl LibraryEngine for BlockingEngine {
     fn capabilities(&self, context: &RequestContext) -> Result<HostCapabilities, EngineError> {
         self.entered.wait();
         self.release.wait();
-        FakeEngine.capabilities(context)
+        FakeEngine::default().capabilities(context)
     }
 
     fn status(&self, context: &RequestContext) -> Result<RuntimeStatus, EngineError> {
-        FakeEngine.status(context)
+        FakeEngine::default().status(context)
     }
 
     fn list_models(
@@ -832,7 +875,7 @@ impl LibraryEngine for BlockingEngine {
         limit: u16,
         query: library_protocol::ModelQuery,
     ) -> Result<Page<ModelSummary>, EngineError> {
-        FakeEngine.list_models(context, cursor, limit, query)
+        FakeEngine::default().list_models(context, cursor, limit, query)
     }
 
     fn call_tool(
@@ -841,18 +884,18 @@ impl LibraryEngine for BlockingEngine {
         name: &str,
         arguments: Value,
     ) -> Result<Value, EngineError> {
-        FakeEngine.call_tool(context, name, arguments)
+        FakeEngine::default().call_tool(context, name, arguments)
     }
 
     fn supports_tool(&self, context: &RequestContext, name: &str) -> bool {
-        FakeEngine.supports_tool(context, name)
+        FakeEngine::default().supports_tool(context, name)
     }
     fn list_thumbnails(
         &self,
         c: &RequestContext,
         m: &str,
     ) -> Result<Vec<library_protocol::ThumbnailDescriptor>, EngineError> {
-        FakeEngine.list_thumbnails(c, m)
+        FakeEngine::default().list_thumbnails(c, m)
     }
     fn set_active_thumbnail(
         &self,
@@ -861,7 +904,7 @@ impl LibraryEngine for BlockingEngine {
         v: u64,
         t: &str,
     ) -> Result<u64, EngineError> {
-        FakeEngine.set_active_thumbnail(c, m, v, t)
+        FakeEngine::default().set_active_thumbnail(c, m, v, t)
     }
     fn add_thumbnail(
         &self,
@@ -871,7 +914,7 @@ impl LibraryEngine for BlockingEngine {
         n: String,
         b: Vec<u8>,
     ) -> Result<u64, EngineError> {
-        FakeEngine.add_thumbnail(c, m, v, n, b)
+        FakeEngine::default().add_thumbnail(c, m, v, n, b)
     }
     fn delete_thumbnail(
         &self,
@@ -880,7 +923,7 @@ impl LibraryEngine for BlockingEngine {
         v: u64,
         t: &str,
     ) -> Result<u64, EngineError> {
-        FakeEngine.delete_thumbnail(c, m, v, t)
+        FakeEngine::default().delete_thumbnail(c, m, v, t)
     }
     fn issue_thumbnail_media(
         &self,
@@ -888,7 +931,7 @@ impl LibraryEngine for BlockingEngine {
         m: &str,
         t: &str,
     ) -> Result<library_protocol::ContentLease, EngineError> {
-        FakeEngine.issue_thumbnail_media(c, m, t)
+        FakeEngine::default().issue_thumbnail_media(c, m, t)
     }
     fn issue_model_download(
         &self,
@@ -896,7 +939,7 @@ impl LibraryEngine for BlockingEngine {
         m: &str,
         h: Option<&str>,
     ) -> Result<library_protocol::ContentLease, EngineError> {
-        FakeEngine.issue_model_download(c, m, h)
+        FakeEngine::default().issue_model_download(c, m, h)
     }
     fn stream_content(
         &self,
@@ -904,19 +947,19 @@ impl LibraryEngine for BlockingEngine {
         l: &str,
         sink: &mut dyn std::io::Write,
     ) -> Result<(), EngineError> {
-        FakeEngine.stream_content(c, l, sink)
+        FakeEngine::default().stream_content(c, l, sink)
     }
     fn describe_content(
         &self,
         c: &RequestContext,
         l: &str,
     ) -> Result<library_protocol::ContentLease, EngineError> {
-        FakeEngine.describe_content(c, l)
+        FakeEngine::default().describe_content(c, l)
     }
 }
 
 fn test_router() -> axum::Router {
-    router(Arc::new(FakeEngine), security(8))
+    router(Arc::new(FakeEngine::default()), security(8))
 }
 
 fn security(max_in_flight: usize) -> SecurityConfig {
@@ -1026,7 +1069,7 @@ async fn tls_proxy_mode_rejects_direct_or_spoofed_requests_without_trusted_peer_
     let mut policy = security(8);
     policy.public_base_url = Some(AllowedOrigin::parse("https://nas.example").unwrap());
     policy.trusted_proxy_peers = BTreeSet::from(["10.0.0.2".parse().unwrap()]);
-    let response = router(Arc::new(FakeEngine), policy)
+    let response = router(Arc::new(FakeEngine::default()), policy)
         .oneshot(
             request("GET", "/api/v1/capabilities", true)
                 .header("x-forwarded-for", "10.0.0.2")
@@ -1112,7 +1155,20 @@ async fn native_admission_refuses_concurrent_requests_without_queue_growth() {
 
 #[tokio::test]
 async fn content_stream_admission_is_held_until_body_drop() {
-    let app = test_router();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let probe = Arc::new(SlowProducerProbe {
+        active: AtomicUsize::new(0),
+        events,
+        start_allowed: Mutex::new(false),
+        start_changed: std::sync::Condvar::new(),
+    });
+    let _release_on_failure = ReleaseProducerStartOnDrop(Arc::clone(&probe));
+    let app = router(
+        Arc::new(FakeEngine {
+            slow_probe: Some(Arc::clone(&probe)),
+        }),
+        security(8),
+    );
     let mut held = Vec::new();
     for _ in 0..4 {
         let response = app
@@ -1137,10 +1193,34 @@ async fn content_stream_admission_is_held_until_body_drop() {
         .await
         .unwrap();
     assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    assert_eq!(SLOW_PRODUCERS.load(Ordering::SeqCst), 0);
+    // Deliberately delay every producer after HTTP admission. An active count
+    // of zero at this point says nothing about whether streaming has completed.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..4 {
+            assert_eq!(
+                received.recv().await,
+                Some(SlowProducerEvent::WaitingToStart)
+            );
+        }
+    })
+    .await
+    .expect("all four producers should reach the start gate");
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+    probe.release_start();
+    wait_for_slow_producers(&mut received, 4, 0).await;
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+
+    let still_held = app
+        .clone()
+        .oneshot(
+            request("GET", "/api/v1/content/slow", true)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_held.status(), StatusCode::TOO_MANY_REQUESTS);
     drop(held);
-    tokio::time::sleep(Duration::from_millis(20)).await;
     let admitted = app
         .oneshot(
             request("GET", "/api/v1/content/slow", true)
@@ -1150,6 +1230,35 @@ async fn content_stream_admission_is_held_until_body_drop() {
         .await
         .unwrap();
     assert_eq!(admitted.status(), StatusCode::OK);
+    drop(admitted);
+    wait_for_slow_producers(&mut received, 1, 1).await;
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+}
+
+async fn wait_for_slow_producers(
+    received: &mut tokio::sync::mpsc::UnboundedReceiver<SlowProducerEvent>,
+    expected: usize,
+    expected_waiting: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut waiting, mut started, mut finished) = (0, 0, 0);
+        while finished < expected {
+            match received
+                .recv()
+                .await
+                .expect("producer event channel closed")
+            {
+                SlowProducerEvent::WaitingToStart => waiting += 1,
+                SlowProducerEvent::Started => started += 1,
+                SlowProducerEvent::Finished => finished += 1,
+            }
+        }
+        assert_eq!(waiting, expected_waiting);
+        assert_eq!(started, expected);
+        assert_eq!(finished, expected);
+    })
+    .await
+    .expect("every admitted producer should start and finish");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3089,7 +3198,8 @@ async fn opaque_root_handle_and_admitted_catalog_id_both_start_the_same_scan() {
 async fn static_browser_assets_are_loopback_host_guarded_without_embedding_the_token() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("index.html"), "<main>GoggleLab</main>").unwrap();
-    let app = router_with_static(Arc::new(FakeEngine), security(8), temp.path()).unwrap();
+    let app =
+        router_with_static(Arc::new(FakeEngine::default()), security(8), temp.path()).unwrap();
     let response = app
         .oneshot(request("GET", "/", false).body(Body::empty()).unwrap())
         .await
@@ -3121,7 +3231,7 @@ async fn static_browser_assets_never_follow_symlinks_or_accept_broad_private_roo
     let secret = temp.path().join("server-token");
     std::fs::write(&secret, "do-not-serve").unwrap();
     symlink(&secret, web.join("assets/key.js")).unwrap();
-    let app = router_with_static(Arc::new(FakeEngine), security(8), &web).unwrap();
+    let app = router_with_static(Arc::new(FakeEngine::default()), security(8), &web).unwrap();
     let response = app
         .oneshot(
             request("GET", "/assets/key.js", false)
@@ -3133,7 +3243,7 @@ async fn static_browser_assets_never_follow_symlinks_or_accept_broad_private_roo
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     std::fs::write(temp.path().join("index.html"), "<main>Too broad</main>").unwrap();
-    let error = router_with_static(Arc::new(FakeEngine), security(8), temp.path())
+    let error = router_with_static(Arc::new(FakeEngine::default()), security(8), temp.path())
         .expect_err("a web root containing a secret must be rejected");
     assert!(!error.contains(temp.path().to_string_lossy().as_ref()));
     assert!(!error.contains("server-token"));
@@ -6837,7 +6947,7 @@ async fn printer_network_synthetic_discovery_routes_preserve_review_and_job_shap
     config
         .principal_capabilities
         .insert(Capability::PrinterNetwork);
-    let app = router(Arc::new(FakeEngine), config);
+    let app = router(Arc::new(FakeEngine::default()), config);
     for (method, path, body, expected) in [
         (
             "POST",
