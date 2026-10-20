@@ -1501,7 +1501,8 @@ dialog::backdrop {
 
 .library-editor-dialog,
 .library-tag-dialog,
-.library-history-dialog {
+.library-history-dialog,
+.printer-fleet-dialog {
   width: min(680px, calc(100vw - 32px));
   max-height: min(760px, calc(100vh - 32px));
   padding: var(--space-4);
@@ -1511,6 +1512,98 @@ dialog::backdrop {
   background: var(--sheet);
   color: var(--text);
   box-shadow: var(--shadow-sheet);
+}
+.printer-fleet-dialog {
+  box-sizing: border-box;
+  width: min(680px, calc(100vw - var(--space-4) * 2));
+  max-height: calc(100vh - var(--space-4) * 2);
+}
+.printer-fleet-dialog header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.printer-fleet-dialog header h2 {
+  margin: 0;
+  font-size: var(--font-2xl);
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.printer-fleet-dialog header .btn {
+  flex: none;
+}
+.printer-fleet-dialog form,
+.printer-fleet-dialog form > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+}
+.printer-fleet-dialog form > label:not(:first-child) {
+  margin-top: var(--space-1);
+}
+.printer-fleet-dialog form > *,
+.printer-fleet-dialog fieldset > * {
+  min-width: 0;
+}
+.printer-fleet-dialog input:not([type="checkbox"]),
+.printer-fleet-dialog select,
+.printer-fleet-dialog textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--button-border);
+  border-radius: var(--space-1);
+  background: var(--button);
+  color: var(--text);
+  font: inherit;
+}
+.printer-fleet-dialog textarea {
+  resize: vertical;
+}
+.printer-fleet-dialog label:has(> input[type="checkbox"]) {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  overflow-wrap: anywhere;
+}
+.printer-fleet-dialog input[type="checkbox"] {
+  flex: none;
+  width: auto;
+  margin: 0;
+}
+.printer-fleet-dialog .printer-fleet-bed-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--hairline);
+}
+.printer-fleet-dialog .printer-fleet-bed-fields legend {
+  padding-inline: var(--space-1);
+}
+.printer-fleet-dialog form > button {
+  justify-self: start;
+  max-width: 100%;
+  white-space: normal;
+}
+.printer-fleet-dialog p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.printer-fleet-dialog .hint {
+  color: var(--dim);
+}
+.printer-fleet-dialog .settings-error:not(:empty) {
+  margin-top: var(--space-3);
+  color: var(--bad);
+  white-space: pre-line;
+}
+.printer-fleet-dialog [hidden] {
+  display: none;
 }
 .library-management-dialog {
   width: min(640px, calc(100vw - 32px));
