@@ -138,7 +138,7 @@ fn prepare_model_geometry_with_parser_in_context(
             .into_geometry_charge(expected_bytes)?;
         before_derivative();
         check()?;
-        let (positions, plates, parts) = if let Some(plate) = selected {
+        let positions = if let Some(plate) = selected {
             let start = usize::try_from(plate.triangle_start)
                 .ok()
                 .and_then(|value| value.checked_mul(9))
@@ -171,26 +171,20 @@ fn prepare_model_geometry_with_parser_in_context(
             {
                 return Err(invalid("Requested plate was not found"));
             }
-            let parts = parsed
-                .plate_parts(plate.id)
+            parsed
+                .plate_part_refs(plate.id)
                 .ok_or_else(|| invalid("Requested plate has overlapping part ranges"))?;
-            (
-                positions,
-                vec![GeometryPlate {
-                    id: plate.id,
-                    name: plate.name.clone(),
-                    triangle_start: 0,
-                    triangle_count: plate.triangle_count,
-                }],
-                parts,
-            )
+            positions
         } else {
-            (
-                parsed.model.positions.as_slice(),
-                map_plates(&parsed.plates),
-                parsed.parts.clone(),
-            )
+            parsed.model.positions.as_slice()
         };
+        // A selected range and every part end were checked by plate_part_refs.
+        let selected_range = selected.map(|plate| {
+            (
+                plate.triangle_start,
+                plate.triangle_start + plate.triangle_count,
+            )
+        });
         checked_packet_bytes(triangles, positions.len())?;
         if positions.iter().any(|value| !value.is_finite()) {
             return Err(invalid("Model geometry is not a finite triangle packet"));
@@ -207,6 +201,30 @@ fn prepare_model_geometry_with_parser_in_context(
             file,
             _charge: charge,
         });
+        let plates = if let Some(id) = plate_id {
+            let plate = parsed
+                .plates
+                .into_iter()
+                .find(|plate| plate.id == id)
+                .ok_or_else(|| invalid("Requested plate was not found"))?;
+            vec![GeometryPlate {
+                id: plate.id,
+                name: plate.name,
+                triangle_start: 0,
+                triangle_count: plate.triangle_count,
+            }]
+        } else {
+            parsed
+                .plates
+                .into_iter()
+                .map(|plate| GeometryPlate {
+                    id: plate.id,
+                    name: plate.name,
+                    triangle_start: plate.triangle_start,
+                    triangle_count: plate.triangle_count,
+                })
+                .collect()
+        };
         Ok(PreparedGeometry {
             packet,
             model_format: match parsed.model.format {
@@ -217,8 +235,20 @@ fn prepare_model_geometry_with_parser_in_context(
             .into(),
             triangle_count: triangles,
             plates,
-            parts: parts
+            parts: parsed
+                .parts
                 .into_iter()
+                .filter_map(|mut part| {
+                    if let Some((start, end)) = selected_range {
+                        if part.triangle_start < start
+                            || part.triangle_start + part.triangle_count > end
+                        {
+                            return None;
+                        }
+                        part.triangle_start -= start;
+                    }
+                    Some(part)
+                })
                 .map(|part| GeometryPart {
                     id: part.id,
                     name: part.name,
@@ -280,18 +310,6 @@ fn checked_packet_bytes(triangles: u32, positions: usize) -> Result<u64, Runtime
         ));
     }
     Ok(bytes)
-}
-
-fn map_plates(plates: &[stl_core::Plate]) -> Vec<GeometryPlate> {
-    plates
-        .iter()
-        .map(|plate| GeometryPlate {
-            id: plate.id,
-            name: plate.name.clone(),
-            triangle_start: plate.triangle_start,
-            triangle_count: plate.triangle_count,
-        })
-        .collect()
 }
 
 fn build_packet(triangle_count: u32, positions: &[f32]) -> Vec<u8> {
@@ -364,6 +382,180 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes
     }
+    fn assert_part_backing_is_moved(selected: Option<u32>) {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("triangle.stl");
+        fs::write(&source, triangle_file()).unwrap();
+        let runtime = LibraryRuntime::open(crate::RuntimeConfig::desktop(
+            temp.path().join("library"),
+            temp.path().join("integrations.json"),
+        ))
+        .unwrap();
+        let model = runtime
+            .mutate_db(|db| {
+                db.import_file(&source, None, None)
+                    .map(|result| result.model)
+            })
+            .unwrap();
+        let original = std::cell::RefCell::new(Vec::new());
+        let prepared = prepare_model_geometry_with_parser(
+            &runtime,
+            &model,
+            selected,
+            || {},
+            |bytes, context| {
+                let mut parsed = stl_core::parse_model_with_plates_in_context(bytes, context)?;
+                let positions = parsed.model.positions.clone();
+                let normals = parsed.model.stored_normals.clone();
+                parsed.model.positions.extend_from_slice(&positions);
+                parsed.model.stored_normals.extend_from_slice(&normals);
+                parsed.model.triangle_count = 2;
+                parsed.plates = vec![
+                    stl_core::Plate {
+                        id: 10,
+                        name: "First plate".into(),
+                        triangle_start: 0,
+                        triangle_count: 1,
+                    },
+                    stl_core::Plate {
+                        id: 20,
+                        name: "Second plate".into(),
+                        triangle_start: 1,
+                        triangle_count: 1,
+                    },
+                ];
+                parsed.parts = (0..2)
+                    .map(|index| stl_core::ParsedPart {
+                        id: format!("source-part-{index}"),
+                        name: format!("Source part {index}"),
+                        triangle_start: index,
+                        triangle_count: 1,
+                        material_id: Some(format!("source-material-{index}")),
+                        filament_slot: Some(index + 1),
+                    })
+                    .collect();
+                *original.borrow_mut() = parsed
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        (
+                            part.id.as_ptr() as usize,
+                            part.name.as_ptr() as usize,
+                            part.material_id.as_ref().unwrap().as_ptr() as usize,
+                        )
+                    })
+                    .collect();
+                Ok(parsed)
+            },
+        )
+        .unwrap();
+        let indices: &[usize] = if selected.is_some() { &[1] } else { &[0, 1] };
+        assert_eq!(prepared.triangle_count as usize, indices.len());
+        assert_eq!(prepared.parts.len(), indices.len());
+        assert_eq!(prepared.plates.len(), indices.len());
+        for (part, index) in prepared.parts.iter().zip(indices) {
+            assert_eq!(part.id, format!("source-part-{index}"));
+            assert_eq!(part.name, format!("Source part {index}"));
+            assert_eq!(part.material_id, Some(format!("source-material-{index}")));
+            assert_eq!(
+                part.triangle_start,
+                if selected.is_some() { 0 } else { *index as u32 }
+            );
+            assert_eq!(part.triangle_count, 1);
+            assert_eq!(part.filament_slot, Some(*index as u32 + 1));
+        }
+        let mut packet = Vec::new();
+        prepared.packet.stream_to(&mut packet).unwrap();
+        assert_eq!(
+            packet,
+            build_packet(
+                indices.len() as u32,
+                &[0., 0., 0., 1., 0., 0., 0., 1., 0.].repeat(indices.len())
+            )
+        );
+        assert_eq!(fs::read(&source).unwrap(), triangle_file());
+        assert!(
+            fs::read_dir(runtime.host_library_root().join("staging/geometry"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        for (part, index) in prepared.parts.iter().zip(indices) {
+            assert_eq!(
+                (
+                    part.id.as_ptr() as usize,
+                    part.name.as_ptr() as usize,
+                    part.material_id.as_ref().unwrap().as_ptr() as usize
+                ),
+                original.borrow()[*index],
+                "nonempty final part fields must retain their original parsed backing"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_geometry_moves_nonempty_part_backing() {
+        assert_part_backing_is_moved(None);
+    }
+
+    #[test]
+    fn selected_geometry_moves_nonempty_part_backing() {
+        assert_part_backing_is_moved(Some(20));
+    }
+
+    #[test]
+    fn whole_geometry_does_not_apply_selected_part_range_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("triangle.stl");
+        fs::write(&source, triangle_file()).unwrap();
+        let runtime = LibraryRuntime::open(crate::RuntimeConfig::desktop(
+            temp.path().join("library"),
+            temp.path().join("integrations.json"),
+        ))
+        .unwrap();
+        let model = runtime
+            .mutate_db(|db| {
+                db.import_file(&source, None, None)
+                    .map(|result| result.model)
+            })
+            .unwrap();
+        for selected in [Some(0), None] {
+            let result = prepare_model_geometry_with_parser(
+                &runtime,
+                &model,
+                selected,
+                || {},
+                |bytes, context| {
+                    let mut parsed = stl_core::parse_model_with_plates_in_context(bytes, context)?;
+                    parsed.parts.push(stl_core::ParsedPart {
+                        id: "outside-overflow".into(),
+                        name: "Outside overflow".into(),
+                        triangle_start: u32::MAX,
+                        triangle_count: 1,
+                        material_id: None,
+                        filament_slot: None,
+                    });
+                    Ok(parsed)
+                },
+            );
+            match (selected, result) {
+                (Some(_), Err(error)) => {
+                    assert_eq!(error.code, RuntimeErrorCode::InvalidInput);
+                    assert_eq!(error.message, "Requested plate has overlapping part ranges");
+                }
+                (None, Ok(prepared)) => {
+                    assert_eq!(prepared.parts.len(), 1);
+                    assert_eq!(prepared.parts[0].triangle_start, u32::MAX);
+                }
+                _ => panic!("whole and selected part range rules changed"),
+            }
+            let usage = runtime.temp_resources.lock().unwrap();
+            assert_eq!(usage.owned_bytes, 0);
+            assert_eq!(usage.reserved_owned_bytes, 0);
+        }
+        assert_eq!(fs::read(source).unwrap(), triangle_file());
+    }
+
     #[test]
     fn typed_geometry_parser_stops_precede_all_derivative_work() {
         let temp = tempfile::tempdir().unwrap();

@@ -179,18 +179,23 @@ fn plate_summaries(parsed: &stl_core::ParsedModel) -> Vec<PlateSummary> {
                 .and_then(|mesh| stl_core::measure(&mesh))
                 .map(Into::into),
             parts: parsed
-                .plate_parts(plate.id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|part| PartSummary {
-                    id: part.id,
-                    name: part.name,
-                    triangle_start: part.triangle_start,
-                    triangle_count: part.triangle_count,
-                    material_id: part.material_id,
-                    filament_slot: part.filament_slot,
+                .plate_part_refs(plate.id)
+                .map(|parts| {
+                    parts
+                        .map(|view| {
+                            let part = view.source();
+                            PartSummary {
+                                id: part.id.clone(),
+                                name: part.name.clone(),
+                                triangle_start: view.triangle_start(),
+                                triangle_count: part.triangle_count,
+                                material_id: part.material_id.clone(),
+                                filament_slot: part.filament_slot,
+                            }
+                        })
+                        .collect()
                 })
-                .collect(),
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -523,8 +528,12 @@ mod tests {
         let file = write_temp_stl(2);
         let identity = format!("path:{}", file.path.to_string_lossy());
         let state = AppState::default();
-        let (summary, _) =
+        let (summary, original) =
             load_and_commit(&state, file.path.to_str().unwrap(), 6, &identity).unwrap();
+        assert!(Arc::ptr_eq(
+            &original,
+            &state.current.lock().unwrap().as_ref().unwrap().parsed
+        ));
 
         assert_eq!(summary.source_identity, identity);
         assert_eq!(
@@ -600,6 +609,48 @@ mod tests {
         assert_eq!(summaries[0].parts[0].triangle_start, 0);
         assert_eq!(summaries[1].parts[0].triangle_start, 0);
         assert_eq!(summaries[1].parts[0].triangle_count, 1);
+        assert_eq!(
+            serde_json::to_value(&summaries[0].parts).unwrap(),
+            serde_json::json!([{
+                "id": "first-part", "name": "First part", "triangle_start": 0,
+                "triangle_count": 1, "material_id": "mat", "filament_slot": 2
+            }])
+        );
+        assert_eq!(
+            serde_json::to_value(&summaries[1].parts).unwrap(),
+            serde_json::json!([{
+                "id": "second-part", "name": "Second part", "triangle_start": 0,
+                "triangle_count": 1, "material_id": null, "filament_slot": null
+            }])
+        );
+        assert_eq!(parsed.parts[1].triangle_start, 1);
+        assert_eq!(parsed.parts[0].id, "first-part");
+    }
+
+    #[test]
+    fn plate_summaries_keep_invalid_part_selections_empty() {
+        let mut parsed = two_plate_model();
+        parsed.parts = vec![
+            stl_core::ParsedPart {
+                id: "first-contained".into(),
+                name: "Contained".into(),
+                triangle_start: 0,
+                triangle_count: 1,
+                material_id: None,
+                filament_slot: None,
+            },
+            stl_core::ParsedPart {
+                id: "outside-overflow".into(),
+                name: "Overflow".into(),
+                triangle_start: u32::MAX,
+                triangle_count: 1,
+                material_id: None,
+                filament_slot: None,
+            },
+        ];
+        let summaries = plate_summaries(&parsed);
+        assert!(summaries.iter().all(|plate| plate.parts.is_empty()));
+        assert_eq!(parsed.parts.len(), 2);
     }
 
     #[test]

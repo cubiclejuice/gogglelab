@@ -1,6 +1,48 @@
 # Thumbnail parser resource prerequisite
 
-## Current checkpoint: settings sidecar lifetime (2026-10-20)
+## Current checkpoint: metadata projections (2026-10-20)
+
+A validated borrowed plate-part view is shared by the runtime and native summary
+consumer. It checks every range before yielding, keeps source ordering and the
+existing inclusive zero-length boundary behavior, and preserves missing-plate,
+partial-overlap and outside-range overflow results. The existing owned
+`plate_parts` API delegates to the same view and remains source-compatible.
+
+The runtime consumes its exclusive parsed result after packet preparation,
+moving original part and plate strings into response rows. Whole-model requests
+keep their existing validation behavior. Native summaries read borrowed rows
+directly, avoiding an intermediate owned part vector; their final public string
+copies remain explicit. The original cached model `Arc`, public JSON fields,
+packet/source/charge handling and source bytes remain unchanged.
+
+Two actual runtime regressions first preserved packet/row/source/no-staging
+assertions and then failed because final nonempty strings had copied backing.
+Both now pass with the original backing retained. Focused verification passes six
+core model tests and eight runtime geometry tests. Final serial workspace checks
+pass 326 non-doc core tests and two doctests (one existing fixture ignored), 378
+runtime, 210 native and 65 server-library plus five CLI tests. The native checks
+include exact public JSON, invalid-selection behavior and the real cached model's
+original Arc identity. All 150 compiled inputs stayed frozen. Workspace all-target
+Clippy retains all 46 existing actionable diagnostics with zero new diagnostics,
+no suppression and no exception; formatting passes. Core/runtime and native/API
+reviews found no blocking issue.
+
+A newly compiled driver linked to the current normal core artifact passes all four
+preserved long-path/distinct-label fixtures, Stored and Deflate. Each retains
+1,024 triangles, parts and materials and original borrowed row/string addresses.
+Actual local iterator/view control sizes are 32/16 bytes. Selected field capacities
+are recorded separately; they are not total metadata or allocator/RSS accounting.
+Explicit legacy owned-copy controls still duplicate the 10,317,652-byte selected
+field subtotal to 20,635,304 bytes, so they do not fit a 16 MiB policy. Required
+source-bound composed, hosted and immutable server gates have separate records;
+no older source revision's results establish this checkpoint's acceptance.
+
+This is a representation prerequisite for complete live-capacity funding; it does
+not enable the proposed 16 MiB policy, a producer allowance or a new transport.
+Native public response copies, SDK/control/frame ownership, whole-result
+retention and immutable publication remain open.
+
+## Accepted checkpoint: settings sidecar lifetime (2026-10-20)
 
 Model-settings text is released after the existing slicer scan and compact plate
 preparation, before project-settings text is collected. Plate preparation retains
@@ -34,9 +76,26 @@ The first workspace attempt used the shared macOS temporary parent and lacked
 native event access. Controlled same-binary comparisons identified the existing
 4,096-entry recovery guard and native watcher access as the two causes; verification
 uses the established isolated temporary directory and confirmed native access.
-Product guards, assertions and deadlines were preserved. Composed, hosted and
-immutable server acceptance have their own source-bound records and remain required
-before this unit is accepted.
+Product guards, assertions and deadlines were preserved. This unit is accepted
+at source commit `1daced7fb76bd13c0c18e7ae19869033388d0744`: the disposable
+composed application check passed; both fresh hosted workflows passed, including
+macOS packaging, Linux headless tests/build and Windows GNU compilation; and all
+eleven synthetic container checks passed with 76 unchanged source models. The
+container includes eight new Stored/Deflate sidecar cases, exact geometry/field
+assertions and 550 Cargo / 37 npm license entries. Its runner stopped only the
+image-bound task container and preserved all evidence and data. Independent
+publication, hosted and final container reviews found no actionable issue.
+
+Container attempt 1 stopped before compilation because the sandbox denied Docker
+buildx activity bookkeeping. A separately reviewed explicit attempt 2 used the
+same bound source/command with local permission and passed; the first failure
+remains preserved. Both live and extracted 370-file source sets matched before
+that attempt, and the extracted context matched after building. The actual image
+is `sha256:0beb630adc367b05f53e154fb1bf15844fc5df3c621d6f56119558135acd12ee`.
+See `output/sidecar-sequencing/hosted/review.md` and
+`output/container-acceptance-sidecar-sequencing/final-review.md`. Hosted Windows
+cross-compilation does not close native Windows acceptance; synthetic headless
+Linux does not close native Linux desktop acceptance. No cleanup was performed.
 
 This removes simultaneous raw model/project sidecar backing. Full live metadata
 ownership, internal snapshots/response lifetimes, SDK/control layouts, producer
