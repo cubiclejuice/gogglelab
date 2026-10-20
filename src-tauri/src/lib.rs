@@ -143,6 +143,7 @@ pub fn configure_builder() -> tauri::Builder<tauri::Wry> {
             library_commands::library_start_scan,
             library_commands::library_scan_status,
             library_commands::library_cancel_scan,
+            library_commands::library_get_catalog_thumbnail,
             library_commands::library_get_thumbnail,
             library_commands::library_get_catalog_settings,
             library_commands::library_set_catalog_settings,

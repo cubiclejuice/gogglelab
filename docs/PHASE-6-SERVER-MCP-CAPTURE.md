@@ -3,6 +3,19 @@ Date: 2026-10-14
 Status (2026-10-14): shared runtime, authenticated browser, scans, geometry, gallery, management, HTTP/MCP catalog slices, capture, and synthetic Docker fixtures are implemented and locally verified. Current Printventory main is pinned at 59171cb (2.2.27); Phases 7–9 baseline features are confirmed, but remain gated on Phase 6 closure. The rebuilt Community app was visually checked under a temporary isolated HOME with two synthetic indexed STL models. Catalog and backup/recovery SQLite access now use pinned identity checks and a guarded VFS. Phase 6 remains open for friend-run native Windows runtime/DACL/junction/replacement tests and final release review. Full JSON round-trip for printers, parts, and slicers follows Phases 7–9.
 All implementation is public MPL-2.0 Community with no license requirement.
 
+Current cleanup correction (2026-10-19, `dda35c8851abb65adb444c4a9afb8da662bfb703`):
+the historical cleanup descriptions below are superseded by the shared
+[thumbnail cleanup contract](THUMBNAIL-CLEANUP-CONTRACT.md). Orphan removal now
+requires bounded independent raster reproduction from admitted current loose
+sources and retained file receipts, with explicit confirmation per page. All
+indexed-cache source/archive-member copies, custom and embedded previews, unknown
+files and historical holds are preserved. Default-preview reset clears only catalog
+entries and keeps every file. Windows durable cleanup remains explicitly
+unsupported; no pathname-delete fallback exists. Automated workspace/frontend
+gates and the Community build/signature pass; packaged native and container
+acceptance for this caller slice are still pending. Earlier acceptance numbers
+and platform claims remain historical evidence, not current release closure.
+
 ## Pinned primary baseline
 Upstream f551c4601c03072362b426c652b5dd37e4c55601:
 README server/Docker/MCP sections; GUIDE; chrome-extension/manifest.json,

@@ -737,6 +737,24 @@ fn render_thumbnail_models(state: &LibraryState, model_ids: Vec<String>, regener
 }
 
 #[tauri::command]
+pub async fn library_get_catalog_thumbnail(
+    state: tauri::State<'_, LibraryState>,
+    model_id: String,
+) -> Result<Option<String>, AppError> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || get_catalog_thumbnail(&state, &model_id))
+        .await
+        .map_err(|error| AppError::Library {
+            message: format!("Thumbnail reader failed: {error}"),
+        })?
+}
+
+fn get_catalog_thumbnail(state: &LibraryState, model_id: &str) -> Result<Option<String>, AppError> {
+    let _io_guard = state.begin_io()?;
+    with_db(state, |db| cached_thumbnail(db, model_id))
+}
+
+#[tauri::command]
 pub async fn library_get_thumbnail(
     state: tauri::State<'_, LibraryState>,
     model_id: String,
@@ -1043,6 +1061,62 @@ mod access_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn catalog_thumbnail_read_does_not_recreate_reset_entries() {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gogglelab-catalog-preview-read-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("fixture.stl");
+        let bytes = vec![0_u8; 84];
+        std::fs::write(&source, &bytes).unwrap();
+        let state = LibraryState::try_new(root.join("library")).unwrap();
+        let id = state
+            .with_db(|db| {
+                db.import_file(&source, None, None)
+                    .map(|result| result.model.id)
+                    .map_err(super::library_error)
+            })
+            .unwrap();
+        assert!(super::get_thumbnail(&state, &id, true).unwrap().is_some());
+        let path = state
+            .with_db(|db| {
+                let path = db
+                    .thumbnail_for_model(&id)
+                    .map_err(super::library_error)?
+                    .unwrap();
+                let snapshot = db
+                    .default_thumbnail_reset_snapshot()
+                    .map_err(super::library_error)?;
+                assert_eq!(
+                    db.reset_default_thumbnail_records(&snapshot)
+                        .map_err(super::library_error)?,
+                    1
+                );
+                Ok(path)
+            })
+            .unwrap();
+        let png = std::fs::read(&path).unwrap();
+        assert!(super::get_catalog_thumbnail(&state, &id).unwrap().is_none());
+        state
+            .with_db(|db| {
+                assert!(db
+                    .thumbnail_for_model(&id)
+                    .map_err(super::library_error)?
+                    .is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), png);
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+        assert!(super::get_thumbnail(&state, &id, true).unwrap().is_some());
+        assert!(super::get_catalog_thumbnail(&state, &id).unwrap().is_some());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn basic_library_operations_do_not_require_license_state() {

@@ -538,6 +538,14 @@ export function didLibraryScanComplete(
   );
 }
 
+export function createNativeThumbnailReader(adapter: {
+  readCatalog: (modelId: string) => Promise<string | null>;
+  generate: (modelId: string, regenerate: boolean) => Promise<string | null>;
+}): (modelId: string, regenerate: boolean) => Promise<string | null> {
+  return (modelId, regenerate) =>
+    regenerate ? adapter.generate(modelId, true) : adapter.readCatalog(modelId);
+}
+
 export function thumbnailCacheInvalidations(
   previous: LibraryModel[],
   next: LibraryModel[],

@@ -31,6 +31,7 @@ import {
   libraryScanStatus,
   libraryCancelScan,
   libraryGetThumbnail,
+  libraryGetCatalogThumbnail,
   libraryStartThumbnailJob,
   libraryGetCatalogSettings,
   librarySetCatalogSettings,
@@ -140,7 +141,7 @@ import { mountRecoveryControl } from "./lib/recovery";
 import { isLibraryRequestCurrent, type LibraryRequestToken } from "./lib/library-load-guard";
 import { handoffAvailability } from "./lib/handoff-availability";
 import { withCoreEntitlements } from "./lib/core-entitlements";
-import { LibraryPanel } from "./lib/library";
+import { LibraryPanel, createNativeThumbnailReader } from "./lib/library";
 import { LibraryOperationGuard } from "./lib/library-operation";
 import { ThumbnailCleanupDialog } from "./lib/thumbnail-cleanup-dialog";
 import { LibraryManagementDialog } from "./lib/library-management-dialog";
@@ -232,6 +233,7 @@ export function startApp(extensions: AppExtensions): void {
     scanStatus: libraryScanStatus,
     cancelScan: libraryCancelScan,
     getThumbnail: libraryGetThumbnail,
+    getCatalogThumbnail: libraryGetCatalogThumbnail,
     startThumbnailJob: libraryStartThumbnailJob,
     getCatalogSettings: libraryGetCatalogSettings,
     setCatalogSettings: librarySetCatalogSettings,
@@ -1412,7 +1414,10 @@ export function startApp(extensions: AppExtensions): void {
   };
   libraryPanel.onPollScanStatus = libraryService.scanStatus;
   libraryPanel.onScanCompleted = () => void refreshLibrary();
-  libraryPanel.onGetThumbnail = libraryService.getThumbnail;
+  libraryPanel.onGetThumbnail = createNativeThumbnailReader({
+    readCatalog: libraryService.getCatalogThumbnail,
+    generate: libraryService.getThumbnail,
+  });
   libraryPanel.onPurgeThumbnails = async () => thumbnailCleanup.show("resetDefaults");
   libraryPanel.onStartThumbnailJob = libraryService.startThumbnailJob;
   libraryPanel.onSaveCatalogSettings = async (settings) => {
@@ -1488,7 +1493,7 @@ export function startApp(extensions: AppExtensions): void {
     const groups = await libraryService.duplicateGroups(modelIds);
     libraryDuplicates.show(groups, modelIds.length);
   };
-  libraryDuplicates.onGetThumbnail = (modelId) => libraryService.getThumbnail(modelId, false);
+  libraryDuplicates.onGetThumbnail = libraryService.getCatalogThumbnail;
   libraryDuplicates.onRemove = async (models) => {
     await libraryService.removeModels(removalTargets(models));
     await refreshLibrary();

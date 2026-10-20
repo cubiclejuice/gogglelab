@@ -4,6 +4,7 @@ import {
   clampLibraryNavigationWidth,
   didLibraryScanComplete,
   LibraryPanel,
+  createNativeThumbnailReader,
   filterAndSortLibraryModels,
   LIBRARY_CATALOG_TIER,
   LIBRARY_VIEW_MODES,
@@ -537,4 +538,70 @@ test("opening the default-preview review does not clear cached views or claim a 
   expect(cleared).toBe(0);
   expect(messages).toEqual([]);
   expect(panel.purgeButton.disabled).toBe(false);
+});
+
+test("ordinary card reads after reset do not recreate catalog rows; explicit refresh still generates", async () => {
+  const rows = new Map([["model", "data:image/png;base64,old"]]);
+  const files = new Map([["model", "retained bytes"]]);
+  const reads = [];
+  const generated = [];
+  const reader = createNativeThumbnailReader({
+    readCatalog: async (id) => {
+      reads.push(id);
+      return rows.get(id) ?? null;
+    },
+    generate: async (id, force) => {
+      generated.push({ id, force });
+      rows.set(id, "data:image/png;base64,new");
+      return rows.get(id);
+    },
+  });
+  const classes = { add() {}, remove() {} };
+  const card = { isConnected: true, querySelector: () => ({ classList: classes }) };
+  const panel = {
+    renderRevision: 1,
+    thumbnailGuard: new ThumbnailRequestGuard(),
+    thumbnailCache: new Map(),
+    thumbnailQueue: [],
+    onGetThumbnail: reader,
+    drainThumbnailQueue() {},
+    installThumbnail() {},
+    setStatus() {},
+  };
+  rows.clear(); // Confirmed metadata-only reset kept the physical files.
+  await LibraryPanel.prototype.requestThumbnail.call(panel, "model", card, false);
+  await panel.thumbnailQueue.shift()();
+  expect(rows.size).toBe(0);
+  expect(generated).toEqual([]);
+  expect(reads).toEqual(["model"]);
+  expect(panel.thumbnailCache.get("model")).toBe(null);
+  expect(files.get("model")).toBe("retained bytes");
+  await LibraryPanel.prototype.requestThumbnail.call(panel, "model", card, true);
+  await panel.thumbnailQueue.shift()();
+  expect(generated).toEqual([{ id: "model", force: true }]);
+  expect(rows.size).toBe(1);
+  expect(panel.thumbnailCache.get("model")).toBe("data:image/png;base64,new");
+});
+
+test("catalog preview read errors and missing entries never fall back to source generation", async () => {
+  let generated = 0;
+  const missing = createNativeThumbnailReader({
+    readCatalog: async () => null,
+    generate: async () => {
+      generated++;
+      return "generated";
+    },
+  });
+  expect(await missing("missing", false)).toBe(null);
+  const failed = createNativeThumbnailReader({
+    readCatalog: async () => {
+      throw Error("read failed");
+    },
+    generate: async () => {
+      generated++;
+      return "generated";
+    },
+  });
+  await expect(failed("invalid", false)).rejects.toThrow("read failed");
+  expect(generated).toBe(0);
 });

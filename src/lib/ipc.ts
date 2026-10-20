@@ -1115,6 +1115,11 @@ export function libraryCancelScan(): Promise<void> {
   return invoke("library_cancel_scan");
 }
 
+/** Catalog read only: a missing or invalid entry never starts generation. */
+export function libraryGetCatalogThumbnail(modelId: string): Promise<string | null> {
+  return invoke("library_get_catalog_thumbnail", { modelId });
+}
+
 export function libraryGetThumbnail(modelId: string, regenerate = false): Promise<string | null> {
   return invoke("library_get_thumbnail", { modelId, regenerate });
 }
