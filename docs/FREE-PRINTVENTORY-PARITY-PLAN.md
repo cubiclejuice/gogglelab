@@ -1117,10 +1117,52 @@ material implementation and public-test bytes remain identical to their tested
 freeze; only eight approved comments in three consumer files differ. The explicit
 bridge is recorded in `output/material-retention-after-history-handoff.json` and
 `output/material-retention-post-history-review.md`; it is not a new post-rewrite
-test run. Downstream composition, current-source hosted/container and packaged
-acceptance remain pending for this material checkpoint.
+test run. The committed material checkpoint `17f8b6e` subsequently passed
+368-input downstream compilation, both hosted workflows/Community packaging and
+nine synthetic container check stages. The first fixture-warning assertion
+failure remains recorded; its reviewed exact-warning correction reused the same
+source bytes without rebuilding, restarting or rescanning. Evidence is retained
+in `output/material-retention-checkpoint.json` and its linked records.
 
 SDK Cow scratch, other owned text/public clones, the live-metadata ownership
 policy, producer admission, publication and final platform/release acceptance
 remain open. Settings-map retention is next in the reviewed sequence. Cleanup
 still requires exact fresh approval; this code change performs none.
+
+### Slicer settings selection and guarded growth (2026-10-20)
+
+Free now retains slicer settings only for the root-object and direct-component
+keys consumed by the existing viewer boundary paths. Relevance of an object and
+its nested part is independent. Irrelevant records still participate in scanner
+state and attribute processing, preserving ignored nesting, duplicate-field
+invalid flags, complementary merges, invalid/Empty/nested contexts and existing
+EOF behavior. Bare EOF preserves completed records without flushing unfinished
+records; actual ordinary malformed metadata still falls back without losing
+geometry. No new ID quota, hierarchy validator or text-byte policy is added.
+
+Relevant name backing and missing-key map growth reserve fallibly at three
+actual sites. Pre/post checks and typed terminal-source propagation preserve the
+same observer's first cause before optional fallback. Retained settings parsing
+does not recharge text usage. SDK attribute scratch and temporary relevant-record
+names remain explicit; root/direct-component relevance bounds do not establish an
+aggregate live-memory or RSS allowance.
+
+Two real Stored RED cases preserved geometry/name/slot output before exposing
+copy/object/part tuples `(3,3,0)` versus `(1,1,0)` and `(4,2,3)` versus `(2,1,1)`.
+The new path passes both Stored and Deflate, six local controls including 48
+actual-site terminal-failure cases, and all 17 public compatibility controls
+(18 XML inputs). The full parser suite passes 307 tests and two doctests, with
+one existing ignored fixture. Workspace Clippy passes with the same two existing
+changed-area diagnostics and no new warning or suppression. Full serial workspace
+tests also pass, including 375 runtime, 209 native and 70 server tests, with all
+150 frozen Rust/Cargo inputs unchanged. Exact downstream compilation also passes
+with all 370 public inputs matching and 1,333 pre-Cargo entries preserved.
+Current-source hosted/container results are tracked separately.
+
+The next ordered work remains live metadata ownership/lifetimes and snapshots,
+defensible producer admission, immutable preview publication and final
+platform/release acceptance. This checkpoint does not authorize installed-app
+replacement, private pin integration, release or additional cleanup. The exact
+approved old-target library-core dev cleanup recovered a measured 1.54 GiB;
+its receipt is `output/settings-relevance-build-storage-result.md`. That approval
+has been consumed; future deletion follows AGENTS.md and needs fresh exact scope.

@@ -25,6 +25,7 @@ use serde_json::Value;
 mod derived_maps;
 mod materials;
 mod project_json;
+mod settings;
 use derived_maps::BuildIndex;
 
 use crate::error::{ResourceStop, StlError};
@@ -590,6 +591,27 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct SettingsOwnedTestProfile {
+    name_copies: std::cell::Cell<usize>,
+    object_inserts: std::cell::Cell<usize>,
+    part_inserts: std::cell::Cell<usize>,
+    requests: std::cell::RefCell<Vec<(settings::ReserveSite, usize)>>,
+    before_site: std::cell::Cell<Option<(settings::ReserveSite, ParserTestFailure)>>,
+    after_site: std::cell::Cell<Option<(settings::ReserveSite, ParserTestFailure)>>,
+    finish_failure: std::cell::Cell<Option<ParserTestFailure>>,
+    entries: std::cell::Cell<usize>,
+    ordinary_fallbacks: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SETTINGS_OWNED_TEST_PROFILE: std::cell::RefCell<Option<Rc<SettingsOwnedTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// Original input cursor; its private fault seam exists only in parser tests.
 struct PackageInput<'a> {
     inner: Cursor<&'a [u8]>,
@@ -632,6 +654,8 @@ struct Package<'a, 'context> {
     derived_maps_test: Option<Rc<DerivedMapsTestProfile>>,
     #[cfg(test)]
     material_owned_test: Option<Rc<MaterialOwnedTestProfile>>,
+    #[cfg(test)]
+    settings_owned_test: Option<Rc<SettingsOwnedTestProfile>>,
     collections: InputCollections,
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
@@ -677,6 +701,8 @@ impl<'a, 'context> Package<'a, 'context> {
             derived_maps_test: DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.borrow().clone()),
             #[cfg(test)]
             material_owned_test: MATERIAL_OWNED_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            settings_owned_test: SETTINGS_OWNED_TEST_PROFILE.with(|slot| slot.borrow().clone()),
             collections,
             parts: HashMap::new(),
             materials: Vec::new(),
@@ -1043,156 +1069,6 @@ fn parse_plate_settings_observed(
         return Err("duplicated plate plater_id".into());
     }
     Ok(plates)
-}
-
-fn update_settings_record(record: &mut SettingsRecord, key: &str, value: &str) {
-    match key {
-        "name" => {
-            if record.name_invalid || record.name.is_some() {
-                record.name = None;
-                record.name_invalid = true;
-            } else if let Some(name) = normalize_label(value) {
-                record.name = Some(name);
-            } else {
-                record.name_invalid = true;
-            }
-        }
-        "extruder" => {
-            if record.extruder_invalid || record.extruder.is_some() {
-                record.extruder = None;
-                record.extruder_invalid = true;
-            } else if let Ok(slot) = value.trim().parse::<u32>() {
-                if slot > 0 {
-                    record.extruder = Some(slot);
-                } else {
-                    record.extruder_invalid = true;
-                }
-            } else {
-                record.extruder_invalid = true;
-            }
-        }
-        _ => {}
-    }
-}
-fn merge_settings_record(
-    records: &mut HashMap<u32, SettingsRecord>,
-    id: u32,
-    record: SettingsRecord,
-) {
-    let Some(existing) = records.get_mut(&id) else {
-        records.insert(id, record);
-        return;
-    };
-    if existing.name_invalid
-        || record.name_invalid
-        || (existing.name.is_some() && record.name.is_some())
-    {
-        existing.name = None;
-        existing.name_invalid = true;
-    } else if existing.name.is_none() {
-        existing.name = record.name;
-    }
-    if existing.extruder_invalid
-        || record.extruder_invalid
-        || (existing.extruder.is_some() && record.extruder.is_some())
-    {
-        existing.extruder = None;
-        existing.extruder_invalid = true;
-    } else if existing.extruder.is_none() {
-        existing.extruder = record.extruder;
-    }
-}
-
-fn parse_slicer_metadata(
-    text: &str,
-    observer: &ZipResourceObserver,
-) -> Result<SlicerMetadata, String> {
-    let mut xml = XmlEventReader::new(text.as_bytes(), observer.clone())
-        .map_err(|error| error.to_string())?;
-    xml.set_trim_text(true);
-    let mut metadata = SlicerMetadata::default();
-    let mut object: Option<(u32, SettingsRecord)> = None;
-    let mut part: Option<(u32, SettingsRecord)> = None;
-    let mut ignored_part_depth = 0u32;
-    loop {
-        match xml
-            .next_event()
-            .map_err(|e| format!("invalid slicer metadata XML ({e})"))?
-        {
-            Event::Start(e) => match e.local_name().as_ref() {
-                b"object" if object.is_none() && part.is_none() && ignored_part_depth == 0 => {
-                    let Some(id) = attr_str(&e, b"id")
-                        .map_err(|e| e.to_string())?
-                        .and_then(|v| v.trim().parse().ok())
-                    else {
-                        continue;
-                    };
-                    object = Some((id, SettingsRecord::default()));
-                }
-                b"part" if object.is_some() => {
-                    if ignored_part_depth > 0 {
-                        ignored_part_depth = ignored_part_depth.saturating_add(1);
-                    } else if part.is_some() {
-                        ignored_part_depth = 1;
-                    } else if let Some(id) = attr_str(&e, b"id")
-                        .map_err(|e| e.to_string())?
-                        .and_then(|v| v.trim().parse().ok())
-                    {
-                        part = Some((id, SettingsRecord::default()));
-                    } else {
-                        ignored_part_depth = 1;
-                    }
-                }
-                b"metadata" if ignored_part_depth == 0 => {
-                    let key = attr_str(&e, b"key").map_err(|e| e.to_string())?;
-                    let value = attr_str(&e, b"value").map_err(|e| e.to_string())?;
-                    if let (Some(key), Some(value)) = (key, value) {
-                        if let Some((_, record)) = part.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        } else if let Some((_, record)) = object.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Event::Empty(e) => match e.local_name().as_ref() {
-                b"metadata" if ignored_part_depth == 0 => {
-                    let key = attr_str(&e, b"key").map_err(|e| e.to_string())?;
-                    let value = attr_str(&e, b"value").map_err(|e| e.to_string())?;
-                    if let (Some(key), Some(value)) = (key, value) {
-                        if let Some((_, record)) = part.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        } else if let Some((_, record)) = object.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Event::End(e) => match e.local_name().as_ref() {
-                b"part" => {
-                    if ignored_part_depth > 0 {
-                        ignored_part_depth -= 1;
-                    } else if let Some((id, record)) = part.take() {
-                        merge_settings_record(&mut metadata.parts, id, record);
-                    }
-                }
-                b"object" => {
-                    if part.is_some() || ignored_part_depth > 0 {
-                        return Err("unclosed slicer metadata part".into());
-                    }
-                    if let Some((id, record)) = object.take() {
-                        merge_settings_record(&mut metadata.objects, id, record);
-                    }
-                }
-                _ => {}
-            },
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    Ok(metadata)
 }
 
 fn normalize_label(value: &str) -> Option<String> {
@@ -2536,9 +2412,46 @@ fn parse_3mf_with_context(
         .as_ref()
         .ok()
         .and_then(|text| text.as_deref())
-        .map(|text| parse_slicer_metadata(text, &pkg.observer));
+        .map(|text| {
+            settings::parse_slicer_metadata(
+                text,
+                &pkg.observer,
+                &root.objects,
+                &component_paths,
+                #[cfg(test)]
+                pkg.settings_owned_test.as_deref(),
+            )
+        });
+    #[cfg(test)]
+    if let Some(failure) = pkg
+        .settings_owned_test
+        .as_ref()
+        .and_then(|probe| probe.finish_failure.take())
+    {
+        match failure {
+            ParserTestFailure::Stop(stop) => {
+                let _ = pkg.observer.stop_io(stop);
+            }
+            ParserTestFailure::Allocation => {
+                let _ = pkg.observer.allocation_failed_io();
+            }
+        }
+    }
     pkg.observer.check()?;
-    let slicer = slicer_result.and_then(Result::ok).unwrap_or_default();
+    let slicer = match slicer_result {
+        Some(Ok(metadata)) => metadata,
+        Some(Err(settings::SettingsError::Source(error))) => return Err(error),
+        Some(Err(settings::SettingsError::Metadata(_))) => {
+            #[cfg(test)]
+            if let Some(probe) = &pkg.settings_owned_test {
+                probe
+                    .ordinary_fallbacks
+                    .set(probe.ordinary_fallbacks.get() + 1);
+            }
+            SlicerMetadata::default()
+        }
+        None => SlicerMetadata::default(),
+    };
     let project_result =
         pkg.optional_bounded_text(PROJECT_SETTINGS_PATH, MAX_APPEARANCE_METADATA_BYTES);
     pkg.observer.check()?;
@@ -5695,6 +5608,302 @@ mod tests {
             }
         }
     }
+    struct SettingsOwnedProfileGuard(Option<Rc<SettingsOwnedTestProfile>>);
+    impl SettingsOwnedProfileGuard {
+        fn install(profile: Rc<SettingsOwnedTestProfile>) -> Self {
+            Self(SETTINGS_OWNED_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for SettingsOwnedProfileGuard {
+        fn drop(&mut self) {
+            drop(SETTINGS_OWNED_TEST_PROFILE.with(|slot| slot.replace(self.0.take())));
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_irrelevant_object_names_and_rows_are_not_retained() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Useful"/><metadata key="extruder" value="2"/></object><object id="999"><metadata key="name" value="Unused A"/></object><object id="1000"><metadata key="name" value="Unused B"/></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            ))
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.model.positions.len(), 108);
+            assert_eq!(
+                &parsed.model.positions[..9],
+                &[0., 0., 0., 10., 10., 0., 10., 0., 0.]
+            );
+            assert_eq!(parsed.parts.len(), 1);
+            assert_eq!(parsed.parts[0].id, "object:1:instance:0");
+            assert_eq!(
+                (
+                    parsed.parts[0].triangle_start,
+                    parsed.parts[0].triangle_count
+                ),
+                (0, 12)
+            );
+            assert_eq!(parsed.parts[0].name, "Useful");
+            assert_eq!(parsed.parts[0].filament_slot, Some(2));
+            assert!(parsed.part_warning.is_none());
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (1, 1, 0),
+                "only the consumed root record needs retained name backing and a map slot"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_part_retention_is_independent_of_outer_object() {
+        let resources = format!(
+            r#"{}<object id="1"><components><component objectid="2"/></components></object>"#,
+            cube_mesh_xml(2)
+        );
+        let root = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Root label"/><metadata key="extruder" value="2"/></object><object id="999"><part id="2"><metadata key="name" value="Useful part"/><metadata key="extruder" value="3"/></part><part id="998"><metadata key="name" value="Unused A"/></part><part id="997"><metadata key="name" value="Unused B"/></part></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            ))
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.model.positions.len(), 108);
+            assert_eq!(
+                &parsed.model.positions[..9],
+                &[0., 0., 0., 10., 10., 0., 10., 0., 0.]
+            );
+            assert_eq!(parsed.parts.len(), 1);
+            assert_eq!(
+                parsed.parts[0].id,
+                "object:1:instance:0/component:0:object:2"
+            );
+            assert_eq!(
+                (
+                    parsed.parts[0].triangle_start,
+                    parsed.parts[0].triangle_count
+                ),
+                (0, 12)
+            );
+            assert_eq!(parsed.parts[0].name, "Root label · Useful part");
+            assert_eq!(parsed.parts[0].filament_slot, Some(3));
+            assert!(parsed.part_warning.is_none());
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (2, 1, 1),
+                "part relevance must not depend on its unrelated outer object record"
+            );
+        }
+    }
+
+    fn settings_owned_fault_fixture() -> (String, &'static str) {
+        let resources = format!(
+            r#"{}<object id="1"><components><component objectid="2"/></components></object>"#,
+            cube_mesh_xml(2)
+        );
+        let root = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Root label"/><metadata key="extruder" value="2"/></object><object id="999"><part id="2"><metadata key="name" value="Useful part"/><metadata key="extruder" value="3"/></part></object></config>"#;
+        (root, settings)
+    }
+
+    #[test]
+    fn settings_relevance_owned_actual_reserve_stops_remain_terminal_before_and_after() {
+        for deflate in [false, true] {
+            let (root, settings) = settings_owned_fault_fixture();
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            );
+            for site in [
+                settings::ReserveSite::Name,
+                settings::ReserveSite::Objects,
+                settings::ReserveSite::Parts,
+            ] {
+                for after in [false, true] {
+                    for failure in PARSER_TEST_FAILURES {
+                        let profile = Rc::new(SettingsOwnedTestProfile::default());
+                        if after {
+                            profile.after_site.set(Some((site, failure)));
+                        } else {
+                            profile.before_site.set(Some((site, failure)));
+                        }
+                        profile.finish_failure.set(Some(match failure {
+                            ParserTestFailure::Stop(_) => ParserTestFailure::Allocation,
+                            ParserTestFailure::Allocation => {
+                                ParserTestFailure::Stop(ResourceStop::EnvelopeChanged)
+                            }
+                        }));
+                        let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+                        let observer = ZipResourceObserver::new();
+                        let mut context = PackageProcessingContext::new(observer.clone());
+                        assert_eq!(
+                            crate::parse_model_with_plates_in_context(&bytes, &mut context)
+                                .map(|_| ()),
+                            Err(failure.error())
+                        );
+                        assert_eq!(
+                            observer.check().map_err(StlError::from),
+                            Err(failure.error())
+                        );
+                        assert_eq!(profile.entries.get(), 1);
+                        assert_eq!(profile.ordinary_fallbacks.get(), 0);
+                        assert!(profile.before_site.get().is_none());
+                        assert!(profile.after_site.get().is_none());
+                        assert!(profile.finish_failure.get().is_none());
+                        let requests = profile.requests.borrow();
+                        assert_eq!(requests.last().map(|(actual, _)| *actual), Some(site));
+                        assert_eq!(
+                            requests.len(),
+                            match site {
+                                settings::ReserveSite::Name => 1,
+                                settings::ReserveSite::Objects => 2,
+                                settings::ReserveSite::Parts => 4,
+                            }
+                        );
+                        match site {
+                            settings::ReserveSite::Name => assert_eq!(profile.name_copies.get(), 0),
+                            settings::ReserveSite::Objects => {
+                                assert_eq!(profile.object_inserts.get(), 0)
+                            }
+                            settings::ReserveSite::Parts => {
+                                assert_eq!(profile.part_inserts.get(), 0)
+                            }
+                        }
+                        assert_eq!(
+                            context.usage().inflation_bytes,
+                            (root.len() + settings.len()) as u64
+                        );
+                        assert_eq!(context.usage().retained_input_bytes, settings.len());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_shared_context_usage_is_not_recharged() {
+        for deflate in [false, true] {
+            let (root, settings) = settings_owned_fault_fixture();
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            );
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+            let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.parts[0].name, "Root label · Useful part");
+            assert_eq!(parsed.parts[0].filament_slot, Some(3));
+            assert_eq!(
+                context.usage().inflation_bytes,
+                (root.len() + settings.len()) as u64
+            );
+            assert_eq!(context.usage().retained_input_bytes, settings.len());
+            assert_eq!(profile.entries.get(), 1);
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (2, 1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_duplicates_and_irrelevant_records_do_not_reserve_map_slots() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Useful"/><metadata key="extruder" value="2"/></object><object id="999"><metadata key="name" value="Unused A"/></object><object id="1"><metadata key="extruder" value="2"/></object><object id="1000"><metadata key="name" value="Unused B"/></object><object id="1"><metadata key="extruder" value="3"/></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            ))
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.parts[0].name, "Useful");
+            assert_eq!(parsed.parts[0].filament_slot, None);
+            assert_eq!(
+                &*profile.requests.borrow(),
+                &[
+                    (settings::ReserveSite::Name, 6),
+                    (settings::ReserveSite::Objects, 1)
+                ]
+            );
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (1, 1, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_ordinary_tail_still_discards_optional_settings() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Useful"/><metadata key="extruder" value="2"/></object><object id="999"><part id="999"></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            let parsed = crate::parse_model_with_plates_in_context(
+                &package(
+                    &[
+                        (ROOT_MODEL_FALLBACK, &root),
+                        (MODEL_SETTINGS_PATH, settings),
+                    ],
+                    deflate,
+                ),
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.parts[0].name, "Object 1");
+            assert_eq!(parsed.parts[0].filament_slot, None);
+            assert_eq!(profile.ordinary_fallbacks.get(), 1);
+            assert_eq!(profile.object_inserts.get(), 1);
+            assert!(observer.check().is_ok());
+        }
+    }
+
     struct MaterialOwnedProfileGuard(Option<Rc<MaterialOwnedTestProfile>>);
     impl MaterialOwnedProfileGuard {
         fn install(profile: Rc<MaterialOwnedTestProfile>) -> Self {

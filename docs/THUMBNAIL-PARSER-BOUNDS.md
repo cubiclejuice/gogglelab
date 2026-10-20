@@ -1,5 +1,52 @@
 # Thumbnail parser resource prerequisite
 
+## Slicer settings retention checkpoint (2026-10-20)
+
+Settings maps retain records only for root object IDs and the diagnostic map's
+direct-component target IDs, the existing consumers' relevance superset. Object
+and part relevance are independent: useful part settings beneath an irrelevant
+object survive. Irrelevant open objects/parts still occupy scanner state;
+ignored nested-part depth, invalid IDs, Empty tags, permissive nested objects,
+End-event merging and EOF behavior remain unchanged. Completed records survive
+bare EOF; unfinished records are not merged. Actual ordinary reader/scanner
+errors still discard optional settings while preserving geometry.
+
+Only relevant records obtain retained name backing and map entries. Names retain
+trim/256-Unicode-scalar behavior; duplicate IDs merge complementary fields, while
+equal repeated/invalid fields remain permanently invalid. All attribute lookups,
+including unknown keys and irrelevant records, preserve existing first-error and
+first-local-name selection. Existing ignored-depth paths remain undecoded.
+
+Name backing and missing-key object/part map growth reserve fallibly, with
+pre/post acquisition checks on the same observer. Private typed terminal errors
+cross the actual optional caller before ordinary fallback. Retained settings
+parsing does not recharge package text usage. The relevance bounds follow already
+admitted root objects/direct-component targets; no new arbitrary-ID quota or
+stricter XML hierarchy is introduced. Temporary relevant-record names and SDK
+attribute key/value normalization scratch remain separate contributors.
+
+Two compiled RED tests first preserved geometry and consumed fields, then
+observed old copy/object/part tuples `(3,3,0)` versus `(1,1,0)` and `(4,2,3)` versus
+`(2,1,1)`. Those failures occurred on Stored inputs before reaching the Deflate
+iteration. Current GREEN executes both methods: six local controls include 48
+actual-site before/post checks across three reserve sites, four terminal causes,
+first-cause/fallback/commit checks and shared-context accounting. Seventeen public
+controls (18 concrete XML inputs, Stored and Deflate) passed on the unchanged
+scanner and on the new path. Full parser verification passes 307 tests and two
+doctests, with one existing ignored fixture. Workspace all-target Clippy passes
+with the same two changed-area diagnostics and no new warning or suppression.
+
+Full serial workspace tests pass, including 375 runtime, 209 native and 70
+server tests, with all 150 frozen Rust/Cargo inputs unchanged; see
+`output/settings-relevance-workspace-results.json`. Exact downstream compilation
+also passes with all 370 public inputs matching and all 1,333 pre-Cargo entries
+preserved. Hosted/container checks have separate immutable provenance records. Actual evidence
+is under `output/settings-relevance-*`; the frozen verification covers all Rust
+sources/Cargo manifests/locks and both new owned files. Count/relevance and named
+fallible-growth controls do not complete live owned-text/snapshot lifetimes,
+SDK/allocator overlap, producer admission or immutable preview publication.
+Those and final platform/release gates remain open.
+
 ## Standard material acquisition checkpoint (2026-10-20)
 
 Standard base/color material rows keep the existing 1,024 accepted distinct
@@ -42,8 +89,13 @@ material source/test bytes still match the tested freeze; the only source-hash
 changes are eight approved comments in three consumer files. The evidence bridge
 is separate in `output/material-retention-after-history-handoff.json` and
 `output/material-retention-post-history-review.md`, rather than a claimed new test
-run. Downstream composition and current-source hosted/container/packaged
-acceptance remain pending for this material unit.
+run. The committed material checkpoint `17f8b6e` subsequently passed exact
+368-input downstream compilation, both hosted workflows and Community packaging,
+and nine synthetic container check stages. The original material fixture-warning
+assertion failure remains preserved; the reviewed correction required the exact
+existing whole-build warning without rebuilding, restarting or rescanning. See
+`output/material-retention-checkpoint.json` and
+`output/material-retention-hosted-review.md`.
 
 This bounds existing row/lookup acquisition and selected field copies. It does
 not impose 1,024 materials across the entire package, recover every SDK/std/Rc
