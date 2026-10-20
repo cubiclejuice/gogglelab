@@ -5,7 +5,7 @@ use library_protocol::{
 };
 use std::any::{Any, TypeId};
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -74,6 +74,7 @@ pub use secure_fs::{
     GeneratedControlKind, GeneratedControlNamespace, GeneratedControlRole, GeneratedFileLocation,
     GeneratedFileReceipt, HeldEntry, MovedEntry,
 };
+mod thumbnail_cleanup;
 pub mod thumbnails;
 
 /// Opaque handle used by native management code for one admitted directory.
@@ -811,7 +812,6 @@ const DEFAULT_UPLOAD_TEMP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PHYSICAL_MUTATION_TARGETS: usize = 100;
 const MAX_PHYSICAL_MUTATION_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ORPHAN_CLEANUP_FILES: usize = 10_000;
-const MAX_ORPHAN_CLEANUP_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ORPHAN_CLEANUP_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 type EpochInvalidator = Arc<dyn Fn(u64) + Send + Sync>;
@@ -1073,7 +1073,6 @@ struct TempResourceState {
     geometry_inventory_error: Option<RuntimeError>,
 }
 
-#[derive(Clone)]
 struct PlannedAction {
     action: ManagementAction,
     principal_id: String,
@@ -1084,7 +1083,7 @@ struct PlannedAction {
     input_fingerprint: Option<(u64, String)>,
     physical_sources: Vec<PhysicalSourceSnapshot>,
     managed_assets: Vec<ManagedAssetSnapshot>,
-    orphan_files: Vec<OrphanFileSnapshot>,
+    thumbnail_cleanup: Option<thumbnail_cleanup::Plan>,
 }
 
 #[derive(Clone)]
@@ -1168,20 +1167,6 @@ struct ManagedAssetSnapshot {
     relative_path: PathBuf,
     bytes: u64,
     sha256: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OrphanFileKind {
-    GeneratedThumbnail,
-    IndexedCache,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OrphanFileSnapshot {
-    relative_path: PathBuf,
-    bytes: u64,
-    sha256: String,
-    kind: OrphanFileKind,
 }
 
 use std::io;
@@ -2059,6 +2044,7 @@ pub struct LibraryRuntime {
     temp_limits: Mutex<TempResourceLimits>,
     temp_resources: Arc<Mutex<TempResourceState>>,
     actions: Mutex<HashMap<String, PlannedAction>>,
+    thumbnail_cleanup: thumbnail_cleanup::Store,
     #[cfg(test)]
     before_action_dispatch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -2127,6 +2113,7 @@ impl LibraryRuntime {
             temp_limits: Mutex::new(TempResourceLimits::default()),
             temp_resources: Arc::new(Mutex::new(TempResourceState::default())),
             actions: Mutex::new(HashMap::new()),
+            thumbnail_cleanup: thumbnail_cleanup::Store::default(),
             #[cfg(test)]
             before_action_dispatch: Mutex::new(None),
             #[cfg(test)]
@@ -3279,11 +3266,55 @@ impl SettingsEngine for LibraryRuntime {
 }
 
 impl ManagementEngine for LibraryRuntime {
+    fn discard_action(&self, context: &RequestContext, token: &str) -> Result<(), RuntimeError> {
+        thumbnail_cleanup::prune(self);
+        let mut actions = self.actions.lock().unwrap();
+        let planned = actions
+            .get(token)
+            .ok_or_else(|| stale("Management plan is unknown or already used"))?;
+        if planned.principal_id != context.principal_id {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Forbidden,
+                message: "Management plan belongs to another principal".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let planned = actions.remove(token);
+        drop(actions);
+        drop(planned);
+        Ok(())
+    }
     fn plan_action(
         &self,
         context: &RequestContext,
         action: ManagementAction,
     ) -> Result<ActionPlan, RuntimeError> {
+        match &action {
+            ManagementAction::CleanupOrphans { continuation } => {
+                return thumbnail_cleanup::review(
+                    self,
+                    context,
+                    library_protocol::ThumbnailCleanupRequest {
+                        mode: library_protocol::ThumbnailCleanupMode::Orphans,
+                        continuation: continuation.clone(),
+                    },
+                )
+            }
+            ManagementAction::ResetDefaultThumbnails => {
+                return thumbnail_cleanup::review(
+                    self,
+                    context,
+                    library_protocol::ThumbnailCleanupRequest {
+                        mode: library_protocol::ThumbnailCleanupMode::ResetDefaults,
+                        continuation: None,
+                    },
+                )
+            }
+            _ => {}
+        }
+        thumbnail_cleanup::prune(self);
         let action_kind = match &action {
             ManagementAction::RecoverableRemove { .. } => {
                 self.require(context, Capability::CatalogWrite)?;
@@ -3347,7 +3378,7 @@ impl ManagementEngine for LibraryRuntime {
                 self.require(context, Capability::BackupWrite)?;
                 "purgeCatalog"
             }
-            ManagementAction::CleanupOrphans => {
+            ManagementAction::CleanupOrphans { .. } | ManagementAction::ResetDefaultThumbnails => {
                 require_durable_source_mutations()?;
                 self.require(context, Capability::Maintenance)?;
                 self.require(context, Capability::MediaWrite)?;
@@ -3435,11 +3466,6 @@ impl ManagementEngine for LibraryRuntime {
         } else {
             Vec::new()
         };
-        let orphan_files = if matches!(&action, ManagementAction::CleanupOrphans) {
-            snapshot_orphan_files(self)?
-        } else {
-            Vec::new()
-        };
         if is_physical_batch {
             validate_physical_source_batch(&physical_sources)?;
         }
@@ -3495,11 +3521,6 @@ impl ManagementEngine for LibraryRuntime {
                 "Configured index roots and their original model files are preserved".into(),
                 "The previous managed Library directory is retained for recovery".into(),
             ],
-            ManagementAction::CleanupOrphans => vec![format!(
-                "Remove {} verified, unreferenced app-owned files ({} bytes); configured model roots are not scanned or changed",
-                orphan_files.len(),
-                orphan_files.iter().map(|file| file.bytes).sum::<u64>()
-            )],
             _ => vec!["The action will be rejected if the catalog changes before execution".into()],
         };
         actions.insert(
@@ -3514,7 +3535,7 @@ impl ManagementEngine for LibraryRuntime {
                 input_fingerprint: input_fingerprint.clone(),
                 physical_sources,
                 managed_assets: managed_assets.clone(),
-                orphan_files: orphan_files.clone(),
+                thumbnail_cleanup: None,
             },
         );
         Ok(ActionPlan {
@@ -3527,6 +3548,7 @@ impl ManagementEngine for LibraryRuntime {
             impact,
             input_bytes: input_fingerprint.as_ref().map(|value| value.0),
             input_sha256: input_fingerprint.map(|value| value.1),
+            thumbnail_review: None,
         })
     }
 
@@ -3535,10 +3557,10 @@ impl ManagementEngine for LibraryRuntime {
         context: &RequestContext,
         token: &str,
     ) -> Result<ManagementResult, RuntimeError> {
+        thumbnail_cleanup::prune(self);
         let mut actions = self.actions.lock().unwrap();
         let planned = actions
             .get(token)
-            .cloned()
             .ok_or_else(|| stale("Management plan is unknown or already used"))?;
         if planned.principal_id != context.principal_id {
             return Err(RuntimeError {
@@ -3549,13 +3571,22 @@ impl ManagementEngine for LibraryRuntime {
                 source_holds: Vec::new(),
             });
         }
-        actions.remove(token);
+        let mut planned = actions.remove(token).unwrap();
         drop(actions);
         if planned.expires <= SystemTime::now()
             || planned.library_epoch != self.library_epoch()
             || planned.catalog_revision != self.catalog_revision()
         {
             return Err(stale("Management plan is stale"));
+        }
+        if let Some(cleanup) = planned.thumbnail_cleanup.take() {
+            return thumbnail_cleanup::execute(
+                self,
+                context,
+                cleanup,
+                planned.library_epoch,
+                planned.catalog_revision,
+            );
         }
         revalidate_action_targets(self, &planned.targets)?;
         #[cfg(test)]
@@ -3704,13 +3735,9 @@ impl ManagementEngine for LibraryRuntime {
                 planned.library_epoch,
                 planned.catalog_revision,
             ),
-            ManagementAction::CleanupOrphans => execute_cleanup_orphans(
-                self,
-                context,
-                &planned.orphan_files,
-                planned.library_epoch,
-                planned.catalog_revision,
-            ),
+            ManagementAction::CleanupOrphans { .. } | ManagementAction::ResetDefaultThumbnails => {
+                Err(internal("Preview cleanup plan is missing"))
+            }
         }
     }
 
@@ -5978,7 +6005,7 @@ fn validate_management_action(
                 false,
             )?;
         }
-        ManagementAction::CleanupOrphans => {}
+        ManagementAction::CleanupOrphans { .. } | ManagementAction::ResetDefaultThumbnails => {}
     }
     Ok(())
 }
@@ -6098,226 +6125,6 @@ fn verify_managed_asset_snapshots(
         }
     }
     Ok(())
-}
-
-fn snapshot_orphan_files(
-    runtime: &LibraryRuntime,
-) -> Result<Vec<OrphanFileSnapshot>, RuntimeError> {
-    let (thumbnail_paths, content_hashes) =
-        runtime.read_db(|db| Ok((db.thumbnail_relative_paths()?, db.catalog_content_hashes()?)))?;
-    let protected_paths = runtime
-        .leases
-        .lock()
-        .unwrap()
-        .values()
-        .filter_map(|lease| lease.backing.path().map(Path::to_path_buf))
-        .collect::<Vec<_>>();
-    collect_orphan_files(
-        &runtime.root,
-        &thumbnail_paths,
-        &content_hashes,
-        &protected_paths,
-        !runtime.local_catalog_root_access,
-    )
-}
-
-fn collect_orphan_files(
-    library_root: &Path,
-    thumbnail_paths: &HashSet<String>,
-    content_hashes: &HashSet<String>,
-    protected_paths: &[PathBuf],
-    include_indexed_cache: bool,
-) -> Result<Vec<OrphanFileSnapshot>, RuntimeError> {
-    let root = library_root.canonicalize().map_err(|_| io_error())?;
-    let mut snapshots = Vec::new();
-    let mut total_bytes = 0u64;
-
-    let mut add_file = |path: &Path, kind: OrphanFileKind, cache_hash: Option<&str>| {
-        if snapshots.len() >= MAX_ORPHAN_CLEANUP_FILES {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Busy,
-                message: "Orphan cleanup contains too many files".into(),
-                retryable: true,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        let relative = path
-            .strip_prefix(&root)
-            .map_err(|_| invalid("Orphan candidate escaped the Library"))?
-            .to_path_buf();
-        validate_relative_source_path(&relative)?;
-        let canonical = path.canonicalize().map_err(|_| io_error())?;
-        if canonical != *path || !canonical.starts_with(&root) {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Orphan candidate is not inside an owned Library namespace".into(),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Orphan candidate is not a regular file".into(),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        let (bytes, sha256) = hash_management_file(path, MAX_ORPHAN_CLEANUP_FILE_BYTES)?;
-        if cache_hash.is_some_and(|expected| sha256 != expected) {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Indexed cache file hash does not match its namespace".into(),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        total_bytes = total_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| invalid("Orphan cleanup byte total is out of range"))?;
-        if total_bytes > MAX_ORPHAN_CLEANUP_TOTAL_BYTES {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Busy,
-                message: "Orphan cleanup exceeds its byte limit".into(),
-                retryable: true,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        snapshots.push(OrphanFileSnapshot {
-            relative_path: relative,
-            bytes,
-            sha256,
-            kind,
-        });
-        Ok(())
-    };
-
-    let thumbnails = root.join("thumbnails");
-    for entry in safe_optional_directory_entries(&root, &thumbnails)? {
-        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| io_error())?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && is_generated_thumbnail_name(&name)
-        {
-            let relative = entry
-                .path()
-                .strip_prefix(&root)
-                .map_err(|_| invalid("Thumbnail path escaped the Library"))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if !thumbnail_paths.contains(&relative)
-                && !protected_paths
-                    .iter()
-                    .any(|protected| protected == &entry.path())
-            {
-                add_file(&entry.path(), OrphanFileKind::GeneratedThumbnail, None)?;
-            }
-        }
-    }
-
-    if include_indexed_cache {
-        let cache_root = root.join("indexed-cache");
-        for directory in safe_optional_directory_entries(&root, &cache_root)? {
-            let dir_path = directory.path();
-            let metadata = fs::symlink_metadata(&dir_path).map_err(|_| io_error())?;
-            let hash = directory.file_name().to_string_lossy().into_owned();
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || hash.len() != 64
-                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(RuntimeError {
-                    code: RuntimeErrorCode::Corrupt,
-                    message: "Indexed cache contains an unsafe entry".into(),
-                    retryable: false,
-                    current_version: None,
-                    source_holds: Vec::new(),
-                });
-            }
-            if content_hashes.contains(&hash)
-                || protected_paths
-                    .iter()
-                    .any(|protected| protected.starts_with(&dir_path))
-            {
-                continue;
-            }
-            let children = fs::read_dir(&dir_path).map_err(|_| io_error())?;
-            let mut child_count = 0usize;
-            for child in children {
-                let child = child.map_err(|_| io_error())?;
-                child_count += 1;
-                if child_count > MAX_ORPHAN_CLEANUP_FILES {
-                    return Err(RuntimeError {
-                        code: RuntimeErrorCode::Busy,
-                        message: "Indexed cache directory has too many entries".into(),
-                        retryable: true,
-                        current_version: None,
-                        source_holds: Vec::new(),
-                    });
-                }
-                let child_path = child.path();
-                let child_meta = fs::symlink_metadata(&child_path).map_err(|_| io_error())?;
-                if child_meta.file_type().is_symlink() || !child_meta.is_file() {
-                    return Err(RuntimeError {
-                        code: RuntimeErrorCode::Corrupt,
-                        message: "Indexed cache hash directory is unsafe".into(),
-                        retryable: false,
-                        current_version: None,
-                        source_holds: Vec::new(),
-                    });
-                }
-                add_file(&child_path, OrphanFileKind::IndexedCache, Some(&hash))?;
-            }
-        }
-    }
-
-    snapshots.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(snapshots)
-}
-
-fn safe_optional_directory_entries(
-    root: &Path,
-    directory: &Path,
-) -> Result<Vec<fs::DirEntry>, RuntimeError> {
-    let metadata = match fs::symlink_metadata(directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(io_error()),
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || directory.canonicalize().map_err(|_| io_error())? != directory
-        || !directory.starts_with(root)
-    {
-        return Err(RuntimeError {
-            code: RuntimeErrorCode::Corrupt,
-            message: "Orphan cleanup namespace is unsafe".into(),
-            retryable: false,
-            current_version: None,
-            source_holds: Vec::new(),
-        });
-    }
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|_| io_error())? {
-        if entries.len() >= MAX_ORPHAN_CLEANUP_FILES {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Busy,
-                message: "Orphan cleanup namespace has too many entries".into(),
-                retryable: true,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        entries.push(entry.map_err(|_| io_error())?);
-    }
-    Ok(entries)
 }
 
 fn purge_journal_path(root: &Path) -> Result<PathBuf, RuntimeError> {
@@ -7007,24 +6814,6 @@ fn open_optional_real_directory_at(
             source_holds: Vec::new(),
         }),
     }
-}
-
-fn is_generated_thumbnail_name(name: &str) -> bool {
-    let Some((hash, suffix)) = name
-        .strip_suffix(".png")
-        .and_then(|value| value.split_once("-isometric-v"))
-    else {
-        return false;
-    };
-    let parts = suffix.split('-').collect::<Vec<_>>();
-    hash.len() == 64
-        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && parts.len() == 3
-        && !parts[0].is_empty()
-        && parts[0].bytes().all(|byte| byte.is_ascii_digit())
-        && matches!(parts[1], "128" | "256" | "512")
-        && parts[2].len() == 6
-        && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_physical_model_action(
@@ -9302,150 +9091,6 @@ fn execute_purge_catalog(
         backup_destination_handle_id: backup_handle_id.into(),
         backup_file_name: backup_file_name.into(),
         library_epoch: epoch,
-    })
-}
-
-fn execute_cleanup_orphans(
-    runtime: &LibraryRuntime,
-    context: &RequestContext,
-    planned_orphans: &[OrphanFileSnapshot],
-    expected_epoch: u64,
-    expected_revision: u64,
-) -> Result<ManagementResult, RuntimeError> {
-    require_durable_source_mutations()?;
-    runtime.require(context, Capability::Maintenance)?;
-    runtime.require(context, Capability::MediaWrite)?;
-    let runtime_arc = runtime
-        .self_weak
-        .get()
-        .and_then(Weak::upgrade)
-        .ok_or_else(|| internal("Runtime self reference is unavailable"))?;
-    let _guard = runtime_arc.begin_maintenance()?;
-    recheck_management_plan(runtime, expected_epoch, expected_revision)?;
-    let root = runtime.root.clone();
-    let root_directory = secure_fs::Directory::open(&root)
-        .map_err(|_| stale("Library root is no longer a safe directory"))?;
-    if !root_directory
-        .matches_path(&root)
-        .map_err(|_| stale("Library root identity changed"))?
-    {
-        return Err(stale("Library root identity changed"));
-    }
-    if planned_orphans.is_empty() {
-        return Ok(ManagementResult::CleanupCompleted { files: 0, bytes: 0 });
-    }
-
-    let db = LibraryDb::open(&root).map_err(runtime_library_error)?;
-    if db.root() != root
-        || !root_directory
-            .matches_path(&root)
-            .is_ok_and(|matches| matches)
-    {
-        return Err(stale("Library root identity changed during cleanup"));
-    }
-    let thumbnail_paths = db
-        .thumbnail_relative_paths()
-        .map_err(runtime_library_error)?;
-    let content_hashes = db.catalog_content_hashes().map_err(runtime_library_error)?;
-    drop(db);
-    let protected_paths = runtime
-        .leases
-        .lock()
-        .unwrap()
-        .values()
-        .filter_map(|lease| lease.backing.path().map(Path::to_path_buf))
-        .collect::<Vec<_>>();
-    let current_orphans = collect_orphan_files(
-        &root,
-        &thumbnail_paths,
-        &content_hashes,
-        &protected_paths,
-        !runtime.local_catalog_root_access,
-    )?;
-    if !root_directory
-        .matches_path(&root)
-        .is_ok_and(|matches| matches)
-    {
-        return Err(stale("Library root identity changed during cleanup"));
-    }
-    if planned_orphans
-        .iter()
-        .any(|planned| !current_orphans.contains(planned))
-    {
-        return Err(stale(
-            "An orphan changed or became referenced after confirmation",
-        ));
-    }
-
-    for snapshot in planned_orphans {
-        validate_relative_source_path(&snapshot.relative_path)?;
-        let actual = root_directory
-            .hash_relative_file(&snapshot.relative_path, MAX_ORPHAN_CLEANUP_FILE_BYTES)
-            .map_err(|_| stale("Orphan file changed"))?;
-        if actual != (snapshot.bytes, snapshot.sha256.clone()) {
-            return Err(stale("Orphan file bytes changed after confirmation"));
-        }
-    }
-
-    let mut deleted_files = 0_u64;
-    let mut bytes = 0u64;
-    let mut cache_directories = BTreeSet::new();
-    for snapshot in planned_orphans {
-        if !root_directory
-            .matches_path(&root)
-            .is_ok_and(|matches| matches)
-        {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Io,
-                message: format!(
-                    "Orphan cleanup stopped after deleting {deleted_files} of {} generated files ({bytes} bytes); original model files were not touched, and a new plan is required. Root identity changed before the next file.",
-                    planned_orphans.len()
-                ),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        let expected = (snapshot.bytes, snapshot.sha256.clone());
-        if let Err(error) = root_directory.delete_verified_relative_file(
-            &snapshot.relative_path,
-            &expected,
-            MAX_ORPHAN_CLEANUP_FILE_BYTES,
-        ) {
-            if root_directory
-                .relative_file_exists(&snapshot.relative_path)
-                .is_ok_and(|exists| !exists)
-            {
-                deleted_files += 1;
-                bytes = bytes.saturating_add(snapshot.bytes);
-            }
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Io,
-                message: format!(
-                    "Orphan cleanup stopped after deleting {deleted_files} of {} generated files ({bytes} bytes); original model files were not touched, and a new plan is required. Current file error: {error}",
-                    planned_orphans.len()
-                ),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        deleted_files += 1;
-        bytes = bytes
-            .checked_add(snapshot.bytes)
-            .ok_or_else(|| internal("Orphan cleanup byte count overflow"))?;
-        if snapshot.kind == OrphanFileKind::IndexedCache {
-            if let Some(parent) = snapshot.relative_path.parent() {
-                cache_directories.insert(parent.to_path_buf());
-            }
-        }
-    }
-    for directory in cache_directories {
-        let _ = root_directory.remove_empty_relative_directory(&directory);
-    }
-    Ok(ManagementResult::CleanupCompleted {
-        files: deleted_files,
-        bytes,
     })
 }
 
@@ -17827,7 +17472,52 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_orphans_deletes_generated_assets_without_recoverable_holds() {
+    fn thumbnail_cleanup_preserves_unproven_png_and_archive_source_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let mut cfg = config(library.clone());
+        cfg.local_catalog_root_access = false;
+        cfg.capabilities
+            .extend([Capability::MediaWrite, Capability::Maintenance]);
+        let runtime = LibraryRuntime::open(cfg).unwrap();
+        let png = library
+            .join("thumbnails")
+            .join(format!("{}-isometric-v1-256-ffffff.png", "a".repeat(64)));
+        fs::create_dir_all(png.parent().unwrap()).unwrap();
+        fs::write(&png, b"foreign PNG-looking bytes").unwrap();
+        let original = b"extracted original model bytes";
+        let source = library
+            .join("indexed-cache")
+            .join(format!("{:x}", Sha256::digest(original)))
+            .join("original.stl");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, original).unwrap();
+        let ctx = RequestContext {
+            principal_id: "cleanup-proof".into(),
+            capabilities: BTreeSet::from([
+                Capability::CatalogRead,
+                Capability::Maintenance,
+                Capability::MediaWrite,
+            ]),
+            request_id: "proof".into(),
+        };
+        let plan = runtime
+            .plan_action(
+                &ctx,
+                ManagementAction::CleanupOrphans { continuation: None },
+            )
+            .unwrap();
+        let result = runtime.execute_action(&ctx, &plan.token).unwrap();
+        assert!(matches!(
+            result,
+            ManagementResult::CleanupCompleted { files: 0, .. }
+        ));
+        assert_eq!(fs::read(png).unwrap(), b"foreign PNG-looking bytes");
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn cleanup_orphans_preserves_unproven_assets_without_recoverable_holds() {
         let temp = tempfile::tempdir().unwrap();
         let library = temp.path().join("library");
         let mut runtime_config = config(library.clone());
@@ -17849,8 +17539,6 @@ mod tests {
         fs::write(&thumbnail, b"generated thumbnail orphan").unwrap();
         fs::write(&cache, cache_bytes).unwrap();
         fs::write(&note, b"operator file").unwrap();
-        let expected_bytes =
-            fs::metadata(&thumbnail).unwrap().len() + fs::metadata(&cache).unwrap().len();
         let context = RequestContext {
             principal_id: "cleanup-operator".into(),
             capabilities: BTreeSet::from([
@@ -17861,27 +17549,37 @@ mod tests {
             request_id: "cleanup-orphans".into(),
         };
         let plan = runtime
-            .plan_action(&context, ManagementAction::CleanupOrphans)
+            .plan_action(
+                &context,
+                ManagementAction::CleanupOrphans { continuation: None },
+            )
             .unwrap();
         assert_eq!(plan.action_kind, "cleanupOrphans");
-        assert!(plan.impact.iter().any(|item| item.contains("2")));
+        assert_eq!(plan.thumbnail_review.as_ref().unwrap().eligible_files, 0);
+        assert_eq!(
+            plan.thumbnail_review
+                .as_ref()
+                .unwrap()
+                .protected_source_copies,
+            1
+        );
         let result = runtime.execute_action(&context, &plan.token).unwrap();
         assert!(matches!(
             result,
-            ManagementResult::CleanupCompleted { files: 2, bytes }
-                if bytes == expected_bytes
+            ManagementResult::CleanupCompleted {
+                files: 0,
+                bytes: 0,
+                ..
+            }
         ));
-        assert!(!thumbnail.exists());
-        assert!(!cache.exists());
-        assert!(!cache_dir.exists());
+        assert!(thumbnail.exists());
+        assert!(cache.exists());
+        assert!(cache_dir.exists());
         let remaining_thumbnail_files = fs::read_dir(&thumbnail_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        assert_eq!(
-            remaining_thumbnail_files,
-            vec![std::ffi::OsString::from("operator-note.png")]
-        );
+        assert_eq!(remaining_thumbnail_files.len(), 2);
         assert_eq!(fs::read(&note).unwrap(), b"operator file");
         assert_eq!(
             runtime
@@ -17893,7 +17591,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_orphans_rejects_changed_file_hashes_without_deleting_the_replacement() {
+    fn cleanup_orphans_preserves_changed_unproven_file_without_deleting_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let library = temp.path().join("library");
         let mut runtime_config = config(library.clone());
@@ -17916,16 +17614,16 @@ mod tests {
             request_id: "cleanup-hash".into(),
         };
         let plan = runtime
-            .plan_action(&context, ManagementAction::CleanupOrphans)
+            .plan_action(
+                &context,
+                ManagementAction::CleanupOrphans { continuation: None },
+            )
             .unwrap();
         fs::write(&orphan, b"changed generated bytes").unwrap();
-        assert_eq!(
-            runtime
-                .execute_action(&context, &plan.token)
-                .unwrap_err()
-                .code,
-            RuntimeErrorCode::Stale
-        );
+        assert!(matches!(
+            runtime.execute_action(&context, &plan.token).unwrap(),
+            ManagementResult::CleanupCompleted { files: 0, .. }
+        ));
         assert_eq!(fs::read(&orphan).unwrap(), b"changed generated bytes");
     }
 

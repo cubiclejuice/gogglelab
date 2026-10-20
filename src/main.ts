@@ -31,7 +31,6 @@ import {
   libraryScanStatus,
   libraryCancelScan,
   libraryGetThumbnail,
-  libraryPurgeThumbnails,
   libraryStartThumbnailJob,
   libraryGetCatalogSettings,
   librarySetCatalogSettings,
@@ -65,7 +64,9 @@ import {
   libraryCreateBackup,
   libraryRestoreBackup,
   libraryPurgeCatalog,
-  libraryCleanupOrphanCache,
+  libraryReviewThumbnailCleanup,
+  libraryExecuteThumbnailCleanup,
+  libraryDiscardManagementAction,
   libraryListFilaments,
   libraryCreateFilament,
   libraryUpdateFilament,
@@ -141,6 +142,7 @@ import { handoffAvailability } from "./lib/handoff-availability";
 import { withCoreEntitlements } from "./lib/core-entitlements";
 import { LibraryPanel } from "./lib/library";
 import { LibraryOperationGuard } from "./lib/library-operation";
+import { ThumbnailCleanupDialog } from "./lib/thumbnail-cleanup-dialog";
 import { LibraryManagementDialog } from "./lib/library-management-dialog";
 import { LibraryBundleDialog } from "./lib/library-bundle-dialog";
 import { LibraryDuplicatesDialog } from "./lib/library-duplicates-dialog";
@@ -189,12 +191,30 @@ export function startApp(extensions: AppExtensions): void {
       plateControls.dispose();
       colorFeature.dispose();
       libraryPanel.dispose();
+      thumbnailCleanup.dismiss();
       extensions.dispose?.();
     },
     { once: true },
   );
   const libraryPanel = new LibraryPanel(app);
   const libraryManagement = new LibraryManagementDialog(app);
+  const thumbnailCleanup = new ThumbnailCleanupDialog(
+    app,
+    {
+      review: libraryReviewThumbnailCleanup,
+      execute: libraryExecuteThumbnailCleanup,
+      discard: libraryDiscardManagementAction,
+    },
+    {
+      onChanged: async () => {
+        libraryPanel.clearThumbnailCache();
+        await refreshLibrary();
+      },
+      onNotice: (text) => libraryPanel.setStatus(text),
+      focusFallback: () => libraryPanel.focusSearch(),
+    },
+  );
+  libraryManagement.onDismiss = () => thumbnailCleanup.dismiss();
   const libraryBundle = new LibraryBundleDialog(app);
   const libraryDuplicates = new LibraryDuplicatesDialog(app);
   const libraryFilaments = new LibraryFilamentDialog(app);
@@ -212,7 +232,6 @@ export function startApp(extensions: AppExtensions): void {
     scanStatus: libraryScanStatus,
     cancelScan: libraryCancelScan,
     getThumbnail: libraryGetThumbnail,
-    purgeThumbnails: libraryPurgeThumbnails,
     startThumbnailJob: libraryStartThumbnailJob,
     getCatalogSettings: libraryGetCatalogSettings,
     setCatalogSettings: librarySetCatalogSettings,
@@ -246,7 +265,6 @@ export function startApp(extensions: AppExtensions): void {
     createBackup: libraryCreateBackup,
     restoreBackup: libraryRestoreBackup,
     purgeCatalog: libraryPurgeCatalog,
-    cleanupOrphanCache: libraryCleanupOrphanCache,
     listFilaments: libraryListFilaments,
     createFilament: libraryCreateFilament,
     updateFilament: libraryUpdateFilament,
@@ -1046,6 +1064,7 @@ export function startApp(extensions: AppExtensions): void {
   }
 
   function invalidateViewerAfterLibraryReplacement(message: string): void {
+    thumbnailCleanup.dismiss();
     const nextGeneration = ++generation;
     pendingLibraryLoad = null;
     cancelCadPreview();
@@ -1394,7 +1413,7 @@ export function startApp(extensions: AppExtensions): void {
   libraryPanel.onPollScanStatus = libraryService.scanStatus;
   libraryPanel.onScanCompleted = () => void refreshLibrary();
   libraryPanel.onGetThumbnail = libraryService.getThumbnail;
-  libraryPanel.onPurgeThumbnails = libraryService.purgeThumbnails;
+  libraryPanel.onPurgeThumbnails = async () => thumbnailCleanup.show("resetDefaults");
   libraryPanel.onStartThumbnailJob = libraryService.startThumbnailJob;
   libraryPanel.onSaveCatalogSettings = async (settings) => {
     const saved = await libraryService.setCatalogSettings(settings);
@@ -1577,19 +1596,7 @@ export function startApp(extensions: AppExtensions): void {
       `Catalog purged after preserving ${result.files} files at ${result.path}.`,
     );
   };
-  libraryManagement.onCleanup = async () => {
-    const result = await libraryService.cleanupOrphanCache();
-    const status =
-      result.files > 0
-        ? `Removed ${result.files} generated orphan files · ${result.bytes} bytes. Original model files were untouched.`
-        : "No generated orphan files needed cleanup.";
-    const handoff = result.handoffCleanupSkipped ? " Slicer handoff cleanup was skipped." : "";
-    const issues =
-      result.issues.length > 0
-        ? ` ${result.issues.length} item(s) could not be fully confirmed: ${result.issues.slice(0, 2).join("; ")}`
-        : "";
-    libraryPanel.setStatus(`${status}${handoff}${issues}`);
-  };
+  libraryManagement.onCleanup = async () => thumbnailCleanup.show("orphans");
   let filamentDialogModelIds: string[] = [];
   const refreshFilamentDialog = async () => {
     const [filaments, models] = await Promise.all([

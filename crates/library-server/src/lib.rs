@@ -656,6 +656,11 @@ enum WireManagementAction {
     },
     CleanupOrphans {
         confirm: bool,
+        #[serde(default)]
+        continuation: Option<String>,
+    },
+    ResetDefaultThumbnails {
+        confirm: bool,
     },
 }
 impl WireManagementAction {
@@ -755,14 +760,35 @@ impl WireManagementAction {
                     backup_file_name,
                 }
             }
-            Self::CleanupOrphans { confirm } => {
+            Self::CleanupOrphans {
+                confirm,
+                continuation,
+            } => {
                 if !confirm {
                     return Err(api_bad(
                         "invalidInput",
                         "Orphan cleanup requires confirm:true",
                     ));
                 }
-                ManagementAction::CleanupOrphans
+                if continuation
+                    .as_ref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 256)
+                {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Continuation is outside its limits",
+                    ));
+                }
+                ManagementAction::CleanupOrphans { continuation }
+            }
+            Self::ResetDefaultThumbnails { confirm } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Default preview reset requires confirm:true",
+                    ));
+                }
+                ManagementAction::ResetDefaultThumbnails
             }
         })
     }
@@ -786,6 +812,8 @@ struct WireActionPlan {
     impact: Vec<String>,
     input_bytes: Option<String>,
     input_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail_review: Option<library_protocol::ThumbnailBatch>,
 }
 impl From<ActionPlan> for WireActionPlan {
     fn from(value: ActionPlan) -> Self {
@@ -807,6 +835,7 @@ impl From<ActionPlan> for WireActionPlan {
             impact: value.impact,
             input_bytes: value.input_bytes.map(|bytes| bytes.to_string()),
             input_sha256: value.input_sha256,
+            thumbnail_review: value.thumbnail_review,
         }
     }
 }
@@ -919,9 +948,20 @@ fn wire_management_result(value: ManagementResult) -> Value {
             "kind":"purged","backupDestinationHandleId":backup_destination_handle_id,
             "backupFileName":backup_file_name,"libraryEpoch":library_epoch.to_string()
         }),
-        ManagementResult::CleanupCompleted { files, bytes } => serde_json::json!({
-            "kind":"cleanupCompleted","files":files.to_string(),"bytes":bytes.to_string()
-        }),
+        ManagementResult::CleanupCompleted {
+            files,
+            bytes,
+            thumbnail_progress,
+        } => {
+            let mut result = serde_json::json!({
+                "kind":"cleanupCompleted","files":files.to_string(),"bytes":bytes.to_string()
+            });
+            if let Some(progress) = thumbnail_progress {
+                result["thumbnailProgress"] = serde_json::to_value(progress)
+                    .expect("thumbnail cleanup progress is serializable");
+            }
+            result
+        }
     }
 }
 fn parse_decimal(value: &str) -> Result<u64, ApiError> {
@@ -1923,6 +1963,19 @@ pub trait LibraryEngine: Send + Sync + 'static {
         c: &RequestContext,
         token: &str,
     ) -> Result<ManagementResult, EngineError>;
+    fn discard_management_action(
+        &self,
+        _context: &RequestContext,
+        _token: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Action discard is unavailable".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
     fn list_captures(
         &self,
         c: &RequestContext,
@@ -3139,6 +3192,14 @@ impl<
                     self.execute_management_action(context, token)?,
                 ));
             }
+            "discard_management_action" => {
+                let token = arguments
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.discard_management_action(context, token)?;
+                return Ok(serde_json::json!({"discarded":true}));
+            }
             "get_index_root_settings" => {
                 return encoded!(self
                     .list_index_root_settings(context)?
@@ -4091,6 +4152,11 @@ impl<
                 && (context.capabilities.contains(&Capability::CatalogWrite)
                     || context.capabilities.contains(&Capability::Maintenance));
         }
+        if name == "discard_management_action" {
+            // Authenticated ownership is checked by the token store. Revoking
+            // mutation scopes must not prevent the owner releasing a review.
+            return true;
+        }
         if name == "check_files_exist" {
             return connected
                 && context.capabilities.contains(&Capability::CatalogRead)
@@ -4967,6 +5033,15 @@ impl<
             .execute_action(c, token)
             .map_err(map_runtime_error)
     }
+    fn discard_management_action(
+        &self,
+        context: &RequestContext,
+        token: &str,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .discard_action(context, token)
+            .map_err(map_runtime_error)
+    }
     fn list_captures(
         &self,
         c: &RequestContext,
@@ -5470,7 +5545,7 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
         ),
         "export_library" => (&["destPath"], &[]),
         "plan_management_action" => (&["action"], &["action"]),
-        "execute_management_action" => (&["token"], &["token"]),
+        "execute_management_action" | "discard_management_action" => (&["token"], &["token"]),
         "get_index_root_settings" | "get_catalog_settings" => (&[], &[]),
         "update_index_root_settings" => (&["handleId", "settings"], &["handleId", "settings"]),
         "update_catalog_settings" => (&["settings"], &["settings"]),
@@ -5920,6 +5995,10 @@ fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
                 })
         }
         "execute_management_action" => string_field_valid("token"),
+        "discard_management_action" => object
+            .get("token")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty() && token.len() <= 256),
         "update_index_root_settings" => {
             string_field_valid("handleId") && object.get("settings").is_some_and(Value::is_object)
         }
@@ -6821,6 +6900,10 @@ fn build_router<E: LibraryEngine>(
             axum::routing::post(execute_management_action::<E>),
         )
         .route(
+            "/api/v1/management/actions/discard",
+            axum::routing::post(discard_management_action::<E>),
+        )
+        .route(
             "/api/v1/integrations/settings",
             get(integration_settings::<E>),
         )
@@ -6938,6 +7021,36 @@ async fn openapi<E: LibraryEngine>(
     .map(Json)
 }
 
+fn thumbnail_cleanup_output_schemas() -> Value {
+    serde_json::json!({
+        "ThumbnailBatch": {
+            "type":"object","additionalProperties":false,
+            "required":["mode","reviewedFiles","eligibleFiles","eligibleBytes","preservedFiles",
+                "protectedSourceCopies","defaultRecordsToClear","partial","hasMore","remainingFiles","continuation"],
+            "properties":{
+                "mode":{"type":"string","enum":["orphans","resetDefaults"]},
+                "reviewedFiles":{"type":"integer","minimum":0},
+                "eligibleFiles":{"type":"integer","minimum":0,"maximum":4},
+                "eligibleBytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                "preservedFiles":{"type":"integer","minimum":0},
+                "protectedSourceCopies":{"type":"integer","minimum":0},
+                "defaultRecordsToClear":{"type":"integer","minimum":0},
+                "partial":{"type":"boolean"},"hasMore":{"type":"boolean"},
+                "remainingFiles":{"type":["integer","null"],"minimum":0},
+                "continuation":{"type":["string","null"],"maxLength":256}
+            }
+        },
+        "ThumbnailProgress": {
+            "type":"object","additionalProperties":false,
+            "required":["review","defaultRecordsCleared","stopped"],
+            "properties":{
+                "review":{"$ref":"#/components/schemas/ThumbnailBatch"},
+                "defaultRecordsCleared":{"type":"integer","minimum":0},
+                "stopped":{"type":"boolean"}
+            }
+        }
+    })
+}
 pub fn openapi_document() -> Value {
     let mut document = serde_json::json!({
         "openapi":"3.1.0",
@@ -7045,6 +7158,7 @@ pub fn openapi_document() -> Value {
             "/api/v1/settings/catalog":{"get":{"responses":{"200":{"description":"Catalog thumbnail and scan settings"}}},"put":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["thumbnailSize","thumbnailBackground","thumbnailConcurrency","scanBatchSize"],"properties":{"thumbnailSize":{"type":"integer","enum":[128,256,512]},"thumbnailBackground":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},"thumbnailConcurrency":{"type":"integer","minimum":1,"maximum":2},"scanBatchSize":{"type":"integer","minimum":16,"maximum":256}}}}}},"responses":{"200":{"description":"Validated catalog settings update"},"403":{"description":"CatalogWrite capability required"}}}},
             "/api/v1/management/actions/plan":{"post":{"responses":{"200":{"description":"Five-minute principal, epoch, revision, version, and source-hash-bound action plan"},"403":{"description":"Required catalog-write or maintenance capability is absent"}}}},
             "/api/v1/management/actions/execute":{"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}}}},"responses":{"200":{"description":"One-use planned action result"},"409":{"description":"Plan is stale or already consumed"}}}},
+            "/api/v1/management/actions/discard":{"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}}}},"responses":{"204":{"description":"Owner review discarded without executing or changing files"},"403":{"description":"Token belongs to another principal"},"409":{"description":"Plan is stale or already consumed"}}}},
             "/api/v1/integrations/settings":{"get":{"responses":{"200":{"description":"Redacted integration settings; credentials are never returned"}}}},
             "/api/v1/integrations/spoolman":{"put":{"responses":{"200":{"description":"Validated nonsecret Spoolman configuration"}}}},
             "/api/v1/integrations/spoolman/pull":{"post":{"responses":{"200":{"description":"Atomic filament and spool snapshot result"},"501":{"description":"Network transport is not enabled by this host"}}}},
@@ -7073,6 +7187,45 @@ pub fn openapi_document() -> Value {
         .as_object_mut()
         .unwrap()
         .extend(network_output_schemas().as_object().unwrap().clone());
+    document["components"]["schemas"]
+        .as_object_mut()
+        .unwrap()
+        .extend(
+            thumbnail_cleanup_output_schemas()
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+    document["paths"]["/api/v1/management/actions/plan"]["post"]["requestBody"] = serde_json::json!({
+        "required":true,"content":{"application/json":{"schema":{"oneOf":[
+            {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{
+                "kind":{"const":"cleanupOrphans"},"confirm":{"const":true},
+                "continuation":{"type":["string","null"],"minLength":1,"maxLength":256}
+            }},
+            {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{
+                "kind":{"const":"resetDefaultThumbnails"},"confirm":{"const":true}
+            }},
+            {"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":[
+                "recoverableRemove","restoreRemoval","createBackup","restoreBackup","exportSelection",
+                "quarantineLooseSource","undoQuarantine","moveLooseSource","purgeCatalog"
+            ]}}}
+        ]}}}
+    });
+    document["paths"]["/api/v1/management/actions/plan"]["post"]["responses"]["200"]["content"] = serde_json::json!({
+        "application/json":{"schema":{"type":"object","properties":{
+            "thumbnailReview":{"$ref":"#/components/schemas/ThumbnailBatch"}
+        }}}
+    });
+    document["paths"]["/api/v1/management/actions/execute"]["post"]["responses"]["200"]
+        ["content"] = serde_json::json!({
+        "application/json":{"schema":{"type":"object","properties":{
+            "thumbnailProgress":{"$ref":"#/components/schemas/ThumbnailProgress"}
+        },"allOf":[{"if":{"required":["kind"],"properties":{"kind":{"const":"cleanupCompleted"}}},
+            "then":{"required":["files","bytes"],"properties":{
+                "files":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                "bytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}
+            }}}]}}
+    });
     document["paths"]
         .as_object_mut()
         .unwrap()
@@ -8169,6 +8322,24 @@ async fn execute_management_action<E: LibraryEngine>(
     .await
     .map(|result| Json(wire_management_result(result)))
 }
+async fn discard_management_action<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<ExecuteActionRequest>,
+) -> Result<StatusCode, ApiError> {
+    if body.token.is_empty() || body.token.len() > 256 {
+        return Err(api_bad(
+            "invalidInput",
+            "Action token is outside its limits",
+        ));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.discard_management_action(&request, &body.token)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 async fn integration_settings<E: LibraryEngine>(
     State(state): State<ServerState<E>>,
     axum::Extension(context): axum::Extension<RequestContext>,
@@ -8782,6 +8953,7 @@ pub fn tool_names() -> &'static [&'static str] {
         "discard_tag_review",
         "plan_management_action",
         "execute_management_action",
+        "discard_management_action",
         "get_index_root_settings",
         "update_index_root_settings",
         "get_catalog_settings",
@@ -8979,10 +9151,11 @@ pub fn tool_definitions() -> Vec<Value> {
                         {"type":"object","additionalProperties":false,"required":["kind","sourceHandleId","fileName","rootMappings"],"properties":{"kind":{"const":"restoreBackup"},"sourceHandleId":{"type":"string"},"fileName":{"type":"string"},"rootMappings":{"type":"array","maxItems":256}}},
                         {"type":"object","additionalProperties":false,"required":["kind","targets","destinationHandleId","fileName"],"properties":{"kind":{"const":"exportSelection"},"targets":{"type":"array","maxItems":50000},"destinationHandleId":{"type":"string"},"fileName":{"type":"string"}}},
                         {"type":"object","additionalProperties":false,"required":["kind","backupDestinationHandleId","backupFileName","confirm"],"properties":{"kind":{"const":"purgeCatalog"},"backupDestinationHandleId":{"type":"string","minLength":1,"maxLength":128},"backupFileName":{"type":"string","minLength":1,"maxLength":200},"confirm":{"const":true}}},
-                        {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{"kind":{"const":"cleanupOrphans"},"confirm":{"const":true}}}
+                        {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{"kind":{"const":"cleanupOrphans"},"confirm":{"const":true},"continuation":{"type":["string","null"],"minLength":1,"maxLength":256}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{"kind":{"const":"resetDefaultThumbnails"},"confirm":{"const":true}}}
                     ]}}
                 }),
-                "execute_management_action" => serde_json::json!({"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}),
+                "execute_management_action" | "discard_management_action" => serde_json::json!({"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}),
                 "get_index_root_settings"|"get_catalog_settings" => serde_json::json!({"type":"object","additionalProperties":false}),
                 "update_index_root_settings" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"handleId":{"type":"string","minLength":1,"maxLength":128},"settings":{"type":"object","additionalProperties":false,"required":["enabled","scanIntervalMinutes","maxFileBytes","scanZip"],"properties":{"enabled":{"type":"boolean"},"scanIntervalMinutes":{"type":"integer","minimum":1,"maximum":1440},"maxFileBytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"scanZip":{"type":"boolean"}}}},"required":["handleId","settings"]}),
                 "update_catalog_settings" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"settings":{"type":"object","additionalProperties":false,"required":["thumbnailSize","thumbnailBackground","thumbnailConcurrency","scanBatchSize"],"properties":{"thumbnailSize":{"type":"integer","enum":[128,256,512]},"thumbnailBackground":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},"thumbnailConcurrency":{"type":"integer","minimum":1,"maximum":2},"scanBatchSize":{"type":"integer","minimum":16,"maximum":256}}}},"required":["settings"]}),
@@ -9097,7 +9270,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "log_print_events_batch" => "Create print events atomically with an idempotency key. Replaying the same key and payload returns the original events without charging parts stock again.".to_owned(),
                     "check_files_exist" => "Check source status for explicit modelIds, or omit modelIds to scan a bounded catalog slice. Catalog scans check up to 500 models by default and 2000 maximum; missingOnly defaults to true for catalog scans. Each request is capped at 256 MiB of source bytes: split large selections into smaller explicit modelIds batches. A single source larger than 256 MiB cannot be checked by this tool. Returns catalog IDs and source states, never host paths.".to_owned(),
                     "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
-                    "plan_management_action" => "Plan a versioned one-use library action. purgeCatalog requires confirm:true and writes a verified archive under an admitted BackupOnly handle before replacing the active catalog; the previous managed Library directory and configured external model roots are retained. cleanupOrphans requires confirm:true and removes only hash-verified, unreferenced generated thumbnails or indexed-cache files; it never scans configured model roots.".to_owned(),
+                    "plan_management_action" => "Review a versioned one-use library action. purgeCatalog requires confirm:true and a verified archive before catalog replacement; previous Libraries and external source roots remain. cleanupOrphans requires confirm:true, independently reproduces a bounded batch of unreferenced raster previews, and preserves unknown, custom, embedded and indexed-cache source copies. Continuation reviews another batch; every batch needs separate execution. resetDefaultThumbnails requires confirm:true and clears only default catalog records, keeping files. Discard cancelled plans separately.".to_owned(),
+                    "discard_management_action" => "Discard one plan owned by this authenticated principal, releasing retained review resources without executing the plan or changing files. A cancelled plan cannot be executed afterward.".to_owned(),
                     "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
                     "get_thumbnails" => "List thumbnail gallery descriptors for a model. When the caller has MediaRead, each descriptor includes a short-lived authenticated mediaLease for fetching its image bytes.".to_owned(),
                     "get_models_missing_thumbnails" => "List missing-thumbnail models with keyset pagination. Pass excludeIds for models that repeatedly fail rendering; excluded IDs are filtered before the page limit.".to_owned(),

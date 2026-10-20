@@ -504,6 +504,17 @@ macro_rules! fake_extended_engine {
                 _ => fake_unsupported(),
             }
         }
+        fn discard_management_action(
+            &self,
+            _: &RequestContext,
+            token: &str,
+        ) -> Result<(), EngineError> {
+            if token == "discard-safe" {
+                Ok(())
+            } else {
+                fake_unsupported()
+            }
+        }
         fn list_captures(
             &self,
             _: &RequestContext,
@@ -1888,7 +1899,7 @@ fn advertised_mutation_tools_have_strict_discoverable_schemas_and_argument_guard
         serde_json::from_value(json!({"kind":"cleanupOrphans","confirm":true})).unwrap();
     assert!(matches!(
         cleanup_with_confirmation.parse().unwrap(),
-        library_protocol::ManagementAction::CleanupOrphans
+        library_protocol::ManagementAction::CleanupOrphans { .. }
     ));
     for name in [
         "update_model",
@@ -4539,10 +4550,19 @@ fn mcp_purge_and_orphan_cleanup_use_confirmed_one_use_management_plans() {
         )
         .unwrap();
     assert_eq!(cleanup_result["kind"], "cleanupCompleted");
-    assert_eq!(cleanup_result["files"], "1");
-    assert_eq!(cleanup_result["bytes"], orphan_bytes.len().to_string());
-    assert!(!orphan.exists());
-    assert!(std::fs::read_dir(&thumbnail_dir).unwrap().next().is_none());
+    assert_eq!(cleanup_result["files"], "0");
+    assert_eq!(cleanup_result["bytes"], "0");
+    assert_eq!(std::fs::read(&orphan).unwrap(), orphan_bytes);
+    assert_eq!(
+        cleanup_result["thumbnailProgress"]["review"]["eligibleBytes"],
+        "0"
+    );
+    assert!(
+        cleanup_result["thumbnailProgress"]["review"]["preservedFiles"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 }
 
 #[test]
@@ -6877,4 +6897,179 @@ async fn printer_network_synthetic_discovery_routes_preserve_review_and_job_shap
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn thumbnail_cleanup_transport_discard_is_distinct_and_owner_checked() {
+    assert!(openapi_document()["paths"]["/api/v1/management/actions/discard"]["post"].is_object());
+    assert!(tool_names().contains(&"discard_management_action"));
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("library");
+    let runtime = library_runtime::LibraryRuntime::open(library_runtime::RuntimeConfig::desktop(
+        library.clone(),
+        temp.path().join("integrations.json"),
+    ))
+    .unwrap();
+    let sentinel = library.join("thumbnails/custom-original.png");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"preserve original synthetic bytes").unwrap();
+    let adapter = ProtocolEngineAdapter::new(Arc::clone(&runtime), HostMode::Headless);
+    let owner = RequestContext {
+        principal_id: "cleanup-owner".into(),
+        request_id: "cleanup-discard".into(),
+        capabilities: BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::CatalogWrite,
+            Capability::Maintenance,
+            Capability::MediaWrite,
+        ]),
+    };
+    let plan = adapter
+        .call_tool(
+            &owner,
+            "plan_management_action",
+            json!({"action":{"kind":"cleanupOrphans","confirm":true}}),
+        )
+        .unwrap();
+    assert_eq!(plan["thumbnailReview"]["eligibleBytes"], "0");
+    let mut other = owner.clone();
+    other.principal_id = "another-owner".into();
+    assert!(adapter
+        .call_tool(
+            &other,
+            "discard_management_action",
+            json!({"token":plan["token"]})
+        )
+        .is_err());
+    assert!(adapter
+        .call_tool(
+            &owner,
+            "discard_management_action",
+            json!({"token":plan["token"],"execute":true})
+        )
+        .is_err());
+    let mut reduced = owner.clone();
+    reduced.capabilities.clear();
+    assert_eq!(
+        adapter
+            .call_tool(
+                &reduced,
+                "discard_management_action",
+                json!({"token":plan["token"]})
+            )
+            .unwrap(),
+        json!({"discarded":true})
+    );
+    assert!(adapter
+        .call_tool(
+            &owner,
+            "execute_management_action",
+            json!({"token":plan["token"]})
+        )
+        .is_err());
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"preserve original synthetic bytes"
+    );
+}
+
+#[tokio::test]
+async fn thumbnail_cleanup_transport_discard_rest_is_authenticated_strict_and_nonexecuting() {
+    let app = test_router();
+    let denied = app
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/management/actions/discard", false)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"token":"discard-safe"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    for body in [
+        json!({"token":""}),
+        json!({"token":"x".repeat(257)}),
+        json!({"token":"discard-safe","execute":true}),
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                request("POST", "/api/v1/management/actions/discard", true)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(rejected.status().is_client_error(), "{}", rejected.status());
+    }
+    // Fake execution rejects this token. Only the dedicated discard method accepts it.
+    let discarded = app
+        .oneshot(
+            request("POST", "/api/v1/management/actions/discard", true)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"token":"discard-safe"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discarded.status(), StatusCode::NO_CONTENT);
+    assert!(to_bytes(discarded.into_body(), 1024)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn thumbnail_cleanup_transport_review_controls_are_explicit_and_bounded() {
+    let document = openapi_document();
+    let variants = document["paths"]["/api/v1/management/actions/plan"]["post"]["requestBody"]
+        ["content"]["application/json"]["schema"]["oneOf"]
+        .as_array()
+        .unwrap();
+    let cleanup = variants
+        .iter()
+        .find(|schema| schema["properties"]["kind"]["const"] == "cleanupOrphans")
+        .unwrap();
+    assert_eq!(cleanup["additionalProperties"], false);
+    assert_eq!(cleanup["properties"]["continuation"]["maxLength"], 256);
+    let reset_schema = variants
+        .iter()
+        .find(|schema| schema["properties"]["kind"]["const"] == "resetDefaultThumbnails")
+        .unwrap();
+    assert_eq!(reset_schema["properties"]["confirm"]["const"], true);
+    let continued: super::WireManagementAction = serde_json::from_value(json!({
+        "kind":"cleanupOrphans", "confirm":true, "continuation":"opaque-cursor"
+    }))
+    .unwrap();
+    assert!(matches!(continued.parse().unwrap(),
+        library_protocol::ManagementAction::CleanupOrphans { continuation: Some(value) } if value == "opaque-cursor"));
+    for continuation in ["".to_owned(), "x".repeat(257)] {
+        let invalid: super::WireManagementAction = serde_json::from_value(json!({
+            "kind":"cleanupOrphans", "confirm":true, "continuation":continuation
+        }))
+        .unwrap();
+        assert!(invalid.parse().is_err());
+    }
+    let reset: super::WireManagementAction = serde_json::from_value(json!({
+        "kind":"resetDefaultThumbnails", "confirm":true
+    }))
+    .unwrap();
+    assert_eq!(
+        reset.parse().unwrap(),
+        library_protocol::ManagementAction::ResetDefaultThumbnails
+    );
+    for body in [
+        json!({"kind":"resetDefaultThumbnails"}),
+        json!({"kind":"resetDefaultThumbnails","confirm":true,"path":"/outside"}),
+        json!({"kind":"resetDefaultThumbnails","confirm":true,"continuation":"other-mode"}),
+    ] {
+        assert!(serde_json::from_value::<super::WireManagementAction>(body).is_err());
+    }
+    let denied: super::WireManagementAction = serde_json::from_value(json!({
+        "kind":"resetDefaultThumbnails", "confirm":false
+    }))
+    .unwrap();
+    assert!(denied.parse().is_err());
 }

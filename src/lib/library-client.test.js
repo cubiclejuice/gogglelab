@@ -892,3 +892,34 @@ test("printer network client keeps explicit review confirmation and version prec
     globalThis.fetch = original;
   }
 });
+
+test("preview review maps to authenticated plans; discard is a distinct empty response and preserves decimal byte totals", async () => {
+  const client = new HttpLibraryClient("https://library.test");
+  client.setToken("secret");
+  const before = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    if (String(url).endsWith("/discard")) return new Response(null, { status: 204 });
+    return Response.json({
+      token: "review",
+      thumbnailReview: { eligibleBytes: "18446744073709551615" },
+    });
+  };
+  try {
+    const result = await client.reviewThumbnailCleanup({ mode: "orphans", continuation: "next" });
+    expect(result.thumbnailReview.eligibleBytes).toBe("18446744073709551615");
+    await client.reviewThumbnailCleanup({ mode: "resetDefaults", continuation: null });
+    await client.discardManagementAction("review");
+    expect(calls.map((c) => JSON.parse(c.init.body))).toEqual([
+      { kind: "cleanupOrphans", confirm: true, continuation: "next" },
+      { kind: "resetDefaultThumbnails", confirm: true },
+      { token: "review" },
+    ]);
+    expect(calls[2].url).toBe("https://library.test/api/v1/management/actions/discard");
+    expect(calls.every((c) => c.init.headers.get("Authorization") === "Bearer secret")).toBe(true);
+    expect(calls.every((c) => !c.url.endsWith("/execute"))).toBe(true);
+  } finally {
+    globalThis.fetch = before;
+  }
+});

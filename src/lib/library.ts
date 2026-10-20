@@ -957,7 +957,11 @@ export class LibraryPanel {
       "",
       () => void this.startThumbnailJob(true),
     );
-    this.purgeButton = this.actionButton("Clear previews", "", () => void this.purgeThumbnails());
+    this.purgeButton = this.actionButton(
+      "Reset default previews…",
+      "",
+      () => void this.purgeThumbnails(),
+    );
     thumbnailActions.append(this.generateMissingButton, this.regenerateAllButton, this.purgeButton);
     contentHeader.append(this.resultCount, viewSwitcher, thumbnailActions, selectionActions);
     this.gallery = document.createElement("div");
@@ -1049,6 +1053,10 @@ export class LibraryPanel {
     activePrinterId: string | null,
   ): void {
     this.printHistory.setPrinterOptions(printers, activePrinterId);
+  }
+
+  focusSearch(): void {
+    if (this.root.open) this.searchInput.focus();
   }
 
   show(invoker?: HTMLElement): void {
@@ -1985,12 +1993,6 @@ export class LibraryPanel {
     this.purgeButton.disabled = true;
     try {
       await this.onPurgeThumbnails();
-      this.thumbnailCache.clear();
-      for (const model of this.allModels) this.thumbnailGuard.invalidate(model.id);
-      this.setStatus(
-        "Generated previews cleared. They will be recreated as models become visible.",
-      );
-      this.renderContent();
     } catch (error) {
       this.setStatus(`Could not clear previews: ${libraryErrorMessage(error)}`);
     } finally {

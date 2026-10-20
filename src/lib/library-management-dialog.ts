@@ -14,6 +14,7 @@ export class LibraryManagementDialog {
   onChoosePurgeBackupDestination: () => Promise<string | null> = async () => null;
   onPurge: (confirmation: string, destinationPath: string) => Promise<void> = async () => {};
   onCleanup: () => Promise<void> = async () => {};
+  onDismiss: () => void = () => {};
 
   constructor(container: HTMLElement) {
     this.dialog = document.createElement("dialog");
@@ -30,6 +31,7 @@ export class LibraryManagementDialog {
 
   show(removedModels: RemovedModel[], invoker?: HTMLElement): void {
     this.revision += 1;
+    this.onDismiss();
     this.purgeConfirmation.dismiss();
     this.invoker =
       invoker ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
@@ -51,7 +53,7 @@ export class LibraryManagementDialog {
       maintenanceTitle,
       this.button("Create full backup…", () => void this.run(status, this.onBackup)),
       this.button("Restore full backup…", () => void this.run(status, this.onRestoreBackup)),
-      this.button("Clean orphan cache", () => void this.run(status, this.onCleanup)),
+      this.button("Review unused previews…", () => void this.run(status, this.onCleanup)),
       this.button("Back up and purge catalog…", () => void this.confirmPurge(status)),
     );
     const removed = document.createElement("section");
@@ -140,6 +142,7 @@ export class LibraryManagementDialog {
 
   private close(): void {
     this.revision += 1;
+    this.onDismiss();
     this.purgeConfirmation.dismiss();
     if (this.dialog.open) this.dialog.close();
     const invoker = this.invoker;

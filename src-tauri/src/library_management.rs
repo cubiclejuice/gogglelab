@@ -73,6 +73,8 @@ pub struct RestoreResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_progress: Option<library_protocol::ThumbnailProgress>,
     /// Generated, rebuildable files permanently removed by this cleanup.
     pub files: u64,
     pub bytes: u64,
@@ -1421,288 +1423,149 @@ fn purge_catalog_impl(
     Ok(backup)
 }
 
+fn thumbnail_cleanup_context() -> library_protocol::RequestContext {
+    use library_protocol::Capability;
+    library_protocol::RequestContext {
+        principal_id: "native-thumbnail-cleanup".into(),
+        capabilities: std::collections::BTreeSet::from([
+            Capability::CatalogRead,
+            Capability::CatalogWrite,
+            Capability::MediaRead,
+            Capability::MediaWrite,
+            Capability::Maintenance,
+        ]),
+        request_id: format!("native-thumbnail-cleanup-{}", unique_suffix()),
+    }
+}
+
 #[tauri::command]
-pub async fn library_cleanup_orphan_cache(
+pub async fn library_review_thumbnail_cleanup(
+    state: tauri::State<'_, LibraryState>,
+    request: library_protocol::ThumbnailCleanupRequest,
+) -> Result<library_protocol::ActionPlan, AppError> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .runtime()
+            .review_thumbnail_cleanup(&thumbnail_cleanup_context(), request)
+            .map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::Library {
+        message: format!("Preview review worker failed: {error}"),
+    })?
+}
+
+#[tauri::command]
+pub async fn library_execute_thumbnail_cleanup(
     app: tauri::AppHandle,
     state: tauri::State<'_, LibraryState>,
+    token: String,
 ) -> Result<CleanupResult, AppError> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let viewer = app.state::<AppState>();
-        cleanup_orphan_cache_with_viewer_lock(&state, &viewer, || {})
+        execute_thumbnail_cleanup_with_viewer_lock(&state, &viewer, &token, || {})
     })
     .await
     .map_err(|error| AppError::Library {
-        message: format!("Cache cleanup worker failed: {error}"),
+        message: format!("Preview cleanup worker failed: {error}"),
     })?
 }
+
+#[tauri::command]
+pub async fn library_discard_management_action(
+    state: tauri::State<'_, LibraryState>,
+    token: String,
+) -> Result<(), AppError> {
+    use library_protocol::ManagementEngine;
+    state
+        .runtime()
+        .discard_action(&thumbnail_cleanup_context(), &token)
+        .map_err(AppError::from)
+}
+
+fn execute_thumbnail_cleanup_with_viewer_lock(
+    state: &LibraryState,
+    viewer: &AppState,
+    token: &str,
+    before_execute: impl FnOnce(),
+) -> Result<CleanupResult, AppError> {
+    let _request_guard = viewer.request_commit.lock().unwrap();
+    viewer.latest_requested.fetch_add(1, Ordering::SeqCst);
+    let _current_guard = viewer.current.lock().unwrap();
+    state.wait_for_thumbnail_idle()?;
+    before_execute();
+    execute_thumbnail_cleanup(state, token)
+}
+
+fn execute_thumbnail_cleanup(state: &LibraryState, token: &str) -> Result<CleanupResult, AppError> {
+    use library_protocol::{ManagementEngine, ManagementResult};
+    match state
+        .runtime()
+        .execute_action(&thumbnail_cleanup_context(), token)
+        .map_err(AppError::from)?
+    {
+        ManagementResult::CleanupCompleted {
+            files,
+            bytes,
+            thumbnail_progress,
+        } => Ok(CleanupResult {
+            files,
+            bytes,
+            thumbnail_progress,
+            issues: Vec::new(),
+            handoff_cleanup_skipped: true,
+        }),
+        _ => Err(AppError::Library {
+            message: "Preview cleanup returned an unexpected result".into(),
+        }),
+    }
+}
+
 #[cfg(test)]
 fn cleanup_orphan_cache_impl(
     state: &LibraryState,
-    current_viewer: Option<&Path>,
+    _current_viewer: Option<&Path>,
 ) -> Result<CleanupResult, AppError> {
-    let maintenance = state.begin_maintenance()?;
-    cleanup_orphan_cache_with_guard(state, &maintenance, current_viewer, || {})
+    cleanup_orphan_cache_impl_after_root_admission(state, None, || {})
 }
-
 #[cfg(test)]
-fn cleanup_orphan_cache_impl_after_root_admission<F>(
+fn cleanup_orphan_cache_impl_after_root_admission(
     state: &LibraryState,
-    current_viewer: Option<&Path>,
-    after_root_admission: F,
-) -> Result<CleanupResult, AppError>
-where
-    F: FnOnce(),
-{
-    let maintenance = state.begin_maintenance()?;
-    cleanup_orphan_cache_with_guard(state, &maintenance, current_viewer, after_root_admission)
+    _current_viewer: Option<&Path>,
+    after_admission: impl FnOnce(),
+) -> Result<CleanupResult, AppError> {
+    let plan = state
+        .runtime()
+        .review_thumbnail_cleanup(
+            &thumbnail_cleanup_context(),
+            library_protocol::ThumbnailCleanupRequest {
+                mode: library_protocol::ThumbnailCleanupMode::Orphans,
+                continuation: None,
+            },
+        )
+        .map_err(AppError::from)?;
+    after_admission();
+    execute_thumbnail_cleanup(state, &plan.token)
 }
-
-fn cleanup_orphan_cache_with_viewer_lock<F>(
+#[cfg(test)]
+fn cleanup_orphan_cache_with_viewer_lock(
     state: &LibraryState,
     viewer: &AppState,
-    after_root_admission: F,
-) -> Result<CleanupResult, AppError>
-where
-    F: FnOnce(),
-{
-    let maintenance = state.begin_maintenance()?;
-    let _request_guard = viewer.request_commit.lock().unwrap();
-    viewer.latest_requested.fetch_add(1, Ordering::SeqCst);
-    let current_guard = viewer.current.lock().unwrap();
-    let current = current_guard
-        .as_ref()
-        .map(|loaded| PathBuf::from(&loaded.path));
-    cleanup_orphan_cache_with_guard(
-        state,
-        &maintenance,
-        current.as_deref(),
-        after_root_admission,
-    )
-}
-
-fn cleanup_orphan_cache_with_guard<F>(
-    state: &LibraryState,
-    guard: &library_runtime::RuntimeMaintenanceGuard,
-    current_viewer: Option<&Path>,
-    after_root_admission: F,
-) -> Result<CleanupResult, AppError>
-where
-    F: FnOnce(),
-{
-    require_handle_relative_management()?;
-    let root = guard.root().canonicalize().map_err(map_io)?;
-    if root != guard.root() {
-        return Err(AppError::Library {
-            message: "Library root identity changed before cleanup".into(),
-        });
-    }
-    let root_directory = library_runtime::GuardedDirectory::open(&root).map_err(map_io)?;
-    if !root_directory.matches_path(&root).map_err(map_io)? {
-        return Err(AppError::Library {
-            message: "Library root identity changed before cleanup".into(),
-        });
-    }
-    after_root_admission();
-    if !root_directory.matches_path(&root).map_err(map_io)? {
-        return Err(AppError::Library {
-            message: "Library root identity changed after cleanup admission".into(),
-        });
-    }
-    let current_viewer = current_viewer.and_then(|path| path.canonicalize().ok());
-    let db = LibraryDb::open(&root).map_err(library_error)?;
-    let referenced = db.thumbnail_relative_paths().map_err(library_error)?;
-    let content_hashes = db.catalog_content_hashes().map_err(library_error)?;
-    drop(db);
-    let active_content_lease_paths = state.runtime().active_content_lease_paths();
-    let thumbnails = root.join("thumbnails");
-    let mut candidates = Vec::new();
-    let thumbnail_meta = fs::symlink_metadata(&thumbnails).map_err(map_io)?;
-    if thumbnail_meta.file_type().is_symlink() || !thumbnail_meta.is_dir() {
-        return Err(AppError::Library {
-            message: "Thumbnail namespace is unsafe".into(),
-        });
-    }
-    if thumbnails.is_dir() {
-        for entry in fs::read_dir(&thumbnails).map_err(map_io)? {
-            let entry = entry.map_err(map_io)?;
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).map_err(map_io)?;
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                continue;
-            }
-            let relative = path
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            if !referenced.contains(&relative)
-                && is_generated_thumbnail_name(&entry.file_name().to_string_lossy())
-                && !active_content_lease_paths
-                    .iter()
-                    .any(|leased_path| leased_path == &path)
-            {
-                let (file_bytes, file_hash) =
-                    hash_file(&path).map_err(|message| AppError::Library { message })?;
-                candidates.push(CleanupCandidate {
-                    path,
-                    bytes: file_bytes,
-                    sha256: file_hash,
-                });
-            }
-        }
-    }
-    let indexed_cache = root.join("indexed-cache");
-    if let Ok(cache_meta) = fs::symlink_metadata(&indexed_cache) {
-        if cache_meta.file_type().is_symlink() || !cache_meta.is_dir() {
-            return Err(AppError::Library {
-                message: "Indexed cache namespace is unsafe".into(),
-            });
-        }
-        for entry in fs::read_dir(&indexed_cache).map_err(map_io)? {
-            let entry = entry.map_err(map_io)?;
-            let dir = entry.path();
-            let meta = fs::symlink_metadata(&dir).map_err(map_io)?;
-            let hash = entry.file_name().to_string_lossy().into_owned();
-            if meta.file_type().is_symlink()
-                || !meta.is_dir()
-                || hash.len() != 64
-                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(AppError::Library {
-                    message: "Indexed cache contains an unsafe entry".into(),
-                });
-            }
-            if content_hashes.contains(&hash)
-                || current_viewer
-                    .as_deref()
-                    .is_some_and(|path| path.starts_with(&dir))
-                || active_content_lease_paths
-                    .iter()
-                    .any(|path| path.starts_with(&dir))
-            {
-                continue;
-            }
-            let mut dir_files = Vec::new();
-            for child in fs::read_dir(&dir).map_err(map_io)? {
-                let child = child.map_err(map_io)?;
-                let path = child.path();
-                let meta = fs::symlink_metadata(&path).map_err(map_io)?;
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    return Err(AppError::Library {
-                        message: "Indexed cache hash directory is unsafe".into(),
-                    });
-                }
-                let (actual_bytes, actual_hash) =
-                    hash_file(&path).map_err(|message| AppError::Library { message })?;
-                if actual_hash != hash {
-                    return Err(AppError::Library {
-                        message: "Indexed cache file hash does not match its namespace".into(),
-                    });
-                }
-                dir_files.push((path, actual_bytes));
-            }
-            for (path, size) in dir_files {
-                path.strip_prefix(&root).map_err(|_| AppError::Library {
-                    message: "Indexed cache file escaped the Library root".into(),
-                })?;
-                let (actual_bytes, actual_hash) =
-                    hash_file(&path).map_err(|message| AppError::Library { message })?;
-                if actual_bytes != size || actual_hash != hash {
-                    return Err(AppError::Library {
-                        message: "Indexed cache file changed during cleanup".into(),
-                    });
-                }
-                candidates.push(CleanupCandidate {
-                    path,
-                    bytes: size,
-                    sha256: hash.clone(),
-                });
-            }
-        }
-    }
-
-    if !root_directory.matches_path(&root).map_err(map_io)? {
-        return Err(AppError::Library {
-            message: "Library root identity changed while orphan candidates were collected".into(),
-        });
-    }
-
-    let mut deleted_files = 0;
-    let mut deleted_bytes = 0;
-    let mut issues = Vec::new();
-    for candidate in candidates {
-        match root_directory.matches_path(&root) {
-            Ok(true) => {}
-            Ok(false) => {
-                issues.push("Library root changed before the next generated-file deletion".into());
-                break;
-            }
-            Err(error) => {
-                issues.push(format!(
-                    "Could not verify the Library root before deletion: {error}"
-                ));
-                break;
-            }
-        }
-        let relative = candidate
-            .path
-            .strip_prefix(&root)
-            .map_err(|_| AppError::Library {
-                message: "Orphan cache file escaped the Library root".into(),
-            })?;
-        match root_directory.delete_verified_file(
-            relative,
-            candidate.bytes,
-            &candidate.sha256,
-            library_core::MAX_INDEXED_FILE_BYTES,
-        ) {
-            Ok(()) => {
-                deleted_files += 1;
-                deleted_bytes += candidate.bytes;
-                match root_directory.matches_path(&root) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        issues.push(format!(
-                            "Library root changed after deleting {}",
-                            candidate.path.display()
-                        ));
-                        break;
-                    }
-                    Err(error) => {
-                        issues.push(format!(
-                            "Could not verify the Library root after deleting {}: {error}",
-                            candidate.path.display()
-                        ));
-                        break;
-                    }
-                }
-            }
-            Err(error) => {
-                if root_directory.relative_file_exists(relative).ok() == Some(false) {
-                    deleted_files += 1;
-                    deleted_bytes += candidate.bytes;
-                }
-                issues.push(format!(
-                    "Could not delete verified generated cache file {}: {error}",
-                    candidate.path.display()
-                ));
-                break;
-            }
-        }
-    }
-    Ok(CleanupResult {
-        files: deleted_files,
-        bytes: deleted_bytes,
-        issues,
-        handoff_cleanup_skipped: true,
-    })
-}
-
-struct CleanupCandidate {
-    path: PathBuf,
-    bytes: u64,
-    sha256: String,
+    after_admission: impl FnOnce(),
+) -> Result<CleanupResult, AppError> {
+    let plan = state
+        .runtime()
+        .review_thumbnail_cleanup(
+            &thumbnail_cleanup_context(),
+            library_protocol::ThumbnailCleanupRequest {
+                mode: library_protocol::ThumbnailCleanupMode::Orphans,
+                continuation: None,
+            },
+        )
+        .map_err(AppError::from)?;
+    execute_thumbnail_cleanup_with_viewer_lock(state, viewer, &plan.token, after_admission)
 }
 
 fn require_handle_relative_management() -> Result<(), AppError> {
@@ -2245,23 +2108,6 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
         return Err("Bounded file grew beyond limit".into());
     }
     Ok(bytes)
-}
-fn is_generated_thumbnail_name(name: &str) -> bool {
-    let Some((hash, suffix)) = name
-        .strip_suffix(".png")
-        .and_then(|value| value.split_once("-isometric-v"))
-    else {
-        return false;
-    };
-    let parts = suffix.split('-').collect::<Vec<_>>();
-    hash.len() == 64
-        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && parts.len() == 3
-        && !parts[0].is_empty()
-        && parts[0].bytes().all(|byte| byte.is_ascii_digit())
-        && matches!(parts[1], "128" | "256" | "512")
-        && parts[2].len() == 6
-        && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 fn reveal_source<F>(path: &Path, launch: F) -> Result<(), String>
 where
@@ -3394,8 +3240,92 @@ mod tests {
             .iter()
             .any(|item| item.snapshot_id == snapshot && item.model.id == model.id));
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn orphan_indexed_cache_cleanup_verifies_hash_and_preserves_current_viewer() {
+    fn native_thumbnail_cleanup_discard_and_reset_keep_unknown_files() {
+        use library_protocol::{ManagementEngine, ThumbnailCleanupMode, ThumbnailCleanupRequest};
+        let temp = tempfile::tempdir().unwrap();
+        let state = LibraryState::new(temp.path().join("library"));
+        state.with_db(|_| Ok(())).unwrap();
+        let unknown = state.root().join("thumbnails/unknown.png");
+        fs::write(&unknown, b"uploaded or unknown bytes").unwrap();
+        let context = thumbnail_cleanup_context();
+        let plan = state
+            .runtime()
+            .review_thumbnail_cleanup(
+                &context,
+                ThumbnailCleanupRequest {
+                    mode: ThumbnailCleanupMode::Orphans,
+                    continuation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.thumbnail_review.as_ref().unwrap().eligible_files, 0);
+        state
+            .runtime()
+            .discard_action(&context, &plan.token)
+            .unwrap();
+        assert!(execute_thumbnail_cleanup(&state, &plan.token).is_err());
+        assert_eq!(fs::read(&unknown).unwrap(), b"uploaded or unknown bytes");
+        let reset = state
+            .runtime()
+            .review_thumbnail_cleanup(
+                &context,
+                ThumbnailCleanupRequest {
+                    mode: ThumbnailCleanupMode::ResetDefaults,
+                    continuation: None,
+                },
+            )
+            .unwrap();
+        let result = execute_thumbnail_cleanup_with_viewer_lock(
+            &state,
+            &AppState::default(),
+            &reset.token,
+            || {},
+        )
+        .unwrap();
+        assert_eq!((result.files, result.bytes), (0, 0));
+        assert_eq!(
+            result.thumbnail_progress.unwrap().default_records_cleared,
+            0
+        );
+        assert_eq!(fs::read(&unknown).unwrap(), b"uploaded or unknown bytes");
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn native_thumbnail_cleanup_rejects_execution_while_scan_is_running() {
+        use library_protocol::{ManagementEngine, ThumbnailCleanupMode, ThumbnailCleanupRequest};
+        let temp = tempfile::tempdir().unwrap();
+        let state = LibraryState::new(temp.path().join("library"));
+        state.with_db(|_| Ok(())).unwrap();
+        let context = thumbnail_cleanup_context();
+        let plan = state
+            .runtime()
+            .review_thumbnail_cleanup(
+                &context,
+                ThumbnailCleanupRequest {
+                    mode: ThumbnailCleanupMode::Orphans,
+                    continuation: None,
+                },
+            )
+            .unwrap();
+        assert!(state.scan_control().try_begin(0, "scan"));
+        assert!(execute_thumbnail_cleanup_with_viewer_lock(
+            &state,
+            &AppState::default(),
+            &plan.token,
+            || {}
+        )
+        .is_err());
+        state.scan_control().finish();
+        state
+            .runtime()
+            .discard_action(&context, &plan.token)
+            .unwrap();
+    }
+
+    #[test]
+    fn orphan_indexed_cache_cleanup_preserves_source_copies_with_and_without_viewer() {
         let temp = tempfile::tempdir().unwrap();
         let state = LibraryState::new(temp.path().join("library"));
         state.with_db(|_| Ok(())).unwrap();
@@ -3410,12 +3340,20 @@ mod tests {
         assert_eq!(preserved.bytes, 0);
         assert!(file.exists());
         let removed = cleanup_orphan_cache_impl(&state, None).unwrap();
-        assert_eq!(removed.files, 1);
-        assert_eq!(removed.bytes, bytes.len() as u64);
+        assert_eq!(removed.files, 0);
+        assert_eq!(removed.bytes, 0);
         assert!(removed.issues.is_empty());
-        assert!(!file.exists());
+        assert_eq!(fs::read(&file).unwrap(), bytes);
         assert!(dir.is_dir());
-        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        assert!(
+            removed
+                .thumbnail_progress
+                .as_ref()
+                .unwrap()
+                .review
+                .protected_source_copies
+                > 0
+        );
         assert!(removed.handoff_cleanup_skipped);
     }
 

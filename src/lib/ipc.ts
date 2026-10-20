@@ -1023,7 +1023,8 @@ export interface RestoreResult {
 }
 
 export interface CleanupResult {
-  /** Hash-verified generated files permanently removed after cleanup admission. */
+  thumbnailProgress?: import("./library-client").ThumbnailProgress | null;
+  /** Generated previews retired through retained proof ownership. */
   files: number;
   bytes: number;
   issues: string[];
@@ -1116,10 +1117,6 @@ export function libraryCancelScan(): Promise<void> {
 
 export function libraryGetThumbnail(modelId: string, regenerate = false): Promise<string | null> {
   return invoke("library_get_thumbnail", { modelId, regenerate });
-}
-
-export function libraryPurgeThumbnails(): Promise<void> {
-  return invoke("library_purge_thumbnails");
 }
 
 export function libraryStartThumbnailJob(regenerate: boolean): Promise<void> {
@@ -1328,8 +1325,16 @@ export function libraryPurgeCatalog(
   return invoke("library_purge_catalog", { confirmation, destinationPath });
 }
 
-export function libraryCleanupOrphanCache(): Promise<CleanupResult> {
-  return invoke("library_cleanup_orphan_cache");
+export function libraryReviewThumbnailCleanup(
+  request: import("./library-client").ThumbnailCleanupRequest,
+): Promise<Pick<import("./library-client").ActionPlan, "token" | "expiresAt" | "thumbnailReview">> {
+  return invoke("library_review_thumbnail_cleanup", { request });
+}
+export function libraryExecuteThumbnailCleanup(token: string): Promise<CleanupResult> {
+  return invoke("library_execute_thumbnail_cleanup", { token });
+}
+export function libraryDiscardManagementAction(token: string): Promise<void> {
+  return invoke("library_discard_management_action", { token });
 }
 
 export function libraryManagementStatus(): Promise<ManagementStatus> {

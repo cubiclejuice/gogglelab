@@ -504,3 +504,37 @@ test("Library replacement rejects a pre-replacement in-flight status reply", asy
   expect(panel.completed).toBe(0);
   expect(panel.previousScanStatus).toBe(null);
 });
+
+test("opening the default-preview review does not clear cached views or claim a completed reset", async () => {
+  let opened = 0;
+  let cleared = 0;
+  const messages = [];
+  const panel = {
+    purgeButton: { disabled: false },
+    onPurgeThumbnails: async () => {
+      opened++;
+    },
+    thumbnailCache: {
+      clear() {
+        cleared++;
+      },
+    },
+    thumbnailGuard: {
+      invalidate() {
+        cleared++;
+      },
+    },
+    allModels: [{ id: "model" }],
+    setStatus(text) {
+      messages.push(text);
+    },
+    renderContent() {
+      cleared++;
+    },
+  };
+  await LibraryPanel.prototype.purgeThumbnails.call(panel);
+  expect(opened).toBe(1);
+  expect(cleared).toBe(0);
+  expect(messages).toEqual([]);
+  expect(panel.purgeButton.disabled).toBe(false);
+});

@@ -67,6 +67,9 @@ impl ThumbnailRecipe {
             png_hash_hint: png_hash_hint.map(str::to_owned),
         })
     }
+    pub(crate) fn raster_sample_budget(&self) -> u64 {
+        BASE_MAX_RASTER_SAMPLES as u64 * u64::from(self.size) * u64::from(self.size) / (256 * 256)
+    }
     pub(crate) fn source_hash(&self) -> &str {
         &self.source_hash
     }

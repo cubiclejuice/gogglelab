@@ -491,8 +491,33 @@ export type ManagementAction =
       backupFileName: string;
       confirm: true;
     }
-  | { kind: "cleanupOrphans"; confirm: true };
+  | { kind: "cleanupOrphans"; confirm: true; continuation?: string | null }
+  | { kind: "resetDefaultThumbnails"; confirm: true };
+export type ThumbnailCleanupMode = "orphans" | "resetDefaults";
+export interface ThumbnailCleanupRequest {
+  mode: ThumbnailCleanupMode;
+  continuation: string | null;
+}
+export interface ThumbnailBatch {
+  mode: ThumbnailCleanupMode;
+  reviewedFiles: number;
+  eligibleFiles: number;
+  eligibleBytes: string;
+  preservedFiles: number;
+  protectedSourceCopies: number;
+  defaultRecordsToClear: number;
+  partial: boolean;
+  hasMore: boolean;
+  remainingFiles: number | null;
+  continuation: string | null;
+}
+export interface ThumbnailProgress {
+  review: ThumbnailBatch;
+  defaultRecordsCleared: number;
+  stopped: boolean;
+}
 export interface ActionPlan {
+  thumbnailReview?: ThumbnailBatch | null;
   token: string;
   actionKind: string;
   expiresAt: string;
@@ -551,7 +576,12 @@ export type ManagementResult =
       backupFileName: string;
       libraryEpoch: string;
     }
-  | { kind: "cleanupCompleted"; files: string; bytes: string };
+  | {
+      kind: "cleanupCompleted";
+      files: string;
+      bytes: string;
+      thumbnailProgress?: ThumbnailProgress | null;
+    };
 export interface SpoolmanConfig {
   baseUrl: string;
   endpointScope: "local" | "remote";
@@ -681,6 +711,11 @@ export interface LibraryClient {
   ): Promise<BrowserCatalogSettings>;
   planManagementAction(action: ManagementAction, signal?: AbortSignal): Promise<ActionPlan>;
   executeManagementAction(token: string, signal?: AbortSignal): Promise<ManagementResult>;
+  discardManagementAction(token: string, signal?: AbortSignal): Promise<void>;
+  reviewThumbnailCleanup(
+    request: ThumbnailCleanupRequest,
+    signal?: AbortSignal,
+  ): Promise<ActionPlan>;
   integrationSettings(signal?: AbortSignal): Promise<IntegrationSettings>;
   saveSpoolmanConfig(
     config: SpoolmanConfig | null,
@@ -1048,6 +1083,25 @@ export class HttpLibraryClient implements LibraryClient {
       body: JSON.stringify({ token }),
       signal,
     });
+  }
+  discardManagementAction(token: string, signal?: AbortSignal): Promise<void> {
+    return this.json("/api/v1/management/actions/discard", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+      signal,
+    });
+  }
+  reviewThumbnailCleanup(
+    request: ThumbnailCleanupRequest,
+    signal?: AbortSignal,
+  ): Promise<ActionPlan> {
+    return this.planManagementAction(
+      request.mode === "resetDefaults"
+        ? { kind: "resetDefaultThumbnails", confirm: true }
+        : { kind: "cleanupOrphans", confirm: true, continuation: request.continuation },
+      signal,
+    );
   }
   integrationSettings(signal?: AbortSignal): Promise<IntegrationSettings> {
     return this.json("/api/v1/integrations/settings", { signal });

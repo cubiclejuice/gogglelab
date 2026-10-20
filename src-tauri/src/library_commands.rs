@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 
 use crate::extension_api::{AppError, AppState, ModelSummary};
@@ -148,6 +148,15 @@ impl LibraryState {
     }
     pub(crate) fn begin_io(&self) -> Result<RuntimeIoGuard, AppError> {
         self.inner.runtime.begin_io().map_err(AppError::from)
+    }
+    pub(crate) fn wait_for_thumbnail_idle(&self) -> Result<(), AppError> {
+        if self.scan_control().status().running {
+            return Err(AppError::Library {
+                message: "Library job is running".into(),
+            });
+        }
+        THUMBNAIL_RENDER_LIMITER.wait_idle();
+        Ok(())
     }
     pub(crate) fn begin_maintenance(&self) -> Result<RuntimeMaintenanceGuard, AppError> {
         if self.scan_control().status().running {
@@ -931,99 +940,6 @@ fn cached_thumbnail(db: &LibraryDb, model_id: &str) -> Result<Option<String>, Ap
         .map_err(|message| AppError::Library { message })
 }
 
-#[tauri::command]
-pub async fn library_purge_thumbnails(
-    state: tauri::State<'_, LibraryState>,
-) -> Result<u64, AppError> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || purge_thumbnails(&state))
-        .await
-        .map_err(|error| AppError::Library {
-            message: format!("Thumbnail purge worker failed: {error}"),
-        })?
-}
-
-fn purge_thumbnails(state: &LibraryState) -> Result<u64, AppError> {
-    let paths = with_db(state, |db| db.purge_thumbnails().map_err(library_error))?;
-    remove_thumbnail_paths(state.root(), paths)
-}
-
-fn remove_thumbnail_paths(library_root: &Path, paths: Vec<PathBuf>) -> Result<u64, AppError> {
-    let canonical_library = library_root
-        .canonicalize()
-        .map_err(|error| crate::error::map_io_error(&error))?;
-    let thumbnail_root = library_root
-        .join("thumbnails")
-        .canonicalize()
-        .map_err(|error| crate::error::map_io_error(&error))?;
-    if thumbnail_root != canonical_library.join("thumbnails") {
-        return Err(AppError::Library {
-            message: "Thumbnail directory identity changed".into(),
-        });
-    }
-    let mut removed = 0_u64;
-    for path in paths {
-        if !path.starts_with(&thumbnail_root) || path.parent().is_none() {
-            return Err(AppError::Library {
-                message: "Refused to purge a path outside the thumbnail directory".into(),
-            });
-        }
-        let relative = path
-            .strip_prefix(&thumbnail_root)
-            .map_err(|_| AppError::Library {
-                message: "Refused to purge a malformed thumbnail path".into(),
-            })?;
-        let components = relative.components().collect::<Vec<_>>();
-        if components.is_empty()
-            || components
-                .iter()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(AppError::Library {
-                message: "Refused to purge a malformed thumbnail path".into(),
-            });
-        }
-        let mut ancestor = thumbnail_root.clone();
-        for component in &components[..components.len() - 1] {
-            let Component::Normal(component) = component else {
-                unreachable!("components were validated");
-            };
-            ancestor.push(component);
-            let metadata = std::fs::symlink_metadata(&ancestor)
-                .map_err(|error| crate::error::map_io_error(&error))?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(AppError::Library {
-                    message: "Refused to purge through a symlinked thumbnail directory".into(),
-                });
-            }
-        }
-        let parent = path
-            .parent()
-            .unwrap()
-            .canonicalize()
-            .map_err(|error| crate::error::map_io_error(&error))?;
-        if !parent.starts_with(&thumbnail_root) {
-            return Err(AppError::Library {
-                message: "Refused to purge through a symlinked thumbnail directory".into(),
-            });
-        }
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                return Err(AppError::Library {
-                    message: "Refused to purge a non-regular thumbnail".into(),
-                });
-            }
-            Ok(_) => {
-                std::fs::remove_file(&path).map_err(|error| crate::error::map_io_error(&error))?;
-                removed += 1;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(crate::error::map_io_error(&error)),
-        }
-    }
-    Ok(removed)
-}
-
 fn library_source_identity(model_id: &str) -> String {
     format!("library:{model_id}")
 }
@@ -1193,7 +1109,7 @@ mod access_tests {
 mod tests {
     use super::{
         cached_thumbnail, library_source_identity, open_library, persist_generated_thumbnail,
-        remove_thumbnail_paths, render_thumbnail_models, LibraryState,
+        render_thumbnail_models, LibraryState,
     };
     use library_core::ScannedModel;
     use sha2::{Digest, Sha256};
@@ -1422,57 +1338,6 @@ mod tests {
         state.scan_control().finish();
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(source_root);
-    }
-
-    #[test]
-    fn native_purge_guard_refuses_paths_outside_thumbnail_directory() {
-        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "gogglelab-library-purge-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(root.join("thumbnails")).unwrap();
-        let outside = root.join("originals-do-not-delete.stl");
-        std::fs::write(&outside, b"preserve").unwrap();
-        assert!(remove_thumbnail_paths(&root, vec![outside.clone()]).is_err());
-        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
-        let thumbnail = root.join("thumbnails/generated.png");
-        std::fs::write(&thumbnail, b"generated").unwrap();
-        assert_eq!(
-            remove_thumbnail_paths(&root, vec![thumbnail.canonicalize().unwrap()]).unwrap(),
-            1
-        );
-        assert!(!thumbnail.exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_purge_guard_rejects_swapped_symlink_ancestor() {
-        use std::os::unix::fs::symlink;
-
-        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "gogglelab-library-purge-symlink-{}-{nonce}",
-            std::process::id()
-        ));
-        let thumbnails = root.join("thumbnails");
-        let original_dir = thumbnails.join("original");
-        let replacement_dir = thumbnails.join("replacement");
-        std::fs::create_dir_all(&original_dir).unwrap();
-        std::fs::create_dir_all(&replacement_dir).unwrap();
-        let original = original_dir.join("generated.png");
-        std::fs::write(&original, b"original").unwrap();
-        let stored_path = original.canonicalize().unwrap();
-        std::fs::remove_file(&original).unwrap();
-        std::fs::remove_dir(&original_dir).unwrap();
-        let replacement = replacement_dir.join("generated.png");
-        std::fs::write(&replacement, b"preserve").unwrap();
-        symlink(&replacement_dir, &original_dir).unwrap();
-
-        assert!(remove_thumbnail_paths(&root, vec![stored_path]).is_err());
-        assert_eq!(std::fs::read(&replacement).unwrap(), b"preserve");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

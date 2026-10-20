@@ -3256,6 +3256,175 @@ impl LibraryDb {
             .transpose()
     }
 
+    /// One current source only; historical hashes are deliberately not resolved.
+    pub fn current_model_for_content_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<Model>, LibraryError> {
+        validate_hash(hash)?;
+        let id: Option<String> = self.conn.query_row(
+            "SELECT m.id FROM models m LEFT JOIN revisions r ON r.id=m.current_revision_id LEFT JOIN indexed_model_data d ON d.model_id=m.id WHERE m.deleted_at IS NULL AND COALESCE(r.blob_hash,d.content_hash)=?1 ORDER BY m.id LIMIT 1", [hash], |row| row.get(0)).optional()?;
+        id.map(|id| self.get_model(&id))
+            .transpose()
+            .map(Option::flatten)
+    }
+    /// Constant-size snapshot. Stream bounded metadata, never retain catalog paths.
+    pub fn default_thumbnail_reset_snapshot(&self) -> Result<(u32, [u8; 32]), LibraryError> {
+        self.default_thumbnail_reset_snapshot_with_limits(10_000, 200_000, 64 * 1024 * 1024)
+    }
+    fn default_thumbnail_reset_snapshot_with_limits(
+        &self,
+        max_records: usize,
+        max_rows: usize,
+        max_text_bytes: usize,
+    ) -> Result<(u32, [u8; 32]), LibraryError> {
+        let started = std::time::Instant::now();
+        let exceeded = || {
+            LibraryError::UnsupportedFormat("Default preview reset exceeds its bounded metadata review; rows and files were preserved".into())
+        };
+        let mut query=self.conn.prepare("SELECT id,model_id,relative_path,content_hash,is_custom,source_content_hash,ordinal,is_active FROM thumbnails ORDER BY id LIMIT ?1")?;
+        let mut rows = query.query([max_rows.saturating_add(1) as i64])?;
+        let mut digest = Sha256::new();
+        let mut count = 0u32;
+        let mut scanned = 0usize;
+        let mut text_bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            scanned += 1;
+            if scanned > max_rows || started.elapsed() >= std::time::Duration::from_secs(2) {
+                return Err(exceeded());
+            }
+            for column in [0, 1, 2, 3, 5] {
+                let value = row.get_ref(column)?;
+                match value {
+                    rusqlite::types::ValueRef::Null if column == 5 => digest.update([0]),
+                    _ => {
+                        let value = value.as_str().map_err(|_| exceeded())?;
+                        let limit = if matches!(column, 0 | 1) { 128 } else { 4096 };
+                        text_bytes = text_bytes.checked_add(value.len()).ok_or_else(exceeded)?;
+                        if value.len() > limit || text_bytes > max_text_bytes {
+                            return Err(exceeded());
+                        }
+                        digest.update([1]);
+                        digest.update((value.len() as u64).to_le_bytes());
+                        digest.update(value.as_bytes());
+                    }
+                }
+            }
+            let custom: i64 = row.get(4)?;
+            let ordinal: i64 = row.get(6)?;
+            let active: i64 = row.get(7)?;
+            if !matches!(custom, 0 | 1) || ordinal < 0 || !matches!(active, 0 | 1) {
+                return Err(exceeded());
+            }
+            for value in [custom, ordinal, active] {
+                digest.update(value.to_le_bytes());
+            }
+            if custom == 0 {
+                count += 1;
+                if count as usize > max_records {
+                    return Err(exceeded());
+                }
+            }
+        }
+        Ok((count, digest.finalize().into()))
+    }
+    /// Metadata only. The caller reserves count*192 bytes before this bounded
+    /// affected-model allocation; no paths or PNG bytes are deletion authority.
+    pub fn reset_default_thumbnail_records(
+        &self,
+        expected: &(u32, [u8; 32]),
+    ) -> Result<u32, LibraryError> {
+        let started = std::time::Instant::now();
+        let tx = self.conn.unchecked_transaction()?;
+        if self.default_thumbnail_reset_snapshot()? != *expected {
+            return Err(LibraryError::SourceChanged);
+        }
+        let mut models = Vec::with_capacity(expected.0 as usize);
+        {
+            let mut query = tx.prepare(
+                "SELECT DISTINCT model_id FROM thumbnails WHERE is_custom=0 LIMIT 10001",
+            )?;
+            let mut rows = query.query([])?;
+            while let Some(row) = rows.next()? {
+                let value = row.get_ref(0)?;
+                let id = value.as_str().map_err(|_| {
+                    LibraryError::UnsupportedFormat("Invalid preview model identity".into())
+                })?;
+                if models.len() >= expected.0 as usize
+                    || id.len() > 128
+                    || started.elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    return Err(LibraryError::UnsupportedFormat(
+                        "Default preview reset exceeds its bounded model review".into(),
+                    ));
+                }
+                models.push(id.to_owned());
+            }
+        }
+        let cleared = tx.execute("DELETE FROM thumbnails WHERE is_custom=0", [])?;
+        for id in models {
+            if started.elapsed() >= std::time::Duration::from_secs(2) {
+                return Err(LibraryError::UnsupportedFormat(
+                    "Default preview reset exceeded its work limit; transaction rolled back".into(),
+                ));
+            }
+            select_thumbnail_fallback(&tx, &id)?;
+        }
+        if cleared != expected.0 as usize {
+            return Err(LibraryError::SourceChanged);
+        }
+        tx.commit()?;
+        Ok(expected.0)
+    }
+
+    /// True may return early; false requires a complete bounded reference scan.
+    /// This includes custom, inactive and stale rows, without retaining paths.
+    pub fn thumbnail_path_is_referenced(&self, relative: &str) -> Result<bool, LibraryError> {
+        self.thumbnail_path_is_referenced_with_limits(relative, 200_000, 64 * 1024 * 1024, 4096)
+    }
+    fn thumbnail_path_is_referenced_with_limits(
+        &self,
+        relative: &str,
+        max_rows: usize,
+        max_text_bytes: usize,
+        max_field_bytes: usize,
+    ) -> Result<bool, LibraryError> {
+        let started = std::time::Instant::now();
+        let uncertain = || {
+            LibraryError::UnsupportedFormat("Preview references could not be completely reviewed within safe limits; files were preserved".into())
+        };
+        let candidate = thumbnail_reference_components(relative).ok_or_else(uncertain)?;
+        let mut query = self
+            .conn
+            .prepare("SELECT relative_path FROM thumbnails ORDER BY id LIMIT ?1")?;
+        let mut rows = query.query([max_rows.saturating_add(1) as i64])?;
+        let mut count = 0usize;
+        let mut text_bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            if count > max_rows || started.elapsed() >= std::time::Duration::from_secs(2) {
+                return Err(uncertain());
+            }
+            let value = row.get_ref(0)?;
+            let path = value.as_str().map_err(|_| uncertain())?;
+            text_bytes = text_bytes.checked_add(path.len()).ok_or_else(uncertain)?;
+            if path.len() > max_field_bytes || text_bytes > max_text_bytes {
+                return Err(uncertain());
+            }
+            let reference = thumbnail_reference_components(path).ok_or_else(uncertain)?;
+            if reference.clone().count() == candidate.clone().count()
+                && reference.zip(candidate.clone()).all(|(a, b)| {
+                    a.as_os_str()
+                        .as_encoded_bytes()
+                        .eq_ignore_ascii_case(b.as_os_str().as_encoded_bytes())
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn thumbnail_relative_paths(&self) -> Result<HashSet<String>, LibraryError> {
         let mut stmt = self.conn.prepare("SELECT relative_path FROM thumbnails")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -7843,6 +8012,30 @@ fn retain_import_staging(staging: &Path) -> Result<(), LibraryError> {
     std::fs::symlink_metadata(staging)
         .map(|_| ())
         .map_err(|error| io(staging, error))
+}
+
+// Match the reader's lexical dot/separator normalization without touching the
+// filesystem. ASCII case folding conservatively protects aliases on insensitive
+// volumes; Unicode/other uncertain reference forms cannot prove absence.
+fn thumbnail_reference_components(value: &str) -> Option<std::path::Components<'_>> {
+    if !value.is_ascii() || value.as_bytes().contains(&0) || value.contains('\\') {
+        return None;
+    }
+    let path = Path::new(value);
+    let mut components = path.components();
+    match components.next()? {
+        Component::Normal(first)
+            if first.as_encoded_bytes().eq_ignore_ascii_case(b"thumbnails") => {}
+        _ => return None,
+    }
+    let mut child = false;
+    for component in components {
+        if !matches!(component, Component::Normal(_)) {
+            return None;
+        }
+        child = true;
+    }
+    child.then(|| path.components())
 }
 
 fn validated_relative_path(path: &Path) -> Result<String, LibraryError> {
@@ -15408,6 +15601,162 @@ mod tests {
         );
         drop(migrated);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thumbnail_cleanup_saved_custom_path_alias_is_a_reference_when_inactive() {
+        for alias in [
+            "thumbnails/./fixture.png",
+            "thumbnails//fixture.png",
+            "thumbnails/FIXTURE.PNG",
+        ] {
+            let root = temp_root("thumbnail-reference-alias");
+            let db = LibraryDb::open(&root).unwrap();
+            let model = db.create_model("Alias fixture", None).unwrap();
+            let png = png_fixture();
+            let hash = format!("{:x}", Sha256::digest(&png));
+            fs::write(root.join("thumbnails/fixture.png"), &png).unwrap();
+            fs::write(root.join(alias), &png).unwrap();
+            fs::write(root.join("thumbnails/other.png"), &png).unwrap();
+            let (model, entry) = db
+                .add_custom_thumbnail(&model.id, model.metadata_version, &hash, Path::new(alias))
+                .unwrap();
+            assert_eq!(entry.relative_path, alias);
+            db.add_custom_thumbnail(
+                &model.id,
+                model.metadata_version,
+                &hash,
+                Path::new("thumbnails/other.png"),
+            )
+            .unwrap();
+            assert!(
+                !db.list_thumbnail_gallery(&model.id)
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.relative_path == alias)
+                    .unwrap()
+                    .is_active
+            );
+            assert!(db
+                .thumbnail_path_is_referenced("thumbnails/fixture.png")
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn thumbnail_cleanup_reference_absence_never_ignores_limits_or_invalid_utf() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let model = db.create_model("Reference fixture", None).unwrap();
+        for (id, path, custom) in [
+            ("a", "thumbnails/unrelated.png", 1),
+            ("b", "thumbnails/referenced.png", 0),
+        ] {
+            db.conn.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,ordinal,is_active) VALUES(?1,?2,?3,?4,?5,0,0)",params![id,model.id,path,"a".repeat(64),custom]).unwrap();
+        }
+        assert!(db
+            .thumbnail_path_is_referenced("thumbnails/referenced.png")
+            .unwrap());
+        assert!(db
+            .thumbnail_path_is_referenced("thumbnails/unrelated.png")
+            .unwrap());
+        assert!(!db
+            .thumbnail_path_is_referenced("thumbnails/absent.png")
+            .unwrap());
+        assert!(db
+            .thumbnail_path_is_referenced_with_limits("thumbnails/referenced.png", 1, 4096, 4096)
+            .is_err());
+        assert!(db
+            .thumbnail_path_is_referenced_with_limits("thumbnails/absent.png", 10, 4, 4096)
+            .is_err());
+        assert!(db
+            .thumbnail_path_is_referenced_with_limits("thumbnails/absent.png", 10, 4096, 4)
+            .is_err());
+        for invalid in [
+            "thumbnails/../outside.png",
+            "/thumbnails/outside.png",
+            "originals/foreign.png",
+            "thumbnails/uncertain-é.png",
+            "thumbnails/nu\0l.png",
+        ] {
+            db.conn
+                .execute(
+                    "UPDATE thumbnails SET relative_path=?1 WHERE id='b'",
+                    [invalid],
+                )
+                .unwrap();
+            assert!(db
+                .thumbnail_path_is_referenced("thumbnails/absent.png")
+                .is_err());
+        }
+        db.conn
+            .execute(
+                "UPDATE thumbnails SET relative_path='thumbnails/referenced.png' WHERE id='b'",
+                [],
+            )
+            .unwrap();
+        db.conn.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,ordinal,is_active) VALUES('z',?1,CAST(X'FF' AS TEXT),?2,1,0,0)",params![model.id,"a".repeat(64)]).unwrap();
+        assert!(db
+            .thumbnail_path_is_referenced("thumbnails/absent.png")
+            .is_err());
+        assert!(db
+            .thumbnail_path_is_referenced("thumbnails/referenced.png")
+            .unwrap());
+    }
+
+    #[test]
+    fn thumbnail_cleanup_helpers_resolve_current_hash_and_reset_only_default_rows() {
+        let temp = temp_root("thumbnail-cleanup-proof");
+        fs::create_dir_all(&temp).unwrap();
+        let root = temp.join("library");
+        let source = temp.join("source.stl");
+        fs::write(&source, stl_fixture()).unwrap();
+        let db = LibraryDb::open(&root).unwrap();
+        let model = db.import_file(&source, None, None).unwrap().model;
+        let hash = model.content_hash.as_ref().unwrap();
+        assert_eq!(
+            db.current_model_for_content_hash(hash).unwrap().unwrap().id,
+            model.id
+        );
+        assert!(db
+            .current_model_for_content_hash(&"0".repeat(64))
+            .unwrap()
+            .is_none());
+        db.conn.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,source_content_hash,ordinal,is_active) VALUES('default-proof',?1,'thumbnails/unknown.png',?2,0,?2,0,1)",params![model.id,hash]).unwrap();
+        db.conn.execute("INSERT INTO thumbnails(id,model_id,relative_path,content_hash,is_custom,ordinal,is_active) VALUES('custom-proof',?1,'thumbnails/custom.png',?2,1,1,0)",params![model.id,hash]).unwrap();
+        let selected = db.default_thumbnail_reset_snapshot().unwrap();
+        assert_eq!(selected.0, 1);
+        assert!(db
+            .default_thumbnail_reset_snapshot_with_limits(0, 10, 4096)
+            .is_err());
+        assert!(db
+            .default_thumbnail_reset_snapshot_with_limits(10, 1, 4096)
+            .is_err());
+        assert!(db
+            .default_thumbnail_reset_snapshot_with_limits(10, 10, 4)
+            .is_err());
+        assert_eq!(db.default_thumbnail_reset_snapshot().unwrap(), selected);
+        db.conn
+            .execute(
+                "UPDATE thumbnails SET relative_path=?1 WHERE id='default-proof'",
+                ["x".repeat(4097)],
+            )
+            .unwrap();
+        assert!(db.default_thumbnail_reset_snapshot().is_err());
+        db.conn.execute("UPDATE thumbnails SET relative_path='thumbnails/unknown.png' WHERE id='default-proof'",[]).unwrap();
+        assert_eq!(db.default_thumbnail_reset_snapshot().unwrap(), selected);
+        assert_eq!(db.reset_default_thumbnail_records(&selected).unwrap(), 1);
+        assert_eq!(db.default_thumbnail_reset_snapshot().unwrap().0, 0);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM thumbnails WHERE id='custom-proof'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(db.reset_default_thumbnail_records(&selected).is_err());
     }
 
     #[test]

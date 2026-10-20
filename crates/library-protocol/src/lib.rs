@@ -452,6 +452,42 @@ pub struct MoveLooseSourceTarget {
     pub file_name: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ThumbnailCleanupMode {
+    Orphans,
+    ResetDefaults,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThumbnailCleanupRequest {
+    pub mode: ThumbnailCleanupMode,
+    pub continuation: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbnailBatch {
+    pub mode: ThumbnailCleanupMode,
+    pub reviewed_files: u32,
+    pub eligible_files: u32,
+    #[serde(with = "printer_decimal_u64")]
+    pub eligible_bytes: u64,
+    pub preserved_files: u32,
+    pub protected_source_copies: u32,
+    pub default_records_to_clear: u32,
+    pub partial: bool,
+    pub has_more: bool,
+    pub remaining_files: Option<u32>,
+    pub continuation: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbnailProgress {
+    pub review: ThumbnailBatch,
+    pub default_records_cleared: u32,
+    pub stopped: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ManagementAction {
@@ -501,7 +537,11 @@ pub enum ManagementAction {
         backup_destination_handle_id: String,
         backup_file_name: String,
     },
-    CleanupOrphans,
+    CleanupOrphans {
+        #[serde(default)]
+        continuation: Option<String>,
+    },
+    ResetDefaultThumbnails,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -524,6 +564,8 @@ pub struct ActionPlan {
     pub impact: Vec<String>,
     pub input_bytes: Option<u64>,
     pub input_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_review: Option<ThumbnailBatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -595,6 +637,8 @@ pub enum ManagementResult {
     CleanupCompleted {
         files: u64,
         bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thumbnail_progress: Option<ThumbnailProgress>,
     },
 }
 
@@ -1465,6 +1509,15 @@ pub trait EmbeddedMetadataEngine: Send + Sync {
 }
 
 pub trait ManagementEngine: Send + Sync {
+    fn discard_action(&self, _context: &RequestContext, _token: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError {
+            code: RuntimeErrorCode::Unsupported,
+            message: "Management discard is unavailable".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
     fn plan_action(
         &self,
         context: &RequestContext,
@@ -2062,10 +2115,53 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_cleanup_protocol_is_additive_and_uses_exact_byte_totals() {
+        let action: ManagementAction =
+            serde_json::from_value(serde_json::json!({"kind":"cleanupOrphans","confirm":true}))
+                .unwrap();
+        assert!(matches!(
+            action,
+            ManagementAction::CleanupOrphans { continuation: None }
+        ));
+        assert!(matches!(
+            serde_json::from_value::<ManagementAction>(
+                serde_json::json!({"kind":"resetDefaultThumbnails","confirm":true})
+            )
+            .unwrap(),
+            ManagementAction::ResetDefaultThumbnails
+        ));
+        let batch = ThumbnailBatch {
+            mode: ThumbnailCleanupMode::Orphans,
+            reviewed_files: 1,
+            eligible_files: 1,
+            eligible_bytes: u64::MAX,
+            preserved_files: 0,
+            protected_source_copies: 0,
+            default_records_to_clear: 0,
+            partial: true,
+            has_more: true,
+            remaining_files: None,
+            continuation: Some("opaque".into()),
+        };
+        let value = serde_json::to_value(&batch).unwrap();
+        assert_eq!(value["eligibleBytes"], u64::MAX.to_string());
+        assert_eq!(value["remainingFiles"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<ThumbnailBatch>(value).unwrap(),
+            batch
+        );
+        assert!(serde_json::from_value::<ThumbnailCleanupRequest>(
+            serde_json::json!({"mode":"orphans","arbitraryPath":"secret"})
+        )
+        .is_err());
+    }
+
+    #[test]
     fn generated_cleanup_reports_only_deleted_counts() {
         let result = ManagementResult::CleanupCompleted {
             files: 1,
             bytes: 19,
+            thumbnail_progress: None,
         };
         let encoded = serde_json::to_value(&result).unwrap();
         assert_eq!(encoded["kind"], "cleanupCompleted");

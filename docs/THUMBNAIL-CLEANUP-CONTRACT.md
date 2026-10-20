@@ -1,14 +1,15 @@
 # Thumbnail cleanup caller contract
 
-Reviewed next-slice contract; implementation and acceptance remain pending.
-No publication/deletion is enabled by
-this document. The raster proof foundation exists; PNG receipts remain unwired.
+Implemented caller contract. Workspace, transport, frontend and static checks pass;
+packaged native and synthetic container acceptance are the current delivery gate.
+Cleanup now uses bounded independent raster proof and retained PNG receipts.
+Content-addressed producer publication remains a separate, later slice.
 
 ## Shared API and review results
 
 Use one coordinator in `library-runtime/src/thumbnail_cleanup.rs`, shared by
 native and remote adapters. Reuse `ManagementEngine::plan_action/execute_action`
-and its existing action-token store. Proposed additions:
+and its action-token store. Shared additions:
 
 ```rust
 // Protocol: camelCase; reject unknown request fields.
@@ -47,7 +48,9 @@ shape. It never executes an action or changes files. Wrong-principal requests mu
 not consume the owner's plan. Remove/drop owned receipts and their pending
 continuation under short store coordination; replay is harmless/stale. Cancel,
 Escape, dialog replacement and disconnect attempt discard before clearing the key.
-A failed request must not be reported as confirmed release; TTL pruning/runtime
+Use a distinct discard command/route. Never send a discard flag to an older
+execute endpoint that might ignore it and perform deletion on Cancel. A failed
+request must not be reported as confirmed release; TTL pruning/runtime
 shutdown remains the bounded fallback. Do not auto-execute to release resources.
 
 Replace unit `ManagementAction::CleanupOrphans` with
@@ -79,8 +82,9 @@ consume the owner's token. Store owned non-Clone receipts, not deletion-authorit
 clones. Bind plans/cursors to principal, mode, pinned root/namespace identity,
 Library epoch, catalog revision, selection and expiry. No caller-supplied root/path.
 
-Keep five-minute plan TTL. Consume continuation tokens once; refresh their
-five-minute TTL on authorized progress. Limit cursor storage to 64 small entries
+Keep five-minute plan TTL. Consume continuation tokens once; start their fresh
+five-minute TTL when successful execution activates them, preserving the original
+confirmation-plan expiry. Limit cursor storage to 64 small entries
 containing the last inspected name, not retained directory listings/source buffers.
 A review's continuation becomes usable only after that review token is consumed;
 protected-only continuation consumes a zero-delete plan before reviewing the next
@@ -109,15 +113,19 @@ Each page: at most **four retained candidate receipts and four uncached renders,
 128 million reserved raster samples, 4 MiB per PNG**, existing 100 MiB per-source
 and parser-expansion limits. Reserve before allocation. Add only the read-only
 `ThumbnailRecipe::raster_sample_budget()` accessor needed for admission. Check a
-**two-second cooperative deadline** between operations; synchronous parsing/encoding
-is not hard-preemptible. The same source-I/O budget and checkpoints apply to
+**two-second cooperative deadline** before each admitted proof unit. Finish the
+bounded source-read/render/receipt-admission unit already admitted, even if it
+overruns; never discard completed proof just because it crossed the soft target.
+Synchronous parsing/encoding is not hard-preemptible. The same source-I/O budget and checkpoints apply to
 execution revalidation; do not hash every source twice in a prepass plus per-file
 checks. Four retained candidates bound per-file source rechecks independently of
 render deduplication. Bound enumeration using the existing namespace limit,
 sort names, resume after the cursor and advance past **every inspected entry**,
 including unprovable/malformed/protected entries. If budget prevents the next
-inspection, leave that entry for continuation. Unsafe/oversized enumeration reports
-partial/unknown remaining and performs no deletion. No broad fallback scan.
+inspection, leave that entry for continuation. Unsafe/oversized PNG enumeration reports partial/unknown remaining and performs
+no deletion. Uncertain non-deleting source-copy counts preserve all copies and
+report unknown totals, while retaining independently proven PNGs and their
+continuation. No broad fallback scan.
 
 ## Admitted source and exclusion rules
 
@@ -192,6 +200,15 @@ not remain on PNG retirement paths.
 
 ## Default reset, protected copies and UI
 
+Reset review retains only a constant-size count/digest of ordered thumbnail
+metadata, not per-row path vectors. Stream at most 10,000 default records, 200,000
+rows total and 64 MiB text, with 128-byte IDs, 4096-byte other fields and cooperative
+two-second metadata checks. Oversize/malformed data is Unsupported with rows/files
+unchanged; never truncate. Transactional reset compares that digest/count, reserves
+bounded affected-model memory before allocation and rolls back if its work bound
+is exceeded. Reference absence checks likewise stream with the 200,000-row/64-MiB/
+4096-byte/two-second limits and cannot establish absence from a truncated scan.
+
 ResetDefaults confirms then clears only noncustom default rows in one revision/
 selection-checked transaction, keeping custom fallback behavior. It creates no PNG
 receipts and deletes **no files**. Afterward offer a separate fresh orphan review
@@ -230,5 +247,6 @@ epoch/revision failures release budgets correctly; unprovable prefixes do not st
 allocation/I/O; post-unlink sync failure reports partial counts; reset keeps unknown
 files/custom fallback; both indexed-cache branches preserve source copies; proof
 performs no temporary extraction writes; DTO/OpenAPI/UI report partial/protected
-results honestly. Run affected runtime/core/native/frontend gates and packaged
-synthetic acceptance before wiring callers. No live network or historical cleanup.
+results honestly. Affected runtime/core/native/frontend gates pass. Packaged native and synthetic
+container acceptance must pass before this caller slice is declared complete.
+No live network or historical cleanup is part of this acceptance.

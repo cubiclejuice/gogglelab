@@ -1,6 +1,41 @@
 # GoggleLab Free: full Printventory parity
 
 Date: 2026-10-15 (updated 2026-10-19)
+
+## Current cleanup caller slice (2026-10-19)
+
+The shared cleanup coordinator is now wired into native, browser, REST and MCP
+callers in Free. Cleanup reviews a bounded page of candidates, independently
+reproduces supported raster previews from admitted current loose sources, and
+requires a fresh explicit confirmation for each page. Results distinguish removed,
+preserved, protected and partially reviewed files; continuing reviews another page
+without automatically deleting it. Cancel/replacement/disconnect use a separate
+owner-checked discard action. An unconfirmed release falls back to bounded expiry
+and pruning; a failed or timed-out execution may have completed some work and must
+not be retried with the same token.
+
+Default-preview reset changes catalog metadata only and keeps every file. Removing
+newly unused previews requires a separate fresh review. Custom and embedded
+previews, unknown or unprovable files, referenced/actively read previews, and
+indexed-cache source/archive-member copies remain protected. No historical holds
+or original sources are swept. Durable guarded cleanup remains unsupported on
+Windows; it must fail explicitly rather than fall back to pathname deletion. See
+[the cleanup contract](THUMBNAIL-CLEANUP-CONTRACT.md) for bounds and authority.
+
+Current automated verification passed: the full Rust workspace includes 201 native,
+124 core, 311 runtime, 65 server and five server-binary tests; the frontend gate
+passed 363 tests with 1,512 assertions. Workspace Clippy and formatting also passed.
+Native packaged and container acceptance for this **caller slice remain pending**;
+earlier native/container evidence below does not satisfy those gates. No full
+Printventory parity, Windows durable-cleanup acceptance, hardware acceptance or
+final release claim follows from these results.
+
+### Earlier checkpoint (historical)
+
+The phase-status paragraphs below retain earlier evidence. Their 326-test frontend
+count and “latest” verification wording refer to that earlier checkpoint; the
+current automated gate and pending caller acceptance are stated above.
+
 Open Phase 6 release gates: friend-run native Windows runtime/DACL/junction/replacement checks and final release review. Ordinary concurrent changes are guarded by pinned file/directory identities; hostile same-UID swap-and-restore windows are documented residuals outside the requested threat model. At the owner's direction, Phase 7 and subsequent phases proceed in order while native validation remains pending; no cross-platform parity claim is made until those checks pass.
 Status (2026-10-19): local phases 1–10 include reviewed printer/parts/slicer JSON in Free and schema v11. Delivery audit exposed missing native stock IPC and browser fleet coverage; those backfills are pushed at `2a6847fa605422e122c5f370041a4baa99457579`. Complete isolated native slicer import/export/restart acceptance now passes. Browser/MCP discovery and selected-printer checks are implemented with separately admitted host policy, default-off multicast/broadcast permissions, one-use review, version checks, and cancellation/revocation guards. The latest full serial Rust workspace suite, Clippy, and 326-test frontend gate pass; the network slice also passes isolated native default-off inspection, synthetic browser acceptance, and a Community production build/signature check. Synthetic browser acceptance covers discovery, unapproved profile saving, approval, fake Moonraker/Carbon printing status, cancellation, and disconnect; no real printer request was made. Remaining gates include the official unified core pin/composition, remaining Linux desktop delivery, friend-run Windows checks, hardware acceptance, provenance-aware generated-media follow-ups, and final release review. Bambu MQTT remains deferred in issue #3. The [Windows handoff](WINDOWS-FRIEND-ACCEPTANCE.md) is embedded in issue #2 with exact source provenance. Verified prior candidates and active builds are preserved; no cleanup or installed-app replacement occurred. No full parity or Windows/hardware acceptance claim is made.
 

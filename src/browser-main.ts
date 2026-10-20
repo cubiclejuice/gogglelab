@@ -25,6 +25,10 @@ import {
   ensureBulkSelectionLimit,
   pagesToRestore,
 } from "./lib/browser-selection";
+import {
+  ThumbnailCleanupDialog,
+  UNCONFIRMED_MANAGEMENT_OUTCOME,
+} from "./lib/thumbnail-cleanup-dialog";
 import { LibraryAiDialog } from "./lib/library-ai-dialog";
 import "./styles.css";
 
@@ -32,6 +36,28 @@ const root = document.querySelector<HTMLElement>("#browser-app")!;
 const client = new HttpLibraryClient();
 const printerFleetDialog = new BrowserPrinterFleetDialog(client);
 const integrationDialog = new LibraryAiDialog(document.body);
+let dismissManagement = () => {};
+const thumbnailCleanup = new ThumbnailCleanupDialog(
+  document.body,
+  {
+    review: (request) => client.reviewThumbnailCleanup(request),
+    execute: async (token) => {
+      const result = await client.executeManagementAction(token);
+      if (result.kind !== "cleanupCompleted") throw new Error("Unexpected preview result");
+      return result;
+    },
+    discard: (token) => client.discardManagementAction(token),
+  },
+  {
+    onChanged: async () => {
+      await reloadLoadedPages();
+    },
+    onNotice: (text) => {
+      status.textContent = text;
+    },
+    focusFallback: () => search.focus(),
+  },
+);
 let bundleDialog: import("./lib/library-bundle-dialog").LibraryBundleDialog | null = null;
 async function getBundleDialog(): Promise<
   import("./lib/library-bundle-dialog").LibraryBundleDialog
@@ -732,6 +758,7 @@ async function showBrowserSettings(): Promise<void> {
 }
 
 async function showManagement(): Promise<void> {
+  dismissManagement();
   const dialog = document.createElement("dialog");
   dialog.className = "browser-catalog-manager";
   const title = document.createElement("h2");
@@ -749,7 +776,38 @@ async function showManagement(): Promise<void> {
   );
   document.body.append(dialog);
   dialog.showModal();
+  let revision = 0;
+  let ownedToken: string | null = null;
+  const discard = async (token: string) => {
+    try {
+      await client.discardManagementAction(token);
+    } catch {
+      status.textContent =
+        "Release of a management review could not be confirmed. It expires after five minutes; the host reclaims expired reviews on its next prune or shutdown.";
+    }
+  };
+  const releasePlan = () => {
+    revision++;
+    const token = ownedToken;
+    ownedToken = null;
+    if (token) void discard(token);
+  };
+  dismissManagement = () => {
+    releasePlan();
+    thumbnailCleanup.dismiss();
+    if (dialog.open) dialog.close();
+  };
+  dialog.addEventListener(
+    "close",
+    () => {
+      releasePlan();
+      thumbnailCleanup.dismiss();
+      dialog.remove();
+    },
+    { once: true },
+  );
   const roots = await client.listRoots();
+  if (!dialog.open || !dialog.isConnected) return;
   const availableActions = managementActionAvailability(capabilities?.features, roots);
   const handles = roots.filter(
     (root) => root.access === "backupOnly" || root.access === "writable",
@@ -776,9 +834,17 @@ async function showManagement(): Promise<void> {
   }
   const targets = () => browserSelectionTargets(selectedModels.values());
   const plan = async (action: import("./lib/library-client").ManagementAction) => {
+    releasePlan();
+    const requestRevision = revision;
+    planArea.replaceChildren();
     message.textContent = "Planning…";
     try {
       const result = await client.planManagementAction(action);
+      if (requestRevision !== revision || !dialog.open || !dialog.isConnected) {
+        await discard(result.token);
+        return;
+      }
+      ownedToken = result.token;
       planArea.replaceChildren();
       const heading = document.createElement("h3");
       heading.textContent = `${result.actionKind} · expires ${new Date(result.expiresAt).toLocaleTimeString()}`;
@@ -789,25 +855,36 @@ async function showManagement(): Promise<void> {
         list.append(item);
       }
       const execute = actionButton("Execute this plan", () => {
+        if (ownedToken !== result.token || requestRevision !== revision || !dialog.open) return;
+        ownedToken = null;
         execute.disabled = true;
         void client
           .executeManagementAction(result.token)
           .then(async (outcome) => {
+            if (requestRevision !== revision || !dialog.open) return;
             message.textContent =
               outcome.kind === "cleanupCompleted"
                 ? `Deleted ${outcome.files} generated orphan files (${outcome.bytes} bytes). Original model files were untouched.`
                 : JSON.stringify(outcome);
             selectedModels.clear();
-            await reloadLoadedPages();
+            try {
+              await reloadLoadedPages();
+            } catch {
+              if (requestRevision === revision && dialog.open)
+                message.textContent += " The catalog view could not be refreshed.";
+            }
           })
-          .catch((error) => {
-            message.textContent = String(error?.message ?? error);
-            execute.disabled = false;
+          .catch(async () => {
+            await discard(result.token);
+            if (requestRevision !== revision || !dialog.open) return;
+            message.textContent = UNCONFIRMED_MANAGEMENT_OUTCOME;
+            // A token may have been consumed; require a fresh review.
           });
       });
       planArea.append(heading, list, execute);
       message.textContent = "Review the impact, then execute explicitly.";
     } catch (error) {
+      if (requestRevision !== revision || !dialog.open) return;
       message.textContent = String((error as { message?: unknown }).message ?? error);
     }
   };
@@ -929,13 +1006,14 @@ async function showManagement(): Promise<void> {
   }
   if (availableActions.cleanupOrphans) {
     controls.append(
-      actionButton(
-        "Plan orphan cleanup",
-        () => void plan({ kind: "cleanupOrphans", confirm: true }),
-      ),
+      actionButton("Review unused previews…", () => thumbnailCleanup.show("orphans")),
+      actionButton("Reset default previews…", () => {
+        releasePlan();
+        planArea.replaceChildren();
+        thumbnailCleanup.show("resetDefaults");
+      }),
     );
   }
-  dialog.addEventListener("close", () => dialog.remove(), { once: true });
 }
 
 async function showIntegrations(): Promise<void> {
@@ -2727,6 +2805,8 @@ async function configureCatalogFilters(paths: Record<string, unknown>): Promise<
 
 login.addEventListener("submit", (event) => {
   event.preventDefault();
+  dismissManagement();
+  thumbnailCleanup.dismiss();
   client.setToken(token.value);
   token.value = "";
   connect.disabled = true;
@@ -2823,6 +2903,8 @@ login.addEventListener("submit", (event) => {
 });
 
 disconnect.addEventListener("click", () => {
+  dismissManagement();
+  thumbnailCleanup.dismiss();
   eventController?.abort();
   modelController?.abort();
   modelLoadRevision += 1;
