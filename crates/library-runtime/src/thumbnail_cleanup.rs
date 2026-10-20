@@ -332,7 +332,15 @@ impl VerifiedSource {
         Ok(())
     }
 }
-fn read_source(runtime: &LibraryRuntime, source: &Source) -> Result<VerifiedSource, RuntimeError> {
+fn read_source(
+    runtime: &LibraryRuntime,
+    source: &Source,
+    context: &mut PackageProcessingContext,
+) -> Result<VerifiedSource, RuntimeError> {
+    let observer = context.observer();
+    observer
+        .check()
+        .map_err(|e| ProcessingError::from(e).into_runtime(io_error()))?;
     if source.source.archive_member.is_some()
         || source.limit.is_some_and(|n| source.source.bytes > n)
     {
@@ -356,14 +364,12 @@ fn read_source(runtime: &LibraryRuntime, source: &Source) -> Result<VerifiedSour
     if metadata.len() != source.source.bytes {
         return Err(stale("Source size changed"));
     }
-    let mut bytes = Vec::with_capacity(source.source.bytes as usize);
-    Read::by_ref(&mut file)
-        .take(source.source.bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| io_error())?;
+    let bytes = collect_verified_model_source(&mut file, source.source.bytes, &observer)
+        .map_err(|e| ProcessingError::from(e).into_runtime(io_error()))?;
     if bytes.len() as u64 != source.source.bytes
         || format!("{:x}", Sha256::digest(&bytes)) != source.source.content_hash
     {
+        let _ = observer.stop_io(stl_core::ResourceStop::EnvelopeChanged);
         return Err(stale("Source bytes changed"));
     }
     #[cfg(test)]
@@ -465,6 +471,7 @@ fn reproduce_for_review(
     recipe: &thumbnails::ThumbnailRecipe,
     bytes: &[u8],
     expected_bytes: u64,
+    context: &mut PackageProcessingContext,
 ) -> Result<Option<thumbnails::RasterGeneratedPng>, crate::ProcessingError> {
     #[cfg(test)]
     {
@@ -482,7 +489,7 @@ fn reproduce_for_review(
     }
     #[cfg(not(test))]
     let _ = runtime;
-    thumbnails::reproduce_thumbnail(recipe, bytes, expected_bytes)
+    thumbnails::reproduce_thumbnail_in_context(recipe, bytes, expected_bytes, context)
 }
 
 pub(super) fn review(
@@ -601,14 +608,20 @@ pub(super) fn review(
                         Source,
                         Processing(crate::ProcessingError),
                     }
-                    let proof = read_source(runtime, &snapshot)
-                        .map_err(|_| ProofError::Source)
+                    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+                    let observer = context.observer();
+                    let proof = read_source(runtime, &snapshot, &mut context)
+                        .map_err(|_| match observer.check() {
+                            Err(error) => ProofError::Processing(error.into()),
+                            Ok(()) => ProofError::Source,
+                        })
                         .and_then(|verified| {
                             let proof = reproduce_for_review(
                                 runtime,
                                 &recipe,
                                 &verified.bytes,
                                 snapshot.source.bytes,
+                                &mut context,
                             )
                             .map_err(ProofError::Processing)?;
                             verified.verify().map_err(|_| ProofError::Source)?;
@@ -797,7 +810,8 @@ fn retire_candidate(
         {
             return Err(stale("Preview review conditions changed"));
         }
-        let verified = read_source(runtime, &candidate.source)?;
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let verified = read_source(runtime, &candidate.source, &mut context)?;
         binding.verify(&runtime.root)?;
         recheck_management_plan(runtime, epoch, revision)?;
         // Recheck references after the bounded source read immediately
@@ -1022,6 +1036,59 @@ mod tests {
             paths,
         }
     }
+    #[test]
+    fn cleanup_plain_source_and_raster_proof_do_not_invent_inflation() {
+        use stl_core::package_bounds::PackageUsage;
+        let f = fixture(1);
+        let snapshot = f
+            .runtime
+            .read_db(|db| {
+                Ok(source(
+                    &f.runtime,
+                    db,
+                    f.model.content_hash.as_deref().unwrap(),
+                ))
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let verified = read_source(&f.runtime, &snapshot, &mut context).unwrap();
+        let zero = PackageUsage {
+            inflation_bytes: 0,
+            retained_input_bytes: 0,
+        };
+        assert_eq!(context.usage(), zero);
+        let recipe =
+            thumbnails::ThumbnailRecipe::parse_filename(f.paths[0].file_name().unwrap()).unwrap();
+        let proof = reproduce_for_review(
+            &f.runtime,
+            &recipe,
+            &verified.bytes,
+            snapshot.source.bytes,
+            &mut context,
+        )
+        .unwrap();
+        assert!(proof.is_some());
+        assert_eq!(context.usage(), zero);
+        verified.verify().unwrap();
+        let _ = context
+            .observer()
+            .stop_io(stl_core::ResourceStop::ReadWorkExceeded);
+        assert!(matches!(
+            reproduce_for_review(
+                &f.runtime,
+                &recipe,
+                &verified.bytes,
+                snapshot.source.bytes,
+                &mut context
+            ),
+            Err(crate::ProcessingError::ResourceStopped(
+                stl_core::ResourceStop::ReadWorkExceeded
+            ))
+        ));
+    }
+
     fn review(f: &Fixture, continuation: Option<String>) -> ActionPlan {
         f.runtime
             .review_thumbnail_cleanup(

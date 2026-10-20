@@ -7,7 +7,9 @@ use std::{ffi::OsStr, ffi::OsString};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use library_core::CatalogSettings;
 use sha2::{Digest, Sha256};
-use stl_core::ParsedStl;
+use stl_core::package_bounds::{collect_verified_model_source, PackageProcessingContext};
+use stl_core::zip_bounds::ZipResourceObserver;
+use stl_core::{ParsedStl, ResourceStop};
 
 use crate::png_output::BoundedPngOutput;
 use crate::secure_fs::Directory;
@@ -165,18 +167,31 @@ impl SourceThumbnail {
 /// Pure bounded source rendering shared with normal generation. Callers still
 /// admit the source through catalog/root/epoch checks; a digest alone is not
 /// permission to read a source. This function accepts no cache path or catalog.
+#[cfg(test)]
 fn render_source_thumbnail(
     source: &[u8],
     source_hash: &str,
     expected_bytes: u64,
     settings: &CatalogSettings,
 ) -> Result<SourceThumbnail, ProcessingError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    render_source_thumbnail_in_context(source, source_hash, expected_bytes, settings, &mut context)
+}
+
+fn render_source_thumbnail_in_context(
+    source: &[u8],
+    source_hash: &str,
+    expected_bytes: u64,
+    settings: &CatalogSettings,
+    context: &mut PackageProcessingContext,
+) -> Result<SourceThumbnail, ProcessingError> {
     render_source_with_preview(
         source,
         source_hash,
         expected_bytes,
         settings,
-        crate::images::embedded_3mf_thumbnail_typed,
+        context,
+        crate::images::embedded_3mf_thumbnail_in_context_typed,
         render_png_typed,
     )
 }
@@ -186,64 +201,92 @@ fn render_source_with_preview(
     source_hash: &str,
     expected_bytes: u64,
     settings: &CatalogSettings,
-    preview: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, ProcessingError>,
+    context: &mut PackageProcessingContext,
+    preview: impl FnOnce(
+        &[u8],
+        &mut PackageProcessingContext,
+    ) -> Result<Option<Vec<u8>>, ProcessingError>,
     raster: impl FnOnce(&ParsedStl, &CatalogSettings) -> Result<Vec<u8>, ProcessingError>,
 ) -> Result<SourceThumbnail, ProcessingError> {
-    if source.len() as u64 != expected_bytes
-        || expected_bytes > stl_core::limits::MAX_FILE_BYTES
-        || hex_digest(source) != source_hash
-    {
-        return Err("Model source changed since it was indexed".into());
-    }
-    let relative = thumbnail_relative_path(source_hash, settings);
-    let recipe = relative
-        .file_name()
-        .and_then(ThumbnailRecipe::parse_filename)
-        .ok_or_else(|| "Unsupported thumbnail recipe".to_owned())?;
-    if recipe.source_hash() != source_hash {
-        return Err("Thumbnail recipe source mismatch".into());
-    }
-    // Keep the existing parser/embedded-selection order and raster algorithm.
-    // Their existing expansion, triangle-stride and raster-sample limits apply.
-    let parsed = stl_core::parse_model(source).map_err(ProcessingError::from)?;
-    let rendered = match preview(source) {
-        Ok(Some(bytes)) => SourceThumbnail::EmbeddedPreviewCopy(EmbeddedPreviewPng { bytes }),
-        Err(error) if error.is_terminal() => return Err(error),
-        Ok(None) | Err(_) => {
-            let bytes = raster(&parsed, settings)?;
-            let png_hash = hex_digest(&bytes);
-            SourceThumbnail::RasterGenerated(RasterGeneratedPng {
-                bytes,
-                recipe,
-                source_bytes: expected_bytes,
-                png_hash,
-            })
+    let observer = context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    let result = (|| {
+        if expected_bytes > stl_core::limits::MAX_FILE_BYTES {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::InputLimitExceeded),
+            ));
         }
-    };
-    let bytes = match &rendered {
-        SourceThumbnail::RasterGenerated(png) => png.bytes(),
-        SourceThumbnail::EmbeddedPreviewCopy(png) => &png.bytes,
-    };
-    if bytes.len() as u64 > MAX_CACHED_PNG_BYTES {
-        return Err("Generated thumbnail exceeds its cache size limit".into());
-    }
-    Ok(rendered)
+        if source.len() as u64 != expected_bytes || hex_digest(source) != source_hash {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
+            ));
+        }
+        let relative = thumbnail_relative_path(source_hash, settings);
+        let recipe = relative
+            .file_name()
+            .and_then(ThumbnailRecipe::parse_filename)
+            .ok_or_else(|| "Unsupported thumbnail recipe".to_owned())?;
+        if recipe.source_hash() != source_hash {
+            return Err("Thumbnail recipe source mismatch".into());
+        }
+        // Keep the existing parser/embedded-selection order and raster algorithm.
+        // Their existing expansion, triangle-stride and raster-sample limits apply.
+        let parsed =
+            stl_core::parse_model_in_context(source, context).map_err(ProcessingError::from)?;
+        observer.check().map_err(ProcessingError::from)?;
+        let rendered = match preview(source, context) {
+            Ok(Some(bytes)) => SourceThumbnail::EmbeddedPreviewCopy(EmbeddedPreviewPng { bytes }),
+            Err(error) if error.is_terminal() => return Err(error),
+            Ok(None) | Err(_) => {
+                observer.check().map_err(ProcessingError::from)?;
+                let bytes = raster(&parsed, settings)?;
+                let png_hash = hex_digest(&bytes);
+                SourceThumbnail::RasterGenerated(RasterGeneratedPng {
+                    bytes,
+                    recipe,
+                    source_bytes: expected_bytes,
+                    png_hash,
+                })
+            }
+        };
+        observer.check().map_err(ProcessingError::from)?;
+        let bytes = match &rendered {
+            SourceThumbnail::RasterGenerated(png) => png.bytes(),
+            SourceThumbnail::EmbeddedPreviewCopy(png) => &png.bytes,
+        };
+        if bytes.len() as u64 > MAX_CACHED_PNG_BYTES {
+            return Err("Generated thumbnail exceeds its cache size limit".into());
+        }
+        Ok(rendered)
+    })();
+    observer.finish(result)
 }
 
 /// Independent raster reproduction only. Embedded previews and a mismatched
 /// content-address hint remain unproven regardless of any cache equality.
-/// Foundation only: cleanup callers are deliberately not wired before review.
-#[allow(dead_code)]
+/// Each standalone call creates one operation; composed callers supply their context.
+#[cfg(test)]
 pub(crate) fn reproduce_thumbnail(
     recipe: &ThumbnailRecipe,
     source: &[u8],
     expected_bytes: u64,
 ) -> Result<Option<RasterGeneratedPng>, ProcessingError> {
-    match render_source_thumbnail(
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    reproduce_thumbnail_in_context(recipe, source, expected_bytes, &mut context)
+}
+
+pub(crate) fn reproduce_thumbnail_in_context(
+    recipe: &ThumbnailRecipe,
+    source: &[u8],
+    expected_bytes: u64,
+    context: &mut PackageProcessingContext,
+) -> Result<Option<RasterGeneratedPng>, ProcessingError> {
+    match render_source_thumbnail_in_context(
         source,
         recipe.source_hash(),
         expected_bytes,
         &recipe.settings(),
+        context,
     )? {
         SourceThumbnail::EmbeddedPreviewCopy(_) => Ok(None),
         SourceThumbnail::RasterGenerated(mut png) => {
@@ -303,31 +346,69 @@ pub fn ensure_thumbnail_typed(
     settings: &CatalogSettings,
     regenerate: bool,
 ) -> Result<ThumbnailArtifact, ProcessingError> {
-    let relative = thumbnail_relative_path(content_hash, settings);
-    if let Some(cached) = cached_thumbnail(library_root, &relative, regenerate)? {
-        return Ok(cached);
-    }
-    let source_metadata = fs::symlink_metadata(source_path).map_err(|error| error.to_string())?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-        return Err("Model source is not a regular file".into());
-    }
-    if source_metadata.len() != expected_source_bytes
-        || source_metadata.len() > stl_core::limits::MAX_FILE_BYTES
-    {
-        return Err("Model source size changed or exceeds the safe render limit".into());
-    }
-    let bytes = read_bounded(source_path, expected_source_bytes)?;
-    if bytes.len() as u64 != expected_source_bytes || hex_digest(&bytes) != content_hash {
-        return Err("Model source changed since it was indexed".into());
-    }
-    ensure_thumbnail_from_bytes_typed(
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    ensure_thumbnail_in_context_typed(
         library_root,
-        &bytes,
+        source_path,
         content_hash,
         expected_source_bytes,
         settings,
         regenerate,
+        &mut context,
     )
+}
+
+/// Generate within an existing source-validation/package operation.
+#[doc(hidden)]
+pub fn ensure_thumbnail_in_context_typed(
+    library_root: &Path,
+    source_path: &Path,
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+    context: &mut PackageProcessingContext,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    let observer = context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    let result = (|| {
+        let relative = thumbnail_relative_path(content_hash, settings);
+        if let Some(cached) = cached_thumbnail(library_root, &relative, regenerate)? {
+            return Ok(cached);
+        }
+        if expected_source_bytes > stl_core::limits::MAX_FILE_BYTES {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::InputLimitExceeded),
+            ));
+        }
+        let metadata = fs::symlink_metadata(source_path).map_err(ProcessingError::from_io)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != expected_source_bytes
+        {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
+            ));
+        }
+        let file = File::open(source_path).map_err(ProcessingError::from_io)?;
+        let bytes = collect_verified_model_source(file, expected_source_bytes, &observer)
+            .map_err(ProcessingError::from)?;
+        if hex_digest(&bytes) != content_hash {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
+            ));
+        }
+        ensure_thumbnail_from_bytes_in_context_typed(
+            library_root,
+            &bytes,
+            content_hash,
+            expected_source_bytes,
+            settings,
+            regenerate,
+            context,
+        )
+    })();
+    observer.finish(result)
 }
 
 fn cached_thumbnail(
@@ -384,6 +465,7 @@ pub(crate) fn ensure_thumbnail_from_bytes(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_thumbnail_from_bytes_typed(
     library_root: &Path,
     source_bytes: &[u8],
@@ -392,7 +474,42 @@ pub(crate) fn ensure_thumbnail_from_bytes_typed(
     settings: &CatalogSettings,
     regenerate: bool,
 ) -> Result<ThumbnailArtifact, ProcessingError> {
-    ensure_from_bytes_with_render(
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    ensure_thumbnail_from_bytes_in_context_typed(
+        library_root,
+        source_bytes,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+        &mut context,
+    )
+}
+
+pub(crate) fn ensure_thumbnail_from_bytes_in_context_typed(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+    context: &mut PackageProcessingContext,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    let observer = context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    if expected_source_bytes > stl_core::limits::MAX_FILE_BYTES {
+        return Err(ProcessingError::from_io(
+            observer.stop_io(ResourceStop::InputLimitExceeded),
+        ));
+    }
+    if source_bytes.len() as u64 != expected_source_bytes
+        || hex_digest(source_bytes) != content_hash
+    {
+        return Err(ProcessingError::from_io(
+            observer.stop_io(ResourceStop::EnvelopeChanged),
+        ));
+    }
+    let result = ensure_from_bytes_with_render(
         library_root,
         source_bytes,
         content_hash,
@@ -400,10 +517,17 @@ pub(crate) fn ensure_thumbnail_from_bytes_typed(
         settings,
         regenerate,
         || {
-            render_source_thumbnail(source_bytes, content_hash, expected_source_bytes, settings)
-                .map(SourceThumbnail::into_bytes)
+            render_source_thumbnail_in_context(
+                source_bytes,
+                content_hash,
+                expected_source_bytes,
+                settings,
+                context,
+            )
+            .map(SourceThumbnail::into_bytes)
         },
-    )
+    );
+    observer.finish(result)
 }
 
 fn ensure_from_bytes_with_render(
@@ -1403,7 +1527,8 @@ mod tests {
                 &hash,
                 source.len() as u64,
                 &settings(),
-                |_| Err(error),
+                &mut PackageProcessingContext::new(ZipResourceObserver::new()),
+                |_, _| Err(error),
                 |_, _| {
                     calls.set(calls.get() + 1);
                     Ok(Vec::new())
@@ -1420,7 +1545,8 @@ mod tests {
             &hash,
             source.len() as u64,
             &settings(),
-            |_| Err("ordinary invalid preview".into()),
+            &mut PackageProcessingContext::new(ZipResourceObserver::new()),
+            |_, _| Err("ordinary invalid preview".into()),
             |model, settings| {
                 calls.set(calls.get() + 1);
                 render_png_typed(model, settings)
@@ -1476,5 +1602,159 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ProcessingError::AllocationFailed));
+    }
+    #[test]
+    fn context_thumbnail_keeps_validation_geometry_and_preview_usage_and_plain_read_is_free() {
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let base = three_mf_cube();
+            let mut original = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+            let mut model = Vec::new();
+            original
+                .by_name("3D/3dmodel.model")
+                .unwrap()
+                .read_to_end(&mut model)
+                .unwrap();
+            let preview = render_png(&one_triangle(), &settings()).unwrap();
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, bytes) in [
+                ("3D/3dmodel.model", model.as_slice()),
+                ("Metadata/thumbnail.png", preview.as_slice()),
+            ] {
+                archive.start_file(name, options).unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            let source = archive.finish().unwrap().into_inner();
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            fs::create_dir(root.join("thumbnails")).unwrap();
+            let path = root.join("part.3mf");
+            fs::write(&path, &source).unwrap();
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer);
+            stl_core::parse_model_in_context(&source, &mut context).unwrap();
+            assert_eq!(context.usage().inflation_bytes, model.len() as u64);
+            assert_eq!(context.usage().retained_input_bytes, 0);
+            let before = context.usage();
+            let artifact = ensure_thumbnail_in_context_typed(
+                &root,
+                &path,
+                &hex_digest(&source),
+                source.len() as u64,
+                &settings(),
+                true,
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(
+                context.usage().inflation_bytes,
+                2 * model.len() as u64 + preview.len() as u64
+            );
+            assert_eq!(context.usage().retained_input_bytes, 0);
+            assert!(context.usage().inflation_bytes > before.inflation_bytes);
+            assert!(
+                validate_png_bytes(&fs::read(root.join(artifact.relative_path)).unwrap()).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn swallowed_preview_stop_rejects_both_optional_successes_before_raster_or_output() {
+        let source = binary_triangle();
+        let hash = hex_digest(&source);
+        for optional in [None, Some(Vec::new())] {
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            let raster_called = std::cell::Cell::new(false);
+            let result = render_source_with_preview(
+                &source,
+                &hash,
+                source.len() as u64,
+                &settings(),
+                &mut context,
+                |_, _| {
+                    let _ = observer.stop_io(ResourceStop::ReadWorkExceeded);
+                    Ok(optional)
+                },
+                |_, _| {
+                    raster_called.set(true);
+                    Ok(Vec::new())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(ProcessingError::ResourceStopped(
+                    ResourceStop::ReadWorkExceeded
+                ))
+            ));
+            assert!(!raster_called.get());
+        }
+    }
+
+    #[test]
+    fn existing_cache_cannot_hide_a_prior_operation_stop() {
+        let root = temp_root("context-stop-cache");
+        let source = binary_triangle();
+        let hash = hex_digest(&source);
+        let artifact = ensure_thumbnail_from_bytes_typed(
+            &root,
+            &source,
+            &hash,
+            source.len() as u64,
+            &settings(),
+            true,
+        )
+        .unwrap();
+        let bytes = fs::read(root.join(&artifact.relative_path)).unwrap();
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        let _ = observer.stop_io(ResourceStop::EnvelopeChanged);
+        let result = ensure_thumbnail_in_context_typed(
+            &root,
+            &root.join("missing.stl"),
+            &hash,
+            source.len() as u64,
+            &settings(),
+            false,
+            &mut context,
+        );
+        assert!(matches!(
+            result,
+            Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged
+            ))
+        ));
+        assert_eq!(fs::read(root.join(artifact.relative_path)).unwrap(), bytes);
+        assert_eq!(fs::read_dir(root.join("thumbnails")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn context_reproduction_keeps_raster_only_authority_and_source_envelope() {
+        let source = binary_triangle();
+        let recipe = proof_recipe(&source);
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        assert!(reproduce_thumbnail_in_context(
+            &recipe,
+            &source,
+            source.len() as u64,
+            &mut context
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(context.usage().inflation_bytes, 0);
+        assert_eq!(context.usage().retained_input_bytes, 0);
+        let mut changed = source.clone();
+        changed[0] ^= 1;
+        assert!(matches!(
+            reproduce_thumbnail_in_context(&recipe, &changed, changed.len() as u64, &mut context),
+            Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged
+            ))
+        ));
+        assert!(observer.check().is_err());
     }
 }

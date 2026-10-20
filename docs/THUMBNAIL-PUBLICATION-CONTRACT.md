@@ -1,12 +1,25 @@
 # Immutable thumbnail publication contract
 
-The cleanup caller slice passed automated, packaged native and synthetic container
-gates. The first **unwired** publication foundation now passes its workspace,
-final affected catalog, Clippy, formatting and Community package/signature gates:
-selected-row catalog snapshots/pure PNG validation, Owned reservation ownership,
-and raw NoReplace ordering. Producer admission, parser hardening, stage lifecycle,
-immutable publication and caller migration remain pending. This contract enables
-no new publication or deletion by itself.
+## Current checkpoint (2026-10-20)
+
+Publication remains **unwired** after the runtime integration following `128da5e`.
+Bounded model ZIP/typed errors are active from `7e6326b`; shared core/runtime contexts
+now enforce actual 512 MiB package inflation, 100 MiB model parts, fixed text roles,
+16 MiB cumulative collected INPUT and core/runtime image/metadata XML acquisition.
+These limits span hidden archived-source validation and later geometry/preview or
+metadata passes, including native viewer/bundle paths. Plain source reads spend no
+inflation. They do not bound all owned metadata/JSON/model collections, decoder
+workspace or whole-producer memory.
+
+The full workspace regression suite and independent caller reviews pass, including
+a reset control proving observer continuity alone cannot hide a fresh counter.
+See [parser bounds](THUMBNAIL-PARSER-BOUNDS.md) for counts and
+[PR #4](https://github.com/cubiclejuice/gogglelab/pull/4) for actual hosted status.
+The hardened public server container at earlier `128da5e` passed synthetic 3MF and
+restart acceptance with regenerated public-image npm+Cargo notices. This is not
+fresh final unified-app/native/composed acceptance or release/core-pin advancement.
+Remaining owned-allocation bounds, defensible producer admission, stage lifecycle
+and immutable publication remain OPEN. This contract enables no publication/deletion.
 
 ## Cache contract and migration sites
 
@@ -60,7 +73,7 @@ fn render_producer_cache_png(
     permit: ThumbnailProducerPermit,
     source: Vec<u8>, expected_hash: &str, expected_bytes: u64,
     settings: &CatalogSettings,
-) -> Result<ProducerCachePng, String>;
+) -> Result<ProducerCachePng, ProcessingError>;
 
 // In secure_fs, adapt existing original-FD/prefix stage machinery only.
 fn create_cache_stage(&self, payload: Arc<ProducerCachePng>)
@@ -111,7 +124,7 @@ the source snapshot is constructed by trusted Runtime admission and includes any
 outer-archive work, not client-provided size claims. The permit grants resources
 only, never source access or mutation permissions.
 
-Proposed additional work cap: **two active producers and 2 GiB reserved work**.
+UNPROVEN sizing proposal, **not enabled**: two active producers and 2 GiB reserved work.
 This is an extra restriction, never an independent ledger that bypasses or raises
 configured `RuntimeOwned` byte/global-memory limits. Admission must satisfy both.
 Before reading/extracting source bytes, reserve input and finite output/scratch
@@ -119,15 +132,17 @@ buffers against the existing RuntimeOwned policy and acquire the non-Clone produ
 permit bound to source identity/hash/length and validated settings. Charge each
 buffer once through a shared owner; no uncharged native/default-scan path remains.
 
-Initial loose-source work estimate: `source_bytes + 512 MiB inflated-parser allowance
+Historical, unproven loose-source sizing placeholder:
+`source_bytes + 512 MiB inflated-parser allowance
 + 192,000,000 geometry bytes + 64 MiB image-decode allowance + size²*8 raster scratch
 + 8 MiB output/winner buffers`. Archive admission must add all outer-input passes
 and expansion layers. These allowances are **implementation-gated proposals**:
 verify actual parser peaks and finite allocation caps without changing the renderer
 before choosing RuntimeOwned buffer reservations. Existing source/parser caps stay
-in force. This formula is not proven RSS accounting and cannot enable production
-by itself. Lower configured limits must cause bounded waiting/Busy/refusal, not a
-larger allowance or fallback. Reject unsupported sizes/overflow before allocation.
+in force. The 512 MiB inflation cap is read work, not a proven RAM allowance. This formula
+is not proven RSS/accounting and must not enable production admission. Lower
+configured limits must cause bounded waiting/Busy/refusal, not a larger allowance
+or fallback. Reject unsupported sizes/overflow before allocation.
 
 Native must acquire before `extract_member_to_temporary` or source read; catalog
 jobs before `verified_model_source_bytes`; default scans before the same read.
@@ -148,23 +163,26 @@ accounting and cross-producer refusal tests pass.
 See [the parser-bound plan](THUMBNAIL-PARSER-BOUNDS.md) for exact allocation sites,
 proposed limits and compatibility gates.
 
-The proposed work allowances above are not established parser peaks. Current 3MF
-parsing can retain input mesh/object vectors before the flattened-triangle cap,
-copy large attributes/model-settings text, and allocate ZIP central-directory
-metadata before application-level entry checks. A source-byte reservation alone
-cannot justify enabling the new producer budget.
+The proposed work allowances above are not established parser peaks. The
+vendored constructor/local-range gate and typed model-reader propagation are
+implemented, as is core actual inflation/XML acquisition and retained INPUT
+collection. Do not describe the current model paths as unrestricted ZIP
+construction or declared-only core inflation.
 
-The first unwired checkpoint adds only an Owned reservation transfer, a dedicated
-catalog-read snapshot/pure stored-digest validator, and raw NoReplace ordering.
-No source reader, parser, producer, cache adoption or publication caller is migrated
-by that checkpoint. Review and verify finite preallocation limits next: bounded
-ZIP entry count/central metadata before ZipArchive construction; aggregate input
-vertices/triangles/objects/components/build items; retained text/token/attribute
-sizes; actual inflated bytes; and archive outer-input/hash/extraction passes.
-Use small test overrides for boundary tests and retain ordinary multipart,
-materials, archive-member and embedded-preview fixtures. Do not silently disable
-normal 3MF generation to ship immutable publication. Parser estimates must remain
-labelled as estimates until allocation bounds are demonstrated.
+Still open: aggregate input vertices/triangles/objects/components/build items,
+all owned metadata strings and JSON-before-DOM/auxiliary-array growth; outer archive
+simultaneous-memory profiling and all producer overlap. Core/runtime XML and
+sequential context integration are active. Their 16 MiB collected-input allowance
+does not close the remaining allocations. The current
+macOS Rust 1.99.1 16 KiB SDK attribute-workspace review is a versioned profile
+estimate, not a RAM hard cap, recoverable private-SDK OOM or an Owned permit.
+
+Preserve ordinary multipart/material/archive/embedded behavior and source identity
+checks. Derive finite simultaneous capacities (including reallocations) before
+choosing producer reservations; no guessed allowance or disabled normal 3MF
+functionality substitutes for that gate. The first unwired snapshot/validator,
+Owned-only transfer and NoReplace primitives do not themselves migrate catalog
+adoption, producer/stage/publication callers. Backup/non-model policy stays separate.
 
 ## Fixed staging namespace and limits
 

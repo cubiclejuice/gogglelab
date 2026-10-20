@@ -14,7 +14,9 @@ use library_protocol::{
 use sha2::{Digest, Sha256};
 
 use crate::secure_fs::Directory;
-use crate::{format_system_time, LibraryRuntime};
+use crate::{format_system_time, LibraryRuntime, ProcessingError};
+use stl_core::package_bounds::PackageProcessingContext;
+use stl_core::zip_bounds::ZipResourceObserver;
 
 const MAX_PREVIEW_MEMBERS: usize = 32;
 const MAX_PREVIEW_TRIANGLES: u32 = 2_000_000;
@@ -526,8 +528,26 @@ fn load_model(
     runtime: &LibraryRuntime,
     model: &Model,
 ) -> Result<stl_core::ParsedStl, RuntimeError> {
-    let bytes = runtime.verified_model_source_bytes(model)?;
-    stl_core::parse_model(&bytes).map_err(|_| invalid("Bundle member could not be parsed"))
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    load_model_in_context(runtime, model, &mut context)
+}
+
+fn load_model_in_context(
+    runtime: &LibraryRuntime,
+    model: &Model,
+    context: &mut PackageProcessingContext,
+) -> Result<stl_core::ParsedStl, RuntimeError> {
+    let observer = context.observer();
+    let result = (|| {
+        let bytes = runtime.verified_model_source_bytes_in_context(model, context)?;
+        stl_core::parse_model_in_context(&bytes, context).map_err(|error| {
+            ProcessingError::from(error).into_runtime(invalid("Bundle member could not be parsed"))
+        })
+    })();
+    observer.check().map_err(|error| {
+        ProcessingError::from(error).into_runtime(invalid("Bundle member could not be parsed"))
+    })?;
+    result
 }
 
 fn layout_offsets(
@@ -672,5 +692,27 @@ mod tests {
         assert!(store.reserve(1).is_ok());
         drop(second);
         assert_eq!(store.state.lock().unwrap().reservations, 0);
+    }
+    #[test]
+    fn bundle_model_nested_validation_and_parse_share_actual_package_counter() {
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, model, _, xml_bytes) =
+                crate::tests::nested_package_fixture(&temp, method);
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            let parsed = load_model_in_context(&runtime, &model, &mut context).unwrap();
+            assert_eq!(parsed.triangle_count, 1);
+            assert_eq!(context.usage().inflation_bytes, xml_bytes * 2);
+            assert_eq!(context.usage().retained_input_bytes, 0);
+            let _ = observer.stop_io(stl_core::ResourceStop::ReadWorkExceeded);
+            let error = load_model_in_context(&runtime, &model, &mut context).unwrap_err();
+            assert_eq!(error.code, RuntimeErrorCode::Unsupported);
+            assert!(!error.retryable);
+            assert_eq!(context.usage().inflation_bytes, xml_bytes * 2);
+        }
     }
 }

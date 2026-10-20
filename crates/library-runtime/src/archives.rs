@@ -7,6 +7,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::ProcessingError;
 use sha2::{Digest, Sha256};
+use stl_core::package_bounds::{collect_verified_model_source, PackageProcessingContext};
 use stl_core::zip_bounds::{BoundedZipArchive, BoundedZipMember, ZipResourceObserver};
 use stl_core::ResourceStop;
 use zip::CompressionMethod;
@@ -167,6 +168,7 @@ pub(crate) fn scan_archive_with_cancel_typed(
             .map_err(ProcessingError::from)?;
         let (plans, central_fingerprint) = preflight(&mut archive, max_member_bytes, cancelled)?;
         let archive_hash = hash_file_with_cancel(path, MAX_ARCHIVE_BYTES, cancelled)?;
+        let mut outer_context = PackageProcessingContext::new(observer.clone());
         let mut members = Vec::with_capacity(plans.len());
         for plan in plans {
             if cancelled() {
@@ -175,8 +177,10 @@ pub(crate) fn scan_archive_with_cancel_typed(
             let mut entry = archive
                 .by_index(plan.index)
                 .map_err(ProcessingError::from)?;
-            let bytes = read_zip_entry(&mut entry, max_member_bytes)?;
-            let parsed = stl_core::parse_model(&bytes).map_err(ProcessingError::from)?;
+            let bytes = read_zip_entry(&mut entry, max_member_bytes, &mut outer_context)?;
+            let mut model_context = PackageProcessingContext::new(observer.clone());
+            let parsed = stl_core::parse_model_in_context(&bytes, &mut model_context)
+                .map_err(ProcessingError::from)?;
             let format = match parsed.format {
                 stl_core::StlFormat::Binary => "stl-binary",
                 stl_core::StlFormat::Ascii => "stl-ascii",
@@ -229,6 +233,28 @@ pub fn extract_member_to_cache_typed(
     )
 }
 
+#[doc(hidden)]
+pub fn extract_member_to_cache_in_context_typed(
+    library_root: &Path,
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+    model_context: &mut PackageProcessingContext,
+) -> Result<PathBuf, ProcessingError> {
+    extract_member_to_cache_with_publish_hook_in_context(
+        library_root,
+        outer_path,
+        member_path,
+        expected_outer_fingerprint,
+        expected_content_hash,
+        expected_bytes,
+        || {},
+        model_context,
+    )
+}
+
 fn extract_member_to_cache_with_publish_hook<F>(
     library_root: &Path,
     outer_path: &Path,
@@ -241,72 +267,120 @@ fn extract_member_to_cache_with_publish_hook<F>(
 where
     F: FnOnce(),
 {
-    let bytes = read_verified_archive_member(
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    extract_member_to_cache_with_publish_hook_in_context(
+        library_root,
         outer_path,
         member_path,
         expected_outer_fingerprint,
         expected_content_hash,
         expected_bytes,
-    )?;
+        after_staging,
+        &mut context,
+    )
+}
 
-    let canonical_library = library_root
-        .canonicalize()
-        .map_err(ProcessingError::from_io)?;
-    if canonical_library != library_root {
-        return Err("Library root identity changed".into());
-    }
-    let cache_root = library_root.join("indexed-cache");
-    create_real_directory(&cache_root)?;
-    let hash_dir = cache_root.join(expected_content_hash);
-    create_real_directory(&hash_dir)?;
-    let filename = sanitized_filename(member_path);
-    let destination = hash_dir.join(filename);
-    let directory = Directory::open(&hash_dir).map_err(ProcessingError::from_io)?;
-    let destination_name = destination
-        .file_name()
-        .ok_or_else(|| "Indexed cache filename is invalid".to_string())?;
-    match directory.open_file(destination_name) {
-        Ok(file) => {
-            validate_cached_member_file(file, expected_content_hash, expected_bytes)?;
-            return Ok(destination);
+fn extract_member_to_cache_with_publish_hook_in_context<F>(
+    library_root: &Path,
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+    after_staging: F,
+    model_context: &mut PackageProcessingContext,
+) -> Result<PathBuf, ProcessingError>
+where
+    F: FnOnce(),
+{
+    let observer = model_context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    let result = (|| {
+        let bytes = read_verified_archive_member_in_context(
+            outer_path,
+            member_path,
+            expected_outer_fingerprint,
+            expected_content_hash,
+            expected_bytes,
+            model_context,
+        )?;
+
+        let canonical_library = library_root
+            .canonicalize()
+            .map_err(ProcessingError::from_io)?;
+        if canonical_library != library_root {
+            return Err("Library root identity changed".into());
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ProcessingError::from_io(error)),
-    }
-    let staging = hash_dir.join(format!(
-        ".member-{}-{}.part",
-        std::process::id(),
-        CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let staging_name = staging
-        .file_name()
-        .ok_or_else(|| "Indexed cache staging filename is invalid".to_string())?;
-    let mut file = directory
-        .create_new_file(staging_name)
-        .map_err(ProcessingError::from_io)?;
-    let write_result = (|| {
-        use std::io::Write;
-        file.write_all(&bytes)?;
-        file.sync_all()
+        observer.check().map_err(ProcessingError::from)?;
+        let cache_root = library_root.join("indexed-cache");
+        create_real_directory(&cache_root)?;
+        let hash_dir = cache_root.join(expected_content_hash);
+        create_real_directory(&hash_dir)?;
+        let filename = sanitized_filename(member_path);
+        let destination = hash_dir.join(filename);
+        let directory = Directory::open(&hash_dir).map_err(ProcessingError::from_io)?;
+        let destination_name = destination
+            .file_name()
+            .ok_or_else(|| "Indexed cache filename is invalid".to_string())?;
+        match directory.open_file(destination_name) {
+            Ok(file) => {
+                validate_cached_member_file(
+                    file,
+                    expected_content_hash,
+                    expected_bytes,
+                    &observer,
+                )?;
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ProcessingError::from_io(error)),
+        }
+        let staging = hash_dir.join(format!(
+            ".member-{}-{}.part",
+            std::process::id(),
+            CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let staging_name = staging
+            .file_name()
+            .ok_or_else(|| "Indexed cache staging filename is invalid".to_string())?;
+        observer.check().map_err(ProcessingError::from)?;
+        let mut file = directory
+            .create_new_file(staging_name)
+            .map_err(ProcessingError::from_io)?;
+        let write_result = (|| {
+            use std::io::Write;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })();
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = directory.hold_entry(staging_name);
+            return Err(ProcessingError::from_io(error));
+        }
+        after_staging();
+        if let Err(error) = observer.check() {
+            let _ = directory.hold_entry(staging_name);
+            return Err(ProcessingError::from(error));
+        }
+        if let Err(error) = directory.rename_child_exclusive(staging_name, destination_name) {
+            let _ = directory.hold_entry(staging_name);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let file = directory
+                    .open_file(destination_name)
+                    .map_err(ProcessingError::from_io)?;
+                validate_cached_member_file(
+                    file,
+                    expected_content_hash,
+                    expected_bytes,
+                    &observer,
+                )?;
+                return Ok(destination);
+            }
+            return Err(ProcessingError::from_io(error));
+        }
+        Ok(destination)
     })();
-    drop(file);
-    if let Err(error) = write_result {
-        let _ = directory.hold_entry(staging_name);
-        return Err(ProcessingError::from_io(error));
-    }
-    after_staging();
-    if let Err(error) = directory.rename_child_exclusive(staging_name, destination_name) {
-        let _ = directory.hold_entry(staging_name);
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            let file = directory
-                .open_file(destination_name)
-                .map_err(ProcessingError::from_io)?;
-            validate_cached_member_file(file, expected_content_hash, expected_bytes)?;
-            return Ok(destination);
-        }
-        return Err(ProcessingError::from_io(error));
-    }
-    Ok(destination)
+    observer.finish(result)
 }
 
 #[doc(hidden)]
@@ -318,55 +392,86 @@ pub fn extract_member_to_temporary_typed(
     expected_content_hash: &str,
     expected_bytes: u64,
 ) -> Result<TemporaryArchiveMember, ProcessingError> {
-    let bytes = read_verified_archive_member(
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    extract_member_to_temporary_in_context_typed(
+        library_root,
         outer_path,
         member_path,
         expected_outer_fingerprint,
         expected_content_hash,
         expected_bytes,
-    )?;
-    let canonical_library = library_root
-        .canonicalize()
-        .map_err(ProcessingError::from_io)?;
-    if canonical_library != library_root {
-        return Err("Library root identity changed".into());
-    }
-    let staging = library_root.join("staging");
-    create_real_directory(&staging)?;
-    let directory = Directory::open(&staging).map_err(ProcessingError::from_io)?;
-    let extension = Path::new(member_path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .filter(|value| value.eq_ignore_ascii_case("stl") || value.eq_ignore_ascii_case("3mf"))
-        .unwrap_or("stl");
-    for _ in 0..1024 {
-        let path = staging.join(format!(
-            "archive-thumbnail-{}-{}.{}",
-            std::process::id(),
-            CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-            extension.to_ascii_lowercase()
-        ));
-        let name = path
-            .file_name()
-            .ok_or_else(|| "Temporary archive member filename is invalid".to_string())?;
-        match directory.create_new_file(name) {
-            Ok(mut file) => {
-                use std::io::Write;
-                if let Err(error) = file.write_all(&bytes) {
-                    drop(file);
-                    let _ = directory.hold_entry(name);
-                    return Err(ProcessingError::from_io(error));
-                }
-                file.sync_all().map_err(ProcessingError::from_io)?;
-                return Ok(TemporaryArchiveMember { path });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(ProcessingError::from_io(error)),
-        }
-    }
-    Err("Could not allocate a temporary archive member path".into())
+        &mut context,
+    )
 }
 
+#[doc(hidden)]
+pub fn extract_member_to_temporary_in_context_typed(
+    library_root: &Path,
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+    model_context: &mut PackageProcessingContext,
+) -> Result<TemporaryArchiveMember, ProcessingError> {
+    let observer = model_context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    let result = (|| {
+        let bytes = read_verified_archive_member_in_context(
+            outer_path,
+            member_path,
+            expected_outer_fingerprint,
+            expected_content_hash,
+            expected_bytes,
+            model_context,
+        )?;
+        let canonical_library = library_root
+            .canonicalize()
+            .map_err(ProcessingError::from_io)?;
+        if canonical_library != library_root {
+            return Err("Library root identity changed".into());
+        }
+        observer.check().map_err(ProcessingError::from)?;
+        let staging = library_root.join("staging");
+        create_real_directory(&staging)?;
+        let directory = Directory::open(&staging).map_err(ProcessingError::from_io)?;
+        let extension = Path::new(member_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| value.eq_ignore_ascii_case("stl") || value.eq_ignore_ascii_case("3mf"))
+            .unwrap_or("stl");
+        for _ in 0..1024 {
+            let path = staging.join(format!(
+                "archive-thumbnail-{}-{}.{}",
+                std::process::id(),
+                CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                extension.to_ascii_lowercase()
+            ));
+            let name = path
+                .file_name()
+                .ok_or_else(|| "Temporary archive member filename is invalid".to_string())?;
+            observer.check().map_err(ProcessingError::from)?;
+            match directory.create_new_file(name) {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(error) = file.write_all(&bytes) {
+                        drop(file);
+                        let _ = directory.hold_entry(name);
+                        return Err(ProcessingError::from_io(error));
+                    }
+                    file.sync_all().map_err(ProcessingError::from_io)?;
+                    return Ok(TemporaryArchiveMember { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(ProcessingError::from_io(error)),
+            }
+        }
+        Err("Could not allocate a temporary archive member path".into())
+    })();
+    observer.finish(result)
+}
+
+#[cfg(test)]
 fn read_verified_archive_member(
     outer_path: &Path,
     member_path: &str,
@@ -384,6 +489,7 @@ fn read_verified_archive_member(
     )
 }
 
+#[cfg(test)]
 fn read_verified_archive_member_with_reader<R: Read + Seek>(
     outer_path: &Path,
     member_path: &str,
@@ -392,10 +498,53 @@ fn read_verified_archive_member_with_reader<R: Read + Seek>(
     expected_bytes: u64,
     open: impl FnOnce(&Path) -> std::io::Result<R>,
 ) -> Result<Vec<u8>, ProcessingError> {
-    let observer = ZipResourceObserver::new();
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    read_verified_archive_member_with_reader_in_context(
+        outer_path,
+        member_path,
+        expected_outer_fingerprint,
+        expected_content_hash,
+        expected_bytes,
+        open,
+        &mut context,
+    )
+}
+
+fn read_verified_archive_member_in_context(
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+    model_context: &mut PackageProcessingContext,
+) -> Result<Vec<u8>, ProcessingError> {
+    read_verified_archive_member_with_reader_in_context(
+        outer_path,
+        member_path,
+        expected_outer_fingerprint,
+        expected_content_hash,
+        expected_bytes,
+        |path| File::open(path),
+        model_context,
+    )
+}
+
+fn read_verified_archive_member_with_reader_in_context<R: Read + Seek>(
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+    open: impl FnOnce(&Path) -> std::io::Result<R>,
+    model_context: &mut PackageProcessingContext,
+) -> Result<Vec<u8>, ProcessingError> {
+    let observer = model_context.observer();
+    observer.check().map_err(ProcessingError::from)?;
     let result = (|| {
         if expected_bytes > stl_core::limits::MAX_FILE_BYTES {
-            return Err("Archive member exceeds the safe model size limit".into());
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::InputLimitExceeded),
+            ));
         }
         let before = validated_archive_metadata(outer_path)?;
         let file = open(outer_path).map_err(ProcessingError::from_io)?;
@@ -410,8 +559,8 @@ fn read_verified_archive_member_with_reader<R: Read + Seek>(
             || outer_fingerprint(&after, &central_fingerprint, &archive_hash)
                 != expected_outer_fingerprint
         {
-            return Err(ProcessingError::ResourceStopped(
-                ResourceStop::EnvelopeChanged,
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
             ));
         }
         let mut entry = archive.by_name(member_path).map_err(|error| {
@@ -419,17 +568,23 @@ fn read_verified_archive_member_with_reader<R: Read + Seek>(
         })?;
         validate_entry(&entry, stl_core::limits::MAX_FILE_BYTES)?;
         if entry.size() != expected_bytes {
-            return Err(ProcessingError::ResourceStopped(
-                ResourceStop::EnvelopeChanged,
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
             ));
         }
-        let bytes = read_zip_entry(&mut entry, expected_bytes)?;
+        let mut outer_context = PackageProcessingContext::new(observer.clone());
+        let bytes = collect_verified_model_source(
+            outer_context.inflated_reader(&mut entry),
+            expected_bytes,
+            &observer,
+        )
+        .map_err(ProcessingError::from)?;
         if hex_digest(&bytes) != expected_content_hash {
-            return Err(ProcessingError::ResourceStopped(
-                ResourceStop::EnvelopeChanged,
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
             ));
         }
-        stl_core::parse_model(&bytes).map_err(ProcessingError::from)?;
+        stl_core::parse_model_in_context(&bytes, model_context).map_err(ProcessingError::from)?;
         Ok(bytes)
     })();
     observer.finish(result)
@@ -550,16 +705,11 @@ fn validate_entry<R: Read + Seek>(
 fn read_zip_entry<R: Read + Seek>(
     entry: &mut BoundedZipMember<'_, R>,
     limit: u64,
+    context: &mut PackageProcessingContext,
 ) -> Result<Vec<u8>, ProcessingError> {
-    let mut bytes = Vec::new();
-    entry
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(ProcessingError::from_io)?;
-    if bytes.len() as u64 > limit {
-        return Err("Archive member expanded beyond its size limit".into());
-    }
-    Ok(bytes)
+    context
+        .collect_model_member(entry, limit)
+        .map_err(ProcessingError::from)
 }
 
 fn validated_archive_metadata(path: &Path) -> Result<fs::Metadata, ProcessingError> {
@@ -680,14 +830,14 @@ fn validate_cached_member_file(
     file: File,
     expected_hash: &str,
     expected_bytes: u64,
+    observer: &ZipResourceObserver,
 ) -> Result<(), ProcessingError> {
+    observer.check().map_err(ProcessingError::from)?;
     if file.metadata().map_err(ProcessingError::from_io)?.len() != expected_bytes {
         return Err("Indexed cache entry has an unexpected size".into());
     }
-    let mut bytes = Vec::new();
-    file.take(expected_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(ProcessingError::from_io)?;
+    let bytes = collect_verified_model_source(file, expected_bytes, observer)
+        .map_err(ProcessingError::from)?;
     if bytes.len() as u64 != expected_bytes || hex_digest(&bytes) != expected_hash {
         return Err("Indexed cache entry hash is invalid".into());
     }
@@ -1074,5 +1224,95 @@ mod tests {
         );
         let _ = fs::remove_dir_all(library);
         let _ = fs::remove_dir_all(source);
+    }
+    #[test]
+    fn model_member_actual_lower_policy_is_terminal_but_declared_scan_failure_stays_ordinary() {
+        let root = temp_root("actual-policy");
+        let archive_path = root.join("models.zip");
+        let payload = empty_stl();
+        write_zip(&archive_path, &[("part.stl", &payload)]);
+        let error =
+            scan_archive_with_cancel_typed(&archive_path, payload.len() as u64 - 1, &|| false)
+                .unwrap_err();
+        assert!(
+            !error.is_terminal(),
+            "declared preflight failure remains ordinary and no-read"
+        );
+        let observer = ZipResourceObserver::new();
+        let mut archive = observer
+            .open_bounded_zip(File::open(&archive_path).unwrap())
+            .unwrap();
+        let mut entry = archive.by_name("part.stl").unwrap();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        assert!(matches!(
+            read_zip_entry(&mut entry, payload.len() as u64 - 1, &mut context),
+            Err(ProcessingError::ResourceStopped(
+                ResourceStop::InputLimitExceeded
+            ))
+        ));
+        assert!(observer.check().is_err());
+    }
+
+    #[test]
+    fn verified_model_member_exact_envelope_is_not_a_policy_limit_and_outer_counter_spends_once() {
+        let root = temp_root("exact-envelope");
+        let archive_path = root.join("models.zip");
+        let payload = empty_stl();
+        write_zip(&archive_path, &[("part.stl", &payload)]);
+        for expected in [
+            payload.len() as u64,
+            payload.len() as u64 - 1,
+            payload.len() as u64 + 1,
+        ] {
+            let observer = ZipResourceObserver::new();
+            let mut archive = observer
+                .open_bounded_zip(File::open(&archive_path).unwrap())
+                .unwrap();
+            let entry = archive.by_name("part.stl").unwrap();
+            let mut outer = PackageProcessingContext::new(observer.clone());
+            let result =
+                collect_verified_model_source(outer.inflated_reader(entry), expected, &observer);
+            if expected == payload.len() as u64 {
+                assert_eq!(result.unwrap(), payload);
+                assert_eq!(outer.usage().inflation_bytes, payload.len() as u64);
+                assert_eq!(outer.usage().retained_input_bytes, 0);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    stl_core::StlError::ResourceStopped(ResourceStop::EnvelopeChanged)
+                );
+            }
+        }
+    }
+    #[test]
+    fn verified_member_policy_excess_latches_before_source_metadata_or_open() {
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        let opened = std::cell::Cell::new(false);
+        let error = read_verified_archive_member_with_reader_in_context(
+            Path::new("/nonexistent-synthetic-policy-fixture.zip"),
+            "part.3mf",
+            "unused",
+            "unused",
+            stl_core::limits::MAX_FILE_BYTES + 1,
+            |_| {
+                opened.set(true);
+                Ok(std::io::Cursor::new(Vec::<u8>::new()))
+            },
+            &mut context,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProcessingError::ResourceStopped(ResourceStop::InputLimitExceeded)
+        ));
+        assert!(!opened.get());
+        assert!(matches!(
+            observer.check(),
+            Err(stl_core::zip_bounds::ZipOpenError::ResourceStopped(
+                ResourceStop::InputLimitExceeded
+            ))
+        ));
+        assert_eq!(context.usage().inflation_bytes, 0);
     }
 }

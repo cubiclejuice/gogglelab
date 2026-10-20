@@ -9,6 +9,7 @@ use library_protocol::{
 };
 
 use crate::{invalid, io_error, thumbnails, LibraryRuntime, ReservationKind};
+use stl_core::{package_bounds::PackageProcessingContext, zip_bounds::ZipResourceObserver};
 
 const MAX_JOB_MODELS: usize = 10_000;
 const MAX_SOURCE_CHECK_BYTES: u64 = 256 * 1024 * 1024;
@@ -202,14 +203,15 @@ fn render_model(
         model,
         settings,
         force,
-        |bytes, hash, settings, force| {
-            thumbnails::ensure_thumbnail_from_bytes_typed(
+        |bytes, hash, settings, force, processing| {
+            thumbnails::ensure_thumbnail_from_bytes_in_context_typed(
                 &runtime.root,
                 bytes,
                 hash,
                 bytes.len() as u64,
                 settings,
                 force,
+                processing,
             )
         },
     )
@@ -225,6 +227,7 @@ fn render_model_with_renderer(
         &str,
         &library_core::CatalogSettings,
         bool,
+        &mut PackageProcessingContext,
     ) -> Result<thumbnails::ThumbnailArtifact, crate::ProcessingError>,
 ) -> Result<(), RuntimeError> {
     if model.catalog_kind == "bookmark" {
@@ -242,8 +245,12 @@ fn render_model_with_renderer(
         .as_deref()
         .ok_or_else(|| invalid("Model has no content hash"))?;
     let _reservation = runtime.reserve_temp(ReservationKind::Owned, model.bytes)?;
-    let bytes = runtime.verified_model_source_bytes(model)?;
-    let artifact = render(&bytes, hash, settings, force)
+    let observer = ZipResourceObserver::new();
+    let mut processing = PackageProcessingContext::new(observer.clone());
+    let bytes = runtime.verified_model_source_bytes_in_context(model, &mut processing)?;
+    let result = render(&bytes, hash, settings, force, &mut processing);
+    let artifact = observer
+        .finish(result)
         .map_err(|error| error.into_runtime(invalid("Thumbnail render failed")))?;
     if !runtime.scan_control().cancelled() {
         runtime.mutate_db(|db| {
@@ -474,7 +481,7 @@ mod tests {
             let settings = runtime.read_db(|db| db.get_catalog_settings()).unwrap();
             let called = std::cell::Cell::new(false);
             let error =
-                render_model_with_renderer(&runtime, &model, &settings, true, |_, _, _, _| {
+                render_model_with_renderer(&runtime, &model, &settings, true, |_, _, _, _, _| {
                     called.set(true);
                     Err(failure)
                 })
@@ -491,5 +498,123 @@ mod tests {
             );
             assert_eq!(fs::read(&path).unwrap(), original);
         }
+    }
+    #[test]
+    fn thumbnail_job_keeps_archived_validation_and_render_usage_before_catalog_commit() {
+        use std::io::{Cursor, Write};
+        let (_temp, runtime, _context, _model, path) = fixture();
+        let xml = br#"<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><object id="1"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/><vertex x="0" y="10" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources><build><item objectid="1"/></build></model>"#;
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[20, 40, 60, 255]).unwrap();
+            writer.finish().unwrap();
+        }
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let mut model_zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, bytes) in [
+                ("3D/3dmodel.model", xml.as_slice()),
+                ("Metadata/thumbnail.png", png.as_slice()),
+            ] {
+                model_zip.start_file(name, options).unwrap();
+                model_zip.write_all(bytes).unwrap();
+            }
+            let model_bytes = model_zip.finish().unwrap().into_inner();
+            let mut outer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            outer.start_file("part.3mf", options).unwrap();
+            outer.write_all(&model_bytes).unwrap();
+            let outer_bytes = outer.finish().unwrap().into_inner();
+            let archive_path = path.parent().unwrap().join(format!("parts-{method:?}.zip"));
+            fs::write(&archive_path, outer_bytes).unwrap();
+            let mut root = runtime
+                .read_db(|db| db.list_index_roots())
+                .unwrap()
+                .remove(0);
+            root.scan_zip = true;
+            let root = runtime.mutate_db(|db| db.update_index_root(&root)).unwrap();
+            crate::scanner::scan_root(&runtime, &root).unwrap();
+            let models = runtime.read_db(|db| db.list_models(None, None)).unwrap();
+            let archived = models
+                .iter()
+                .find(|model| {
+                    model.source_archive_member.as_deref() == Some("part.3mf")
+                        && model.source_path.as_deref().is_some_and(|source| {
+                            source.ends_with(archive_path.file_name().unwrap().to_str().unwrap())
+                        })
+                })
+                .unwrap();
+            let settings = runtime.read_db(|db| db.get_catalog_settings()).unwrap();
+            render_model_with_renderer(
+                &runtime,
+                archived,
+                &settings,
+                true,
+                |bytes, hash, settings, force, processing| {
+                    assert_eq!(processing.usage().inflation_bytes, xml.len() as u64);
+                    assert_eq!(processing.usage().retained_input_bytes, 0);
+                    let artifact = thumbnails::ensure_thumbnail_from_bytes_in_context_typed(
+                        &runtime.root,
+                        bytes,
+                        hash,
+                        bytes.len() as u64,
+                        settings,
+                        force,
+                        processing,
+                    )?;
+                    assert_eq!(
+                        processing.usage().inflation_bytes,
+                        2 * xml.len() as u64 + png.len() as u64
+                    );
+                    assert_eq!(processing.usage().retained_input_bytes, 0);
+                    Ok(artifact)
+                },
+            )
+            .unwrap();
+            assert!(runtime
+                .read_db(|db| db.thumbnail_cache_entry_for_model(&archived.id))
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn thumbnail_job_swallowed_renderer_stop_does_not_commit_success() {
+        let (_temp, runtime, _context, model, path) = fixture();
+        let original = fs::read(&path).unwrap();
+        let before = runtime
+            .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))
+            .unwrap();
+        let settings = runtime.read_db(|db| db.get_catalog_settings()).unwrap();
+        let error = render_model_with_renderer(
+            &runtime,
+            &model,
+            &settings,
+            true,
+            |_, _, _, _, processing| {
+                let _ = processing
+                    .observer()
+                    .stop_io(stl_core::ResourceStop::ReadWorkExceeded);
+                Ok(thumbnails::ThumbnailArtifact {
+                    relative_path: "thumbnails/unpublished.png".into(),
+                    png_hash: "0".repeat(64),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::Unsupported);
+        assert!(!error.retryable);
+        assert_eq!(
+            runtime
+                .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))
+                .unwrap(),
+            before
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 }

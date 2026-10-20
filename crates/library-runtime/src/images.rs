@@ -6,13 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use image::{ImageDecoder, ImageFormat, ImageReader, Limits};
-use quick_xml::{events::Event, Reader};
+use quick_xml::events::Event;
 use sha2::{Digest, Sha256};
+use stl_core::package_bounds::{BinaryRole, PackageProcessingContext, TextRole};
+use stl_core::xml_bounds::XmlEventReader;
 
 use crate::png_output::BoundedPngOutput;
 use crate::secure_fs::Directory;
 use crate::ProcessingError;
-use stl_core::zip_bounds::{BoundedZipArchive, ZipOpenError, ZipResourceObserver};
+use stl_core::zip_bounds::{
+    BoundedZipArchive, BoundedZipMember, ZipOpenError, ZipResourceObserver,
+};
 
 const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 4096;
@@ -243,105 +247,151 @@ pub fn embedded_3mf_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
 pub(crate) fn embedded_3mf_thumbnail_typed(
     bytes: &[u8],
 ) -> Result<Option<Vec<u8>>, ProcessingError> {
-    let observer = ZipResourceObserver::new();
-    let result = select_embedded_thumbnail(bytes, &observer, normalize_image_typed);
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    embedded_3mf_thumbnail_in_context_typed(bytes, &mut context)
+}
+
+pub(crate) fn embedded_3mf_thumbnail_in_context_typed(
+    bytes: &[u8],
+    context: &mut PackageProcessingContext,
+) -> Result<Option<Vec<u8>>, ProcessingError> {
+    let observer = context.observer();
+    observer.check()?;
+    let result = if bytes.starts_with(b"PK") {
+        select_embedded_reader_in_context(Cursor::new(bytes), context, normalize_image_typed)
+    } else {
+        Ok(None)
+    };
     observer.finish(result)
 }
 
+#[cfg(test)]
 fn select_embedded_thumbnail(
     bytes: &[u8],
     observer: &ZipResourceObserver,
     normalize: impl FnMut(&[u8]) -> Result<Vec<u8>, ProcessingError>,
 ) -> Result<Option<Vec<u8>>, ProcessingError> {
+    let mut context = PackageProcessingContext::new(observer.clone());
     if !bytes.starts_with(b"PK") {
-        return Ok(None);
+        return observer.finish(Ok(None));
     }
-    select_embedded_reader(Cursor::new(bytes), observer, normalize)
+    select_embedded_reader_in_context(Cursor::new(bytes), &mut context, normalize)
 }
 
+#[cfg(test)]
 fn select_embedded_reader<R: Read + Seek>(
     source: R,
     observer: &ZipResourceObserver,
+    normalize: impl FnMut(&[u8]) -> Result<Vec<u8>, ProcessingError>,
+) -> Result<Option<Vec<u8>>, ProcessingError> {
+    let mut context = PackageProcessingContext::new(observer.clone());
+    select_embedded_reader_in_context(source, &mut context, normalize)
+}
+
+fn select_embedded_reader_in_context<R: Read + Seek>(
+    source: R,
+    context: &mut PackageProcessingContext,
     mut normalize: impl FnMut(&[u8]) -> Result<Vec<u8>, ProcessingError>,
 ) -> Result<Option<Vec<u8>>, ProcessingError> {
-    let mut archive = observer.open_bounded_zip(source)?;
-    if archive.len() > 10_000 {
-        return Err("3MF preview package has too many entries".into());
-    }
-    let mut candidates = Vec::new();
-    if let Some(relations) = package_entry(&mut archive, "_rels/.rels", 64 * 1024)? {
-        let mut reader = Reader::from_reader(relations.as_slice());
-        let mut xml_version = quick_xml::XmlVersion::Implicit1_0;
-        reader.config_mut().trim_text(true);
-        loop {
-            match reader.read_event().map_err(|error| error.to_string())? {
-                Event::Empty(node) | Event::Start(node)
-                    if node.local_name().as_ref() == b"Relationship" =>
-                {
-                    let mut kind = None;
-                    let mut target = None;
-                    let mut external = false;
-                    for attribute in node.attributes().with_checks(true) {
-                        let attribute = attribute.map_err(|error| error.to_string())?;
-                        let value = attribute
-                            .decoded_and_normalized_value(xml_version, reader.decoder())
-                            .map_err(|error| error.to_string())?
-                            .into_owned();
-                        match attribute.key.local_name().as_ref() {
-                            b"Type" => kind = Some(value),
-                            b"Target" => target = Some(value),
-                            b"TargetMode" => external = value.eq_ignore_ascii_case("External"),
-                            _ => {}
-                        }
-                    }
-                    if kind.as_deref() == Some(THUMBNAIL_RELATION) && !external {
-                        if let Some(target) = target.and_then(|target| safe_package_image(&target))
-                        {
-                            candidates.push(target);
-                        }
-                    }
-                }
-                Event::Decl(declaration) => {
-                    xml_version = match declaration
-                        .version()
-                        .map_err(|error| error.to_string())?
-                        .as_ref()
+    let observer = context.observer();
+    let result = (|| {
+        observer.check()?;
+        let mut archive = observer.open_bounded_zip(source)?;
+        if archive.len() > 10_000 {
+            return Err("3MF preview package has too many entries".into());
+        }
+        let mut candidates = Vec::new();
+        if let Some(entry) = checked_package_entry(
+            &mut archive,
+            "_rels/.rels",
+            TextRole::Relationships.byte_limit() as u64,
+        )? {
+            let relations = context
+                .collect_text(entry, TextRole::Relationships)
+                .map_err(ProcessingError::from)?;
+            let mut reader = XmlEventReader::new(relations.as_bytes(), observer.clone())
+                .map_err(ProcessingError::from)?;
+            let mut xml_version = quick_xml::XmlVersion::Implicit1_0;
+            reader.set_trim_text(true);
+            loop {
+                let event = reader.next_event();
+                observer.check()?;
+                match event.map_err(|error| error.to_string())? {
+                    Event::Empty(node) | Event::Start(node)
+                        if node.local_name().as_ref() == b"Relationship" =>
                     {
-                        b"1.0" => quick_xml::XmlVersion::Explicit1_0,
-                        b"1.1" => quick_xml::XmlVersion::Explicit1_1,
-                        _ => {
-                            return Err("Unsupported XML version in thumbnail relationships".into());
+                        let mut kind = None;
+                        let mut target = None;
+                        let mut external = false;
+                        for attribute in node.attributes().with_checks(true) {
+                            let attribute = attribute.map_err(|error| error.to_string())?;
+                            let value = attribute
+                                .normalized_value(xml_version)
+                                .map_err(|error| error.to_string())?
+                                .into_owned();
+                            match attribute.key.local_name().as_ref() {
+                                b"Type" => kind = Some(value),
+                                b"Target" => target = Some(value),
+                                b"TargetMode" => external = value.eq_ignore_ascii_case("External"),
+                                _ => {}
+                            }
                         }
-                    };
+                        if kind.as_deref() == Some(THUMBNAIL_RELATION) && !external {
+                            if let Some(target) =
+                                target.and_then(|target| safe_package_image(&target))
+                            {
+                                candidates.push(target);
+                            }
+                        }
+                    }
+                    Event::Decl(declaration) => {
+                        xml_version = match declaration
+                            .version()
+                            .map_err(|error| error.to_string())?
+                            .as_ref()
+                        {
+                            b"1.0" => quick_xml::XmlVersion::Explicit1_0,
+                            b"1.1" => quick_xml::XmlVersion::Explicit1_1,
+                            _ => {
+                                return Err(
+                                    "Unsupported XML version in thumbnail relationships".into()
+                                );
+                            }
+                        };
+                    }
+                    Event::DocType(_) => {
+                        return Err("3MF thumbnail relationships cannot contain a DTD".into());
+                    }
+                    Event::Eof => break,
+                    _ => {}
                 }
-                Event::DocType(_) => {
-                    return Err("3MF thumbnail relationships cannot contain a DTD".into());
-                }
-                Event::Eof => break,
-                _ => {}
             }
         }
-    }
-    for name in [
-        "Metadata/thumbnail.png",
-        "Metadata/thumbnail.jpg",
-        "Metadata/thumbnail.jpeg",
-        "thumbnail.png",
-    ] {
-        if !candidates.iter().any(|candidate| candidate == name) {
-            candidates.push(name.into());
-        }
-    }
-    for name in candidates {
-        if let Some(bytes) = package_entry(&mut archive, &name, MAX_INPUT_BYTES)? {
-            match normalize(&bytes) {
-                Ok(png) => return Ok(Some(png)),
-                Err(error) if error.is_terminal() => return Err(error),
-                Err(_) => {}
+        for name in [
+            "Metadata/thumbnail.png",
+            "Metadata/thumbnail.jpg",
+            "Metadata/thumbnail.jpeg",
+            "thumbnail.png",
+        ] {
+            if !candidates.iter().any(|candidate| candidate == name) {
+                candidates.push(name.into());
             }
         }
-    }
-    Ok(None)
+        for name in candidates {
+            if let Some(entry) = checked_package_entry(&mut archive, &name, MAX_INPUT_BYTES)? {
+                let bytes = context
+                    .collect_binary(entry, BinaryRole::EmbeddedImage)
+                    .map_err(ProcessingError::from)?;
+                match normalize(&bytes) {
+                    Ok(png) => return Ok(Some(png)),
+                    Err(error) if error.is_terminal() => return Err(error),
+                    Err(_) => {}
+                }
+            }
+        }
+        Ok(None)
+    })();
+    observer.finish(result)
 }
 
 fn safe_package_image(target: &str) -> Option<String> {
@@ -365,12 +415,12 @@ fn safe_package_image(target: &str) -> Option<String> {
     matches!(extension.as_str(), "png" | "jpg" | "jpeg").then(|| target.to_owned())
 }
 
-fn package_entry<R: Read + Seek>(
-    archive: &mut BoundedZipArchive<R>,
+fn checked_package_entry<'a, R: Read + Seek>(
+    archive: &'a mut BoundedZipArchive<R>,
     name: &str,
     limit: u64,
-) -> Result<Option<Vec<u8>>, ProcessingError> {
-    let mut entry = match archive.by_name(name) {
+) -> Result<Option<BoundedZipMember<'a, R>>, ProcessingError> {
+    let entry = match archive.by_name(name) {
         Ok(entry) => entry,
         Err(ZipOpenError::Archive(zip::result::ZipError::FileNotFound)) => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -388,16 +438,7 @@ fn package_entry<R: Read + Seek>(
     {
         return Err("3MF preview image entry is unsafe or too large".into());
     }
-    let mut bytes = Vec::new();
-    entry
-        .by_ref()
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(ProcessingError::from_io)?;
-    if bytes.len() as u64 > limit {
-        return Err("3MF preview inflated beyond its limit".into());
-    }
-    Ok(Some(bytes))
+    Ok(Some(entry))
 }
 
 #[cfg(test)]
@@ -722,5 +763,74 @@ mod tests {
         assert!(!normalize_image_with_output_limit_typed(&input, 1)
             .unwrap_err()
             .is_terminal());
+    }
+    #[test]
+    fn image_context_xml_versions_preserve_utf8_attribute_newline_normalization() {
+        for (version, expected) in [("1.0", false), ("1.1", true)] {
+            let rels=format!("<?xml version='{version}'?><Relationships><Relationship Type='{THUMBNAIL_RELATION}' Target='/Metadata/\u{85}custom.png'/></Relationships>");
+            let bytes = package(&[
+                ("_rels/.rels", rels.as_bytes().to_vec()),
+                ("Metadata/ custom.png", png(2, 2)),
+            ]);
+            let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+            let result = embedded_3mf_thumbnail_in_context_typed(&bytes, &mut context).unwrap();
+            assert_eq!(result.is_some(), expected, "XML{version}");
+            assert_eq!(context.usage().retained_input_bytes, rels.len());
+        }
+    }
+    #[test]
+    fn image_context_relationship_guard_never_reaches_normalizer_or_later_io() {
+        let rels = format!(
+            "<Relationships><Relationship unused='{}'/></Relationships>",
+            "x".repeat(4097)
+        );
+        let bytes = package(&[
+            ("_rels/.rels", rels.as_bytes().to_vec()),
+            ("Metadata/thumbnail.png", png(2, 2)),
+        ]);
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let calls = std::cell::Cell::new(0);
+        let error = select_embedded_reader_in_context(Cursor::new(&bytes), &mut context, |_| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::InputLimitExceeded)
+        ));
+        assert_eq!(calls.get(), 0);
+        let before = context.usage();
+        assert!(embedded_3mf_thumbnail_in_context_typed(&bytes, &mut context).is_err());
+        assert_eq!(context.usage(), before);
+    }
+    #[test]
+    fn image_context_declared_oversize_remains_ordinary_without_payload_collection() {
+        let mut bytes = package(&[("Metadata/thumbnail.png", png(2, 2))]);
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        let declared = (MAX_INPUT_BYTES as u32 + 1).to_le_bytes();
+        bytes[22..26].copy_from_slice(&declared);
+        bytes[central + 24..central + 28].copy_from_slice(&declared);
+        let target = 30
+            + u16::from_le_bytes(bytes[26..28].try_into().unwrap()) as u64
+            + u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as u64;
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let source = CandidateFaultReader {
+            inner: Cursor::new(bytes),
+            target,
+            error: Some(stl_core::ResourceStop::EnvelopeChanged.into_io_error()),
+            fired: fired.clone(),
+        };
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let error = select_embedded_reader_in_context(source, &mut context, normalize_image_typed)
+            .unwrap_err();
+        assert!(!error.is_terminal());
+        assert!(!fired.get());
+        assert_eq!(context.usage().inflation_bytes, 0);
+        assert_eq!(context.usage().retained_input_bytes, 0);
+        assert!(context.observer().check().is_ok());
     }
 }

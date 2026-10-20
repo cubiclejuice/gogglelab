@@ -1,8 +1,63 @@
 # GoggleLab Free: full Printventory parity
 
-Date: 2026-10-15 (updated 2026-10-19)
+Date: 2026-10-15 (updated 2026-10-20)
 
-## Current cleanup caller slice (2026-10-19)
+## Current checkpoint: shared runtime parser contexts (2026-10-20)
+
+The current runtime integration follows core checkpoint
+`128da5ecc0c47bd2864d295f886187ee0844715a`. Shared contexts now span hidden
+archived-source validation and subsequent geometry, previews, metadata, bundle and
+native viewer loading. Plain source/readback files use exact before-growth
+collection without spending ZIP inflation. Runtime image/metadata XML is guarded,
+root metadata streams without a full XML buffer, and image inputs use a 16 MiB cap.
+The existing bounded model-ZIP/typed error boundary remains. Package contexts share actual 512 MiB inflation,
+100 MiB model-part input, relationships 64 KiB, settings/project 8 MiB each, and
+16 MiB cumulative collected **INPUT** text. All four core XML paths use the opaque
+guard: 64 KiB wire token, 4 KiB values, 128 attribute items, depth 128 and 256 KiB
+live raw names. Ordinary malformed optional fallback and interrupted-read retry
+remain supported. These are not bounds on every owned metadata String, JSON tree,
+mesh/map allocation or whole-producer RAM.
+
+Local full-workspace regressions pass: 190 core tests (one existing ignored),
+366 runtime, 209 native and 70 server tests, with other suites. The reset control
+fails when validation gets a fresh counter while keeping the same observer, then
+passes after exact restoration. Independent collector/caller reviews are closed.
+Current evidence is recorded in `output/runtime-context-implementation-gates.json`.
+Earlier `128da5e` passed workspace Clippy, 12 Python notice tests and disposable
+composed Rust checks; its composed Cargo inventory has 558 components and omits
+12 local packages. Final unified packaging/notices/source-kit acceptance is separate.
+Hosted checkpoint verification is tracked in [PR #4](https://github.com/cubiclejuice/gogglelab/pull/4);
+check its actual status rather than treating local gates as hosted completion.
+
+The actual macOS hosted Rust 1.99.1 SDK attribute-workspace estimate was re-reviewed:
+16 KiB remains a versioned **profile estimate**, not a RAM hard cap or an
+Owned permit. JSON/model/owned-metadata allocation bounds, defensible producer admission and
+immutable publication are still **OPEN**. The two-slot/2 GiB producer proposal is
+unproven and disabled. See [parser bounds](THUMBNAIL-PARSER-BOUNDS.md) and
+[publication contract](THUMBNAIL-PUBLICATION-CONTRACT.md).
+
+Full parity/release acceptance remains open: [Windows #2](https://github.com/cubiclejuice/gogglelab/issues/2)
+retains the stable `431256a` UI and `9e480a7` checkpoint provenance; Bambu hardware/MQTT
+stays deferred in [#3](https://github.com/cubiclejuice/gogglelab/issues/3). Current-source
+native/composed acceptance, native Linux desktop delivery, official
+main/private core-pin integration, release artifacts and final review are separate
+remaining gates. No installed-app replacement or new cleanup is implied.
+
+Current-source synthetic Linux/container acceptance now passes at `128da5e`:
+loopback-only hardened server, REST/MCP, indexing, geometry leases, restart
+persistence, and an authored 3MF's XML/geometry/default thumbnail. The actual
+server image regenerates 550 Cargo and 37 npm notices and retains ZIP's exact MIT
+text. Evidence: `output/container-acceptance-128da5e/README.md` and `checks.json`.
+The fixture is stopped and preserved. This closes that server checkpoint's
+container gate; later runtime sources and final unified/native composition require
+their own acceptance. No cleanup occurred; free space was 11 GiB at that checkpoint
+and 9.7 GiB at the later runtime build check (displayed `df` precision).
+
+
+## Historical cleanup caller slice (2026-10-19)
+
+The following native/container/package evidence belongs to its named earlier
+sources; it is not fresh acceptance of checkpoint `128da5e`.
 
 The shared cleanup coordinator is now wired into native, browser, REST and MCP
 callers in Free. Cleanup reviews a bounded page of candidates, independently
@@ -69,7 +124,7 @@ swept. Build cleanup performed in this slice: none; space recovered: zero.
 
 The phase-status paragraphs below retain earlier evidence. Their 326-test frontend
 count and “latest” verification wording refer to that earlier checkpoint; the
-current automated gate and pending caller acceptance are stated above.
+current automated gate and remaining acceptance scope are stated above.
 
 Open Phase 6 release gates: friend-run native Windows runtime/DACL/junction/replacement checks and final release review. Ordinary concurrent changes are guarded by pinned file/directory identities; hostile same-UID swap-and-restore windows are documented residuals outside the requested threat model. At the owner's direction, Phase 7 and subsequent phases proceed in order while native validation remains pending; no cross-platform parity claim is made until those checks pass.
 Status (2026-10-19): local phases 1–10 include reviewed printer/parts/slicer JSON in Free and schema v11. Delivery audit exposed missing native stock IPC and browser fleet coverage; those backfills are pushed at `2a6847fa605422e122c5f370041a4baa99457579`. Complete isolated native slicer import/export/restart acceptance now passes. Browser/MCP discovery and selected-printer checks are implemented with separately admitted host policy, default-off multicast/broadcast permissions, one-use review, version checks, and cancellation/revocation guards. The latest full serial Rust workspace suite, Clippy, and 326-test frontend gate pass; the network slice also passes isolated native default-off inspection, synthetic browser acceptance, and a Community production build/signature check. Synthetic browser acceptance covers discovery, unapproved profile saving, approval, fake Moonraker/Carbon printing status, cancellation, and disconnect; no real printer request was made. Remaining gates include the official unified core pin/composition, remaining Linux desktop delivery, friend-run Windows checks, hardware acceptance, provenance-aware generated-media follow-ups, and final release review. Bambu MQTT remains deferred in issue #3. The [Windows handoff](WINDOWS-FRIEND-ACCEPTANCE.md) is embedded in issue #2 with exact source provenance. Verified prior candidates and active builds are preserved; no cleanup or installed-app replacement occurred. No full parity or Windows/hardware acceptance claim is made.
@@ -91,7 +146,7 @@ Primary sources reviewed on 2026-10-10:
 
 The homepage, dynamic public version file, and repository documentation differ. Repository-documented functionality is part of the target, but is not represented here as runtime-verified stable behavior. Before each later milestone, pin the upstream commit/build and verify the relevant behavior. Parity is functional, not copying Printventory code or its UI. Browser-extension distribution/capabilities remain an investigation item; they must be resolved before declaring full parity.
 
-Current GoggleLab baseline was checked against Community README, architecture, extension API and Pro library/frontend/native handlers. Existing Pro library is an imported managed catalog with folder filtering and text search, not a completed thumbnail catalog or metadata editor.
+Initial (2026-10-10) GoggleLab baseline was checked against Community README, architecture, extension API and Pro library/frontend/native handlers. Existing Pro library is an imported managed catalog with folder filtering and text search, not a completed thumbnail catalog or metadata editor.
 
 ## Full Free scope and acceptance matrix
 

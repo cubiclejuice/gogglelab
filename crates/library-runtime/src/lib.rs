@@ -57,6 +57,8 @@ use library_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use stl_core::package_bounds::{collect_verified_model_source, PackageProcessingContext};
+use stl_core::zip_bounds::ZipResourceObserver;
 
 pub mod archives;
 pub mod bundles;
@@ -2508,52 +2510,82 @@ impl LibraryRuntime {
         &self,
         model: &Model,
     ) -> Result<Vec<u8>, RuntimeError> {
-        let (source, root_limit) = self.read_db(|db| {
-            let root_limit = if model.source_kind == "indexed" {
-                let root_id = model.source_root_id.as_deref().ok_or_else(|| {
-                    LibraryError::InvalidInput("Indexed model has no source root".into())
-                })?;
-                Some(
-                    db.list_index_roots()?
-                        .into_iter()
-                        .find(|root| root.id == root_id)
-                        .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.into()))?
-                        .max_file_bytes,
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        self.verified_model_source_bytes_in_context(model, &mut context)
+    }
+
+    pub(crate) fn verified_model_source_bytes_in_context(
+        &self,
+        model: &Model,
+        context: &mut PackageProcessingContext,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let observer = context.observer();
+        observer
+            .check()
+            .map_err(|e| ProcessingError::from(e).into_runtime(io_error()))?;
+        let result = (|| {
+            let (source, root_limit) = self.read_db(|db| {
+                let root_limit = if model.source_kind == "indexed" {
+                    let root_id = model.source_root_id.as_deref().ok_or_else(|| {
+                        LibraryError::InvalidInput("Indexed model has no source root".into())
+                    })?;
+                    Some(
+                        db.list_index_roots()?
+                            .into_iter()
+                            .find(|root| root.id == root_id)
+                            .ok_or_else(|| LibraryError::IndexRootNotFound(root_id.into()))?
+                            .max_file_bytes,
+                    )
+                } else {
+                    None
+                };
+                Ok((db.resolve_model_source_ref(&model.id)?, root_limit))
+            })?;
+            self.validate_indexed_source_admission(model, &source)?;
+            if root_limit.is_some_and(|limit| source.bytes > limit)
+                || source.bytes > library_core::MAX_INDEXED_FILE_BYTES
+            {
+                return Err(RuntimeError {
+                    code: RuntimeErrorCode::Unsupported,
+                    message: "Model source exceeds its admitted file limit".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+            if let Some(member) = source.archive_member.as_deref() {
+                let temporary = archives::extract_member_to_temporary_in_context_typed(
+                    &self.root,
+                    &source.outer_path,
+                    member,
+                    source
+                        .outer_fingerprint
+                        .as_deref()
+                        .ok_or_else(|| internal("Archive model has no source fingerprint"))?,
+                    &source.content_hash,
+                    source.bytes,
+                    context,
+                )
+                .map_err(|error| error.into_runtime(stale("Archive model source changed")))?;
+                read_verified_content_in_context(
+                    temporary.path(),
+                    source.bytes,
+                    &source.content_hash,
+                    context,
                 )
             } else {
-                None
-            };
-            Ok((db.resolve_model_source_ref(&model.id)?, root_limit))
-        })?;
-        self.validate_indexed_source_admission(model, &source)?;
-        if root_limit.is_some_and(|limit| source.bytes > limit)
-            || source.bytes > library_core::MAX_INDEXED_FILE_BYTES
-        {
-            return Err(RuntimeError {
-                code: RuntimeErrorCode::Unsupported,
-                message: "Model source exceeds its admitted file limit".into(),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
-            });
-        }
-        if let Some(member) = source.archive_member.as_deref() {
-            let temporary = archives::extract_member_to_temporary_typed(
-                &self.root,
-                &source.outer_path,
-                member,
-                source
-                    .outer_fingerprint
-                    .as_deref()
-                    .ok_or_else(|| internal("Archive model has no source fingerprint"))?,
-                &source.content_hash,
-                source.bytes,
-            )
-            .map_err(|error| error.into_runtime(stale("Archive model source changed")))?;
-            read_verified_content(temporary.path(), source.bytes, &source.content_hash)
-        } else {
-            read_verified_content(&source.outer_path, source.bytes, &source.content_hash)
-        }
+                read_verified_content_in_context(
+                    &source.outer_path,
+                    source.bytes,
+                    &source.content_hash,
+                    context,
+                )
+            }
+        })();
+        observer
+            .check()
+            .map_err(|e| ProcessingError::from(e).into_runtime(io_error()))?;
+        result
     }
 
     fn require(
@@ -11998,39 +12030,8 @@ fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &s
         if runtime.scan_control().cancelled() {
             break;
         }
-        let result: Result<(), RuntimeError> = (|| {
-            if runtime
-                .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))?
-                .is_some()
-            {
-                return Ok(());
-            }
-            let settings = runtime.read_db(|db| db.get_catalog_settings())?;
-            let content_hash = model
-                .content_hash
-                .as_deref()
-                .ok_or_else(|| invalid("Thumbnail model has no content hash"))?;
-            let bytes = runtime.verified_model_source_bytes(&model)?;
-            let artifact = thumbnails::ensure_thumbnail_from_bytes_typed(
-                &runtime.root,
-                &bytes,
-                content_hash,
-                bytes.len() as u64,
-                &settings,
-                false,
-            )
-            .map_err(|error| error.into_runtime(invalid("Thumbnail render failed")))?;
-            runtime.mutate_db(|db| {
-                db.set_thumbnail_for_source_and_settings(
-                    &model.id,
-                    content_hash,
-                    &settings,
-                    &artifact.png_hash,
-                    &artifact.relative_path,
-                )
-            })?;
-            Ok(())
-        })();
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let result = render_default_thumbnail_for_model(runtime, &model, &mut context);
         if let Err(error) = result {
             runtime
                 .scan_control()
@@ -12039,6 +12040,53 @@ fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &s
         runtime.scan_control().thumbnail_completed();
     }
     runtime.scan_control().set_job_kind("scan");
+}
+
+fn render_default_thumbnail_for_model(
+    runtime: &LibraryRuntime,
+    model: &Model,
+    context: &mut PackageProcessingContext,
+) -> Result<(), RuntimeError> {
+    context
+        .observer()
+        .check()
+        .map_err(|e| ProcessingError::from(e).into_runtime(invalid("Thumbnail render failed")))?;
+    if runtime
+        .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let settings = runtime.read_db(|db| db.get_catalog_settings())?;
+    let content_hash = model
+        .content_hash
+        .as_deref()
+        .ok_or_else(|| invalid("Thumbnail model has no content hash"))?;
+    let bytes = runtime.verified_model_source_bytes_in_context(model, context)?;
+    let artifact = thumbnails::ensure_thumbnail_from_bytes_in_context_typed(
+        &runtime.root,
+        &bytes,
+        content_hash,
+        bytes.len() as u64,
+        &settings,
+        false,
+        context,
+    )
+    .map_err(|error| error.into_runtime(invalid("Thumbnail render failed")))?;
+    context
+        .observer()
+        .check()
+        .map_err(|e| ProcessingError::from(e).into_runtime(invalid("Thumbnail render failed")))?;
+    runtime.mutate_db(|db| {
+        db.set_thumbnail_for_source_and_settings(
+            &model.id,
+            content_hash,
+            &settings,
+            &artifact.png_hash,
+            &artifact.relative_path,
+        )
+    })?;
+    Ok(())
 }
 
 fn scan_error(message: String) -> RuntimeError {
@@ -12191,6 +12239,20 @@ fn read_verified_content(
     expected_bytes: u64,
     expected_hash: &str,
 ) -> Result<Vec<u8>, RuntimeError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    read_verified_content_in_context(path, expected_bytes, expected_hash, &mut context)
+}
+
+fn read_verified_content_in_context(
+    path: &Path,
+    expected_bytes: u64,
+    expected_hash: &str,
+    context: &mut PackageProcessingContext,
+) -> Result<Vec<u8>, RuntimeError> {
+    let observer = context.observer();
+    observer
+        .check()
+        .map_err(|e| ProcessingError::from(e).into_runtime(io_error()))?;
     if expected_bytes > library_core::MAX_INDEXED_FILE_BYTES {
         return Err(RuntimeError {
             code: RuntimeErrorCode::Unsupported,
@@ -12203,17 +12265,16 @@ fn read_verified_content(
     let metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_bytes
     {
+        let _ = observer.stop_io(stl_core::ResourceStop::EnvelopeChanged);
         return Err(stale("Model source file changed"));
     }
     let mut file = File::open(path).map_err(|_| io_error())?;
-    let mut bytes = Vec::with_capacity(expected_bytes as usize);
-    Read::by_ref(&mut file)
-        .take(expected_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| io_error())?;
+    let bytes = collect_verified_model_source(&mut file, expected_bytes, &observer)
+        .map_err(|e| ProcessingError::from(e).into_runtime(io_error()))?;
     if bytes.len() as u64 != expected_bytes
         || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
     {
+        let _ = observer.stop_io(stl_core::ResourceStop::EnvelopeChanged);
         return Err(stale("Model source bytes changed"));
     }
     Ok(bytes)
@@ -12278,6 +12339,156 @@ mod tests {
         MetadataEngine, ModelQuery, PageRequest, RuntimeStatusEngine, UploadEngine, UploadIntent,
         CAPTURE_ENVELOPE_VERSION,
     };
+
+    pub(super) fn nested_package_fixture(
+        temp: &tempfile::TempDir,
+        method: zip::CompressionMethod,
+    ) -> (Arc<LibraryRuntime>, Model, Vec<u8>, u64) {
+        use library_core::{ScannedModel, SourceRef};
+        let sources = temp.path().join("nested-sources");
+        fs::create_dir(&sources).unwrap();
+        let inner = metadata_3mf();
+        let model_xml_len = zip::ZipArchive::new(std::io::Cursor::new(&inner))
+            .unwrap()
+            .by_name("3D/3dmodel.model")
+            .unwrap()
+            .size();
+        let outer = sources.join("models.zip");
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "part.3mf",
+                zip::write::SimpleFileOptions::default().compression_method(method),
+            )
+            .unwrap();
+        writer.write_all(&inner).unwrap();
+        fs::write(&outer, writer.finish().unwrap().into_inner()).unwrap();
+        let inventory =
+            archives::archive_inventory_with_cancel(&outer, 1024 * 1024, &|| false).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| {
+                let root = db.add_index_root(&sources, 60, 16 * 1024 * 1024)?;
+                let added = db.record_scan_entries(
+                    &root.id,
+                    &[ScannedModel {
+                        relative_path: "models.zip".into(),
+                        content_hash: format!("{:x}", Sha256::digest(&inner)),
+                        bytes: inner.len() as u64,
+                        format: "3mf".into(),
+                        modified_at: 1,
+                        display_name: None,
+                        archive_member: Some("part.3mf".into()),
+                        outer_fingerprint: Some(inventory.outer_fingerprint.clone()),
+                    }],
+                )?;
+                db.complete_scan_sources_with_new_models(
+                    &root.id,
+                    &[SourceRef {
+                        relative_path: "models.zip".into(),
+                        archive_member: Some("part.3mf".into()),
+                    }],
+                    &added.added_model_ids,
+                    "1",
+                )?;
+                Ok(db.get_model(&added.added_model_ids[0])?.unwrap())
+            })
+            .unwrap();
+        (runtime, model, inner, model_xml_len)
+    }
+
+    #[test]
+    fn verified_source_and_default_thumbnail_keep_nested_validation_work() {
+        use stl_core::package_bounds::PackageUsage;
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, model, inner, model_xml_len) = nested_package_fixture(&temp, method);
+            let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+            let bytes = runtime
+                .verified_model_source_bytes_in_context(&model, &mut context)
+                .unwrap();
+            assert_eq!(bytes, inner);
+            assert_eq!(
+                context.usage(),
+                PackageUsage {
+                    inflation_bytes: model_xml_len,
+                    retained_input_bytes: 0,
+                },
+                "the archived source's hidden validation must spend model work"
+            );
+            stl_core::parse_model_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(context.usage().inflation_bytes, 2 * model_xml_len);
+            let mut render_context = PackageProcessingContext::new(ZipResourceObserver::new());
+            render_default_thumbnail_for_model(&runtime, &model, &mut render_context).unwrap();
+            assert_eq!(
+                render_context.usage(),
+                PackageUsage {
+                    inflation_bytes: 2 * model_xml_len,
+                    retained_input_bytes: 0,
+                },
+                "default job must keep validation and geometry on the same counter"
+            );
+            assert!(runtime
+                .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))
+                .unwrap()
+                .is_some());
+            // A cached return still cannot hide a stop already recorded by this operation.
+            let _ = render_context
+                .observer()
+                .stop_io(stl_core::ResourceStop::ReadWorkExceeded);
+            let error = render_default_thumbnail_for_model(&runtime, &model, &mut render_context)
+                .unwrap_err();
+            assert_eq!(error.code, RuntimeErrorCode::Unsupported);
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn plain_verified_source_leaves_package_usage_unchanged_and_latches_changed_hash() {
+        use stl_core::package_bounds::PackageUsage;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.stl");
+        let bytes = triangle_stl(0.0);
+        fs::write(&path, &bytes).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        assert_eq!(
+            read_verified_content_in_context(&path, bytes.len() as u64, &hash, &mut context)
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            context.usage(),
+            PackageUsage {
+                inflation_bytes: 0,
+                retained_input_bytes: 0
+            }
+        );
+        let error = read_verified_content_in_context(
+            &path,
+            bytes.len() as u64,
+            &"0".repeat(64),
+            &mut context,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::Stale);
+        assert!(error.retryable);
+        assert!(matches!(
+            context.observer().check(),
+            Err(stl_core::zip_bounds::ZipOpenError::ResourceStopped(
+                stl_core::ResourceStop::EnvelopeChanged
+            ))
+        ));
+        // The same terminal state wins before even looking up this absent path.
+        let later =
+            read_verified_content_in_context(&temp.path().join("absent"), 0, "", &mut context)
+                .unwrap_err();
+        assert_eq!(later.code, RuntimeErrorCode::Stale);
+        assert!(later.retryable);
+    }
 
     #[test]
     fn archive_resource_stop_is_not_stale_or_corrupt_and_issues_no_download() {

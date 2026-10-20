@@ -1,6 +1,9 @@
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
+use stl_core::package_bounds::{collect_verified_model_source, PackageProcessingContext};
+use stl_core::zip_bounds::{ZipAllocationFailed, ZipResourceObserver};
 
 use tauri::{Emitter, Manager};
 
@@ -16,85 +19,151 @@ use crate::types::{
 /// runtime type so it can be unit-tested directly against a plain `AppState`
 /// — no mock app, no async runtime, no IPC. `open_model` (below) is a thin
 /// wrapper that adds the background integrity dispatch, which does need an
+#[cfg(test)]
 pub fn load_and_commit(
     state: &AppState,
     path: &str,
     generation: u64,
     source_identity: &str,
 ) -> Result<(ModelSummary, Arc<stl_core::ParsedModel>), AppError> {
-    let start = Instant::now();
-    state.register_generation(generation);
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    load_and_commit_in_context(state, path, generation, source_identity, &mut context)
+}
 
-    let metadata = std::fs::metadata(path).map_err(|e| map_io_error(&e))?;
-    let size = metadata.len();
-    if size == 0 {
-        return Err(AppError::EmptyFile);
+pub(crate) fn load_and_commit_in_context(
+    state: &AppState,
+    path: &str,
+    generation: u64,
+    source_identity: &str,
+    context: &mut PackageProcessingContext,
+) -> Result<(ModelSummary, Arc<stl_core::ParsedModel>), AppError> {
+    let observer = context.observer();
+    observer.check().map_err(AppError::from)?;
+    let result = (|| {
+        let start = Instant::now();
+        state.register_generation(generation);
+
+        let metadata = std::fs::metadata(path).map_err(|e| map_io_error(&e))?;
+        let size = metadata.len();
+        if size == 0 {
+            return Err(AppError::EmptyFile);
+        }
+        if size > stl_core::limits::MAX_FILE_BYTES {
+            return Err(AppError::FileTooLarge {
+                size,
+                limit: stl_core::limits::MAX_FILE_BYTES,
+            });
+        }
+
+        let file = std::fs::File::open(path).map_err(|e| map_io_error(&e))?;
+        let bytes = collect_native_source(file, size, &observer)?;
+        let source_digest = format!("{:x}", Sha256::digest(&bytes));
+        let parsed = stl_core::parse_model_with_plates_in_context(&bytes, context)?;
+        observer.check().map_err(AppError::from)?;
+
+        // Parsing and measurement are done off-lock. The final commit below takes
+        // the request/commit boundary and checks freshness immediately before the
+        // active-model write, so a newer request can never be overwritten by a
+        // slower one that started earlier.
+        let geometry = stl_core::measure(&parsed.model);
+        let plates = plate_summaries(&parsed);
+        let parse_ms = start.elapsed().as_millis() as u32;
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let summary = ModelSummary {
+            generation,
+            file_name,
+            file_size_bytes: size,
+            format: parsed.model.format.into(),
+            triangle_count: parsed.model.triangle_count,
+            geometry: geometry.map(Into::into),
+            parse_ms,
+            plates,
+            materials: parsed
+                .materials
+                .iter()
+                .cloned()
+                .map(|material| MaterialSummary {
+                    id: material.id,
+                    name: material.name,
+                    color: material.color,
+                    source: material.source.into(),
+                })
+                .collect(),
+            embedded_filaments: parsed
+                .embedded_filaments
+                .iter()
+                .cloned()
+                .map(|filament| EmbeddedFilamentSummary {
+                    slot: filament.slot,
+                    name: filament.name,
+                    material: filament.material,
+                    color: filament.color,
+                })
+                .collect(),
+            part_warning: parsed.part_warning.clone(),
+            plate_metadata: parsed.plate_metadata,
+            plate_warning: parsed.plate_warning.clone(),
+            source_identity: source_identity.to_string(),
+            source_digest,
+        };
+
+        let parsed = Arc::new(parsed);
+        commit_loaded_with_observer(
+            state,
+            generation,
+            path,
+            &summary,
+            parsed.clone(),
+            Some(&observer),
+        )?;
+
+        Ok((summary, parsed))
+    })();
+    observer.finish(result)
+}
+
+// Preserve the native IO classification before a collector adds ordinary model
+// context, without recognizing errors by their message text.
+struct NativeReadErrorRecorder<'a, R> {
+    input: R,
+    ordinary: &'a mut Option<AppError>,
+}
+impl<R: Read> Read for NativeReadErrorRecorder<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let result = self.input.read(output);
+        if let Err(error) = &result {
+            if stl_core::ResourceStop::from_io_error(error).is_none()
+                && ZipAllocationFailed::from_io_error(error).is_none()
+            {
+                *self.ordinary = Some(map_io_error(error));
+            }
+        }
+        result
     }
-    if size > stl_core::limits::MAX_FILE_BYTES {
-        return Err(AppError::FileTooLarge {
-            size,
-            limit: stl_core::limits::MAX_FILE_BYTES,
-        });
+}
+fn collect_native_source<R: Read>(
+    input: R,
+    expected: u64,
+    observer: &ZipResourceObserver,
+) -> Result<Vec<u8>, AppError> {
+    let mut ordinary = None;
+    let result = collect_verified_model_source(
+        NativeReadErrorRecorder {
+            input,
+            ordinary: &mut ordinary,
+        },
+        expected,
+        observer,
+    );
+    observer.check().map_err(AppError::from)?;
+    match result {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => Err(ordinary.unwrap_or_else(|| AppError::from(error))),
     }
-
-    let bytes = std::fs::read(path).map_err(|e| map_io_error(&e))?;
-    let source_digest = format!("{:x}", Sha256::digest(&bytes));
-    let parsed = stl_core::parse_model_with_plates(&bytes)?;
-
-    // Parsing and measurement are done off-lock. The final commit below takes
-    // the request/commit boundary and checks freshness immediately before the
-    // active-model write, so a newer request can never be overwritten by a
-    // slower one that started earlier.
-    let geometry = stl_core::measure(&parsed.model);
-    let plates = plate_summaries(&parsed);
-    let parse_ms = start.elapsed().as_millis() as u32;
-    let file_name = std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    let summary = ModelSummary {
-        generation,
-        file_name,
-        file_size_bytes: size,
-        format: parsed.model.format.into(),
-        triangle_count: parsed.model.triangle_count,
-        geometry: geometry.map(Into::into),
-        parse_ms,
-        plates,
-        materials: parsed
-            .materials
-            .iter()
-            .cloned()
-            .map(|material| MaterialSummary {
-                id: material.id,
-                name: material.name,
-                color: material.color,
-                source: material.source.into(),
-            })
-            .collect(),
-        embedded_filaments: parsed
-            .embedded_filaments
-            .iter()
-            .cloned()
-            .map(|filament| EmbeddedFilamentSummary {
-                slot: filament.slot,
-                name: filament.name,
-                material: filament.material,
-                color: filament.color,
-            })
-            .collect(),
-        part_warning: parsed.part_warning.clone(),
-        plate_metadata: parsed.plate_metadata,
-        plate_warning: parsed.plate_warning.clone(),
-        source_identity: source_identity.to_string(),
-        source_digest,
-    };
-
-    let parsed = Arc::new(parsed);
-    commit_loaded(state, generation, path, &summary, parsed.clone())?;
-
-    Ok((summary, parsed))
 }
 
 fn plate_summaries(parsed: &stl_core::ParsedModel) -> Vec<PlateSummary> {
@@ -129,6 +198,7 @@ fn plate_summaries(parsed: &stl_core::ParsedModel) -> Vec<PlateSummary> {
 /// Publish a completed load while holding the same boundary used to register
 /// new requests. This closes the gap where a newer request could register
 /// between a freshness check and the active-model write.
+#[cfg(test)]
 fn commit_loaded(
     state: &AppState,
     generation: u64,
@@ -136,7 +206,21 @@ fn commit_loaded(
     summary: &ModelSummary,
     parsed: Arc<stl_core::ParsedModel>,
 ) -> Result<(), AppError> {
+    commit_loaded_with_observer(state, generation, path, summary, parsed, None)
+}
+
+fn commit_loaded_with_observer(
+    state: &AppState,
+    generation: u64,
+    path: &str,
+    summary: &ModelSummary,
+    parsed: Arc<stl_core::ParsedModel>,
+    observer: Option<&ZipResourceObserver>,
+) -> Result<(), AppError> {
     let _request_guard = state.request_commit.lock().unwrap();
+    if let Some(observer) = observer {
+        observer.check().map_err(AppError::from)?;
+    }
     if !state.is_latest_locked(generation) {
         return Err(AppError::Superseded);
     }
@@ -182,7 +266,30 @@ pub(crate) fn load_and_dispatch_integrity(
     generation: u64,
     source_identity: &str,
 ) -> Result<ModelSummary, AppError> {
-    let (summary, parsed) = load_and_commit(state, path, generation, source_identity)?;
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    load_and_dispatch_integrity_in_context(
+        app,
+        state,
+        path,
+        generation,
+        source_identity,
+        &mut context,
+    )
+}
+
+pub(crate) fn load_and_dispatch_integrity_in_context(
+    app: tauri::AppHandle,
+    state: &AppState,
+    path: &str,
+    generation: u64,
+    source_identity: &str,
+    context: &mut PackageProcessingContext,
+) -> Result<ModelSummary, AppError> {
+    let observer = context.observer();
+    observer.check().map_err(AppError::from)?;
+    let (summary, parsed) =
+        load_and_commit_in_context(state, path, generation, source_identity, context)?;
+    observer.check().map_err(AppError::from)?;
 
     let app_for_thread = app;
     std::thread::spawn(move || {
@@ -647,5 +754,134 @@ mod tests {
         assert_eq!(integrity.boundary_edges, 3);
         assert_eq!(integrity.distinct_vertices, 3);
         assert!(integrity_for_plate(&parsed, 7, 99).is_none());
+    }
+    #[test]
+    fn native_cache_validation_then_pure_load_share_counter_without_tauri_mock() {
+        use std::io::{Cursor, Write};
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let library = root.join("library");
+            std::fs::create_dir(&library).unwrap();
+            let xml = r#"<model unit="millimeter"><resources><object id="1" type="model"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources><build><item objectid="1"/></build></model>"#;
+            let mut inner = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            inner
+                .start_file(
+                    "3D/3dmodel.model",
+                    zip::write::SimpleFileOptions::default().compression_method(method),
+                )
+                .unwrap();
+            inner.write_all(xml.as_bytes()).unwrap();
+            let inner = inner.finish().unwrap().into_inner();
+            let outer = root.join("source.zip");
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+            writer
+                .start_file(
+                    "part.3mf",
+                    zip::write::SimpleFileOptions::default().compression_method(method),
+                )
+                .unwrap();
+            writer.write_all(&inner).unwrap();
+            writer.finish().unwrap();
+            let inventory = library_runtime::archives::archive_inventory_with_cancel(
+                &outer,
+                1024 * 1024,
+                &|| false,
+            )
+            .unwrap();
+            let hash = format!("{:x}", Sha256::digest(&inner));
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            let path = library_runtime::archives::extract_member_to_cache_in_context_typed(
+                &library,
+                &outer,
+                "part.3mf",
+                &inventory.outer_fingerprint,
+                &hash,
+                inner.len() as u64,
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(
+                context.usage().inflation_bytes,
+                xml.len() as u64,
+                "actual hidden validation"
+            );
+            let before_read = context.usage();
+            let readback = collect_native_source(
+                std::fs::File::open(&path).unwrap(),
+                inner.len() as u64,
+                &observer,
+            )
+            .unwrap();
+            assert_eq!(readback, inner);
+            assert_eq!(
+                context.usage().inflation_bytes,
+                before_read.inflation_bytes,
+                "plain FD must not debit ZIP work"
+            );
+            let state = AppState::default();
+            let (summary, _) = load_and_commit_in_context(
+                &state,
+                path.to_str().unwrap(),
+                1,
+                "library:fixture",
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(summary.triangle_count, 1);
+            assert_eq!(summary.source_identity, "library:fixture");
+            assert_eq!(context.usage().inflation_bytes, 2 * xml.len() as u64);
+            assert_eq!(context.usage().retained_input_bytes, 0);
+            assert_eq!(
+                state.current.lock().unwrap().as_ref().unwrap().generation,
+                1
+            );
+            let _ = observer.stop_io(stl_core::ResourceStop::EnvelopeChanged);
+            assert!(load_and_commit_in_context(
+                &state,
+                path.to_str().unwrap(),
+                2,
+                "library:new",
+                &mut context
+            )
+            .is_err());
+            assert_eq!(
+                state.current.lock().unwrap().as_ref().unwrap().generation,
+                1
+            );
+            assert_eq!(context.usage().inflation_bytes, 2 * xml.len() as u64);
+        }
+    }
+
+    #[test]
+    fn native_source_collection_preserves_io_errors_and_exact_envelope() {
+        struct Failed;
+        impl Read for Failed {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+        }
+        let observer = ZipResourceObserver::new();
+        assert!(matches!(
+            collect_native_source(Failed, 1, &observer),
+            Err(AppError::NotReadable)
+        ));
+        assert!(observer.check().is_ok());
+        for expected in [2, 4] {
+            let observer = ZipResourceObserver::new();
+            assert!(
+                collect_native_source(std::io::Cursor::new(b"abc"), expected, &observer).is_err()
+            );
+            assert!(matches!(
+                observer.check(),
+                Err(stl_core::zip_bounds::ZipOpenError::ResourceStopped(
+                    stl_core::ResourceStop::EnvelopeChanged
+                ))
+            ));
+        }
     }
 }

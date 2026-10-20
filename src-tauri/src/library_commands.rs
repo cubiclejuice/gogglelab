@@ -850,9 +850,12 @@ pub(crate) fn get_thumbnail(
             message: "Library maintenance is in progress".into(),
         });
     }
+    let mut processing = stl_core::package_bounds::PackageProcessingContext::new(
+        stl_core::zip_bounds::ZipResourceObserver::new(),
+    );
     let temporary_member = if let Some(member) = source.archive_member.as_deref() {
         Some(
-            crate::library_archives::extract_member_to_temporary_typed(
+            crate::library_archives::extract_member_to_temporary_in_context_typed(
                 &library_root,
                 &source.outer_path,
                 member,
@@ -864,6 +867,7 @@ pub(crate) fn get_thumbnail(
                     })?,
                 &source.content_hash,
                 source.bytes,
+                &mut processing,
             )
             .map_err(AppError::from)?,
         )
@@ -873,15 +877,17 @@ pub(crate) fn get_thumbnail(
     let source_path = temporary_member
         .as_ref()
         .map_or(source.outer_path.as_path(), |member| member.path());
-    let thumbnail = crate::library_thumbnail::ensure_thumbnail_typed(
+    let thumbnail = crate::library_thumbnail::ensure_thumbnail_in_context_typed(
         &library_root,
         source_path,
         &content_hash,
         source.bytes,
         &settings,
         regenerate,
+        &mut processing,
     )
     .map_err(AppError::from)?;
+    processing.observer().check().map_err(AppError::from)?;
     with_db(state, |db| {
         persist_generated_thumbnail(db, model_id, &content_hash, &settings, &thumbnail)
     })?;
@@ -1006,8 +1012,11 @@ pub fn library_open_model(
         ))
     })?;
     validate_indexed_source_limit(&source, indexed_limit)?;
+    let mut processing = stl_core::package_bounds::PackageProcessingContext::new(
+        stl_core::zip_bounds::ZipResourceObserver::new(),
+    );
     let path = if let Some(member) = source.archive_member.as_deref() {
-        crate::library_archives::extract_member_to_cache_typed(
+        crate::library_archives::extract_member_to_cache_in_context_typed(
             &library_root,
             &source.outer_path,
             member,
@@ -1019,17 +1028,19 @@ pub fn library_open_model(
                 })?,
             &source.content_hash,
             source.bytes,
+            &mut processing,
         )
         .map_err(AppError::from)?
     } else {
         source.outer_path
     };
-    crate::extension_api::load_model_from_path(
+    crate::extension_api::load_model_from_path_in_context(
         app,
         &viewer_state,
         &path,
         generation,
         &library_source_identity(&model_id),
+        &mut processing,
     )
 }
 

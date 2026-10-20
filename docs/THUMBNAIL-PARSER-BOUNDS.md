@@ -1,86 +1,107 @@
 # Thumbnail parser resource prerequisite
 
-Proposed implementation gate, not an enabled producer or publication change.
-The unwired `OwnedTempReservation` foundation preserves the existing configured
-Owned limit; it does not establish a parser memory allowance. Implement and verify
-the bounds below before assigning a shared producer work allowance or wiring the
-publication contract. Keep ordinary STL, 3MF, embedded-preview and archive-member
-generation available within explicit limits. No source or historical cache cleanup
-is part of this prerequisite.
+## Current checkpoint (2026-10-20)
 
-## Allocation boundaries to change
+The current runtime integration follows core checkpoint `128da5e`. Shared mutable
+package contexts now span archived-source validation and later geometry, metadata,
+preview and viewer/bundle loading. Runtime model ZIP reads use the actual inflation
+budget once; ordinary file/readback collection uses an exact source envelope with
+no fictional inflation charge. Scan member limits remain clamped to the narrower
+configured policy and the fixed 100 MiB model cap. Actual policy excess is terminal
+Input; changed exact length/hash is Envelope/Stale; ordinary CRC remains corruption.
 
-- `crates/stl-core/src/threemf.rs`: `Package::open` constructs `ZipArchive` before
-  an application metadata limit; `Package::reader` charges declared entry sizes,
-  while `parse_model_part` retains input meshes without a package-wide count cap.
-  `Out::push_triangle` limits flattened output only. `optional_text`,
-  `root_model_path`, `attr_str` and `read_event_into` can allocate large text before
-  downstream truncation. Share one budget across every distinct referenced part,
-  including unused, unprinted and disabled objects; a per-part reset is unsafe.
-- `crates/stl-core/src/parse.rs`: enforce the triangle cap before binary
-  `with_capacity` in every dispatch branch. For ASCII, check before appending and
-  bound capacity growth rather than treating used length as allocation size.
-- `crates/library-runtime/src/archives.rs`: `preflight` runs after `ZipArchive::new`.
-  `extract_member_to_temporary` first calls `read_verified_archive_member`, which
-  hashes the outer file, inflates the member and validates it with `parse_model`.
-  Admission after extraction is too late.
-- `crates/library-runtime/src/images.rs`: `embedded_3mf_thumbnail` also constructs
-  ZIP metadata before its entry check. `normalize_image` has decoder limits, but
-  input, decoded/oriented image, resized/RGBA image and encoded output can overlap.
-  Both its PNG encoder and `thumbnails.rs::render_png` now use a shared bounded
-  output sink and explicitly finish the PNG stream. The sink refuses a write
-  before it would exceed 4 MiB and retains errors through footer retries. This
-  bounds encoded output, not compressor workspace or the complete producer.
-- `crates/library-runtime/src/embedded.rs`: `parse_standard_fields` is a sixth
-  production ZIP constructor. Its package and later root-model metadata reads
-  need the same bounded constructor and text/work policy.
+Bounded model ZIP construction/local ranges and terminal propagation were already
+wired at `7e6326b`: all seven model/manual readers use the reviewed facade, while
+backup restoration keeps its separate format policy. Default ZIP APIs remain
+unchanged. Runtime metadata now streams root XML instead of retaining its complete
+buffer; images use fixed 16 MiB binary input and 64 KiB retained relationships.
 
-The locked ZIP implementation has no application entry-budget option and may
-reserve from the EOCD count during construction. A subsequent `archive.len()` check
-does not prevent that allocation.
+Local full-workspace regressions pass: 190 core tests plus one existing ignored,
+366 runtime, 209 native, 70 server and other suites. A real reset control fails when
+hidden validation receives a fresh counter with the same observer, then passes
+after exact restoration. Independent plan/collector/caller reviews are closed.
+See `output/runtime-context-implementation-gates.json` and
+[PR #4](https://github.com/cubiclejuice/gogglelab/pull/4) for current verification.
+Earlier `128da5e` actual public-server image acceptance includes 550 Cargo and 37 npm
+notices with exact ZIP MIT text; the previous disposable composed Cargo inventory
+contains 558 Rust components. Neither establishes fresh final unified-app packaging,
+its complete source-kit/notices, Windows execution or hardware acceptance.
 
-## Initial finite limits and enforcement
+The opaque XML facade bounds wire/event acquisition and successful raw/recovered
+values before caller normalization: 64 KiB tokens, 4 KiB values, 128 attribute
+items, depth 128 and 256 KiB live raw names. Its actual SDK admission iterator is
+bounded to 129 inspections (the last distinguishes overflow from None); PI/XML
+declarations are token-only scope. The 16 KiB temporary attribute-workspace
+estimate was re-reviewed against actual macOS Rust 1.99.1/hashbrown 0.17.1 and
+quick-xml 0.41.0. It is a versioned profile estimate, not a portable hard cap,
+fallible SDK-allocation guarantee, RSS bound or completed Owned permit.
 
-These are conservative proposed defaults, subject to the fixture gate below.
+## Remaining allocation and integration boundaries
+
+- Core `threemf.rs` now charges actual returned model bytes through one mutable
+  context; it no longer sums declared entry sizes. Context collection is bounded
+  before growth, settings are retained once/reparsed without another inflation
+  debit, and ordinary EINTR is retried. Its 16 MiB counter is cumulative collected
+  **INPUT**, not every owned name/path/normalized metadata copy. Input mesh/object/
+  component/build collections, JSON Value/auxiliary arrays and their controlled
+  capacities remain OPEN; the flattened output cap alone does not close them.
+- `parse.rs` binary/ASCII dispatch growth and capacity guards still need their
+  remaining explicit preallocation audit; do not infer a whole-parser memory cap.
+- Runtime `archives.rs` has bounded ZIP/typed pure-read-before-stage handling,
+  regular-source/1 GiB outer admission, one actual outer budget across scan members,
+  and before-growth member collection. Nested 3MF budgets are separate from outer
+  ZIP work, share the terminal observer, and survive subsequent operation passes.
+- Runtime images/embedded metadata now use the opaque XML facade, bounded retained
+  relationships, binary image collection and streamed root-model metadata. Native,
+  catalog/default jobs, geometry, bundles and cleanup proof use context adapters.
+  Remaining owned metadata/candidate copies and full decode/producer overlap are OPEN.
+- PNG output is already capped at 4 MiB with explicit finish and a known sink
+  allocation category. Decoder/compressor workspace and full producer overlap are
+  not established by that encoded-output limit.
+
+No source/historical-cache cleanup or publication is enabled by these parser
+changes. The existing Owned transfer retains the configured ledger; it does not
+establish a defensible producer allowance. The two-slot/2 GiB proposal remains
+unproven and disabled until the remaining bounds/profile/admission gates pass.
+
+## Active and proposed finite limits
+
+The table distinguishes active input policy from proposed/open allocation bounds.
 Use a private test-limit override to exercise boundaries without large fixtures.
 
 | Resource | Initial cap | Enforcement point |
 | --- | --- | --- |
-| ZIP central records / metadata envelope | 10,000 / 16 MiB | Before every ZIP constructor; include names, comments and extras |
-| Aggregate referenced-part input vertices / triangles | 6,000,000 / 2,000,000 | Before vector growth, across the package |
-| Aggregate objects / components / build items | 10,000 / 100,000 / 100,000 | Before insertion or push, across the package |
-| Retained copied text | 16 MiB per package | Before allocating owned names, attributes, paths and metadata text |
-| XML token / attribute value | 64 KiB / 4 KiB | Before parser token-buffer growth / owned attribute copy |
-| Model settings / project metadata / root relationships | 8 MiB / 8 MiB / 64 KiB | Declared check plus actual bounded read |
-| Actual inflated read work | 512 MiB per package parse | Shared counter on bytes delivered, including repeated real reads |
-| Encoded PNG | 4 MiB | Sink refuses the next write before exceeding the limit |
-| Component processing work | 10,000,000 visits | Shared by diagnostic scans, membership checks and emission; checked before work |
+| ZIP central records / metadata envelope | 10,000 / 16 MiB | Active model facade: intrinsic constructor checks across retries, including local metadata |
+| Aggregate referenced-part input vertices / triangles | 6,000,000 / 2,000,000 proposed | OPEN: before vector growth across the package |
+| Aggregate objects / components / build items | 10,000 / 100,000 / 100,000 proposed | OPEN: before insertion/push across the package |
+| Collected INPUT text | 16 MiB cumulative | Active core/runtime context, before append; no refund on dropped/invalid UTF-8 input |
+| All owned metadata copies | 16 MiB proposed | OPEN: names/paths/normalized strings/JSON are not covered by input collection |
+| XML token / attribute value | 64 KiB / 4 KiB | Active four core and runtime image/metadata XML paths; 128 items, depth 128, live raw names 256 KiB |
+| Model settings / project metadata / root relationships | 8 MiB / 8 MiB / 64 KiB | Active shared actual collection; existing declared-oversize project None/no-read skip retained |
+| Actual inflated read work / model part | 512 MiB / 100 MiB | Active core/runtime contexts; actual bytes and EOF/CRC probes; outer/nested packages stay separate |
+| Encoded PNG | 4 MiB | Active sink/finalization; does not bound compressor/decoder memory |
+| Component processing work | 10,000,000 visits | Active per parse: diagnostic scans, membership and emission checked before work |
 
 Retain existing 100 MiB model input, 2,000,000 flattened triangles, component depth
 32, viewer plates 256, viewer parts 1,024, standard materials 1,024 and embedded
 filaments 256. Retain embedded input 16 MiB, dimensions 4,096, pixels 4 million and
 decoder allocation limit 64 MiB. None alone is a whole-producer memory bound.
 
-Introduce a small shared ZIP-envelope preflight in `stl-core` usable by both
-in-memory 3MF readers and the runtime's seekable outer-archive reader. Read only a
-bounded bootstrap window under an admitted permit. Validate EOCD/ZIP64 locator and
-end record, checked offsets/ranges, central-record structure and actual record
-count/aggregate variable fields before constructing ZIP metadata. Preserve small
-valid ZIP64 archives; do not reject ZIP64 simply because its format is supported.
-Reject malformed, unsupported multi-volume or ambiguous envelopes before metadata
-allocation. A declared count, declared inflated length or compressed length is
-only an early check, never sufficient authority for allocation or read work.
+The earlier application-preflight proposal was superseded by the reviewed
+vendored ZIP 8.6 constructor: 64 combined footer candidates, 64 MiB metadata
+read/allocation-work allowances and a finite read/seek-call budget apply across
+all attempts, including mutable seekable sources. Physical records/ranges are
+checked before deduplication; original wire identity, bit-3 placeholders and small
+ZIP64 remain supported. Checked cached offsets do not establish payload/source
+identity or verify descriptor gaps. A consumer workspace must select the same
+reviewed vendor patch at its own root.
 
-Use one checked package budget for mesh counts, retained text and inflated reads.
-Cached repeated references charge stored mesh once; every actual read charges
-work. Bound XML tokens before `quick_xml` grows its event buffer, for example with
-a bounded streaming lexical preflight that handles quoted attributes, comments,
-CDATA and declarations correctly. A post-`read_event_into` length check is too
-late. Attribute limits apply to raw and decoded/copied forms; normalize labels
-only after admission. Bound JSON/config collection counts and retained text too.
-Use checked arithmetic and controlled `try_reserve` growth; account capacity and
-map overhead, not just the number of live elements. Limit errors must propagate;
-they must not become optional-metadata fallbacks that continue unbounded work.
+Next, enforce package-wide input storage/metadata/JSON counts and controlled
+fallible growth before every remaining copy/push/insertion. Cached reuse must not
+charge stored input twice; actual re-reads still spend work. Do not replace these
+remaining bounds with the already active XML acquisition or collected-input caps.
+Typed terminal errors must remain terminal through optional/default paths while
+ordinary bounded malformed metadata retains existing fallback.
 
 ## Admission and the finite work profile
 
@@ -113,10 +134,13 @@ not a measured or guaranteed process RSS number; decoder/parser internals and
 allocator overhead need explicit conservative allowances. If a defensible bound
 is still missing, keep publication wiring gated and report that gap.
 
-## Review findings that block wiring
+## Historical review findings and foundation checkpoints
 
-The plan review found the following concrete requirements. They describe existing
-allocation/fallback behavior, not regressions introduced by the unwired foundation.
+These earlier requirements/checkpoint results are retained as historical evidence.
+Constructor/local-range, typed-error, PNG-finalization, component-work and core
+XML/actual-inflation items are now implemented as stated above; JSON/model storage,
+owned allocation and producer admission remain open. The future-tense notes
+below describe their original checkpoint, not current missing ZIP protection.
 
 - **High — constructor fallback:** ZIP 8.6 retries earlier EOCD records after a
   central decode failure. A terminal-envelope preflight followed by unrestricted
@@ -317,7 +341,7 @@ Known operational allocation failure stays distinct from deterministic input/wor
 limits and temporary runtime contention. Runtime errors retain their existing
 codes and retry policy; native errors retain the Library/message shape. Existing
 public String APIs are terminal compatibility adapters around typed bodies.
-Source fingerprint/hash comparisons alone produce a source-changed stop.
+Source fingerprint/hash and exact length-envelope comparisons produce source-changed stops.
 
 Verified archive reading finishes before cache/staging creation. Rendering stops
 before thumbnail staging or catalog writes. A terminal cleanup-proof failure
@@ -328,10 +352,12 @@ keep their existing behavior. Source holds and publication authority are unchang
 Consumer workspace roots must resolve the same vendored ZIP package before using
 this API, because a dependency's Cargo patch does not propagate to its consumer.
 Backup restoration is a separate format outside this model-reader profile.
-Member inflation, XML/JSON allocation, whole-producer memory admission, source
-identity and immutable publication remain separately reviewed gates.
+Core/runtime actual member inflation/XML acquisition and operation-context
+composition are active as stated at the top. JSON/model/owned-copy allocation,
+whole-producer admission, final composed acceptance, source identity and immutable
+publication remain separate gates.
 
-Local validation passes 128 parser tests (one existing ignored fixture), 347 runtime
+Historical typed-boundary validation passed 128 parser tests (one existing ignored fixture), 347 runtime
 tests, 207 native tests and 70 server tests, plus workspace Clippy and formatting.
 The native watcher tests require normal macOS event access: the identical binary
 fails callbacks inside the workspace sandbox and passes all eight watcher tests

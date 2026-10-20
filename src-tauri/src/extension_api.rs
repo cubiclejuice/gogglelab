@@ -37,11 +37,34 @@ pub fn load_model_from_path(
     generation: u64,
     source_identity: &str,
 ) -> Result<ModelSummary, AppError> {
+    let mut context = stl_core::package_bounds::PackageProcessingContext::new(
+        stl_core::zip_bounds::ZipResourceObserver::new(),
+    );
+    load_model_from_path_in_context(app, state, path, generation, source_identity, &mut context)
+}
+
+#[doc(hidden)]
+pub fn load_model_from_path_in_context(
+    app: AppHandle,
+    state: &AppState,
+    path: &Path,
+    generation: u64,
+    source_identity: &str,
+    context: &mut stl_core::package_bounds::PackageProcessingContext,
+) -> Result<ModelSummary, AppError> {
+    context.observer().check().map_err(AppError::from)?;
     state.register_generation(generation);
     let canonical =
         std::fs::canonicalize(path).map_err(|error| crate::error::map_io_error(&error))?;
     let canonical = canonical.to_str().ok_or(AppError::NotReadable)?;
-    crate::commands::load_and_dispatch_integrity(app, state, canonical, generation, source_identity)
+    crate::commands::load_and_dispatch_integrity_in_context(
+        app,
+        state,
+        canonical,
+        generation,
+        source_identity,
+        context,
+    )
 }
 
 /// Admit an operation on the source already loaded for the current viewer

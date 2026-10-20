@@ -2,7 +2,8 @@
 //!
 //! This bounds delivered bytes, not caller buffer allocation, decompressor work
 //! space or process RSS. In particular, `Read::read_to_end` may reserve before
-//! calling this reader; retained-buffer admission remains a separate prerequisite.
+//! calling this reader. The fixed-role collectors below admit their own buffers
+//! before growth; arbitrary consumers of an inflation reader must do likewise.
 
 use std::io::{self, Read};
 
@@ -31,6 +32,23 @@ impl TextRole {
     }
 }
 
+/// Fixed binary input roles; collected bytes do not spend the text counter.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryRole {
+    EmbeddedImage,
+    ModelMember,
+}
+
+impl BinaryRole {
+    pub const fn byte_limit(self) -> usize {
+        match self {
+            Self::EmbeddedImage => 16 * 1024 * 1024,
+            Self::ModelMember => crate::limits::MAX_FILE_BYTES as usize,
+        }
+    }
+}
+
 /// One context reused across sequential processing of an admitted package.
 ///
 /// The retained counter measures cumulative copied INPUT bytes, not all owned
@@ -44,6 +62,16 @@ pub struct PackageProcessingContext {
     limits: PackageTestLimits,
     #[cfg(test)]
     collector_test: CollectorTestState,
+}
+
+/// Read-only accounting for one package operation; this grants no allowance.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageUsage {
+    /// Bytes successfully charged by the inflation reader, excluding its terminal excess probe.
+    pub inflation_bytes: u64,
+    /// Cumulative collected text input, excluding binary and normalized metadata copies.
+    pub retained_input_bytes: usize,
 }
 
 impl PackageProcessingContext {
@@ -61,6 +89,14 @@ impl PackageProcessingContext {
 
     pub fn observer(&self) -> ZipResourceObserver {
         self.observer.clone()
+    }
+
+    /// Inspect accounting without resetting, refunding or changing its policy.
+    pub fn usage(&self) -> PackageUsage {
+        PackageUsage {
+            inflation_bytes: self.inflation.initial - self.inflation.remaining,
+            retained_input_bytes: self.retained_input,
+        }
     }
 
     /// The returned unique reader must finish/drop before another context pass.
@@ -90,6 +126,49 @@ impl PackageProcessingContext {
         }
     }
 
+    /// Collect one raw ZIP member under a fixed binary-input role.
+    pub fn collect_binary<R: Read>(
+        &mut self,
+        raw: R,
+        role: BinaryRole,
+    ) -> Result<Vec<u8>, crate::StlError> {
+        self.collect_binary_with_limit(raw, role.byte_limit())
+    }
+
+    /// Preserve a caller's narrower model policy without expanding the fixed cap.
+    pub fn collect_model_member<R: Read>(
+        &mut self,
+        raw: R,
+        policy_max: u64,
+    ) -> Result<Vec<u8>, crate::StlError> {
+        let limit = policy_max.min(crate::limits::MAX_FILE_BYTES) as usize;
+        self.collect_binary_with_limit(raw, limit)
+    }
+
+    fn collect_binary_with_limit<R: Read>(
+        &mut self,
+        raw: R,
+        limit: usize,
+    ) -> Result<Vec<u8>, crate::StlError> {
+        let observer = self.observer.clone();
+        let result = collect_input(
+            self.inflation.reader(raw),
+            CollectionPolicy {
+                limit,
+                exact: false,
+                text_role: None,
+            },
+            None,
+            &observer,
+            #[cfg(test)]
+            CollectorTest {
+                fail_reserve: self.limits.fail_reserve,
+                state: &mut self.collector_test,
+            },
+        );
+        observer.finish(result)
+    }
+
     pub fn collect_text<R: Read>(
         &mut self,
         raw: R,
@@ -108,93 +187,22 @@ impl PackageProcessingContext {
         let total_limit = self.limits.text_total;
         #[cfg(not(test))]
         let total_limit = RETAINED_INPUT_BYTES;
-        #[cfg(test)]
-        let fail_reserve = self.limits.fail_reserve;
-        let copied = &mut self.retained_input;
-        let inflation = &mut self.inflation;
-        #[cfg(test)]
-        let instrumentation = &mut self.collector_test;
-        let result = (|| {
-            observer.check()?;
-            let mut reader = inflation.reader(raw);
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; TEXT_CHUNK];
-            loop {
-                observer.check()?;
-                let role_remaining = role_limit
-                    .checked_sub(bytes.len())
-                    .ok_or_else(|| input_limit(&observer))?;
-                let aggregate_remaining = total_limit
-                    .checked_sub(*copied)
-                    .ok_or_else(|| input_limit(&observer))?;
-                let available = role_remaining.min(aggregate_remaining);
-                if available == 0 {
-                    let mut probe = [0_u8; 1];
-                    #[cfg(test)]
-                    let before = (bytes.len(), bytes.capacity());
-                    let result = read_retained_chunk(&mut reader, &mut probe, &observer);
-                    #[cfg(test)]
-                    instrumentation
-                        .probes
-                        .push((before, (bytes.len(), bytes.capacity())));
-                    let read = result.map_err(|error| text_io_error(&observer, role, error))?;
-                    observer.check()?;
-                    if read == 0 {
-                        break;
-                    }
-                    return Err(input_limit(&observer));
-                }
-                let length = available.min(chunk.len());
-                let read = read_retained_chunk(&mut reader, &mut chunk[..length], &observer)
-                    .map_err(|error| text_io_error(&observer, role, error))?;
-                observer.check()?;
-                if read == 0 {
-                    break;
-                }
-                let prospective = bytes
-                    .len()
-                    .checked_add(read)
-                    .filter(|value| *value <= role_limit)
-                    .ok_or_else(|| input_limit(&observer))?;
-                let next_copied = copied
-                    .checked_add(read)
-                    .filter(|value| *value <= total_limit)
-                    .ok_or_else(|| input_limit(&observer))?;
-                if prospective > bytes.capacity() {
-                    let target = retained_capacity_target(
-                        bytes.len(),
-                        bytes.capacity(),
-                        prospective,
-                        role_limit,
-                        aggregate_remaining,
-                    )
-                    .ok_or_else(|| input_limit(&observer))?;
-                    let additional = target
-                        .checked_sub(bytes.len())
-                        .ok_or_else(|| input_limit(&observer))?;
-                    #[cfg(test)]
-                    instrumentation.targets.push(target);
-                    #[cfg(test)]
-                    if fail_reserve {
-                        return Err(allocation_failure(&observer));
-                    }
-                    #[cfg(test)]
-                    let old_capacity = bytes.capacity();
-                    bytes
-                        .try_reserve_exact(additional)
-                        .map_err(|_| allocation_failure(&observer))?;
-                    #[cfg(test)]
-                    instrumentation
-                        .capacities
-                        .push((old_capacity, target, bytes.capacity()));
-                }
-                observer.check()?;
-                bytes.extend_from_slice(&chunk[..read]);
-                *copied = next_copied;
-            }
-            observer.check()?;
-            String::from_utf8(bytes).map_err(|_| invalid_text(role))
-        })();
+        let result = collect_input(
+            self.inflation.reader(raw),
+            CollectionPolicy {
+                limit: role_limit,
+                exact: false,
+                text_role: Some(role),
+            },
+            Some((&mut self.retained_input, total_limit)),
+            &observer,
+            #[cfg(test)]
+            CollectorTest {
+                fail_reserve: self.limits.fail_reserve,
+                state: &mut self.collector_test,
+            },
+        )
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| invalid_text(role)));
         observer.finish(result)
     }
 
@@ -210,6 +218,189 @@ impl PackageProcessingContext {
             limits,
             collector_test: CollectorTestState::default(),
         }
+    }
+}
+
+/// Collect an already-admitted model source against its exact version envelope.
+///
+/// This does not charge ZIP inflation. When reading a ZIP member, the caller
+/// supplies exactly one context inflation reader around that member.
+#[doc(hidden)]
+pub fn collect_verified_model_source<R: Read>(
+    raw: R,
+    expected_len: u64,
+    observer: &ZipResourceObserver,
+) -> Result<Vec<u8>, crate::StlError> {
+    observer.check()?;
+    if expected_len > crate::limits::MAX_FILE_BYTES {
+        return Err(input_limit(observer));
+    }
+    let limit = usize::try_from(expected_len).map_err(|_| input_limit(observer))?;
+    let result = collect_input(
+        raw,
+        CollectionPolicy {
+            limit,
+            exact: true,
+            text_role: None,
+        },
+        None,
+        observer,
+        #[cfg(test)]
+        CollectorTest {
+            fail_reserve: false,
+            state: &mut CollectorTestState::default(),
+        },
+    );
+    observer.finish(result)
+}
+
+struct CollectionPolicy {
+    limit: usize,
+    exact: bool,
+    text_role: Option<TextRole>,
+}
+
+#[cfg(test)]
+struct CollectorTest<'a> {
+    fail_reserve: bool,
+    state: &'a mut CollectorTestState,
+}
+
+fn collect_input<R: Read>(
+    mut reader: R,
+    policy: CollectionPolicy,
+    mut copied: Option<(&mut usize, usize)>,
+    observer: &ZipResourceObserver,
+    #[cfg(test)] instrumentation: CollectorTest<'_>,
+) -> Result<Vec<u8>, crate::StlError> {
+    observer.check()?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; TEXT_CHUNK];
+    loop {
+        observer.check()?;
+        let role_remaining = policy
+            .limit
+            .checked_sub(bytes.len())
+            .ok_or_else(|| input_limit(observer))?;
+        let aggregate_remaining = match &copied {
+            Some((count, limit)) => limit
+                .checked_sub(**count)
+                .ok_or_else(|| input_limit(observer))?,
+            None => role_remaining,
+        };
+        let available = role_remaining.min(aggregate_remaining);
+        if available == 0 {
+            let mut probe = [0_u8; 1];
+            #[cfg(test)]
+            let before = (bytes.len(), bytes.capacity());
+            let result = read_retained_chunk(&mut reader, &mut probe, observer);
+            #[cfg(test)]
+            instrumentation
+                .state
+                .probes
+                .push((before, (bytes.len(), bytes.capacity())));
+            let read = result.map_err(|e| collection_io_error(observer, policy.text_role, e))?;
+            observer.check()?;
+            if read == 0 {
+                break;
+            }
+            return Err(if policy.exact {
+                envelope_changed(observer)
+            } else {
+                input_limit(observer)
+            });
+        }
+        let length = available.min(chunk.len());
+        let read = read_retained_chunk(&mut reader, &mut chunk[..length], observer)
+            .map_err(|e| collection_io_error(observer, policy.text_role, e))?;
+        observer.check()?;
+        if read > length {
+            return Err(collection_io_error(
+                observer,
+                policy.text_role,
+                invalid_read_length(),
+            ));
+        }
+        if read == 0 {
+            if policy.exact {
+                return Err(envelope_changed(observer));
+            }
+            break;
+        }
+        let prospective = bytes
+            .len()
+            .checked_add(read)
+            .filter(|value| *value <= policy.limit)
+            .ok_or_else(|| input_limit(observer))?;
+        let next_copied = match &copied {
+            Some((count, limit)) => Some(
+                count
+                    .checked_add(read)
+                    .filter(|value| *value <= *limit)
+                    .ok_or_else(|| input_limit(observer))?,
+            ),
+            None => None,
+        };
+        if prospective > bytes.capacity() {
+            let target = retained_capacity_target(
+                bytes.len(),
+                bytes.capacity(),
+                prospective,
+                policy.limit,
+                aggregate_remaining,
+            )
+            .ok_or_else(|| input_limit(observer))?;
+            let additional = target
+                .checked_sub(bytes.len())
+                .ok_or_else(|| input_limit(observer))?;
+            #[cfg(test)]
+            instrumentation.state.targets.push(target);
+            #[cfg(test)]
+            if instrumentation.fail_reserve {
+                return Err(allocation_failure(observer));
+            }
+            #[cfg(test)]
+            let old_capacity = bytes.capacity();
+            bytes
+                .try_reserve_exact(additional)
+                .map_err(|_| allocation_failure(observer))?;
+            #[cfg(test)]
+            instrumentation
+                .state
+                .capacities
+                .push((old_capacity, target, bytes.capacity()));
+        }
+        observer.check()?;
+        bytes.extend_from_slice(&chunk[..read]);
+        if let (Some((count, _)), Some(next)) = (&mut copied, next_copied) {
+            **count = next;
+        }
+    }
+    observer.check()?;
+    Ok(bytes)
+}
+
+fn envelope_changed(observer: &ZipResourceObserver) -> crate::StlError {
+    let _ = observer.stop_io(ResourceStop::EnvelopeChanged);
+    observer
+        .check()
+        .expect_err("terminal envelope stop was recorded")
+        .into()
+}
+
+fn collection_io_error(
+    observer: &ZipResourceObserver,
+    role: Option<TextRole>,
+    error: io::Error,
+) -> crate::StlError {
+    observer.observe_io(&error);
+    match observer.check() {
+        Err(error) => error.into(),
+        Ok(()) => role
+            .map(invalid_text)
+            .unwrap_or(crate::StlError::Malformed3mf {
+                detail: "Package input could not be read".into(),
+            }),
     }
 }
 
@@ -257,18 +448,6 @@ fn invalid_text(role: TextRole) -> crate::StlError {
     };
     crate::StlError::Malformed3mf {
         detail: detail.into(),
-    }
-}
-
-fn text_io_error(
-    observer: &ZipResourceObserver,
-    role: TextRole,
-    error: io::Error,
-) -> crate::StlError {
-    observer.observe_io(&error);
-    match observer.check() {
-        Err(error) => error.into(),
-        Ok(()) => invalid_text(role),
     }
 }
 
@@ -380,6 +559,7 @@ struct CollectorTestState {
 /// Every repeated member read spends this same allowance. Declared entry lengths
 /// are not charged here; cached parsing without input reads spends nothing.
 pub struct PackageInflationBudget {
+    initial: u64,
     remaining: u64,
     observer: ZipResourceObserver,
 }
@@ -388,6 +568,7 @@ impl PackageInflationBudget {
     /// Use the fixed 512 MiB allowance and the operation's existing observer.
     pub fn new(observer: ZipResourceObserver) -> Self {
         Self {
+            initial: MAX_3MF_INFLATED_BYTES,
             remaining: MAX_3MF_INFLATED_BYTES,
             observer,
         }
@@ -418,6 +599,7 @@ impl PackageInflationBudget {
     #[cfg(test)]
     fn with_limit(observer: ZipResourceObserver, limit: u64) -> Self {
         Self {
+            initial: limit,
             remaining: limit,
             observer,
         }
@@ -853,6 +1035,167 @@ mod tests {
     }
 
     #[test]
+    fn binary_and_plain_collectors_preserve_lower_policy_and_exact_envelopes() {
+        assert_eq!(BinaryRole::EmbeddedImage.byte_limit(), 16 * 1024 * 1024);
+        assert_eq!(BinaryRole::ModelMember.byte_limit(), 100 * 1024 * 1024);
+        for (input, expected, stop) in [
+            (&b"abc"[..], 3, None),
+            (&b"ab"[..], 3, Some(ResourceStop::EnvelopeChanged)),
+            (&b"abcd"[..], 3, Some(ResourceStop::EnvelopeChanged)),
+            (&b""[..], 0, None),
+            (&b"x"[..], 0, Some(ResourceStop::EnvelopeChanged)),
+        ] {
+            let observer = ZipResourceObserver::new();
+            let (raw, stats) = counted(input, 1);
+            let result = collect_verified_model_source(raw, expected, &observer);
+            if let Some(stop) = stop {
+                assert_eq!(result.unwrap_err(), crate::StlError::ResourceStopped(stop));
+                let (later, later_stats) = counted(b"later", 1);
+                assert!(collect_verified_model_source(later, 5, &observer).is_err());
+                assert!(later_stats.lock().unwrap().requests.is_empty());
+            } else {
+                assert_eq!(result.unwrap(), input);
+            }
+            assert!(stats.lock().unwrap().requests.iter().all(|n| *n <= 3));
+        }
+        let observer = ZipResourceObserver::new();
+        let (raw, stats) = counted(b"ignored", 1);
+        assert_eq!(
+            collect_verified_model_source(raw, crate::limits::MAX_FILE_BYTES + 1, &observer)
+                .unwrap_err(),
+            crate::StlError::ResourceStopped(ResourceStop::InputLimitExceeded)
+        );
+        assert!(stats.lock().unwrap().requests.is_empty());
+        let mut context = tiny_context(tiny_limits());
+        assert_eq!(
+            context
+                .collect_model_member(Cursor::new(b"abc"), 3)
+                .unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            context.usage(),
+            PackageUsage {
+                inflation_bytes: 3,
+                retained_input_bytes: 0
+            }
+        );
+        assert_eq!(
+            context
+                .collect_model_member(Cursor::new(b"abcd"), 3)
+                .unwrap_err(),
+            crate::StlError::ResourceStopped(ResourceStop::InputLimitExceeded)
+        );
+        assert!(context.collector_test.probes.iter().all(|(a, b)| a == b));
+        assert!(context.collector_test.targets.iter().all(|n| *n <= 3));
+    }
+
+    #[test]
+    fn plain_collection_spends_no_package_allowance_and_inflated_exact_composition_spends_once() {
+        let mut context = tiny_context(tiny_limits());
+        let observer = context.observer();
+        let before = context.usage();
+        assert_eq!(
+            collect_verified_model_source(Cursor::new(b"abc"), 3, &observer).unwrap(),
+            b"abc"
+        );
+        assert_eq!(context.usage(), before);
+        assert_eq!(
+            collect_verified_model_source(
+                context.inflated_reader(Cursor::new(b"abc")),
+                3,
+                &observer
+            )
+            .unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            context.usage(),
+            PackageUsage {
+                inflation_bytes: 3,
+                retained_input_bytes: 0
+            }
+        );
+        assert_eq!(
+            context
+                .collect_binary(Cursor::new(b"png"), BinaryRole::EmbeddedImage)
+                .unwrap(),
+            b"png"
+        );
+        assert_eq!(
+            context.usage(),
+            PackageUsage {
+                inflation_bytes: 6,
+                retained_input_bytes: 0
+            }
+        );
+        let mut context = tiny_context(PackageTestLimits {
+            fail_reserve: true,
+            ..tiny_limits()
+        });
+        assert_eq!(
+            context
+                .collect_binary(Cursor::new(b"png"), BinaryRole::EmbeddedImage)
+                .unwrap_err(),
+            crate::StlError::AllocationFailed
+        );
+        assert!(context.collector_test.capacities.is_empty());
+        assert_eq!(context.retained_input, 0);
+    }
+
+    #[test]
+    fn real_binary_and_exact_zip_collection_verify_crc_and_first_cause() {
+        for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+            for corrupt in [false, true] {
+                for exact in [false, true] {
+                    let observer = ZipResourceObserver::new();
+                    let mut zip = observer
+                        .open_bounded_zip(Cursor::new(zip_fixture(method, corrupt)))
+                        .unwrap();
+                    let mut context =
+                        PackageProcessingContext::with_test_limits(observer.clone(), tiny_limits());
+                    let raw = zip.by_name("part").unwrap();
+                    let result = if exact {
+                        collect_verified_model_source(context.inflated_reader(raw), 3, &observer)
+                    } else {
+                        context.collect_model_member(raw, 3)
+                    };
+                    if corrupt {
+                        assert!(matches!(result, Err(crate::StlError::Malformed3mf { .. })));
+                    } else {
+                        assert_eq!(result.unwrap(), b"abc");
+                    }
+                    observer.check().unwrap();
+                }
+            }
+        }
+        let mut context = tiny_context(PackageTestLimits {
+            inflation: 3,
+            ..tiny_limits()
+        });
+        assert_eq!(
+            context
+                .collect_model_member(Cursor::new(b"abcd"), 3)
+                .unwrap_err(),
+            crate::StlError::ResourceStopped(ResourceStop::ReadWorkExceeded)
+        );
+        let mut context = tiny_context(PackageTestLimits {
+            inflation: 3,
+            ..tiny_limits()
+        });
+        let observer = context.observer();
+        assert_eq!(
+            collect_verified_model_source(
+                context.inflated_reader(Cursor::new(b"abcd")),
+                3,
+                &observer
+            )
+            .unwrap_err(),
+            crate::StlError::ResourceStopped(ResourceStop::ReadWorkExceeded)
+        );
+    }
+
+    #[test]
     fn processing_context_roles_have_canonical_fixed_production_limits() {
         assert_eq!(TextRole::Relationships.byte_limit(), 64 * 1024);
         assert_eq!(TextRole::ModelSettings.byte_limit(), 8 * 1024 * 1024);
@@ -1189,6 +1532,62 @@ mod tests {
             }
             self.inner.read(output)
         }
+    }
+
+    #[test]
+    fn processing_context_usage_tracks_shared_reads_without_resetting() {
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::with_test_limits(
+            observer.clone(),
+            PackageTestLimits {
+                inflation: 7,
+                ..PackageTestLimits::default()
+            },
+        );
+        assert_eq!(
+            context.usage(),
+            PackageUsage {
+                inflation_bytes: 0,
+                retained_input_bytes: 0,
+            }
+        );
+        let mut first = Vec::new();
+        context
+            .inflated_reader(Cursor::new(b"abc"))
+            .read_to_end(&mut first)
+            .unwrap();
+        assert_eq!(first, b"abc");
+        assert_eq!(
+            context
+                .collect_text(Cursor::new(b"de"), TextRole::ModelSettings)
+                .unwrap(),
+            "de"
+        );
+        assert_eq!(
+            context.usage(),
+            PackageUsage {
+                inflation_bytes: 5,
+                retained_input_bytes: 2,
+            }
+        );
+        let mut last = Vec::new();
+        assert!(context
+            .inflated_reader(Cursor::new(b"fgh"))
+            .read_to_end(&mut last)
+            .is_err());
+        assert_eq!(last, b"fg");
+        assert_eq!(context.usage().inflation_bytes, 7);
+        assert!(context
+            .collect_text(Cursor::new(b"ignored"), TextRole::ModelSettings)
+            .is_err());
+        assert_eq!(
+            context.usage(),
+            PackageUsage {
+                inflation_bytes: 7,
+                retained_input_bytes: 2,
+            }
+        );
+        assert!(observer.check().is_err());
     }
 
     #[test]
