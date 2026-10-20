@@ -1,7 +1,7 @@
 //! Bounded ZIP access which preserves terminal processing failures across SDK recovery.
 //!
-//! This foundation is not wired into model producers yet. Constructor metadata
-//! limits do not bound member inflation, parser allocations, source identity or RSS.
+//! Model readers share this boundary. Constructor metadata limits alone do not
+//! bound member inflation, parser allocations, source identity or RSS.
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +54,12 @@ impl TerminalFailure {
         if let Some(stop) = ResourceStop::from_io_error(error) {
             return Some(Self::ResourceStopped(stop));
         }
+        if let Some(limit) = error
+            .get_ref()
+            .and_then(|value| value.downcast_ref::<zip::read::MetadataLimitExceeded>())
+        {
+            return Some(Self::ResourceStopped(metadata_limit_stop(limit.kind)));
+        }
         if ZipAllocationFailed::from_io_error(error).is_some()
             || error
                 .get_ref()
@@ -77,19 +83,22 @@ impl TerminalFailure {
     }
 }
 
+fn metadata_limit_stop(kind: MetadataLimitKind) -> ResourceStop {
+    match kind {
+        MetadataLimitKind::Entries
+        | MetadataLimitKind::EncodedBytes
+        | MetadataLimitKind::AllocationWork => ResourceStop::InputLimitExceeded,
+        MetadataLimitKind::Candidates
+        | MetadataLimitKind::ReadBytes
+        | MetadataLimitKind::IoCalls => ResourceStop::ReadWorkExceeded,
+    }
+}
+
 /// Classify only concrete SDK or project markers, never text or a generic IO kind.
 /// This function does not create an observer or enforce whole-operation completion.
 pub fn classify_zip_error(error: ZipError) -> ZipOpenError {
     if let Some(limit) = error.metadata_limit() {
-        let stop = match limit.kind {
-            MetadataLimitKind::Entries
-            | MetadataLimitKind::EncodedBytes
-            | MetadataLimitKind::AllocationWork => ResourceStop::InputLimitExceeded,
-            MetadataLimitKind::Candidates
-            | MetadataLimitKind::ReadBytes
-            | MetadataLimitKind::IoCalls => ResourceStop::ReadWorkExceeded,
-        };
-        return ZipOpenError::ResourceStopped(stop);
+        return ZipOpenError::ResourceStopped(metadata_limit_stop(limit.kind));
     }
     if error.metadata_allocation_failure().is_some() {
         return ZipOpenError::AllocationFailed;
@@ -131,7 +140,10 @@ impl ZipResourceObserver {
             *terminal = Some(failure);
         }
     }
-    fn observe_io(&self, error: &io::Error) {
+    /// Retain only a concrete processing marker from a surrounding IO guard.
+    /// Ordinary error kinds and matching messages never become terminal causes.
+    #[doc(hidden)]
+    pub fn observe_io(&self, error: &io::Error) {
         if let Some(failure) = TerminalFailure::from_io(error) {
             self.record(failure);
         }
@@ -143,7 +155,26 @@ impl ZipResourceObserver {
             None => Ok(()),
         }
     }
-    fn check_io(&self) -> io::Result<()> {
+    /// Latch a deterministic guard failure and return the first terminal cause.
+    /// This can only stop processing; it cannot reset or relax any allowance.
+    #[doc(hidden)]
+    pub fn stop_io(&self, stop: ResourceStop) -> io::Error {
+        self.record(TerminalFailure::ResourceStopped(stop));
+        self.failure()
+            .expect("terminal cause was recorded")
+            .io_error()
+    }
+    /// Latch a known operational allocation failure, preserving an earlier stop.
+    #[doc(hidden)]
+    pub fn allocation_failed_io(&self) -> io::Error {
+        self.record(TerminalFailure::AllocationFailed);
+        self.failure()
+            .expect("terminal cause was recorded")
+            .io_error()
+    }
+    /// Reject even buffered IO after a terminal cause, without touching input.
+    #[doc(hidden)]
+    pub fn check_io(&self) -> io::Result<()> {
         match self.failure() {
             Some(failure) => Err(failure.io_error()),
             None => Ok(()),
@@ -351,6 +382,194 @@ mod tests {
             (actual, expected) => panic!("expected {expected:?}, got {actual:?}"),
         }
     }
+    fn guard_failure(observer: &ZipResourceObserver, failure: TerminalFailure) -> io::Error {
+        match failure {
+            TerminalFailure::ResourceStopped(stop) => observer.stop_io(stop),
+            TerminalFailure::AllocationFailed => observer.allocation_failed_io(),
+        }
+    }
+
+    #[test]
+    fn zip_facade_external_guards_preserve_the_first_cause_through_io_and_finish() {
+        for first in FAILURES {
+            for second in FAILURES {
+                let observer = ZipResourceObserver::new();
+                assert_eq!(
+                    TerminalFailure::from_io(&guard_failure(&observer, first)),
+                    Some(first)
+                );
+                assert_eq!(
+                    TerminalFailure::from_io(&guard_failure(&observer, second)),
+                    Some(first)
+                );
+                assert_eq!(
+                    TerminalFailure::from_io(&observer.check_io().unwrap_err()),
+                    Some(first)
+                );
+                assert_failure(
+                    observer
+                        .finish(Ok::<_, ZipOpenError>("cached result"))
+                        .unwrap_err(),
+                    first,
+                );
+            }
+        }
+        let observer = ZipResourceObserver::new();
+        for failure in FAILURES {
+            observer.observe_io(&io::Error::other(failure.io_error().to_string()));
+        }
+        observer.observe_io(&io::Error::from(io::ErrorKind::OutOfMemory));
+        assert!(observer.check_io().is_ok());
+        assert_eq!(
+            observer
+                .finish(Ok::<_, ZipOpenError>("ordinary fallback"))
+                .unwrap(),
+            "ordinary fallback"
+        );
+    }
+
+    struct BridgeReader {
+        input: Cursor<Vec<u8>>,
+        calls: Rc<Cell<usize>>,
+        fault: Option<MetadataLimitKind>,
+        fault_call: Rc<Cell<Option<usize>>>,
+        fault_at: u64,
+        on: FaultOn,
+    }
+    impl BridgeReader {
+        fn before(&mut self, trigger: bool) -> io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if let Some(kind) = self.fault.take_if(|_| trigger) {
+                self.fault_call.set(Some(self.calls.get()));
+                return Err(io::Error::other(zip::read::MetadataLimitExceeded {
+                    kind,
+                    limit: 1,
+                    attempted: 2,
+                }));
+            }
+            Ok(())
+        }
+    }
+    impl Read for BridgeReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.before(
+                matches!(self.on, FaultOn::Read) && self.input.position() == self.fault_at,
+            )?;
+            self.input.read(output)
+        }
+    }
+    impl Seek for BridgeReader {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            self.before(
+                matches!(self.on, FaultOn::Seek)
+                    && matches!(from, SeekFrom::Start(position) if position == self.fault_at),
+            )?;
+            self.input.seek(from)
+        }
+    }
+
+    #[test]
+    fn zip_facade_concrete_external_metadata_stops_survive_constructor_recovery() {
+        let bytes = zip64(fixture(CompressionMethod::Stored));
+        let locator = (end(&bytes) - 20) as u64;
+        for kind in [
+            MetadataLimitKind::Entries,
+            MetadataLimitKind::EncodedBytes,
+            MetadataLimitKind::AllocationWork,
+            MetadataLimitKind::Candidates,
+            MetadataLimitKind::ReadBytes,
+            MetadataLimitKind::IoCalls,
+        ] {
+            for on in [FaultOn::Read, FaultOn::Seek] {
+                let control_calls = Rc::new(Cell::new(0));
+                let control_fault = Rc::new(Cell::new(None));
+                let control = BridgeReader {
+                    input: Cursor::new(bytes.clone()),
+                    calls: control_calls.clone(),
+                    fault: Some(kind),
+                    fault_call: control_fault.clone(),
+                    fault_at: locator,
+                    on,
+                };
+                let recovered = ZipArchive::with_metadata_limits(
+                    Config::default(),
+                    control,
+                    MetadataLimits::default(),
+                )
+                .expect("untracked SDK control must recover through the older footer");
+                assert_eq!(recovered.len(), 1);
+                assert!(
+                    control_fault.get().is_some(),
+                    "control must reach the actual locator fault"
+                );
+                assert!(
+                    control_calls.get() > control_fault.get().unwrap(),
+                    "control must continue input after recovery"
+                );
+                let observer = ZipResourceObserver::new();
+                let calls = Rc::new(Cell::new(0));
+                let fault_call = Rc::new(Cell::new(None));
+                let input = BridgeReader {
+                    input: Cursor::new(bytes.clone()),
+                    calls: calls.clone(),
+                    fault: Some(kind),
+                    fault_call: fault_call.clone(),
+                    fault_at: locator,
+                    on,
+                };
+                let error = match observer.open_bounded_zip(input) {
+                    Ok(_) => panic!("concrete input stop must reject construction"),
+                    Err(error) => error,
+                };
+                assert_failure(
+                    error,
+                    TerminalFailure::ResourceStopped(metadata_limit_stop(kind)),
+                );
+                assert_eq!(
+                    Some(calls.get()),
+                    fault_call.get(),
+                    "fault must fire with no later input IO"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zip_facade_external_guard_stops_open_members_without_touching_input() {
+        for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+            for failure in FAILURES {
+                let observer = ZipResourceObserver::new();
+                let calls = Rc::new(Cell::new(0));
+                let input = BridgeReader {
+                    input: Cursor::new(fixture(method)),
+                    calls: calls.clone(),
+                    fault: None,
+                    fault_call: Rc::new(Cell::new(None)),
+                    fault_at: 0,
+                    on: FaultOn::Read,
+                };
+                let mut archive = observer.open_bounded_zip(input).unwrap();
+                let mut member = archive.by_name("model.stl").unwrap();
+                let before = calls.get();
+                let _ = guard_failure(&observer, failure);
+                for output in [&mut [0u8; 1][..], &mut [][..]] {
+                    assert_eq!(
+                        TerminalFailure::from_io(&member.read(output).unwrap_err()),
+                        Some(failure)
+                    );
+                }
+                drop(member);
+                let error = match archive.by_index(0) {
+                    Ok(_) => panic!("a stopped operation must not open another member"),
+                    Err(error) => error,
+                };
+                assert_failure(error, failure);
+                drop(archive);
+                assert_eq!(calls.get(), before);
+            }
+        }
+    }
+
     fn fixture(method: CompressionMethod) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         writer

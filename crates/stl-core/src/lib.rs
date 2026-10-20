@@ -9,9 +9,13 @@ pub mod integrity;
 pub mod limits;
 pub mod measure;
 pub mod model;
+#[doc(hidden)]
+pub mod package_bounds;
 pub mod parse;
 pub mod threemf;
 mod vec3;
+#[doc(hidden)]
+pub mod xml_bounds;
 pub mod zip_bounds;
 
 pub use error::{ResourceStop, StlError};
