@@ -1,5 +1,56 @@
 # Thumbnail parser resource prerequisite
 
+## Standard material acquisition checkpoint (2026-10-20)
+
+Standard base/color material rows keep the existing 1,024 accepted distinct
+(group ID, source index) limit in each parsed model part. Every matching physical
+row advances its group's index, including invalid, duplicate and clipped rows.
+Invalid earlier keys remain available to a later valid group; accepted duplicates
+keep the first row. Global display retention separately selects only the first
+remaining 1,024 rows in part-load order. A full global list does not prevent child
+parts from retaining their own local rows, and existing dangling-ID suppression
+still applies.
+
+Classification preserves the original first attribute-iterator error and first
+matching local name. It borrows normalized Cow values where possible and validates
+RGB/RGBA into a seven-byte stack color. SDK normalization can own bounded scratch;
+that remains separate from controlled retained-field allocation. Local duplicate
+and row admission precede final owned name/color/ID construction. Row vectors and
+lookup buckets reserve fallibly; IDs use checked exact extent before formatting,
+names keep trim/256-scalar behavior, and alpha remains discarded as before.
+Selected global rows copy ID/name/color through fallible field builders instead
+of ordinary Clone. The same observer preserves known allocation/resource stops,
+including a failure reached while checking an unassigned child's geometry.
+
+Three actual RED tests first preserved geometry and retained appearance, then
+observed 1,025 name/color constructions for 1,024 accepted rows or three for one
+duplicate key. The old global selection was already correct and is not claimed
+as an excess-copy RED. Five public Stored/Deflate controls passed on the old path
+and the new path. Final frozen core verification passes 284 tests plus two
+doctests, with one existing ignored fixture; eight local material tests include
+all nine before/post-reserve sites and the deferred-child terminal-error case.
+Full serial workspace verification also passes 375 runtime, 209 native and 70
+server tests with unchanged frozen source hashes; see
+`output/material-retention-workspace-results.json`. Workspace all-target Clippy
+passes with no new changed-area diagnostic: four existing diagnostics become two,
+compared by code, message and exact primary source text without suppression
+(`output/material-retention-clippy-results.json` and
+`output/material-retention-clippy-diagnostics-audit.json`).
+
+These results were executed before the comment-only history rewrite. Current
+material source/test bytes still match the tested freeze; the only source-hash
+changes are eight approved comments in three consumer files. The evidence bridge
+is separate in `output/material-retention-after-history-handoff.json` and
+`output/material-retention-post-history-review.md`, rather than a claimed new test
+run. Downstream composition and current-source hosted/container/packaged
+acceptance remain pending for this material unit.
+
+This bounds existing row/lookup acquisition and selected field copies. It does
+not impose 1,024 materials across the entire package, recover every SDK/std/Rc
+allocation, bound all names/paths/cache/output clones, or select the proposed live
+16 MiB ownership policy. Slicer-settings maps, aggregate live ownership, producer
+admission and immutable publication remain open. No cleanup authority follows.
+
 ## Derived index and plate-retention checkpoint (2026-10-20)
 
 One fallible build index now supplies physical occurrence numbers to streamed
@@ -40,7 +91,7 @@ packaged results remain separate gates under `output/derived-maps-*`.
 
 These are cardinality and controlled-growth bounds, not an exact aggregate
 allocation/RSS bound. Geometric spare capacity and map bucket layout remain
-separate contributors. Material/SlicerMetadata containers, other owned strings,
+separate contributors. Material acquisition is covered above. SlicerMetadata maps, other owned strings,
 public snapshots and clone lifetimes, the proposed live-metadata policy, producer
 admission and immutable publication remain open. No new producer allowance,
 source mutation or cleanup authority follows from this checkpoint.

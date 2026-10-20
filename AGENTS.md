@@ -8,6 +8,10 @@
 - Before reading source files or scanning the codebase, use Tokensave MCP tools (`tokensave_context`, `tokensave_search`, `tokensave_callers`, `tokensave_callees`, `tokensave_impact`, `tokensave_node`, `tokensave_files`, `tokensave_affected`). If those tools cannot answer the code-analysis question, query `.tokensave/tokensave.db` directly. If a Tokensave gap is found, propose an issue at <https://github.com/aovestdipaperino/tokensave> and remind the user to remove sensitive or proprietary code from the report.
 - Always use `mcp__semble__search` before Grep, Glob, or Read to explore the codebase. Use `--content docs` for documentation, `--content config` for configuration, and `--content all` for all content. Use exact-path reads or exhaustive literal searches only when needed; use `mcp__semble__find_related` for related implementations.
 
+## Pull request and comment language
+
+- Describe concrete features and behavior in PR titles, PR descriptions, and project-owned code comments. Do not use the terms `parity` or `Printventory` in those surfaces.
+
 ## Build storage and cleanup policy
 
 - Keep GoggleLab build storage bounded. After successful builds, inspect generated artifacts and duplicate build directories; do not automatically clear all caches after each build.

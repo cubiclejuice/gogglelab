@@ -1085,3 +1085,42 @@ live metadata lifetime/capacity policy, producer memory admission, immutable
 publication and final platform/release acceptance remain in the original scope.
 This checkpoint authorizes no installed-app replacement, private pin update,
 release or additional cleanup.
+
+### Standard material acquisition and selected display copies (2026-10-20)
+
+Free now classifies base/color rows with borrowed normalized values and a fixed
+stack color before final owned-field creation. The existing local 1,024 distinct
+(group,index) policy, invalid/clipped index advancement, first accepted duplicate,
+first attribute error/local-name semantics, Unicode clipping and opaque color
+behavior are preserved. Local row/lookup growth and ID/name/color construction
+are fallible. Global display clipping remains separate and in part-load order;
+only selected rows copy fields through the same terminal observer. Child local
+materials still exist when the global list is full; no new package-wide material
+quota or appearance remapping is introduced.
+
+Three real RED cases observed excess local normalized String constructions after
+output checks passed: 1,025 versus 1,024, or three duplicate-key values versus one.
+Old global selection was already correct. Five public Stored/Deflate compatibility
+controls passed before and after the migration. The frozen core suite passes
+284 tests plus two doctests and one existing ignored fixture, including eight
+local material controls covering nine actual acquisition sites, typed post-reserve
+first causes and deferred child membership. The frozen full serial workspace also
+passes 375 runtime, 209 native and 70 server tests with source hashes unchanged
+(`output/material-retention-workspace-results.json`). Workspace all-target Clippy
+passes; the existing changed-area diagnostics fall from four to two with no new
+diagnostic, compared by code, message and exact primary source text
+(`output/material-retention-clippy-results.json` and
+`output/material-retention-clippy-diagnostics-audit.json`).
+
+Those test and lint results precede the comment-only history rewrite. The current
+material implementation and public-test bytes remain identical to their tested
+freeze; only eight approved comments in three consumer files differ. The explicit
+bridge is recorded in `output/material-retention-after-history-handoff.json` and
+`output/material-retention-post-history-review.md`; it is not a new post-rewrite
+test run. Downstream composition, current-source hosted/container and packaged
+acceptance remain pending for this material checkpoint.
+
+SDK Cow scratch, other owned text/public clones, the live-metadata ownership
+policy, producer admission, publication and final platform/release acceptance
+remain open. Settings-map retention is next in the reviewed sequence. Cleanup
+still requires exact fresh approval; this code change performs none.

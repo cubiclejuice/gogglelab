@@ -23,6 +23,7 @@ use quick_xml::XmlVersion;
 use serde_json::Value;
 
 mod derived_maps;
+mod materials;
 mod project_json;
 use derived_maps::BuildIndex;
 
@@ -570,6 +571,25 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct MaterialOwnedTestProfile {
+    normalized_names: std::cell::Cell<usize>,
+    normalized_colors: std::cell::Cell<usize>,
+    requests: std::cell::RefCell<Vec<(materials::ReserveSite, usize)>>,
+    fail_site: std::cell::Cell<Option<materials::ReserveSite>>,
+    stop_site: std::cell::Cell<Option<(materials::ReserveSite, ParserTestFailure)>>,
+    local_commits: std::cell::Cell<usize>,
+    global_commits: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MATERIAL_OWNED_TEST_PROFILE: std::cell::RefCell<Option<Rc<MaterialOwnedTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// Original input cursor; its private fault seam exists only in parser tests.
 struct PackageInput<'a> {
     inner: Cursor<&'a [u8]>,
@@ -610,6 +630,8 @@ struct Package<'a, 'context> {
     part_retention_test: Option<Rc<PartRetentionTestProfile>>,
     #[cfg(test)]
     derived_maps_test: Option<Rc<DerivedMapsTestProfile>>,
+    #[cfg(test)]
+    material_owned_test: Option<Rc<MaterialOwnedTestProfile>>,
     collections: InputCollections,
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
@@ -653,6 +675,8 @@ impl<'a, 'context> Package<'a, 'context> {
             part_retention_test: PART_RETENTION_TEST_PROFILE.with(|slot| slot.borrow().clone()),
             #[cfg(test)]
             derived_maps_test: DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            material_owned_test: MATERIAL_OWNED_TEST_PROFILE.with(|slot| slot.borrow().clone()),
             collections,
             parts: HashMap::new(),
             materials: Vec::new(),
@@ -732,17 +756,24 @@ impl<'a, 'context> Package<'a, 'context> {
                 return input_stop(&observer);
             }
             let reader = BufReader::new(self.context.model_reader(member));
-            parse_model_part(reader, path, &observer, &mut self.collections)
+            parse_model_part(
+                reader,
+                path,
+                &observer,
+                &mut self.collections,
+                #[cfg(test)]
+                self.material_owned_test.as_deref(),
+            )
         };
         observer.check()?;
         let parsed = parsed?;
-        self.materials.extend(
-            parsed
-                .materials
-                .iter()
-                .take(MAX_STANDARD_MATERIALS.saturating_sub(self.materials.len()))
-                .cloned(),
-        );
+        materials::copy_selected(
+            &mut self.materials,
+            &parsed.materials,
+            &observer,
+            #[cfg(test)]
+            self.material_owned_test.as_deref(),
+        )?;
         // Cache keys are owned only on misses; bucket growth is fallible.
         let key = key.to_string();
         reserve_input_map(
@@ -1456,6 +1487,7 @@ fn has_any_attr(e: &BytesStart, names: &[&[u8]]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn normalize_standard_color(value: &str) -> Option<String> {
     let hex = value.trim().strip_prefix('#')?;
     if !matches!(hex.len(), 6 | 8) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1523,6 +1555,7 @@ fn parse_model_part<R: Read>(
     path: &str,
     observer: &ZipResourceObserver,
     collections: &mut InputCollections,
+    #[cfg(test)] material_probe: Option<&MaterialOwnedTestProfile>,
 ) -> Result<ModelPart, StlError> {
     let mut xml = XmlEventReader::new(reader, observer.clone())?;
     xml.set_trim_text(true);
@@ -1567,64 +1600,26 @@ fn parse_model_part<R: Read>(
                             })
                         };
                     }
-                    b"base" => {
-                        if let Some(group) = material_group
-                            .as_mut()
-                            .filter(|group| matches!(group.kind, MaterialGroupKind::Base))
-                        {
+                    b"base" | b"color" => {
+                        if let Some(group) = material_group.as_mut().filter(|group| {
+                            matches!(
+                                (e.local_name().as_ref(), group.kind),
+                                (b"base", MaterialGroupKind::Base)
+                                    | (b"color", MaterialGroupKind::Color)
+                            )
+                        }) {
                             let index = group.next_index;
                             group.next_index = group.next_index.saturating_add(1);
-                            let name = attr_str(e, b"name")
-                                .ok()
-                                .flatten()
-                                .and_then(|name| normalize_label(&name));
-                            let color = attr_str(e, b"displaycolor")
-                                .ok()
-                                .flatten()
-                                .and_then(|color| normalize_standard_color(&color));
-                            if let (Some(name), Some(color)) = (name, color) {
-                                let key = (group.id, index);
-                                if !part.material_lookup.contains_key(&key) {
-                                    if part.materials.len() < MAX_STANDARD_MATERIALS {
-                                        let material_index = part.materials.len();
-                                        part.materials.push(ParsedMaterial {
-                                            id: format!("3mf:{}:{}:{}", part.path, group.id, index),
-                                            name: Some(name),
-                                            color: Some(color),
-                                            source: MaterialSource::ThreeMfBaseMaterial,
-                                        });
-                                        part.material_lookup.insert(key, material_index);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    b"color" => {
-                        if let Some(group) = material_group
-                            .as_mut()
-                            .filter(|group| matches!(group.kind, MaterialGroupKind::Color))
-                        {
-                            let index = group.next_index;
-                            group.next_index = group.next_index.saturating_add(1);
-                            let color = attr_str(e, b"color")
-                                .ok()
-                                .flatten()
-                                .and_then(|color| normalize_standard_color(&color));
-                            if let Some(color) = color {
-                                let key = (group.id, index);
-                                if !part.material_lookup.contains_key(&key) {
-                                    if part.materials.len() < MAX_STANDARD_MATERIALS {
-                                        let material_index = part.materials.len();
-                                        part.materials.push(ParsedMaterial {
-                                            id: format!("3mf:{}:{}:{}", part.path, group.id, index),
-                                            name: None,
-                                            color: Some(color),
-                                            source: MaterialSource::ThreeMfColorGroup,
-                                        });
-                                        part.material_lookup.insert(key, material_index);
-                                    }
-                                }
-                            }
+                            materials::retain(
+                                &mut part,
+                                e,
+                                group.kind,
+                                group.id,
+                                index,
+                                observer,
+                                #[cfg(test)]
+                                material_probe,
+                            )?;
                         }
                     }
                     b"object" => {
@@ -5698,6 +5693,376 @@ mod tests {
                 assert_eq!(profile.diagnostic_path_copies.get(), 0);
                 assert_eq!(profile.fallback_entries.get(), 0);
             }
+        }
+    }
+    struct MaterialOwnedProfileGuard(Option<Rc<MaterialOwnedTestProfile>>);
+    impl MaterialOwnedProfileGuard {
+        fn install(profile: Rc<MaterialOwnedTestProfile>) -> Self {
+            Self(MATERIAL_OWNED_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for MaterialOwnedProfileGuard {
+        fn drop(&mut self) {
+            drop(MATERIAL_OWNED_TEST_PROFILE.with(|slot| slot.replace(self.0.take())));
+        }
+    }
+
+    #[test]
+    fn material_owned_duplicate_base_keys_do_not_construct_unretained_values() {
+        let resources = format!(
+            r##"<basematerials id="5"><base name="First" displaycolor="#112233"/></basematerials><basematerials id="5"><base name="DiscardedSecond" displaycolor="#abcdef"/></basematerials><basematerials id="5"><base name="DiscardedThird" displaycolor="#fedcba"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let parsed =
+                crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], deflate))
+                    .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.materials.len(), 1);
+            let material = &parsed.materials[0];
+            assert_eq!(material.id, "3mf:3D/3dmodel.model:5:0");
+            assert_eq!(material.name.as_deref(), Some("First"));
+            assert_eq!(material.color.as_deref(), Some("#112233"));
+            assert_eq!(material.source, MaterialSource::ThreeMfBaseMaterial);
+            assert_eq!(
+                parsed.parts[0].material_id.as_deref(),
+                Some(material.id.as_str())
+            );
+            assert_eq!((profile.normalized_names.get(), profile.normalized_colors.get()), (1, 1),
+                "only the accepted row needs owned normalized field backing; duplicate source rows still validate/advance");
+        }
+    }
+
+    #[test]
+    fn material_owned_base_tail_does_not_construct_values_after_local_1024_clip() {
+        let bases = (0..=MAX_STANDARD_MATERIALS)
+            .map(|index| format!(r##"<base name="M{index}" displaycolor="#112233"/>"##))
+            .collect::<String>();
+        let resources = format!(
+            r#"<basematerials id="5">{bases}</basematerials>{}"#,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="1023""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let parsed =
+                crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], deflate))
+                    .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+            let last = parsed.materials.last().unwrap();
+            assert_eq!(last.id, "3mf:3D/3dmodel.model:5:1023");
+            assert_eq!(last.name.as_deref(), Some("M1023"));
+            assert_eq!(last.color.as_deref(), Some("#112233"));
+            assert_eq!(
+                parsed.parts[0].material_id.as_deref(),
+                Some(last.id.as_str())
+            );
+            assert_eq!(
+                (
+                    profile.normalized_names.get(),
+                    profile.normalized_colors.get()
+                ),
+                (MAX_STANDARD_MATERIALS, MAX_STANDARD_MATERIALS),
+                "valid clipped source rows do not need owned normalized values"
+            );
+        }
+    }
+
+    #[test]
+    fn material_owned_color_tail_does_not_construct_values_after_local_1024_clip() {
+        let colors = r##"<color color="#11223380"/>"##.repeat(MAX_STANDARD_MATERIALS + 1);
+        let resources = format!(
+            r#"<colorgroup id="9">{colors}</colorgroup>{}"#,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="9" pindex="1023""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let parsed =
+                crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], deflate))
+                    .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+            let last = parsed.materials.last().unwrap();
+            assert_eq!(last.id, "3mf:3D/3dmodel.model:9:1023");
+            assert!(last.name.is_none());
+            assert_eq!(last.color.as_deref(), Some("#112233"));
+            assert_eq!(last.source, MaterialSource::ThreeMfColorGroup);
+            assert_eq!(
+                parsed.parts[0].material_id.as_deref(),
+                Some(last.id.as_str())
+            );
+            assert_eq!(
+                (
+                    profile.normalized_names.get(),
+                    profile.normalized_colors.get()
+                ),
+                (0, MAX_STANDARD_MATERIALS),
+                "color-only clipped rows do not need a normalized String result"
+            );
+        }
+    }
+    #[test]
+    fn material_owned_actual_reserve_sites_fail_terminally_before_commit() {
+        use materials::ReserveSite;
+        let resources = format!(
+            r##"<basematerials id="5"><base name="First" displaycolor="#112233"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &model)], false);
+        for site in [
+            ReserveSite::LocalRows,
+            ReserveSite::Lookup,
+            ReserveSite::Id,
+            ReserveSite::Name,
+            ReserveSite::Color,
+            ReserveSite::GlobalRows,
+            ReserveSite::GlobalId,
+            ReserveSite::GlobalName,
+            ReserveSite::GlobalColor,
+        ] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            profile.fail_site.set(Some(site));
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(StlError::AllocationFailed)
+            );
+            assert!(
+                profile.fail_site.get().is_none(),
+                "actual allocation site reached"
+            );
+            assert!(matches!(
+                observer.check(),
+                Err(ZipOpenError::AllocationFailed)
+            ));
+            assert_eq!(profile.global_commits.get(), 0);
+            if matches!(
+                site,
+                ReserveSite::LocalRows
+                    | ReserveSite::Lookup
+                    | ReserveSite::Id
+                    | ReserveSite::Name
+                    | ReserveSite::Color
+            ) {
+                assert_eq!(profile.local_commits.get(), 0);
+            }
+            let requests = profile.requests.borrow();
+            assert_eq!(requests.last().map(|(site, _)| *site), Some(site));
+        }
+    }
+
+    #[test]
+    fn material_owned_post_reserve_stops_preserve_exact_first_cause() {
+        use materials::ReserveSite;
+        let resources = format!(
+            r##"<basematerials id="5"><base name="First" displaycolor="#112233"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &model)], true);
+        for site in [
+            ReserveSite::LocalRows,
+            ReserveSite::Lookup,
+            ReserveSite::Id,
+            ReserveSite::Name,
+            ReserveSite::Color,
+            ReserveSite::GlobalRows,
+            ReserveSite::GlobalId,
+            ReserveSite::GlobalName,
+            ReserveSite::GlobalColor,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let profile = Rc::new(MaterialOwnedTestProfile::default());
+                profile.stop_site.set(Some((site, failure)));
+                let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(failure.error())
+                );
+                assert!(
+                    profile.stop_site.get().is_none(),
+                    "actual successful reserve reached"
+                );
+                assert_eq!(profile.global_commits.get(), 0);
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+                let _ = observer.stop_io(ResourceStop::EnvelopeChanged);
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+                let requests = profile.requests.borrow();
+                assert_eq!(requests.last().map(|(site, _)| *site), Some(site));
+            }
+        }
+    }
+
+    #[test]
+    fn material_owned_duplicate_and_clipped_rows_do_not_request_final_fields() {
+        use materials::ReserveSite;
+        let bases = (0..=MAX_STANDARD_MATERIALS)
+            .map(|index| format!(r##"<base name="M{index}" displaycolor="#112233"/>"##))
+            .collect::<String>();
+        let resources = format!(
+            r##"<basematerials id="5">{bases}</basematerials><basematerials id="5"><base name="Duplicate" displaycolor="#abcdef"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let profile = Rc::new(MaterialOwnedTestProfile::default());
+        let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+        let parsed =
+            crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], true))
+                .unwrap();
+        assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+        assert_eq!(profile.local_commits.get(), MAX_STANDARD_MATERIALS);
+        assert_eq!(profile.global_commits.get(), MAX_STANDARD_MATERIALS);
+        let requests = profile.requests.borrow();
+        for site in [
+            ReserveSite::Id,
+            ReserveSite::Name,
+            ReserveSite::Color,
+            ReserveSite::GlobalId,
+            ReserveSite::GlobalName,
+            ReserveSite::GlobalColor,
+        ] {
+            assert_eq!(
+                requests.iter().filter(|(s, _)| *s == site).count(),
+                MAX_STANDARD_MATERIALS
+            );
+        }
+        for &(site, target) in requests.iter() {
+            match site {
+                ReserveSite::LocalRows | ReserveSite::GlobalRows => {
+                    assert!((1..=MAX_STANDARD_MATERIALS).contains(&target))
+                }
+                ReserveSite::Lookup => assert_eq!(target, 1),
+                ReserveSite::Color | ReserveSite::GlobalColor => assert_eq!(target, 7),
+                ReserveSite::Name | ReserveSite::GlobalName => assert!(target <= 1024),
+                ReserveSite::Id | ReserveSite::GlobalId => {
+                    assert!(target <= 4 + ROOT_MODEL_FALLBACK.len() + 2 + 10 + 10)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn material_owned_full_global_display_still_constructs_child_local_rows_only() {
+        use materials::ReserveSite;
+        let bases = (0..MAX_STANDARD_MATERIALS)
+            .map(|index| format!(r##"<base name="R{index}" displaycolor="#112233"/>"##))
+            .collect::<String>();
+        let root = model_xml(
+            "millimeter",
+            &format!(
+                r#"<basematerials id="5">{bases}</basematerials><object id="10"><components><component objectid="2" path="3D/child.model"/></components></object>"#
+            ),
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &format!(
+                r##"<basematerials id="6"><base name="Child" displaycolor="#abcdef"/></basematerials>{}"##,
+                cube_mesh_with_object_attrs_xml(2, r#"pid="6" pindex="0""#)
+            ),
+            "",
+        );
+        let profile = Rc::new(MaterialOwnedTestProfile::default());
+        let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        ))
+        .unwrap();
+        assert_eq!(parsed.model.triangle_count, 12);
+        assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+        assert_eq!(profile.local_commits.get(), MAX_STANDARD_MATERIALS + 1);
+        assert_eq!(profile.global_commits.get(), MAX_STANDARD_MATERIALS);
+        assert!(parsed.parts.iter().all(|part| part.material_id.is_none()));
+        let requests = profile.requests.borrow();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(site, _)| *site == ReserveSite::Id)
+                .count(),
+            MAX_STANDARD_MATERIALS + 1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(site, _)| *site == ReserveSite::GlobalId)
+                .count(),
+            MAX_STANDARD_MATERIALS
+        );
+    }
+
+    #[test]
+    fn material_owned_deferred_child_membership_failure_never_enters_fallback() {
+        use materials::ReserveSite;
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="3D/child.model"/></components></object>"#,
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &format!(
+                r##"<basematerials id="6"><base name="Child" displaycolor="#abcdef"/></basematerials>{}"##,
+                cube_mesh_with_object_attrs_xml(2, r#"pid="6" pindex="0""#)
+            ),
+            "",
+        );
+        let settings = plate_settings(&plate_xml(1, "Empty", &[]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &root),
+                ("3D/child.model", &child),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            true,
+        );
+        for failure in PARSER_TEST_FAILURES {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            profile.stop_site.set(Some((ReserveSite::Name, failure)));
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let derived = Rc::new(DerivedMapsTestProfile::default());
+            let _derived_guard = DerivedMapsProfileGuard::install(derived.clone());
+            let observer = ZipResourceObserver::new();
+            let probe = Rc::new(ParserTestProbe {
+                member: "do-not-inject",
+                failure: ParserTestFailure::Allocation,
+                state: std::cell::RefCell::new(ParserTestState::default()),
+                guard_observer: Some(observer.clone()),
+            });
+            let _parser_guard = ParserProbeGuard::install(probe.clone());
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(failure.error())
+            );
+            assert!(profile.stop_site.get().is_none());
+            assert!(probe.state.borrow().root_cached);
+            assert_eq!(derived.plate_parser_entries.get(), 1);
+            assert_eq!(derived.fallback_entries.get(), 0);
+            assert_eq!(profile.local_commits.get(), 0);
+            assert_eq!(profile.global_commits.get(), 0);
+            assert_eq!(
+                StlError::from(observer.check().unwrap_err()),
+                failure.error()
+            );
         }
     }
 }
