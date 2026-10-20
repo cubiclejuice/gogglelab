@@ -3571,8 +3571,9 @@ mod tests {
         use std::ffi::OsStr;
 
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
         fs::create_dir(&source).unwrap();
         fs::create_dir(&destination).unwrap();
         let source_directory = Directory::open(&source).unwrap();
@@ -3614,12 +3615,13 @@ mod tests {
         use std::ffi::OsStr;
 
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
         fs::create_dir(&source).unwrap();
         fs::create_dir(&destination).unwrap();
         fs::write(source.join("stage"), b"preserve stage").unwrap();
-        fs::write(temp.path().join("outside"), b"preserve outside").unwrap();
+        fs::write(root.join("outside"), b"preserve outside").unwrap();
         let source_directory = Directory::open(&source).unwrap();
         let destination_directory = Directory::open(&destination).unwrap();
         for (from, to) in [("../outside", "published"), ("stage", "../outside")] {
@@ -3632,10 +3634,7 @@ mod tests {
                 .is_err());
         }
         assert_eq!(fs::read(source.join("stage")).unwrap(), b"preserve stage");
-        assert_eq!(
-            fs::read(temp.path().join("outside")).unwrap(),
-            b"preserve outside"
-        );
+        assert_eq!(fs::read(root.join("outside")).unwrap(), b"preserve outside");
         assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
     }
 
@@ -3645,15 +3644,16 @@ mod tests {
         use std::ffi::OsStr;
 
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
         fs::create_dir(&source).unwrap();
         fs::create_dir(&destination).unwrap();
         fs::write(source.join("stage"), b"admitted bytes").unwrap();
         let source_directory = Directory::open(&source).unwrap();
         let destination_directory = Directory::open(&destination).unwrap();
-        let admitted_source = temp.path().join("admitted-source");
-        let admitted_destination = temp.path().join("admitted-destination");
+        let admitted_source = root.join("admitted-source");
+        let admitted_destination = root.join("admitted-destination");
         fs::rename(&source, &admitted_source).unwrap();
         fs::rename(&destination, &admitted_destination).unwrap();
         fs::create_dir(&source).unwrap();
