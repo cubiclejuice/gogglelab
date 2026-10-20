@@ -837,3 +837,24 @@ provenance, licenses and assets remain protected. Inactivity of cleanup candidat
 has not been established; no new cleanup is authorized or performed, so additional
 space recovered is **0 bytes**. Any deletion needs a fresh exact dry-run, idle check
 and approval.
+
+### Model-reader resource-error checkpoint
+
+The shared bounded ZIP facade is now used by the six indexing/thumbnail readers
+and separate native manual extractor. All remain in Free. Concrete resource and
+known allocation failures survive optional settings, project metadata, embedded
+image and geometry handling; they stop fallback and return through existing
+runtime/native error shapes. Verified archive reads finish before staging, and
+terminal render/proof errors prevent catalog writes or new cleanup authority.
+Ordinary malformed optional metadata and image-size fallback remain compatible.
+Backup restoration uses a separate archive format outside this model profile.
+
+Local validation passes 128 parser tests (one existing ignored fixture), 347 runtime
+tests, 207 native tests and 70 server tests, with workspace Clippy and formatting.
+The identical native binary proves the sandbox suppresses filesystem callbacks:
+all eight watcher tests and the complete native suite pass with normal macOS
+access, without changing source or deadlines. The disposable downstream app also
+compiles against the exact reviewed public source and vendored dependency.
+Hosted verification follows this checkpoint; compilation does not close Windows
+runtime acceptance. Inflation, XML/JSON allocation and whole-producer admission
+still precede immutable publication. See the [parser bounds contract](THUMBNAIL-PARSER-BOUNDS.md).

@@ -12,7 +12,7 @@ impl Failure {
             Self::Limit => {
                 io::Error::new(io::ErrorKind::InvalidData, "PNG output exceeds its limit")
             }
-            Self::Allocation => io::Error::other("PNG output allocation failed"),
+            Self::Allocation => stl_core::zip_bounds::ZipAllocationFailed.into_io_error(),
         }
     }
 }
@@ -35,6 +35,19 @@ impl BoundedPngOutput {
 
     pub(crate) fn limit_exceeded(&self) -> bool {
         matches!(self.failure, Some(Failure::Limit))
+    }
+
+    pub(crate) fn allocation_failed(&self) -> bool {
+        matches!(self.failure, Some(Failure::Allocation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocation_failure_for_test() -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit: 4 * 1024 * 1024,
+            failure: Some(Failure::Allocation),
+        }
     }
 
     pub(crate) fn into_bytes(self) -> io::Result<Vec<u8>> {

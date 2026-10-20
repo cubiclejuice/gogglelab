@@ -8,7 +8,7 @@ use library_protocol::{
 };
 
 use crate::secure_fs::{Directory, SealedGeometryFile};
-use crate::LibraryRuntime;
+use crate::{LibraryRuntime, ProcessingError};
 
 pub(crate) const MAX_GEOMETRY_PACKET_BYTES: u64 = crate::secure_fs::MAX_GEOMETRY_PACKET_BYTES;
 
@@ -58,9 +58,26 @@ fn prepare_model_geometry_with_hook(
     plate_id: Option<u32>,
     before_derivative: impl FnOnce(),
 ) -> Result<PreparedGeometry, RuntimeError> {
+    prepare_model_geometry_with_parser(
+        runtime,
+        model,
+        plate_id,
+        before_derivative,
+        stl_core::parse_model_with_plates,
+    )
+}
+
+fn prepare_model_geometry_with_parser(
+    runtime: &LibraryRuntime,
+    model: &library_core::Model,
+    plate_id: Option<u32>,
+    before_derivative: impl FnOnce(),
+    parse: impl FnOnce(&[u8]) -> Result<stl_core::ParsedModel, stl_core::StlError>,
+) -> Result<PreparedGeometry, RuntimeError> {
     let source = runtime.verified_model_source_bytes(model)?;
-    let parsed = stl_core::parse_model_with_plates(&source)
-        .map_err(|_| invalid("Model geometry could not be parsed"))?;
+    let parsed = parse(&source).map_err(|error| {
+        ProcessingError::from(error).into_runtime(invalid("Model geometry could not be parsed"))
+    })?;
     // Select only metadata before admission. Never clone the source mesh or
     // materialize a selected plate's position/normal vectors.
     let selected = plate_id
@@ -305,6 +322,75 @@ mod tests {
         }
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes
+    }
+    #[test]
+    fn typed_geometry_parser_stops_precede_all_derivative_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("triangle.stl");
+        fs::write(&source, triangle_file()).unwrap();
+        let runtime = LibraryRuntime::open(crate::RuntimeConfig::desktop(
+            temp.path().join("library"),
+            temp.path().join("integrations.json"),
+        ))
+        .unwrap();
+        let model = runtime
+            .mutate_db(|db| {
+                db.import_file(&source, None, None)
+                    .map(|result| result.model)
+            })
+            .unwrap();
+        for (error, code, retryable) in [
+            (
+                stl_core::StlError::ResourceStopped(stl_core::ResourceStop::InputLimitExceeded),
+                RuntimeErrorCode::Unsupported,
+                false,
+            ),
+            (
+                stl_core::StlError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
+                RuntimeErrorCode::Unsupported,
+                false,
+            ),
+            (
+                stl_core::StlError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
+                RuntimeErrorCode::Stale,
+                true,
+            ),
+            (
+                stl_core::StlError::AllocationFailed,
+                RuntimeErrorCode::Internal,
+                false,
+            ),
+            (
+                stl_core::StlError::MalformedHeader,
+                RuntimeErrorCode::InvalidInput,
+                false,
+            ),
+        ] {
+            let expected_message = if matches!(error, stl_core::StlError::MalformedHeader) {
+                "Model geometry could not be parsed".to_string()
+            } else {
+                error.to_string()
+            };
+            let derivative = std::cell::Cell::new(false);
+            let result = prepare_model_geometry_with_parser(
+                &runtime,
+                &model,
+                None,
+                || derivative.set(true),
+                |_| Err(error),
+            );
+            let actual = match result {
+                Ok(_) => panic!("injected parser stop must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(actual.code, code);
+            assert_eq!(actual.retryable, retryable);
+            assert_eq!(actual.message, expected_message);
+            assert!(!derivative.get());
+            let usage = runtime.temp_resources.lock().unwrap();
+            assert_eq!(usage.owned_bytes, 0);
+            assert_eq!(usage.reserved_owned_bytes, 0);
+        }
     }
     #[test]
     fn prepared_geometry_never_names_packet_bytes_or_retains_derivative_holds() {

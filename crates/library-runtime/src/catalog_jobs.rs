@@ -197,6 +197,36 @@ fn render_model(
     settings: &library_core::CatalogSettings,
     force: bool,
 ) -> Result<(), RuntimeError> {
+    render_model_with_renderer(
+        runtime,
+        model,
+        settings,
+        force,
+        |bytes, hash, settings, force| {
+            thumbnails::ensure_thumbnail_from_bytes_typed(
+                &runtime.root,
+                bytes,
+                hash,
+                bytes.len() as u64,
+                settings,
+                force,
+            )
+        },
+    )
+}
+
+fn render_model_with_renderer(
+    runtime: &Arc<LibraryRuntime>,
+    model: &Model,
+    settings: &library_core::CatalogSettings,
+    force: bool,
+    render: impl FnOnce(
+        &[u8],
+        &str,
+        &library_core::CatalogSettings,
+        bool,
+    ) -> Result<thumbnails::ThumbnailArtifact, crate::ProcessingError>,
+) -> Result<(), RuntimeError> {
     if model.catalog_kind == "bookmark" {
         return Ok(());
     }
@@ -213,15 +243,8 @@ fn render_model(
         .ok_or_else(|| invalid("Model has no content hash"))?;
     let _reservation = runtime.reserve_temp(ReservationKind::Owned, model.bytes)?;
     let bytes = runtime.verified_model_source_bytes(model)?;
-    let artifact = thumbnails::ensure_thumbnail_from_bytes(
-        &runtime.root,
-        &bytes,
-        hash,
-        bytes.len() as u64,
-        settings,
-        force,
-    )
-    .map_err(|_| invalid("Thumbnail render failed"))?;
+    let artifact = render(&bytes, hash, settings, force)
+        .map_err(|error| error.into_runtime(invalid("Thumbnail render failed")))?;
     if !runtime.scan_control().cancelled() {
         runtime.mutate_db(|db| {
             db.set_thumbnail_for_source_and_settings(
@@ -425,5 +448,48 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with("thumbnail-source-")));
+    }
+    #[test]
+    fn typed_catalog_render_errors_preserve_category_without_thumbnail_commit() {
+        let failures = vec![
+            crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::InputLimitExceeded),
+            crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
+            crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
+            crate::ProcessingError::AllocationFailed,
+        ];
+        for failure in failures {
+            let (_temp, runtime, _context, model, path) = fixture();
+            let original = fs::read(&path).unwrap();
+            let expected = failure.to_string();
+            let (code, retryable) = match &failure {
+                crate::ProcessingError::ResourceStopped(
+                    stl_core::ResourceStop::EnvelopeChanged,
+                ) => (RuntimeErrorCode::Stale, true),
+                crate::ProcessingError::AllocationFailed => (RuntimeErrorCode::Internal, false),
+                _ => (RuntimeErrorCode::Unsupported, false),
+            };
+            let before = runtime
+                .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))
+                .unwrap();
+            let settings = runtime.read_db(|db| db.get_catalog_settings()).unwrap();
+            let called = std::cell::Cell::new(false);
+            let error =
+                render_model_with_renderer(&runtime, &model, &settings, true, |_, _, _, _| {
+                    called.set(true);
+                    Err(failure)
+                })
+                .unwrap_err();
+            assert!(called.get());
+            assert_eq!(error.message, expected);
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+            assert_eq!(
+                runtime
+                    .read_db(|db| db.thumbnail_cache_entry_for_model(&model.id))
+                    .unwrap(),
+                before
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
     }
 }

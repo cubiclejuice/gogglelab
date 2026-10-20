@@ -70,6 +70,9 @@ pub mod integrations;
 mod png_output;
 pub mod printer_network;
 pub mod printer_network_api;
+mod processing_error;
+#[doc(hidden)]
+pub use processing_error::ProcessingError;
 pub mod scanner;
 mod secure_fs;
 pub use secure_fs::{
@@ -2535,7 +2538,7 @@ impl LibraryRuntime {
             });
         }
         if let Some(member) = source.archive_member.as_deref() {
-            let temporary = archives::extract_member_to_temporary(
+            let temporary = archives::extract_member_to_temporary_typed(
                 &self.root,
                 &source.outer_path,
                 member,
@@ -2546,7 +2549,7 @@ impl LibraryRuntime {
                 &source.content_hash,
                 source.bytes,
             )
-            .map_err(|_| stale("Archive model source changed"))?;
+            .map_err(|error| error.into_runtime(stale("Archive model source changed")))?;
             read_verified_content(temporary.path(), source.bytes, &source.content_hash)
         } else {
             read_verified_content(&source.outer_path, source.bytes, &source.content_hash)
@@ -5259,7 +5262,7 @@ impl DownloadEngine for LibraryRuntime {
             return Err(stale("Model source hash changed"));
         }
         let path = if let Some(member) = source.archive_member.as_deref() {
-            archives::extract_member_to_cache(
+            archives::extract_member_to_cache_typed(
                 &self.root,
                 &source.outer_path,
                 member,
@@ -5276,12 +5279,14 @@ impl DownloadEngine for LibraryRuntime {
                 &source.content_hash,
                 source.bytes,
             )
-            .map_err(|_| RuntimeError {
-                code: RuntimeErrorCode::Corrupt,
-                message: "Archive member failed source verification".into(),
-                retryable: false,
-                current_version: None,
-                source_holds: Vec::new(),
+            .map_err(|error| {
+                error.into_runtime(RuntimeError {
+                    code: RuntimeErrorCode::Corrupt,
+                    message: "Archive member failed source verification".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                })
             })?
         } else {
             source.outer_path
@@ -12006,7 +12011,7 @@ fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &s
                 .as_deref()
                 .ok_or_else(|| invalid("Thumbnail model has no content hash"))?;
             let bytes = runtime.verified_model_source_bytes(&model)?;
-            let artifact = thumbnails::ensure_thumbnail_from_bytes(
+            let artifact = thumbnails::ensure_thumbnail_from_bytes_typed(
                 &runtime.root,
                 &bytes,
                 content_hash,
@@ -12014,7 +12019,7 @@ fn render_default_thumbnails_for_root(runtime: &Arc<LibraryRuntime>, root_id: &s
                 &settings,
                 false,
             )
-            .map_err(|_| invalid("Thumbnail render failed"))?;
+            .map_err(|error| error.into_runtime(invalid("Thumbnail render failed")))?;
             runtime.mutate_db(|db| {
                 db.set_thumbnail_for_source_and_settings(
                     &model.id,
@@ -12273,6 +12278,105 @@ mod tests {
         MetadataEngine, ModelQuery, PageRequest, RuntimeStatusEngine, UploadEngine, UploadIntent,
         CAPTURE_ENVELOPE_VERSION,
     };
+
+    #[test]
+    fn archive_resource_stop_is_not_stale_or_corrupt_and_issues_no_download() {
+        use library_core::{ScannedModel, SourceRef};
+
+        let temp = tempfile::tempdir().unwrap();
+        let sources = temp.path().join("sources");
+        fs::create_dir(&sources).unwrap();
+        let outer = sources.join("models.zip");
+        let archive_bytes = |padding_entries: usize, offset: f32| {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("part.stl", options).unwrap();
+            writer.write_all(&triangle_stl(offset)).unwrap();
+            for index in 0..padding_entries {
+                writer
+                    .start_file(format!("padding-{index}.txt"), options)
+                    .unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        };
+        let original = archive_bytes(0, 0.0);
+        fs::write(&outer, &original).unwrap();
+        let inventory =
+            archives::archive_inventory_with_cancel(&outer, 1024 * 1024, &|| false).unwrap();
+        let runtime = LibraryRuntime::open(config(temp.path().join("library"))).unwrap();
+        let model = runtime
+            .mutate_db(|db| {
+                let root = db.add_index_root(&sources, 60, 16 * 1024 * 1024)?;
+                let added = db.record_scan_entries(
+                    &root.id,
+                    &[ScannedModel {
+                        relative_path: "models.zip".into(),
+                        content_hash: format!("{:x}", Sha256::digest(triangle_stl(0.0))),
+                        bytes: triangle_stl(0.0).len() as u64,
+                        format: "stl-binary".into(),
+                        modified_at: 1,
+                        display_name: None,
+                        archive_member: Some("part.stl".into()),
+                        outer_fingerprint: Some(inventory.outer_fingerprint.clone()),
+                    }],
+                )?;
+                db.complete_scan_sources_with_new_models(
+                    &root.id,
+                    &[SourceRef {
+                        relative_path: "models.zip".into(),
+                        archive_member: Some("part.stl".into()),
+                    }],
+                    &added.added_model_ids,
+                    "1",
+                )?;
+                Ok(db.get_model(&added.added_model_ids[0])?.unwrap())
+            })
+            .unwrap();
+        let context = RequestContext {
+            principal_id: "archive-resource-reader".into(),
+            capabilities: BTreeSet::from([Capability::MediaRead]),
+            request_id: "archive-resource-stop".into(),
+        };
+        let staging_entries = || {
+            fs::read_dir(runtime.root.join("staging"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>()
+        };
+        let before = staging_entries();
+        let oversized_directory = archive_bytes(10_000, 0.0);
+        fs::write(&outer, &oversized_directory).unwrap();
+        for error in [
+            runtime.verified_model_source_bytes(&model).unwrap_err(),
+            runtime
+                .issue_model_download(&context, &model.id, None)
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code, RuntimeErrorCode::Unsupported);
+            assert!(!error.retryable);
+            assert_eq!(
+                error.message,
+                stl_core::ResourceStop::InputLimitExceeded.to_string()
+            );
+        }
+        assert!(runtime.leases.lock().unwrap().is_empty());
+        assert_eq!(runtime.temp_resources.lock().unwrap().owned_bytes, 0);
+        assert_eq!(staging_entries(), before);
+        assert_eq!(fs::read(&outer).unwrap(), oversized_directory);
+
+        // A genuine changed source within the metadata budget is still Stale.
+        let changed = archive_bytes(0, 9.0);
+        fs::write(&outer, &changed).unwrap();
+        let error = runtime
+            .issue_model_download(&context, &model.id, None)
+            .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::Stale);
+        assert!(error.retryable);
+        assert!(runtime.leases.lock().unwrap().is_empty());
+        assert_eq!(staging_entries(), before);
+        assert_eq!(fs::read(&outer).unwrap(), changed);
+    }
 
     #[test]
     fn protocol_print_history_cannot_set_local_creation_time() {

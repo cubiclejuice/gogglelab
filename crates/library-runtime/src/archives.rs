@@ -5,8 +5,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
+use crate::ProcessingError;
 use sha2::{Digest, Sha256};
-use zip::{CompressionMethod, ZipArchive};
+use stl_core::zip_bounds::{BoundedZipArchive, BoundedZipMember, ZipResourceObserver};
+use stl_core::ResourceStop;
+use zip::CompressionMethod;
 
 use crate::secure_fs::Directory;
 
@@ -43,19 +46,83 @@ pub fn archive_inventory_with_cancel(
     max_member_bytes: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<ArchiveInventory, String> {
-    let before = validated_archive_metadata(path)?;
-    let file = File::open(path).map_err(|error| error.to_string())?;
-    let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
-    let (plans, central_fingerprint) = preflight(&mut archive, max_member_bytes, cancelled)?;
-    let archive_hash = hash_file_with_cancel(path, MAX_ARCHIVE_BYTES, cancelled)?;
-    let after = validated_archive_metadata(path)?;
-    if file_fingerprint(&before) != file_fingerprint(&after) {
-        return Err("Archive changed while its directory was being read".into());
-    }
-    Ok(ArchiveInventory {
-        outer_fingerprint: outer_fingerprint(&after, &central_fingerprint, &archive_hash),
-        member_paths: plans.into_iter().map(|plan| plan.path).collect(),
-    })
+    archive_inventory_with_cancel_typed(path, max_member_bytes, cancelled)
+        .map_err(|error| error.to_string())
+}
+
+pub fn scan_archive_with_cancel(
+    path: &Path,
+    max_member_bytes: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ArchiveScan, String> {
+    scan_archive_with_cancel_typed(path, max_member_bytes, cancelled)
+        .map_err(|error| error.to_string())
+}
+
+pub fn extract_member_to_cache(
+    library_root: &Path,
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+) -> Result<PathBuf, String> {
+    extract_member_to_cache_typed(
+        library_root,
+        outer_path,
+        member_path,
+        expected_outer_fingerprint,
+        expected_content_hash,
+        expected_bytes,
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub fn extract_member_to_temporary(
+    library_root: &Path,
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+) -> Result<TemporaryArchiveMember, String> {
+    extract_member_to_temporary_typed(
+        library_root,
+        outer_path,
+        member_path,
+        expected_outer_fingerprint,
+        expected_content_hash,
+        expected_bytes,
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn archive_inventory_with_cancel_typed(
+    path: &Path,
+    max_member_bytes: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ArchiveInventory, ProcessingError> {
+    let observer = ZipResourceObserver::new();
+    let result = (|| {
+        let before = validated_archive_metadata(path)?;
+        let file = File::open(path).map_err(ProcessingError::from_io)?;
+        let mut archive = observer
+            .open_bounded_zip(file)
+            .map_err(ProcessingError::from)?;
+        let (plans, central_fingerprint) = preflight(&mut archive, max_member_bytes, cancelled)?;
+        let archive_hash = hash_file_with_cancel(path, MAX_ARCHIVE_BYTES, cancelled)?;
+        let after = validated_archive_metadata(path)?;
+        if file_fingerprint(&before) != file_fingerprint(&after) {
+            return Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged,
+            ));
+        }
+        Ok(ArchiveInventory {
+            outer_fingerprint: outer_fingerprint(&after, &central_fingerprint, &archive_hash),
+            member_paths: plans.into_iter().map(|plan| plan.path).collect(),
+        })
+    })();
+    observer.finish(result)
 }
 
 pub struct TemporaryArchiveMember {
@@ -86,62 +153,71 @@ pub fn scan_archive(path: &Path, max_member_bytes: u64) -> Result<ArchiveScan, S
     scan_archive_with_cancel(path, max_member_bytes, &|| false)
 }
 
-pub fn scan_archive_with_cancel(
+pub(crate) fn scan_archive_with_cancel_typed(
     path: &Path,
     max_member_bytes: u64,
     cancelled: &dyn Fn() -> bool,
-) -> Result<ArchiveScan, String> {
-    let before = validated_archive_metadata(path)?;
-    let file = File::open(path).map_err(|error| error.to_string())?;
-    let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
-    let (plans, central_fingerprint) = preflight(&mut archive, max_member_bytes, cancelled)?;
-    let archive_hash = hash_file_with_cancel(path, MAX_ARCHIVE_BYTES, cancelled)?;
-    let mut members = Vec::with_capacity(plans.len());
-    for plan in plans {
-        if cancelled() {
-            return Err("Archive scan was cancelled".into());
+) -> Result<ArchiveScan, ProcessingError> {
+    let observer = ZipResourceObserver::new();
+    let result = (|| {
+        let before = validated_archive_metadata(path)?;
+        let file = File::open(path).map_err(ProcessingError::from_io)?;
+        let mut archive = observer
+            .open_bounded_zip(file)
+            .map_err(ProcessingError::from)?;
+        let (plans, central_fingerprint) = preflight(&mut archive, max_member_bytes, cancelled)?;
+        let archive_hash = hash_file_with_cancel(path, MAX_ARCHIVE_BYTES, cancelled)?;
+        let mut members = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if cancelled() {
+                return Err("Archive scan was cancelled".into());
+            }
+            let mut entry = archive
+                .by_index(plan.index)
+                .map_err(ProcessingError::from)?;
+            let bytes = read_zip_entry(&mut entry, max_member_bytes)?;
+            let parsed = stl_core::parse_model(&bytes).map_err(ProcessingError::from)?;
+            let format = match parsed.format {
+                stl_core::StlFormat::Binary => "stl-binary",
+                stl_core::StlFormat::Ascii => "stl-ascii",
+                stl_core::StlFormat::ThreeMf => "3mf",
+            };
+            let display_name = Path::new(&plan.path)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            members.push(ScannedArchiveMember {
+                member_path: plan.path,
+                content_hash: hex_digest(&bytes),
+                bytes: bytes.len() as u64,
+                format: format.into(),
+                display_name,
+            });
         }
-        let mut entry = archive
-            .by_index(plan.index)
-            .map_err(|error| error.to_string())?;
-        let bytes = read_zip_entry(&mut entry, max_member_bytes)?;
-        let parsed = stl_core::parse_model(&bytes).map_err(|error| error.to_string())?;
-        let format = match parsed.format {
-            stl_core::StlFormat::Binary => "stl-binary",
-            stl_core::StlFormat::Ascii => "stl-ascii",
-            stl_core::StlFormat::ThreeMf => "3mf",
-        };
-        let display_name = Path::new(&plan.path)
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned);
-        members.push(ScannedArchiveMember {
-            member_path: plan.path,
-            content_hash: hex_digest(&bytes),
-            bytes: bytes.len() as u64,
-            format: format.into(),
-            display_name,
-        });
-    }
-    let after = validated_archive_metadata(path)?;
-    if file_fingerprint(&before) != file_fingerprint(&after) {
-        return Err("Archive changed while it was being indexed".into());
-    }
-    let outer_fingerprint = outer_fingerprint(&after, &central_fingerprint, &archive_hash);
-    Ok(ArchiveScan {
-        outer_fingerprint,
-        members,
-    })
+        let after = validated_archive_metadata(path)?;
+        if file_fingerprint(&before) != file_fingerprint(&after) {
+            return Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged,
+            ));
+        }
+        let outer_fingerprint = outer_fingerprint(&after, &central_fingerprint, &archive_hash);
+        Ok(ArchiveScan {
+            outer_fingerprint,
+            members,
+        })
+    })();
+    observer.finish(result)
 }
 
-pub fn extract_member_to_cache(
+#[doc(hidden)]
+pub fn extract_member_to_cache_typed(
     library_root: &Path,
     outer_path: &Path,
     member_path: &str,
     expected_outer_fingerprint: &str,
     expected_content_hash: &str,
     expected_bytes: u64,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, ProcessingError> {
     extract_member_to_cache_with_publish_hook(
         library_root,
         outer_path,
@@ -161,7 +237,7 @@ fn extract_member_to_cache_with_publish_hook<F>(
     expected_content_hash: &str,
     expected_bytes: u64,
     after_staging: F,
-) -> Result<PathBuf, String>
+) -> Result<PathBuf, ProcessingError>
 where
     F: FnOnce(),
 {
@@ -175,7 +251,7 @@ where
 
     let canonical_library = library_root
         .canonicalize()
-        .map_err(|error| error.to_string())?;
+        .map_err(ProcessingError::from_io)?;
     if canonical_library != library_root {
         return Err("Library root identity changed".into());
     }
@@ -185,7 +261,7 @@ where
     create_real_directory(&hash_dir)?;
     let filename = sanitized_filename(member_path);
     let destination = hash_dir.join(filename);
-    let directory = Directory::open(&hash_dir).map_err(|error| error.to_string())?;
+    let directory = Directory::open(&hash_dir).map_err(ProcessingError::from_io)?;
     let destination_name = destination
         .file_name()
         .ok_or_else(|| "Indexed cache filename is invalid".to_string())?;
@@ -195,7 +271,7 @@ where
             return Ok(destination);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(ProcessingError::from_io(error)),
     }
     let staging = hash_dir.join(format!(
         ".member-{}-{}.part",
@@ -207,7 +283,7 @@ where
         .ok_or_else(|| "Indexed cache staging filename is invalid".to_string())?;
     let mut file = directory
         .create_new_file(staging_name)
-        .map_err(|error| error.to_string())?;
+        .map_err(ProcessingError::from_io)?;
     let write_result = (|| {
         use std::io::Write;
         file.write_all(&bytes)?;
@@ -216,7 +292,7 @@ where
     drop(file);
     if let Err(error) = write_result {
         let _ = directory.hold_entry(staging_name);
-        return Err(error.to_string());
+        return Err(ProcessingError::from_io(error));
     }
     after_staging();
     if let Err(error) = directory.rename_child_exclusive(staging_name, destination_name) {
@@ -224,23 +300,24 @@ where
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             let file = directory
                 .open_file(destination_name)
-                .map_err(|open_error| open_error.to_string())?;
+                .map_err(ProcessingError::from_io)?;
             validate_cached_member_file(file, expected_content_hash, expected_bytes)?;
             return Ok(destination);
         }
-        return Err(error.to_string());
+        return Err(ProcessingError::from_io(error));
     }
     Ok(destination)
 }
 
-pub fn extract_member_to_temporary(
+#[doc(hidden)]
+pub fn extract_member_to_temporary_typed(
     library_root: &Path,
     outer_path: &Path,
     member_path: &str,
     expected_outer_fingerprint: &str,
     expected_content_hash: &str,
     expected_bytes: u64,
-) -> Result<TemporaryArchiveMember, String> {
+) -> Result<TemporaryArchiveMember, ProcessingError> {
     let bytes = read_verified_archive_member(
         outer_path,
         member_path,
@@ -250,13 +327,13 @@ pub fn extract_member_to_temporary(
     )?;
     let canonical_library = library_root
         .canonicalize()
-        .map_err(|error| error.to_string())?;
+        .map_err(ProcessingError::from_io)?;
     if canonical_library != library_root {
         return Err("Library root identity changed".into());
     }
     let staging = library_root.join("staging");
     create_real_directory(&staging)?;
-    let directory = Directory::open(&staging).map_err(|error| error.to_string())?;
+    let directory = Directory::open(&staging).map_err(ProcessingError::from_io)?;
     let extension = Path::new(member_path)
         .extension()
         .and_then(|value| value.to_str())
@@ -278,13 +355,13 @@ pub fn extract_member_to_temporary(
                 if let Err(error) = file.write_all(&bytes) {
                     drop(file);
                     let _ = directory.hold_entry(name);
-                    return Err(error.to_string());
+                    return Err(ProcessingError::from_io(error));
                 }
-                file.sync_all().map_err(|error| error.to_string())?;
+                file.sync_all().map_err(ProcessingError::from_io)?;
                 return Ok(TemporaryArchiveMember { path });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(ProcessingError::from_io(error)),
         }
     }
     Err("Could not allocate a temporary archive member path".into())
@@ -296,36 +373,66 @@ fn read_verified_archive_member(
     expected_outer_fingerprint: &str,
     expected_content_hash: &str,
     expected_bytes: u64,
-) -> Result<Vec<u8>, String> {
-    if expected_bytes > stl_core::limits::MAX_FILE_BYTES {
-        return Err("Archive member exceeds the safe model size limit".into());
-    }
-    let before = validated_archive_metadata(outer_path)?;
-    let file = File::open(outer_path).map_err(|error| error.to_string())?;
-    let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
-    let (_, central_fingerprint) =
-        preflight(&mut archive, stl_core::limits::MAX_FILE_BYTES, &|| false)?;
-    let archive_hash = hash_file(outer_path, MAX_ARCHIVE_BYTES)?;
-    let after = validated_archive_metadata(outer_path)?;
-    if file_fingerprint(&before) != file_fingerprint(&after)
-        || outer_fingerprint(&after, &central_fingerprint, &archive_hash)
-            != expected_outer_fingerprint
-    {
-        return Err("Archive changed since it was indexed".into());
-    }
-    let mut entry = archive
-        .by_name(member_path)
-        .map_err(|_| "Archive member is missing".to_string())?;
-    validate_entry(&entry, stl_core::limits::MAX_FILE_BYTES)?;
-    if entry.size() != expected_bytes {
-        return Err("Archive member changed since it was indexed".into());
-    }
-    let bytes = read_zip_entry(&mut entry, expected_bytes)?;
-    if hex_digest(&bytes) != expected_content_hash {
-        return Err("Archive member content hash changed".into());
-    }
-    stl_core::parse_model(&bytes).map_err(|error| error.to_string())?;
-    Ok(bytes)
+) -> Result<Vec<u8>, ProcessingError> {
+    read_verified_archive_member_with_reader(
+        outer_path,
+        member_path,
+        expected_outer_fingerprint,
+        expected_content_hash,
+        expected_bytes,
+        |path| File::open(path),
+    )
+}
+
+fn read_verified_archive_member_with_reader<R: Read + Seek>(
+    outer_path: &Path,
+    member_path: &str,
+    expected_outer_fingerprint: &str,
+    expected_content_hash: &str,
+    expected_bytes: u64,
+    open: impl FnOnce(&Path) -> std::io::Result<R>,
+) -> Result<Vec<u8>, ProcessingError> {
+    let observer = ZipResourceObserver::new();
+    let result = (|| {
+        if expected_bytes > stl_core::limits::MAX_FILE_BYTES {
+            return Err("Archive member exceeds the safe model size limit".into());
+        }
+        let before = validated_archive_metadata(outer_path)?;
+        let file = open(outer_path).map_err(ProcessingError::from_io)?;
+        let mut archive = observer
+            .open_bounded_zip(file)
+            .map_err(ProcessingError::from)?;
+        let (_, central_fingerprint) =
+            preflight(&mut archive, stl_core::limits::MAX_FILE_BYTES, &|| false)?;
+        let archive_hash = hash_file(outer_path, MAX_ARCHIVE_BYTES)?;
+        let after = validated_archive_metadata(outer_path)?;
+        if file_fingerprint(&before) != file_fingerprint(&after)
+            || outer_fingerprint(&after, &central_fingerprint, &archive_hash)
+                != expected_outer_fingerprint
+        {
+            return Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged,
+            ));
+        }
+        let mut entry = archive.by_name(member_path).map_err(|error| {
+            ProcessingError::from(error).with_ordinary_message("Archive member is missing")
+        })?;
+        validate_entry(&entry, stl_core::limits::MAX_FILE_BYTES)?;
+        if entry.size() != expected_bytes {
+            return Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged,
+            ));
+        }
+        let bytes = read_zip_entry(&mut entry, expected_bytes)?;
+        if hex_digest(&bytes) != expected_content_hash {
+            return Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged,
+            ));
+        }
+        stl_core::parse_model(&bytes).map_err(ProcessingError::from)?;
+        Ok(bytes)
+    })();
+    observer.finish(result)
 }
 
 #[derive(Debug)]
@@ -335,10 +442,10 @@ struct EntryPlan {
 }
 
 fn preflight<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
+    archive: &mut BoundedZipArchive<R>,
     max_member_bytes: u64,
     cancelled: &dyn Fn() -> bool,
-) -> Result<(Vec<EntryPlan>, String), String> {
+) -> Result<(Vec<EntryPlan>, String), ProcessingError> {
     if archive.len() > MAX_ARCHIVE_ENTRIES {
         return Err("Archive contains too many entries".into());
     }
@@ -350,9 +457,7 @@ fn preflight<R: Read + Seek>(
         if cancelled() {
             return Err("Archive scan was cancelled".into());
         }
-        let entry = archive
-            .by_index_raw(index)
-            .map_err(|error| error.to_string())?;
+        let entry = archive.by_index_raw(index).map_err(ProcessingError::from)?;
         let path = validate_entry(&entry, max_member_bytes)?;
         central_digest.update(path.as_bytes());
         central_digest.update(entry.crc32().to_le_bytes());
@@ -376,9 +481,9 @@ fn preflight<R: Read + Seek>(
         }
         if !entry.is_dir() && is_model_member(&path) {
             if entry.size() > max_member_bytes {
-                return Err(format!(
-                    "Archive model member exceeds {max_member_bytes} bytes"
-                ));
+                return Err(
+                    format!("Archive model member exceeds {max_member_bytes} bytes").into(),
+                );
             }
             plans.push(EntryPlan { index, path });
         }
@@ -393,10 +498,10 @@ fn preflight<R: Read + Seek>(
     ))
 }
 
-fn validate_entry<R: Read>(
-    entry: &zip::read::ZipFile<'_, R>,
+fn validate_entry<R: Read + Seek>(
+    entry: &BoundedZipMember<'_, R>,
     max_member_bytes: u64,
-) -> Result<String, String> {
+) -> Result<String, ProcessingError> {
     let raw = entry.name_raw();
     if raw.is_empty() || raw.contains(&0) || raw.len() > MAX_MEMBER_PATH_BYTES {
         return Err("Archive contains an invalid member path".into());
@@ -442,23 +547,23 @@ fn validate_entry<R: Read>(
         .ok_or_else(|| "Archive member path is not valid UTF-8".into())
 }
 
-fn read_zip_entry<R: Read>(
-    entry: &mut zip::read::ZipFile<'_, R>,
+fn read_zip_entry<R: Read + Seek>(
+    entry: &mut BoundedZipMember<'_, R>,
     limit: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ProcessingError> {
     let mut bytes = Vec::new();
     entry
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+        .map_err(ProcessingError::from_io)?;
     if bytes.len() as u64 > limit {
         return Err("Archive member expanded beyond its size limit".into());
     }
     Ok(bytes)
 }
 
-fn validated_archive_metadata(path: &Path) -> Result<fs::Metadata, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+fn validated_archive_metadata(path: &Path) -> Result<fs::Metadata, ProcessingError> {
+    let metadata = fs::symlink_metadata(path).map_err(ProcessingError::from_io)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("Archive source is not a regular file".into());
     }
@@ -486,7 +591,7 @@ fn outer_fingerprint(
     format!("zipmeta:{bytes}:{modified_nanos}:{central_fingerprint}:{archive_hash}")
 }
 
-fn hash_file(path: &Path, limit: u64) -> Result<String, String> {
+fn hash_file(path: &Path, limit: u64) -> Result<String, ProcessingError> {
     hash_file_with_cancel(path, limit, &|| false)
 }
 
@@ -494,8 +599,8 @@ fn hash_file_with_cancel(
     path: &Path,
     limit: u64,
     cancelled: &dyn Fn() -> bool,
-) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
+) -> Result<String, ProcessingError> {
+    let mut file = File::open(path).map_err(ProcessingError::from_io)?;
     let mut digest = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -510,7 +615,7 @@ fn hash_file_with_cancel(
         let read_limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
         let read = file
             .read(&mut buffer[..read_limit])
-            .map_err(|error| error.to_string())?;
+            .map_err(ProcessingError::from_io)?;
         if read == 0 {
             break;
         }
@@ -558,16 +663,16 @@ fn sanitized_filename(member_path: &str) -> String {
     }
 }
 
-fn create_real_directory(path: &Path) -> Result<(), String> {
+fn create_real_directory(path: &Path) -> Result<(), ProcessingError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             Err("Indexed cache path is not a real directory".into())
         }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| error.to_string())
+            fs::create_dir(path).map_err(ProcessingError::from_io)
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(ProcessingError::from_io(error)),
     }
 }
 
@@ -575,14 +680,14 @@ fn validate_cached_member_file(
     file: File,
     expected_hash: &str,
     expected_bytes: u64,
-) -> Result<(), String> {
-    if file.metadata().map_err(|error| error.to_string())?.len() != expected_bytes {
+) -> Result<(), ProcessingError> {
+    if file.metadata().map_err(ProcessingError::from_io)?.len() != expected_bytes {
         return Err("Indexed cache entry has an unexpected size".into());
     }
     let mut bytes = Vec::new();
     file.take(expected_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+        .map_err(ProcessingError::from_io)?;
     if bytes.len() as u64 != expected_bytes || hex_digest(&bytes) != expected_hash {
         return Err("Indexed cache entry hash is invalid".into());
     }
@@ -694,10 +799,139 @@ mod tests {
                 .unwrap();
         }
         writer.finish().unwrap();
-        assert!(scan_archive(&archive, 1024 * 1024)
-            .unwrap_err()
-            .contains("too many entries"));
+        assert!(matches!(
+            scan_archive_with_cancel_typed(&archive, 1024 * 1024, &|| false),
+            Err(ProcessingError::ResourceStopped(
+                ResourceStop::InputLimitExceeded
+            ))
+        ));
+        assert_eq!(
+            scan_archive(&archive, 1024 * 1024).unwrap_err(),
+            ResourceStop::InputLimitExceeded.to_string()
+        );
+        let library = root.join("library");
+        fs::create_dir(&library).unwrap();
+        for temporary in [false, true] {
+            let error = if temporary {
+                extract_member_to_temporary_typed(
+                    &library,
+                    &archive,
+                    "model.stl",
+                    "unused",
+                    "unused",
+                    0,
+                )
+                .err()
+                .unwrap()
+            } else {
+                extract_member_to_cache_typed(
+                    &library,
+                    &archive,
+                    "model.stl",
+                    "unused",
+                    "unused",
+                    0,
+                )
+                .unwrap_err()
+            };
+            assert!(matches!(
+                error,
+                ProcessingError::ResourceStopped(ResourceStop::InputLimitExceeded)
+            ));
+            assert_eq!(
+                fs::read_dir(&library).unwrap().count(),
+                0,
+                "no staging/cache creation before verified-read finish"
+            );
+        }
         let _ = fs::remove_dir_all(root);
+    }
+
+    struct StoppedArchiveReader {
+        file: File,
+        allocation: bool,
+        stop: ResourceStop,
+    }
+
+    impl Read for StoppedArchiveReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(if self.allocation {
+                stl_core::zip_bounds::ZipAllocationFailed.into_io_error()
+            } else {
+                self.stop.into_io_error()
+            })
+        }
+    }
+
+    impl Seek for StoppedArchiveReader {
+        fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.file.seek(from)
+        }
+    }
+
+    #[test]
+    fn typed_archive_verified_reads_preserve_terminal_input_failures_and_source_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("models.zip");
+        let model = empty_stl();
+        write_zip(&archive, &[("model.stl", &model)]);
+        let scan = scan_archive(&archive, 1024).unwrap();
+        let selected = &scan.members[0];
+        let original = fs::read(&archive).unwrap();
+        for (allocation, stop) in [
+            (false, ResourceStop::InputLimitExceeded),
+            (false, ResourceStop::ReadWorkExceeded),
+            (false, ResourceStop::EnvelopeChanged),
+            (true, ResourceStop::InputLimitExceeded),
+        ] {
+            let error = read_verified_archive_member_with_reader(
+                &archive,
+                "model.stl",
+                &scan.outer_fingerprint,
+                &selected.content_hash,
+                selected.bytes,
+                |path| {
+                    Ok(StoppedArchiveReader {
+                        file: File::open(path)?,
+                        allocation,
+                        stop,
+                    })
+                },
+            )
+            .unwrap_err();
+            match error {
+                ProcessingError::AllocationFailed => assert!(allocation),
+                ProcessingError::ResourceStopped(actual) => {
+                    assert!(!allocation);
+                    assert_eq!(actual, stop);
+                }
+                ordinary => panic!("lost terminal archive failure: {ordinary:?}"),
+            }
+        }
+        let error = read_verified_archive_member(
+            &archive,
+            "model.stl",
+            "stale fingerprint",
+            &selected.content_hash,
+            selected.bytes,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProcessingError::ResourceStopped(ResourceStop::EnvelopeChanged)
+        ));
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert_eq!(
+            read_verified_archive_member(
+                &archive,
+                "model.stl",
+                &scan.outer_fingerprint,
+                &selected.content_hash,
+                selected.bytes
+            )
+            .unwrap(),
+            model
+        );
     }
 
     #[test]

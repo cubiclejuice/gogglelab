@@ -51,6 +51,8 @@ pub(super) struct Store {
     #[cfg(test)]
     after_render: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    reproduction_failure: Mutex<Option<(usize, crate::ProcessingError)>>,
+    #[cfg(test)]
     force_deadline: Arc<AtomicBool>,
 }
 impl Store {
@@ -458,6 +460,31 @@ impl LibraryRuntime {
         )
     }
 }
+fn reproduce_for_review(
+    runtime: &LibraryRuntime,
+    recipe: &thumbnails::ThumbnailRecipe,
+    bytes: &[u8],
+    expected_bytes: u64,
+) -> Result<Option<thumbnails::RasterGeneratedPng>, crate::ProcessingError> {
+    #[cfg(test)]
+    {
+        let mut failure = runtime
+            .thumbnail_cleanup
+            .reproduction_failure
+            .lock()
+            .unwrap();
+        if let Some((remaining, _)) = failure.as_mut() {
+            if *remaining == 0 {
+                return Err(failure.take().unwrap().1);
+            }
+            *remaining -= 1;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = runtime;
+    thumbnails::reproduce_thumbnail(recipe, bytes, expected_bytes)
+}
+
 pub(super) fn review(
     runtime: &LibraryRuntime,
     ctx: &RequestContext,
@@ -570,28 +597,45 @@ pub(super) fn review(
                     let mut permit = runtime.thumbnail_cleanup.reserve(PNG_LIMIT, 1)?;
                     let _buffer =
                         runtime.reserve_temp(ReservationKind::Owned, snapshot.source.bytes)?;
-                    let proof = read_source(runtime, &snapshot).and_then(|verified| {
-                        let proof = thumbnails::reproduce_thumbnail(
-                            &recipe,
-                            &verified.bytes,
-                            snapshot.source.bytes,
-                        )
-                        .map_err(|_| stale("Preview could not be reproduced"))?;
-                        verified.verify()?;
-                        #[cfg(test)]
-                        {
-                            let hook = runtime
-                                .thumbnail_cleanup
-                                .after_render
-                                .lock()
-                                .unwrap()
-                                .take();
-                            if let Some(hook) = hook {
-                                hook();
+                    enum ProofError {
+                        Source,
+                        Processing(crate::ProcessingError),
+                    }
+                    let proof = read_source(runtime, &snapshot)
+                        .map_err(|_| ProofError::Source)
+                        .and_then(|verified| {
+                            let proof = reproduce_for_review(
+                                runtime,
+                                &recipe,
+                                &verified.bytes,
+                                snapshot.source.bytes,
+                            )
+                            .map_err(ProofError::Processing)?;
+                            verified.verify().map_err(|_| ProofError::Source)?;
+                            #[cfg(test)]
+                            {
+                                let hook = runtime
+                                    .thumbnail_cleanup
+                                    .after_render
+                                    .lock()
+                                    .unwrap()
+                                    .take();
+                                if let Some(hook) = hook {
+                                    hook();
+                                }
                             }
+                            Ok(proof.map(|proof| (proof, verified)))
+                        });
+                    let proof = match proof {
+                        Err(ProofError::Processing(error)) if error.is_terminal() => {
+                            // Review never deletes: return no token and release all
+                            // tentative receipts/permits instead of continuing proof.
+                            return Err(
+                                error.into_runtime(stale("Preview could not be reproduced"))
+                            );
                         }
-                        Ok(proof.map(|proof| (proof, verified)))
-                    });
+                        result => result,
+                    };
                     if let Ok(Some((proof, verified))) = proof {
                         let proof = Arc::new(proof);
                         if plan.namespace.is_none() {
@@ -1627,5 +1671,104 @@ mod tests {
             ));
             assert_eq!(fs::read(&f.paths[0]).unwrap(), bytes);
         }
+    }
+    #[test]
+    fn terminal_proof_review_returns_no_authority_and_releases_prior_receipts() {
+        let failures = vec![
+            crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::InputLimitExceeded),
+            crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
+            crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
+            crate::ProcessingError::AllocationFailed,
+        ];
+        for error in failures {
+            let f = fixture(3);
+            let expected = error.to_string();
+            let (code, retryable) = match &error {
+                crate::ProcessingError::ResourceStopped(
+                    stl_core::ResourceStop::EnvelopeChanged,
+                ) => (RuntimeErrorCode::Stale, true),
+                crate::ProcessingError::AllocationFailed => (RuntimeErrorCode::Internal, false),
+                _ => (RuntimeErrorCode::Unsupported, false),
+            };
+            let before = f
+                .paths
+                .iter()
+                .map(fs::read)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let source = f
+                .runtime
+                .read_db(|db| db.resolve_model_source_ref(&f.model.id))
+                .unwrap();
+            let original = fs::read(&source.outer_path).unwrap();
+            *f.runtime
+                .thumbnail_cleanup
+                .reproduction_failure
+                .lock()
+                .unwrap() = Some((1, error));
+            let result = f.runtime.review_thumbnail_cleanup(
+                &f.ctx,
+                ThumbnailCleanupRequest {
+                    mode: Mode::Orphans,
+                    continuation: None,
+                },
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.message, expected);
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+            assert!(
+                f.runtime
+                    .thumbnail_cleanup
+                    .reproduction_failure
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "failure reached after a prior successful proof"
+            );
+            assert!(
+                f.runtime.actions.lock().unwrap().is_empty(),
+                "no execute token minted"
+            );
+            assert!(f
+                .runtime
+                .thumbnail_cleanup
+                .cursors
+                .lock()
+                .unwrap()
+                .is_empty());
+            assert_eq!(f.runtime.thumbnail_cleanup.usage.lock().unwrap().bytes, 0);
+            assert_eq!(f.runtime.thumbnail_cleanup.usage.lock().unwrap().fds, 0);
+            assert_eq!(
+                f.paths
+                    .iter()
+                    .map(fs::read)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                before
+            );
+            assert_eq!(fs::read(&source.outer_path).unwrap(), original);
+            assert_eq!(
+                fs::read_dir(f.runtime.root.join("thumbnails"))
+                    .unwrap()
+                    .count(),
+                f.paths.len()
+            );
+        }
+        let f = fixture(3);
+        *f.runtime
+            .thumbnail_cleanup
+            .reproduction_failure
+            .lock()
+            .unwrap() = Some((
+            1,
+            crate::ProcessingError::Ordinary("ordinary unprovable preview".into()),
+        ));
+        let plan = review(&f, None);
+        let summary = plan.thumbnail_review.as_ref().unwrap();
+        assert_eq!(summary.eligible_files, 2);
+        assert_eq!(summary.preserved_files, 1);
+        f.runtime.discard_action(&f.ctx, &plan.token).unwrap();
+        assert_eq!(f.runtime.thumbnail_cleanup.usage.lock().unwrap().fds, 0);
     }
 }

@@ -301,23 +301,40 @@ and review the producer allowance, then wire the existing Owned permit into all
 producer callers. Stage publication and catalog migration remain separate gates.
 No Windows production support is implied by these parser changes.
 
-## Unwired terminal-error boundary
+## Terminal-error boundary for model readers
 
-`stl_core::zip_bounds` provides a project-owned bounded archive/member facade.
-An operation creates one `ZipResourceObserver` before optional opens, shares it
-across all of them, and calls `finish` on the entire result before presentation
-or publication. Reader and member operations check the first terminal cause
-before and after delegation, including successful buffered results. The observer
-records concrete input stops before ZIP recovery can swallow them and records
-SDK metadata-limit/allocation errors before returning failed opens. It never
-recognizes a stop by matching error text or a bare IO kind. Operational allocation
-failure has its own fixed-message category and keeps the existing native Library
-error shape.
+`stl_core::zip_bounds` provides the shared bounded archive/member facade. Its
+observer now covers the six indexing/thumbnail ZIP readers and separate native
+manual extractor. An operation creates one observer before optional opens, shares
+it across those opens, and finishes the entire result before presentation or
+publication. Reads and seeks check the first terminal cause before and after
+delegation, including successful buffered results. Optional settings, project
+metadata and embedded-image handling preserve terminal failures before cached
+geometry, another candidate or raster fallback. Ordinary malformed optional
+metadata and local image-size rejection retain their existing fallback behavior.
 
-This foundation changes no production constructor. The next migration includes
-six indexing/thumbnail ZIP readers and the separate native manual extractor;
-optional settings/image fallbacks and pre-side-effect gates must move together.
+Known operational allocation failure stays distinct from deterministic input/work
+limits and temporary runtime contention. Runtime errors retain their existing
+codes and retry policy; native errors retain the Library/message shape. Existing
+public String APIs are terminal compatibility adapters around typed bodies.
+Source fingerprint/hash comparisons alone produce a source-changed stop.
+
+Verified archive reading finishes before cache/staging creation. Rendering stops
+before thumbnail staging or catalog writes. A terminal cleanup-proof failure
+returns no execution token, drops tentative receipts/permits and leaves every
+file untouched; the caller starts a fresh review. Ordinary unprovable candidates
+keep their existing behavior. Source holds and publication authority are unchanged.
+
 Consumer workspace roots must resolve the same vendored ZIP package before using
 this API, because a dependency's Cargo patch does not propagate to its consumer.
-No inflation, XML/JSON, whole-producer memory, source-identity or publication
-bound is implied by this error-preservation facade.
+Backup restoration is a separate format outside this model-reader profile.
+Member inflation, XML/JSON allocation, whole-producer memory admission, source
+identity and immutable publication remain separately reviewed gates.
+
+Local validation passes 128 parser tests (one existing ignored fixture), 347 runtime
+tests, 207 native tests and 70 server tests, plus workspace Clippy and formatting.
+The native watcher tests require normal macOS event access: the identical binary
+fails callbacks inside the workspace sandbox and passes all eight watcher tests
+and the full native suite outside it. No source, timeout or test disablement was
+used to resolve that environment restriction. Hosted verification follows this
+checkpoint; Windows execution remains separate from compilation.

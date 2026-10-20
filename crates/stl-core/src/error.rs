@@ -61,6 +61,18 @@ pub enum StlError {
     ResourceStopped(#[from] ResourceStop),
 }
 
+impl From<crate::zip_bounds::ZipOpenError> for StlError {
+    fn from(error: crate::zip_bounds::ZipOpenError) -> Self {
+        match error {
+            crate::zip_bounds::ZipOpenError::ResourceStopped(stop) => Self::ResourceStopped(stop),
+            crate::zip_bounds::ZipOpenError::AllocationFailed => Self::AllocationFailed,
+            crate::zip_bounds::ZipOpenError::Archive(error) => Self::Malformed3mf {
+                detail: format!("not a readable zip package ({error})"),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,7 +14,7 @@
 //! DOM: a real project's mesh part is tens of megabytes of `<vertex>` lines.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, Cursor, Read};
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
@@ -29,6 +29,7 @@ use crate::model::{
 };
 use crate::parse::{ParsedStl, StlFormat};
 use crate::vec3::{cross, dot, sub, V3};
+use crate::zip_bounds::{BoundedZipArchive, BoundedZipMember, ZipOpenError, ZipResourceObserver};
 
 /// Zip local-file-header signature. Every 3MF (and every other OPC package)
 /// starts with it; no STL can, so this is the format discriminator.
@@ -151,10 +152,125 @@ struct ModelPart {
     material_lookup: HashMap<(u32, u32), usize>,
 }
 
+fn missing_part_error(error: ZipOpenError, path: &str) -> StlError {
+    match error {
+        ZipOpenError::Archive(_) => malformed(format!("missing part {path}")),
+        terminal => terminal.into(),
+    }
+}
+
+fn preserve_terminal<T>(result: &Result<T, StlError>) -> Result<(), StlError> {
+    match result {
+        Err(StlError::ResourceStopped(stop)) => Err(StlError::ResourceStopped(*stop)),
+        Err(StlError::AllocationFailed) => Err(StlError::AllocationFailed),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ParserTestFailure {
+    Stop(ResourceStop),
+    Allocation,
+}
+
+#[cfg(test)]
+impl ParserTestFailure {
+    fn io_error(self) -> io::Error {
+        match self {
+            Self::Stop(stop) => stop.into_io_error(),
+            Self::Allocation => crate::zip_bounds::ZipAllocationFailed.into_io_error(),
+        }
+    }
+
+    fn error(self) -> StlError {
+        match self {
+            Self::Stop(stop) => StlError::ResourceStopped(stop),
+            Self::Allocation => StlError::AllocationFailed,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ParserTestState {
+    constructor_completed: bool,
+    armed: bool,
+    fired: bool,
+    after_io: usize,
+    work_after_stop: usize,
+    root_cached: bool,
+}
+
+#[cfg(test)]
+struct ParserTestProbe {
+    member: &'static str,
+    failure: ParserTestFailure,
+    state: std::cell::RefCell<ParserTestState>,
+}
+
+#[cfg(test)]
+impl ParserTestProbe {
+    fn before_io(&self, read: bool) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.fired {
+            state.after_io += 1;
+        } else if state.armed && read {
+            state.fired = true;
+            return Err(self.failure.io_error());
+        }
+        Ok(())
+    }
+
+    fn record_work(&self) {
+        let mut state = self.state.borrow_mut();
+        if state.fired {
+            state.work_after_stop += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARSER_TEST_PROBE: std::cell::RefCell<Option<Rc<ParserTestProbe>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Original input cursor; its private fault seam exists only in parser tests.
+struct PackageInput<'a> {
+    inner: Cursor<&'a [u8]>,
+    #[cfg(test)]
+    probe: Option<Rc<ParserTestProbe>>,
+}
+
+impl Read for PackageInput<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.before_io(true)?;
+        }
+        self.inner.read(output)
+    }
+}
+
+impl Seek for PackageInput<'_> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.before_io(false)?;
+        }
+        self.inner.seek(from)
+    }
+}
+
 /// The open package plus a cache of parsed parts, so a part referenced by
 /// several components is parsed once.
 struct Package<'a> {
-    archive: zip::ZipArchive<Cursor<&'a [u8]>>,
+    archive: BoundedZipArchive<PackageInput<'a>>,
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    probe: Option<Rc<ParserTestProbe>>,
     parts: HashMap<String, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
     inflated: u64,
@@ -162,11 +278,24 @@ struct Package<'a> {
 }
 
 impl<'a> Package<'a> {
-    fn open(bytes: &'a [u8]) -> Result<Self, StlError> {
-        let archive = zip::ZipArchive::new(Cursor::new(bytes))
-            .map_err(|e| malformed(format!("not a readable zip package ({e})")))?;
+    fn open(bytes: &'a [u8], observer: ZipResourceObserver) -> Result<Self, StlError> {
+        #[cfg(test)]
+        let probe = PARSER_TEST_PROBE.with(|probe| probe.borrow().clone());
+        let input = PackageInput {
+            inner: Cursor::new(bytes),
+            #[cfg(test)]
+            probe: probe.clone(),
+        };
+        let archive = observer.open_bounded_zip(input)?;
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.state.borrow_mut().constructor_completed = true;
+        }
         Ok(Package {
             archive,
+            observer,
+            #[cfg(test)]
+            probe,
             parts: HashMap::new(),
             materials: Vec::new(),
             inflated: 0,
@@ -197,12 +326,18 @@ impl<'a> Package<'a> {
     fn reader(
         &mut self,
         path: &str,
-    ) -> Result<BufReader<zip::read::ZipFile<'_, Cursor<&'a [u8]>>>, StlError> {
+    ) -> Result<BufReader<BoundedZipMember<'_, PackageInput<'a>>>, StlError> {
         let name = Self::entry_name(path).to_string();
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            if probe.member == name {
+                probe.state.borrow_mut().armed = true;
+            }
+        }
         let file = self
             .archive
             .by_name(&name)
-            .map_err(|_| malformed(format!("missing part {path}")))?;
+            .map_err(|error| missing_part_error(error, path))?;
         self.inflated = self.inflated.saturating_add(file.size());
         if self.inflated > MAX_3MF_INFLATED_BYTES {
             return Err(malformed(format!(
@@ -214,14 +349,18 @@ impl<'a> Package<'a> {
     }
 
     fn part(&mut self, path: &str) -> Result<Rc<ModelPart>, StlError> {
+        self.observer.check()?;
         let key = Self::entry_name(path).to_string();
         if let Some(p) = self.parts.get(&key) {
             return Ok(p.clone());
         }
+        let observer = self.observer.clone();
         let parsed = {
             let reader = self.reader(path)?;
-            parse_model_part(reader, path)?
+            parse_model_part(reader, path)
         };
+        observer.check()?;
+        let parsed = parsed?;
         self.materials.extend(
             parsed
                 .materials
@@ -231,17 +370,25 @@ impl<'a> Package<'a> {
         );
         let rc = Rc::new(parsed);
         self.parts.insert(key, rc.clone());
+        #[cfg(test)]
+        if path == ROOT_MODEL_FALLBACK {
+            if let Some(probe) = &self.probe {
+                probe.state.borrow_mut().root_cached = true;
+            }
+        }
         Ok(rc)
     }
 
     fn optional_text(&mut self, path: &str) -> Result<Option<String>, StlError> {
+        self.observer.check()?;
         if !self.has(path) {
             return Ok(None);
         }
         let mut text = String::new();
-        self.reader(path)?
-            .read_to_string(&mut text)
-            .map_err(|_| malformed(format!("{path} is not valid UTF-8 text")))?;
+        let observer = self.observer.clone();
+        let read = self.reader(path)?.read_to_string(&mut text);
+        observer.check()?;
+        read.map_err(|_| malformed(format!("{path} is not valid UTF-8 text")))?;
         Ok(Some(text))
     }
 
@@ -250,6 +397,7 @@ impl<'a> Package<'a> {
         path: &str,
         max_bytes: u64,
     ) -> Result<Option<String>, StlError> {
+        self.observer.check()?;
         if !self.has(path) {
             return Ok(None);
         }
@@ -257,7 +405,7 @@ impl<'a> Package<'a> {
         let size = self
             .archive
             .by_name(&name)
-            .map_err(|_| malformed(format!("missing part {path}")))?
+            .map_err(|error| missing_part_error(error, path))?
             .size();
         if size > max_bytes {
             return Ok(None);
@@ -268,11 +416,13 @@ impl<'a> Package<'a> {
     /// The root model part per `_rels/.rels`; falls back to the conventional
     /// path when the relationships part is absent or does not name one.
     fn root_model_path(&mut self) -> Result<String, StlError> {
+        self.observer.check()?;
         if self.has("_rels/.rels") {
             let mut text = String::new();
-            self.reader("_rels/.rels")?
-                .read_to_string(&mut text)
-                .map_err(|_| malformed("_rels/.rels is not valid text"))?;
+            let observer = self.observer.clone();
+            let read = self.reader("_rels/.rels")?.read_to_string(&mut text);
+            observer.check()?;
+            read.map_err(|_| malformed("_rels/.rels is not valid text"))?;
             if let Some(target) = model_relationship_target(&text) {
                 return Ok(target);
             }
@@ -1448,6 +1598,10 @@ fn emit_build_item(
     out: &mut Out,
     parts: &mut Vec<ParsedPart>,
 ) -> Result<(), StlError> {
+    #[cfg(test)]
+    if let Some(probe) = &pkg.probe {
+        probe.record_work();
+    }
     if !item.printable {
         return Ok(());
     }
@@ -1620,6 +1774,10 @@ fn whole_build(
     filaments: Vec<ParsedFilament>,
     warning: String,
 ) -> Result<ParsedModel, StlError> {
+    #[cfg(test)]
+    if let Some(probe) = &pkg.probe {
+        probe.record_work();
+    }
     let mut out = new_out(root.scale);
     let mut parts = Vec::new();
     let occurrences = build_item_occurrences(&root.build)?;
@@ -1671,24 +1829,39 @@ fn parse_3mf_with_component_visit_limit(
     bytes: &[u8],
     component_visit_limit: u64,
 ) -> Result<ParsedModel, StlError> {
+    let observer = ZipResourceObserver::new();
+    let result = parse_3mf_with_observer(bytes, component_visit_limit, observer.clone());
+    observer.finish(result)
+}
+
+fn parse_3mf_with_observer(
+    bytes: &[u8],
+    component_visit_limit: u64,
+    observer: ZipResourceObserver,
+) -> Result<ParsedModel, StlError> {
     if bytes.is_empty() {
         return Err(StlError::EmptyFile);
     }
-    let mut pkg = Package::open(bytes)?;
+    let mut pkg = Package::open(bytes, observer)?;
     pkg.component_visits_remaining = component_visit_limit;
     let root_path = pkg.root_model_path()?;
     let root = pkg.part(&root_path)?;
     let component_paths = component_part_metadata_paths(&mut pkg, &root, &root_path)?;
 
     let settings_result = pkg.optional_text(MODEL_SETTINGS_PATH);
+    pkg.observer.check()?;
+    preserve_terminal(&settings_result)?;
     let slicer = settings_result
         .as_ref()
         .ok()
         .and_then(|text| text.as_deref())
         .and_then(|text| parse_slicer_metadata(text).ok())
         .unwrap_or_default();
-    let filaments = pkg
-        .optional_bounded_text(PROJECT_SETTINGS_PATH, MAX_APPEARANCE_METADATA_BYTES)
+    let project_result =
+        pkg.optional_bounded_text(PROJECT_SETTINGS_PATH, MAX_APPEARANCE_METADATA_BYTES);
+    pkg.observer.check()?;
+    preserve_terminal(&project_result)?;
+    let filaments = project_result
         .ok()
         .flatten()
         .and_then(|text| parse_project_filaments(&text))
@@ -1720,6 +1893,9 @@ fn parse_3mf_with_component_visit_limit(
                 NO_PLATE_METADATA_WARNING.into(),
             );
         }
+        Err(err @ (StlError::ResourceStopped(_) | StlError::AllocationFailed)) => {
+            return Err(err);
+        }
         Err(err) => {
             return whole_build(
                 &mut pkg,
@@ -1736,7 +1912,9 @@ fn parse_3mf_with_component_visit_limit(
     let specs = settings.expect("all other metadata branches return");
     let resolved = match resolve_plate_items(&mut pkg, &root_path, &root, &specs) {
         Ok(resolved) => resolved,
-        Err(PlateResolutionError::Source(error @ StlError::ResourceStopped(_))) => {
+        Err(PlateResolutionError::Source(
+            error @ (StlError::ResourceStopped(_) | StlError::AllocationFailed),
+        )) => {
             return Err(error);
         }
         Err(detail) => {
@@ -1809,6 +1987,198 @@ mod tests {
     use crate::model::{MaterialSource, ParsedMaterial};
     use std::io::Write;
     use zip::write::SimpleFileOptions;
+
+    const PARSER_TEST_FAILURES: [ParserTestFailure; 4] = [
+        ParserTestFailure::Stop(ResourceStop::InputLimitExceeded),
+        ParserTestFailure::Stop(ResourceStop::ReadWorkExceeded),
+        ParserTestFailure::Stop(ResourceStop::EnvelopeChanged),
+        ParserTestFailure::Allocation,
+    ];
+
+    struct ParserProbeGuard(Option<Rc<ParserTestProbe>>);
+
+    impl ParserProbeGuard {
+        fn install(probe: Rc<ParserTestProbe>) -> Self {
+            Self(PARSER_TEST_PROBE.with(|slot| slot.replace(Some(probe))))
+        }
+    }
+
+    impl Drop for ParserProbeGuard {
+        fn drop(&mut self) {
+            drop(PARSER_TEST_PROBE.with(|slot| slot.replace(self.0.take())));
+        }
+    }
+
+    fn assert_public_parser_stop(
+        bytes: &[u8],
+        member: &'static str,
+        failure: ParserTestFailure,
+        aggregate: bool,
+        root_cached: bool,
+    ) {
+        let probe = Rc::new(ParserTestProbe {
+            member,
+            failure,
+            state: std::cell::RefCell::new(ParserTestState::default()),
+        });
+        let _guard = ParserProbeGuard::install(probe.clone());
+        let result = if aggregate {
+            parse_3mf(bytes).map(|_| ())
+        } else {
+            parse_3mf_with_plates(bytes).map(|_| ())
+        };
+        assert_eq!(result, Err(failure.error()));
+        let state = probe.state.borrow();
+        assert!(state.constructor_completed);
+        assert!(
+            state.fired,
+            "the selected member payload fault must be reached"
+        );
+        assert_eq!(state.root_cached, root_cached);
+        assert_eq!(
+            state.after_io, 0,
+            "no underlying IO after the observed stop"
+        );
+        assert_eq!(
+            state.work_after_stop, 0,
+            "no fallback or emission after stop"
+        );
+    }
+
+    #[test]
+    fn typed_zip_parser_last_settings_stop_never_enters_cached_whole_build() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, "<config/>"),
+                ],
+                deflate,
+            );
+            // Without the fault, the empty plate configuration falls back to
+            // the already parsed root and succeeds with all twelve triangles.
+            assert_eq!(
+                parse_3mf_with_plates(&bytes).unwrap().model.triangle_count,
+                12
+            );
+            for failure in PARSER_TEST_FAILURES {
+                for aggregate in [false, true] {
+                    assert_public_parser_stop(
+                        &bytes,
+                        MODEL_SETTINGS_PATH,
+                        failure,
+                        aggregate,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_last_project_stop_never_becomes_empty_metadata() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[(ROOT_MODEL_FALLBACK, &root), (PROJECT_SETTINGS_PATH, "{}")],
+                deflate,
+            );
+            let normal = parse_3mf_with_plates(&bytes).unwrap();
+            assert_eq!(normal.model.triangle_count, 12);
+            assert_eq!(
+                normal.plate_warning.as_deref(),
+                Some(NO_PLATE_METADATA_WARNING)
+            );
+            for failure in PARSER_TEST_FAILURES {
+                for aggregate in [false, true] {
+                    assert_public_parser_stop(
+                        &bytes,
+                        PROJECT_SETTINGS_PATH,
+                        failure,
+                        aggregate,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_preserves_stops_erased_by_xml_error_context() {
+        for deflate in [false, true] {
+            let bytes = simple_cube("millimeter", deflate);
+            for failure in PARSER_TEST_FAILURES {
+                assert_public_parser_stop(&bytes, ROOT_MODEL_FALLBACK, failure, false, false);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_plate_resolution_stop_never_enters_fallback() {
+        const CHILD: &str = "3D/Objects/child.model";
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1" type="model"><components><component objectid="2" p:path="/3D/Objects/child.model"/></components></object>"#,
+            r#"<item objectid="1"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let settings = plate_settings(&plate_xml(1, "Unassigned", &[]));
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (CHILD, &child),
+                    (MODEL_SETTINGS_PATH, &settings),
+                ],
+                deflate,
+            );
+            let normal = parse_3mf_with_plates(&bytes).unwrap();
+            assert_eq!(normal.model.triangle_count, 12);
+            assert!(!normal.plate_metadata);
+            for failure in PARSER_TEST_FAILURES {
+                assert_public_parser_stop(&bytes, CHILD, failure, false, true);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_constructor_limit_is_not_formatted_as_malformed() {
+        let mut bytes = simple_cube("millimeter", false);
+        let footer = bytes
+            .windows(4)
+            .rposition(|value| value == b"PK\x05\x06")
+            .unwrap();
+        bytes[footer + 8..footer + 10].copy_from_slice(&10_001u16.to_le_bytes());
+        bytes[footer + 10..footer + 12].copy_from_slice(&10_001u16.to_le_bytes());
+        assert!(matches!(
+            parse_3mf_with_plates(&bytes),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+    }
+
+    #[test]
+    fn typed_zip_parser_keeps_ordinary_optional_metadata_fallback() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, "<config><plate>"),
+                    (PROJECT_SETTINGS_PATH, "{"),
+                ],
+                deflate,
+            );
+            let parsed = parse_3mf_with_plates(&bytes).unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert!(!parsed.plate_metadata);
+            assert!(parsed
+                .plate_warning
+                .unwrap()
+                .starts_with("Plate metadata is unusable ("));
+            assert!(parsed.embedded_filaments.is_empty());
+        }
+    }
 
     const RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -2041,7 +2411,7 @@ mod tests {
             &r#"<item objectid="1"/>"#.repeat(4),
         );
         let bytes = package(&[("3D/3dmodel.model", &root)], false);
-        let mut pkg = Package::open(&bytes).unwrap();
+        let mut pkg = Package::open(&bytes, ZipResourceObserver::new()).unwrap();
         let root = pkg.part("3D/3dmodel.model").unwrap();
         // Four build roots plus sixteen diagnostic edge iterations. Repeated
         // paths still cost work even though the resulting set contains one path.
@@ -2064,7 +2434,7 @@ mod tests {
     fn component_visit_budget_direct_walk_exact_boundary_is_127() {
         let root = model_xml("millimeter", &shared_binary_dag(6, false), "");
         let bytes = package(&[("3D/3dmodel.model", &root)], false);
-        let mut pkg = Package::open(&bytes).unwrap();
+        let mut pkg = Package::open(&bytes, ZipResourceObserver::new()).unwrap();
         pkg.component_visits_remaining = 127;
         assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());
         assert_eq!(pkg.component_visits_remaining, 0);
@@ -2095,7 +2465,7 @@ mod tests {
             "",
         );
         let bytes = package(&[("3D/3dmodel.model", &root)], false);
-        let mut pkg = Package::open(&bytes).unwrap();
+        let mut pkg = Package::open(&bytes, ZipResourceObserver::new()).unwrap();
         pkg.part("3D/3dmodel.model").unwrap();
         pkg.component_visits_remaining = 1;
         assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());

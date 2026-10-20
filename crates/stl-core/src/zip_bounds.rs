@@ -315,6 +315,14 @@ impl<R: Read + Seek> BoundedZipMember<'_, R> {
     pub fn is_dir(&self) -> bool {
         self.inner.is_dir()
     }
+    /// Whether the SDK's interpreted Unix mode identifies a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.inner.is_symlink()
+    }
+    /// The SDK-validated relative member path, without changing path semantics.
+    pub fn enclosed_name(&self) -> Option<std::path::PathBuf> {
+        self.inner.enclosed_name()
+    }
     /// Optional interpreted Unix permission bits.
     pub fn unix_mode(&self) -> Option<u32> {
         self.inner.unix_mode()

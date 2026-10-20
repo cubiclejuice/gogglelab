@@ -5,8 +5,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
+use stl_core::zip_bounds::{
+    classify_zip_error, BoundedZipArchive, BoundedZipMember, ZipOpenError, ZipResourceObserver,
+};
 use zip::result::ZipError;
-use zip::{CompressionMethod, ZipArchive};
+use zip::CompressionMethod;
 
 use crate::error::AppError;
 
@@ -95,69 +98,75 @@ fn extract_zip_with_limits(
     path: &str,
     limits: ExtractionLimits,
 ) -> Result<ExtractResult, AppError> {
-    let root = canonical_directory(root)?;
-    let source_input = Path::new(path);
-    let source_link_meta = fs::symlink_metadata(source_input).map_err(map_path_error)?;
-    if source_link_meta.file_type().is_symlink() {
-        return Err(archive_error(
-            "ZIP shortcuts and symbolic links cannot be extracted.",
-        ));
-    }
-    let source = source_input.canonicalize().map_err(map_path_error)?;
-    if !source.starts_with(&root) {
-        return Err(AppError::OutsideRoot);
-    }
-    if !source_link_meta.is_file()
-        || !source
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
-    {
-        return Err(archive_error(
-            "Choose a regular .zip file inside the selected folder.",
-        ));
-    }
+    let observer = ZipResourceObserver::new();
+    let result = (|| -> Result<ExtractResult, AppError> {
+        let root = canonical_directory(root)?;
+        let source_input = Path::new(path);
+        let source_link_meta = fs::symlink_metadata(source_input).map_err(map_path_error)?;
+        if source_link_meta.file_type().is_symlink() {
+            return Err(archive_error(
+                "ZIP shortcuts and symbolic links cannot be extracted.",
+            ));
+        }
+        let source = source_input.canonicalize().map_err(map_path_error)?;
+        if !source.starts_with(&root) {
+            return Err(AppError::OutsideRoot);
+        }
+        if !source_link_meta.is_file()
+            || !source
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        {
+            return Err(archive_error(
+                "Choose a regular .zip file inside the selected folder.",
+            ));
+        }
 
-    let file = File::open(&source).map_err(map_path_error)?;
-    let archive_size = file.metadata().map_err(|_| AppError::NotReadable)?.len();
-    if archive_size > limits.archive_bytes {
-        return Err(archive_error(format!(
-            "This ZIP is larger than the {} GiB compressed-size limit.",
-            limits.archive_bytes / (1024 * 1024 * 1024)
-        )));
-    }
-    let mut archive = ZipArchive::new(file).map_err(map_zip_open_error)?;
-    let plans = preflight(&mut archive, limits)?;
+        let file = File::open(&source).map_err(map_path_error)?;
+        let archive_size = file.metadata().map_err(|_| AppError::NotReadable)?.len();
+        if archive_size > limits.archive_bytes {
+            return Err(archive_error(format!(
+                "This ZIP is larger than the {} GiB compressed-size limit.",
+                limits.archive_bytes / (1024 * 1024 * 1024)
+            )));
+        }
+        let mut archive = observer.open_bounded_zip(file).map_err(AppError::from)?;
+        let plans = preflight(&mut archive, limits)?;
 
-    #[cfg(target_os = "linux")]
+        #[cfg(target_os = "linux")]
     return Err(archive_error(
         "ZIP extraction is not yet supported on Linux because it cannot safely publish files while the selected folder may move.",
     ));
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let parent = source
-            .parent()
-            .ok_or_else(|| archive_error("The ZIP has no writable parent folder."))?;
-        let stem = source
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .filter(|stem| !stem.is_empty())
-            .ok_or_else(|| archive_error("The ZIP filename has no usable name."))?;
-        let staging_path = create_staging(parent)?;
-        let mut staging = StagingGuard {
-            path: staging_path.clone(),
-            active: true,
-        };
-        let files = extract_plans(&mut archive, &plans, &staging_path, limits)?;
-        let destination = publish_staging(parent, stem, &staging_path)?;
-        staging.active = false;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let parent = source
+                .parent()
+                .ok_or_else(|| archive_error("The ZIP has no writable parent folder."))?;
+            let stem = source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty())
+                .ok_or_else(|| archive_error("The ZIP filename has no usable name."))?;
+            observer.check().map_err(AppError::from)?;
+            let staging_path = create_staging(parent)?;
+            let mut staging = StagingGuard {
+                path: staging_path.clone(),
+                active: true,
+            };
+            let files = extract_plans(&mut archive, &plans, &staging_path, limits, &observer)?;
+            observer.check().map_err(AppError::from)?;
+            let destination = publish_staging(parent, stem, &staging_path)?;
+            staging.active = false;
 
-        Ok(ExtractResult {
-            destination: destination.to_string_lossy().into_owned(),
-            files,
-        })
-    }
+            Ok(ExtractResult {
+                destination: destination.to_string_lossy().into_owned(),
+                files,
+            })
+        }
+    })();
+    observer.finish(result)
 }
 
 fn canonical_directory(path: &str) -> Result<PathBuf, AppError> {
@@ -175,7 +184,7 @@ fn map_path_error(error: io::Error) -> AppError {
     }
 }
 
-fn map_zip_open_error(error: ZipError) -> AppError {
+pub(crate) fn map_zip_open_error(error: ZipError) -> AppError {
     match error {
         ZipError::CompressionMethodNotSupported(_) => {
             archive_error("This ZIP uses a compression method that GoggleLab does not support.")
@@ -187,8 +196,15 @@ fn map_zip_open_error(error: ZipError) -> AppError {
     }
 }
 
+fn map_zip_operation_error(error: ZipOpenError, ordinary_message: &'static str) -> AppError {
+    match error {
+        ZipOpenError::Archive(_) => archive_error(ordinary_message),
+        terminal => terminal.into(),
+    }
+}
+
 fn preflight<R: Read + io::Seek>(
-    archive: &mut ZipArchive<R>,
+    archive: &mut BoundedZipArchive<R>,
     limits: ExtractionLimits,
 ) -> Result<Vec<EntryPlan>, AppError> {
     if archive.len() > limits.entries {
@@ -209,7 +225,9 @@ fn preflight<R: Read + io::Seek>(
             // Metadata-only access keeps encrypted and unsupported entries
             // inspectable, so validation can return the specific remedy.
             .by_index_raw(index)
-            .map_err(|_| archive_error("This ZIP has an unreadable directory entry."))?;
+            .map_err(|error| {
+                map_zip_operation_error(error, "This ZIP has an unreadable directory entry.")
+            })?;
         let path = validate_entry(&file, limits)?;
         let kind = if file.is_dir() {
             EntryKind::Directory
@@ -262,8 +280,8 @@ fn preflight<R: Read + io::Seek>(
     Ok(plans)
 }
 
-fn validate_entry<R: Read>(
-    file: &zip::read::ZipFile<'_, R>,
+fn validate_entry<R: Read + io::Seek>(
+    file: &BoundedZipMember<'_, R>,
     limits: ExtractionLimits,
 ) -> Result<PathBuf, AppError> {
     let raw = file.name_raw();
@@ -384,10 +402,11 @@ fn create_staging(parent: &Path) -> Result<PathBuf, AppError> {
 }
 
 fn extract_plans<R: Read + io::Seek>(
-    archive: &mut ZipArchive<R>,
+    archive: &mut BoundedZipArchive<R>,
     plans: &[EntryPlan],
     staging: &Path,
     limits: ExtractionLimits,
+    observer: &ZipResourceObserver,
 ) -> Result<u32, AppError> {
     let mut total = 0u64;
     let mut files = 0u32;
@@ -395,6 +414,7 @@ fn extract_plans<R: Read + io::Seek>(
     let mut created_directories = HashSet::new();
 
     for plan in plans {
+        observer.check().map_err(AppError::from)?;
         let output = staging.join(&plan.path);
         if plan.kind == EntryKind::Directory {
             ensure_directories(staging, &plan.path, &mut created_directories)?;
@@ -403,9 +423,10 @@ fn extract_plans<R: Read + io::Seek>(
         if let Some(relative_parent) = plan.path.parent() {
             ensure_directories(staging, relative_parent, &mut created_directories)?;
         }
-        let mut input = archive
-            .by_index(plan.index)
-            .map_err(|_| archive_error("A ZIP entry became unreadable during extraction."))?;
+        let mut input = archive.by_index(plan.index).map_err(|error| {
+            map_zip_operation_error(error, "A ZIP entry became unreadable during extraction.")
+        })?;
+        observer.check().map_err(AppError::from)?;
         let mut output_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -415,8 +436,11 @@ fn extract_plans<R: Read + io::Seek>(
             })?;
 
         loop {
-            let read = input.read(&mut buffer).map_err(|_| {
-                archive_error("A ZIP entry is corrupt or could not be decompressed.")
+            let read = input.read(&mut buffer).map_err(|error| {
+                map_zip_operation_error(
+                    classify_zip_error(ZipError::Io(error)),
+                    "A ZIP entry is corrupt or could not be decompressed.",
+                )
             })?;
             if read == 0 {
                 break;
@@ -430,6 +454,7 @@ fn extract_plans<R: Read + io::Seek>(
                     limits.extracted_bytes / (1024 * 1024 * 1024)
                 )));
             }
+            observer.check().map_err(AppError::from)?;
             output_file
                 .write_all(&buffer[..read])
                 .map_err(|_| archive_error("Could not write an extracted file."))?;
@@ -625,6 +650,64 @@ mod tests {
             bytes[start + offset..start + offset + 2].copy_from_slice(&value.to_le_bytes());
         }
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn bounded_directory_stop_publishes_nothing_and_preserves_original_files() {
+        let root = TestDir::new("bounded-directory-stop");
+        let archive = root.0.join("Models.zip");
+        let original = root.0.join("keep.stl");
+        fs::write(&original, b"original source").unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for index in 0..=MAX_ENTRIES {
+            writer
+                .start_file(format!("part-{index}.stl"), options)
+                .unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        fs::write(&archive, &bytes).unwrap();
+
+        let error = extract_zip_core(root.0.to_str().unwrap(), archive.to_str().unwrap())
+            .expect_err("physical directory budget must stop before extraction");
+        assert!(matches!(
+            error,
+            AppError::Library { message }
+                if message == stl_core::ResourceStop::InputLimitExceeded.to_string()
+        ));
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        assert_eq!(fs::read(&original).unwrap(), b"original source");
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn native_zip_operation_keeps_concrete_stops_and_ordinary_remedies_distinct() {
+        use stl_core::zip_bounds::ZipAllocationFailed;
+        for stop in [
+            stl_core::ResourceStop::InputLimitExceeded,
+            stl_core::ResourceStop::ReadWorkExceeded,
+            stl_core::ResourceStop::EnvelopeChanged,
+        ] {
+            let error = map_zip_operation_error(
+                classify_zip_error(ZipError::Io(stop.into_io_error())),
+                "ordinary entry failure",
+            );
+            assert!(matches!(error, AppError::Library { message } if message == stop.to_string()));
+            let ordinary = map_zip_operation_error(
+                classify_zip_error(ZipError::Io(io::Error::other(stop.to_string()))),
+                "ordinary entry failure",
+            );
+            assert!(
+                matches!(ordinary, AppError::Archive { message } if message == "ordinary entry failure")
+            );
+        }
+        let error = map_zip_operation_error(
+            classify_zip_error(ZipError::Io(ZipAllocationFailed.into_io_error())),
+            "ordinary entry failure",
+        );
+        assert!(
+            matches!(error, AppError::Library { message } if message == "Model processing could not allocate memory")
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

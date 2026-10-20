@@ -679,11 +679,12 @@ fn scan_archive_file(
     reconciled: &mut ScanReconcile,
 ) -> Result<(), String> {
     let cancelled = || state.scan_control().cancelled();
-    let inventory = crate::archives::archive_inventory_with_cancel(
+    let inventory = crate::archives::archive_inventory_with_cancel_typed(
         archive_path,
         root.max_file_bytes,
         &cancelled,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let existing = state
         .read_db(|db| db.indexed_archive_metadata(&root.id, relative_path))
         .map_err(runtime_error_text)?;
@@ -715,8 +716,12 @@ fn scan_archive_file(
         return Ok(());
     }
 
-    let scan =
-        crate::archives::scan_archive_with_cancel(archive_path, root.max_file_bytes, &cancelled)?;
+    let scan = crate::archives::scan_archive_with_cancel_typed(
+        archive_path,
+        root.max_file_bytes,
+        &cancelled,
+    )
+    .map_err(|error| error.to_string())?;
     if scan.outer_fingerprint != inventory.outer_fingerprint {
         return Err("Archive changed between metadata and content scans".into());
     }

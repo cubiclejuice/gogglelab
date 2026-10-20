@@ -516,7 +516,7 @@ fn resolve_source(
 
 fn source_bytes(library_root: &Path, source: &ResolvedModelSource) -> Result<Vec<u8>, AppError> {
     if let Some(member) = source.archive_member.as_deref() {
-        let temporary = crate::library_archives::extract_member_to_temporary(
+        let temporary = crate::library_archives::extract_member_to_temporary_typed(
             library_root,
             &source.outer_path,
             member,
@@ -529,7 +529,7 @@ fn source_bytes(library_root: &Path, source: &ResolvedModelSource) -> Result<Vec
             &source.content_hash,
             source.bytes,
         )
-        .map_err(|message| AppError::Library { message })?;
+        .map_err(AppError::from)?;
         read_verified_file(temporary.path(), source.bytes, &source.content_hash)
     } else {
         read_verified_file(&source.outer_path, source.bytes, &source.content_hash)

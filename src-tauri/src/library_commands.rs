@@ -852,7 +852,7 @@ pub(crate) fn get_thumbnail(
     }
     let temporary_member = if let Some(member) = source.archive_member.as_deref() {
         Some(
-            crate::library_archives::extract_member_to_temporary(
+            crate::library_archives::extract_member_to_temporary_typed(
                 &library_root,
                 &source.outer_path,
                 member,
@@ -865,7 +865,7 @@ pub(crate) fn get_thumbnail(
                 &source.content_hash,
                 source.bytes,
             )
-            .map_err(|message| AppError::Library { message })?,
+            .map_err(AppError::from)?,
         )
     } else {
         None
@@ -873,7 +873,7 @@ pub(crate) fn get_thumbnail(
     let source_path = temporary_member
         .as_ref()
         .map_or(source.outer_path.as_path(), |member| member.path());
-    let thumbnail = crate::library_thumbnail::ensure_thumbnail(
+    let thumbnail = crate::library_thumbnail::ensure_thumbnail_typed(
         &library_root,
         source_path,
         &content_hash,
@@ -881,7 +881,7 @@ pub(crate) fn get_thumbnail(
         &settings,
         regenerate,
     )
-    .map_err(|message| AppError::Library { message })?;
+    .map_err(AppError::from)?;
     with_db(state, |db| {
         persist_generated_thumbnail(db, model_id, &content_hash, &settings, &thumbnail)
     })?;
@@ -1007,7 +1007,7 @@ pub fn library_open_model(
     })?;
     validate_indexed_source_limit(&source, indexed_limit)?;
     let path = if let Some(member) = source.archive_member.as_deref() {
-        crate::library_archives::extract_member_to_cache(
+        crate::library_archives::extract_member_to_cache_typed(
             &library_root,
             &source.outer_path,
             member,
@@ -1020,7 +1020,7 @@ pub fn library_open_model(
             &source.content_hash,
             source.bytes,
         )
-        .map_err(|message| AppError::Library { message })?
+        .map_err(AppError::from)?
     } else {
         source.outer_path
     };

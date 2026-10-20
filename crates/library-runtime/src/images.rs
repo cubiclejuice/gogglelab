@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::png_output::BoundedPngOutput;
 use crate::secure_fs::Directory;
+use crate::ProcessingError;
+use stl_core::zip_bounds::{BoundedZipArchive, ZipOpenError, ZipResourceObserver};
 
 const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 4096;
@@ -26,10 +28,29 @@ static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Only the two advertised raster formats are decoded. Check dimensions and
 /// pixel count before allocating the full image, then normalize to a small PNG.
 pub fn normalize_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    normalize_image_with_output_limit(bytes, MAX_OUTPUT_BYTES)
+    normalize_image_typed(bytes).map_err(|error| error.to_string())
 }
 
+pub(crate) fn normalize_image_typed(bytes: &[u8]) -> Result<Vec<u8>, ProcessingError> {
+    normalize_image_with_output_limit_typed(bytes, MAX_OUTPUT_BYTES)
+}
+
+#[cfg(test)]
 fn normalize_image_with_output_limit(bytes: &[u8], output_limit: usize) -> Result<Vec<u8>, String> {
+    normalize_image_with_output_limit_typed(bytes, output_limit).map_err(|error| error.to_string())
+}
+
+fn normalize_image_with_output_limit_typed(
+    bytes: &[u8],
+    output_limit: usize,
+) -> Result<Vec<u8>, ProcessingError> {
+    normalize_image_with_output(bytes, BoundedPngOutput::new(output_limit))
+}
+
+fn normalize_image_with_output(
+    bytes: &[u8],
+    mut output: BoundedPngOutput,
+) -> Result<Vec<u8>, ProcessingError> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err("Preview image must be between 1 byte and 16 MiB".into());
     }
@@ -69,7 +90,6 @@ fn normalize_image_with_output_limit(bytes: &[u8], output_limit: usize) -> Resul
             decoded
         };
     let rgba = decoded.into_rgba8();
-    let mut output = BoundedPngOutput::new(output_limit);
     let encoded = (|| {
         let mut encoder = png::Encoder::new(&mut output, rgba.width(), rgba.height());
         encoder.set_color(png::ColorType::Rgba);
@@ -78,11 +98,14 @@ fn normalize_image_with_output_limit(bytes: &[u8], output_limit: usize) -> Resul
         writer.write_image_data(rgba.as_raw())?;
         writer.finish()
     })();
+    if output.allocation_failed() {
+        return Err(ProcessingError::AllocationFailed);
+    }
     if output.limit_exceeded() {
         return Err("Normalized preview exceeds its output limit".into());
     }
     encoded.map_err(|error| error.to_string())?;
-    output.into_bytes().map_err(|error| error.to_string())
+    output.into_bytes().map_err(ProcessingError::from_io)
 }
 
 pub fn import_custom_image_file(root: &Path, path: &Path) -> Result<(PathBuf, String), String> {
@@ -214,11 +237,34 @@ fn read_bounded_file(file: fs::File, limit: u64) -> Result<Vec<u8>, String> {
 /// Package thumbnails stay inside the ZIP. No external relationships or paths
 /// are followed, and failed optional images can fall back to mesh rendering.
 pub fn embedded_3mf_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    embedded_3mf_thumbnail_typed(bytes).map_err(|error| error.to_string())
+}
+
+pub(crate) fn embedded_3mf_thumbnail_typed(
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>, ProcessingError> {
+    let observer = ZipResourceObserver::new();
+    let result = select_embedded_thumbnail(bytes, &observer, normalize_image_typed);
+    observer.finish(result)
+}
+
+fn select_embedded_thumbnail(
+    bytes: &[u8],
+    observer: &ZipResourceObserver,
+    normalize: impl FnMut(&[u8]) -> Result<Vec<u8>, ProcessingError>,
+) -> Result<Option<Vec<u8>>, ProcessingError> {
     if !bytes.starts_with(b"PK") {
         return Ok(None);
     }
-    let mut archive =
-        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
+    select_embedded_reader(Cursor::new(bytes), observer, normalize)
+}
+
+fn select_embedded_reader<R: Read + Seek>(
+    source: R,
+    observer: &ZipResourceObserver,
+    mut normalize: impl FnMut(&[u8]) -> Result<Vec<u8>, ProcessingError>,
+) -> Result<Option<Vec<u8>>, ProcessingError> {
+    let mut archive = observer.open_bounded_zip(source)?;
     if archive.len() > 10_000 {
         return Err("3MF preview package has too many entries".into());
     }
@@ -288,8 +334,10 @@ pub fn embedded_3mf_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
     }
     for name in candidates {
         if let Some(bytes) = package_entry(&mut archive, &name, MAX_INPUT_BYTES)? {
-            if let Ok(png) = normalize_image(&bytes) {
-                return Ok(Some(png));
+            match normalize(&bytes) {
+                Ok(png) => return Ok(Some(png)),
+                Err(error) if error.is_terminal() => return Err(error),
+                Err(_) => {}
             }
         }
     }
@@ -317,15 +365,15 @@ fn safe_package_image(target: &str) -> Option<String> {
     matches!(extension.as_str(), "png" | "jpg" | "jpeg").then(|| target.to_owned())
 }
 
-fn package_entry(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+fn package_entry<R: Read + Seek>(
+    archive: &mut BoundedZipArchive<R>,
     name: &str,
     limit: u64,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<Vec<u8>>, ProcessingError> {
     let mut entry = match archive.by_name(name) {
         Ok(entry) => entry,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+        Err(ZipOpenError::Archive(zip::result::ZipError::FileNotFound)) => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
     if entry.encrypted()
         || !entry.is_file()
@@ -345,7 +393,7 @@ fn package_entry(
         .by_ref()
         .take(limit + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+        .map_err(ProcessingError::from_io)?;
     if bytes.len() as u64 > limit {
         return Err("3MF preview inflated beyond its limit".into());
     }
@@ -553,5 +601,126 @@ mod tests {
         symlink(&outside, root.join("thumbnails")).unwrap();
         assert!(import_custom_image_file(&root, &image).is_err());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+    fn terminal_errors() -> Vec<ProcessingError> {
+        vec![
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::InputLimitExceeded),
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
+            ProcessingError::AllocationFailed,
+        ]
+    }
+    #[test]
+    fn typed_last_candidate_and_normalizer_stops_never_try_another_candidate() {
+        for error in terminal_errors() {
+            let package = package(&[
+                ("Metadata/thumbnail.png", png(4, 4)),
+                ("Metadata/thumbnail.jpg", jpeg(4, 4)),
+            ]);
+            let expected = error.to_string();
+            let mut failure = Some(error);
+            let calls = std::cell::Cell::new(0);
+            let observer = ZipResourceObserver::new();
+            let result = select_embedded_thumbnail(&package, &observer, |_| {
+                calls.set(calls.get() + 1);
+                Err(failure.take().unwrap())
+            });
+            let error = observer.finish(result).unwrap_err();
+            assert!(error.is_terminal());
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(calls.get(), 1);
+        }
+        for error in terminal_errors() {
+            let package = package(&[("Metadata/thumbnail.png", png(4, 4))]);
+            let mut failure = Some(error);
+            let observer = ZipResourceObserver::new();
+            let result =
+                select_embedded_thumbnail(&package, &observer, |_| Err(failure.take().unwrap()));
+            assert!(observer.finish(result).unwrap_err().is_terminal());
+        }
+        let package = package(&[
+            ("Metadata/thumbnail.png", png(4, 4)),
+            ("Metadata/thumbnail.jpg", jpeg(4, 4)),
+        ]);
+        let calls = std::cell::Cell::new(0);
+        let observer = ZipResourceObserver::new();
+        let result = select_embedded_thumbnail(&package, &observer, |bytes| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err("ordinary invalid image".into())
+            } else {
+                normalize_image_typed(bytes)
+            }
+        });
+        assert!(observer.finish(result).unwrap().is_some());
+        assert_eq!(calls.get(), 2);
+    }
+    struct CandidateFaultReader {
+        inner: Cursor<Vec<u8>>,
+        target: u64,
+        error: Option<std::io::Error>,
+        fired: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl Read for CandidateFaultReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() == self.target {
+                if let Some(error) = self.error.take() {
+                    self.fired.set(true);
+                    return Err(error);
+                }
+            }
+            self.inner.read(output)
+        }
+    }
+    impl Seek for CandidateFaultReader {
+        fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(from)
+        }
+    }
+    #[test]
+    fn typed_final_member_read_stop_is_preserved_by_complete_selection() {
+        for error in terminal_errors() {
+            let bytes = package(&[("Metadata/thumbnail.png", png(4, 4))]);
+            let target = 30
+                + u16::from_le_bytes(bytes[26..28].try_into().unwrap()) as u64
+                + u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as u64;
+            let expected = error.to_string();
+            let io = match error {
+                ProcessingError::ResourceStopped(stop) => stop.into_io_error(),
+                ProcessingError::AllocationFailed => {
+                    stl_core::zip_bounds::ZipAllocationFailed.into_io_error()
+                }
+                _ => unreachable!(),
+            };
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let calls = std::cell::Cell::new(0);
+            let source = CandidateFaultReader {
+                inner: Cursor::new(bytes),
+                target,
+                error: Some(io),
+                fired: fired.clone(),
+            };
+            let observer = ZipResourceObserver::new();
+            let result = select_embedded_reader(source, &observer, |bytes| {
+                calls.set(calls.get() + 1);
+                normalize_image_typed(bytes)
+            });
+            let error = observer.finish(result).unwrap_err();
+            assert!(fired.get());
+            assert!(error.is_terminal());
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(calls.get(), 0);
+        }
+    }
+    #[test]
+    fn typed_normalization_sink_allocation_is_distinct_from_local_output_limit() {
+        let input = png(4, 4);
+        let error =
+            normalize_image_with_output(&input, BoundedPngOutput::allocation_failure_for_test())
+                .unwrap_err();
+        assert!(matches!(error, ProcessingError::AllocationFailed));
+        assert!(!normalize_image_with_output_limit_typed(&input, 1)
+            .unwrap_err()
+            .is_terminal());
     }
 }

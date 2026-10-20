@@ -11,6 +11,7 @@ use stl_core::ParsedStl;
 
 use crate::png_output::BoundedPngOutput;
 use crate::secure_fs::Directory;
+use crate::ProcessingError;
 
 const RENDER_VERSION: u32 = 1;
 const MAX_RENDER_TRIANGLES: usize = 200_000;
@@ -169,7 +170,25 @@ fn render_source_thumbnail(
     source_hash: &str,
     expected_bytes: u64,
     settings: &CatalogSettings,
-) -> Result<SourceThumbnail, String> {
+) -> Result<SourceThumbnail, ProcessingError> {
+    render_source_with_preview(
+        source,
+        source_hash,
+        expected_bytes,
+        settings,
+        crate::images::embedded_3mf_thumbnail_typed,
+        render_png_typed,
+    )
+}
+
+fn render_source_with_preview(
+    source: &[u8],
+    source_hash: &str,
+    expected_bytes: u64,
+    settings: &CatalogSettings,
+    preview: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, ProcessingError>,
+    raster: impl FnOnce(&ParsedStl, &CatalogSettings) -> Result<Vec<u8>, ProcessingError>,
+) -> Result<SourceThumbnail, ProcessingError> {
     if source.len() as u64 != expected_bytes
         || expected_bytes > stl_core::limits::MAX_FILE_BYTES
         || hex_digest(source) != source_hash
@@ -186,11 +205,12 @@ fn render_source_thumbnail(
     }
     // Keep the existing parser/embedded-selection order and raster algorithm.
     // Their existing expansion, triangle-stride and raster-sample limits apply.
-    let parsed = stl_core::parse_model(source).map_err(|error| error.to_string())?;
-    let rendered = match crate::images::embedded_3mf_thumbnail(source) {
+    let parsed = stl_core::parse_model(source).map_err(ProcessingError::from)?;
+    let rendered = match preview(source) {
         Ok(Some(bytes)) => SourceThumbnail::EmbeddedPreviewCopy(EmbeddedPreviewPng { bytes }),
-        _ => {
-            let bytes = render_png(&parsed, settings)?;
+        Err(error) if error.is_terminal() => return Err(error),
+        Ok(None) | Err(_) => {
+            let bytes = raster(&parsed, settings)?;
             let png_hash = hex_digest(&bytes);
             SourceThumbnail::RasterGenerated(RasterGeneratedPng {
                 bytes,
@@ -218,7 +238,7 @@ pub(crate) fn reproduce_thumbnail(
     recipe: &ThumbnailRecipe,
     source: &[u8],
     expected_bytes: u64,
-) -> Result<Option<RasterGeneratedPng>, String> {
+) -> Result<Option<RasterGeneratedPng>, ProcessingError> {
     match render_source_thumbnail(
         source,
         recipe.source_hash(),
@@ -262,6 +282,27 @@ pub fn ensure_thumbnail(
     settings: &CatalogSettings,
     regenerate: bool,
 ) -> Result<ThumbnailArtifact, String> {
+    ensure_thumbnail_typed(
+        library_root,
+        source_path,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Typed generation for native callers; terminal processing errors precede staging.
+#[doc(hidden)]
+pub fn ensure_thumbnail_typed(
+    library_root: &Path,
+    source_path: &Path,
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+) -> Result<ThumbnailArtifact, ProcessingError> {
     let relative = thumbnail_relative_path(content_hash, settings);
     if let Some(cached) = cached_thumbnail(library_root, &relative, regenerate)? {
         return Ok(cached);
@@ -279,7 +320,7 @@ pub fn ensure_thumbnail(
     if bytes.len() as u64 != expected_source_bytes || hex_digest(&bytes) != content_hash {
         return Err("Model source changed since it was indexed".into());
     }
-    ensure_thumbnail_from_bytes(
+    ensure_thumbnail_from_bytes_typed(
         library_root,
         &bytes,
         content_hash,
@@ -323,6 +364,7 @@ fn cached_thumbnail(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_thumbnail_from_bytes(
     library_root: &Path,
     source_bytes: &[u8],
@@ -331,6 +373,48 @@ pub(crate) fn ensure_thumbnail_from_bytes(
     settings: &CatalogSettings,
     regenerate: bool,
 ) -> Result<ThumbnailArtifact, String> {
+    ensure_thumbnail_from_bytes_typed(
+        library_root,
+        source_bytes,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn ensure_thumbnail_from_bytes_typed(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    ensure_from_bytes_with_render(
+        library_root,
+        source_bytes,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+        || {
+            render_source_thumbnail(source_bytes, content_hash, expected_source_bytes, settings)
+                .map(SourceThumbnail::into_bytes)
+        },
+    )
+}
+
+fn ensure_from_bytes_with_render(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+    render: impl FnOnce() -> Result<Vec<u8>, ProcessingError>,
+) -> Result<ThumbnailArtifact, ProcessingError> {
     if source_bytes.len() as u64 != expected_source_bytes
         || source_bytes.len() as u64 > stl_core::limits::MAX_FILE_BYTES
         || hex_digest(source_bytes) != content_hash
@@ -360,8 +444,8 @@ pub(crate) fn ensure_thumbnail_from_bytes(
             None => {}
         }
     }
-    let png = render_source_thumbnail(source_bytes, content_hash, expected_source_bytes, settings)?
-        .into_bytes();
+    // All typed parser/selection completion gates run before a new stage exists.
+    let png = render()?;
     let png_hash = hex_digest(&png);
     // Regeneration can reproduce the exact cache entry. Reuse those verified
     // bytes rather than displacing them into a permanent recovery hold.
@@ -393,11 +477,11 @@ pub(crate) fn ensure_thumbnail_from_bytes(
     drop(file);
     if let Err(error) = write_result {
         let _ = directory.hold_entry(&staging_name);
-        return Err(error.to_string());
+        return Err(error.to_string().into());
     }
     if let Err(error) = directory.replace_child(&staging_name, output_name) {
         let _ = directory.hold_entry(&staging_name);
-        return Err(error.to_string());
+        return Err(error.to_string().into());
     }
     let published = directory
         .open_file(output_name)
@@ -540,15 +624,37 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     read_bounded_file(file, limit)
 }
 
+#[cfg(test)]
 fn render_png(model: &ParsedStl, settings: &CatalogSettings) -> Result<Vec<u8>, String> {
-    render_png_with_output_limit(model, settings, MAX_CACHED_PNG_BYTES as usize)
+    render_png_typed(model, settings).map_err(|error| error.to_string())
 }
 
+fn render_png_typed(
+    model: &ParsedStl,
+    settings: &CatalogSettings,
+) -> Result<Vec<u8>, ProcessingError> {
+    render_png_with_output(
+        model,
+        settings,
+        BoundedPngOutput::new(MAX_CACHED_PNG_BYTES as usize),
+    )
+}
+
+#[cfg(test)]
 fn render_png_with_output_limit(
     model: &ParsedStl,
     settings: &CatalogSettings,
     output_limit: usize,
 ) -> Result<Vec<u8>, String> {
+    render_png_with_output(model, settings, BoundedPngOutput::new(output_limit))
+        .map_err(|error| error.to_string())
+}
+
+fn render_png_with_output(
+    model: &ParsedStl,
+    settings: &CatalogSettings,
+    mut output: BoundedPngOutput,
+) -> Result<Vec<u8>, ProcessingError> {
     let size = usize::try_from(settings.thumbnail_size)
         .map_err(|_| "Thumbnail size is invalid".to_string())?;
     if !matches!(size, 128 | 256 | 512) {
@@ -619,7 +725,6 @@ fn render_png_with_output_limit(
         }
     }
 
-    let mut output = BoundedPngOutput::new(output_limit);
     let encoded = (|| {
         let mut encoder = png::Encoder::new(&mut output, size as u32, size as u32);
         encoder.set_color(png::ColorType::Rgba);
@@ -629,11 +734,14 @@ fn render_png_with_output_limit(
         writer.write_image_data(&rgba)?;
         writer.finish()
     })();
+    if output.allocation_failed() {
+        return Err(ProcessingError::AllocationFailed);
+    }
     if output.limit_exceeded() {
         return Err("Generated thumbnail exceeds its cache size limit".into());
     }
     encoded.map_err(|error| error.to_string())?;
-    output.into_bytes().map_err(|error| error.to_string())
+    output.into_bytes().map_err(ProcessingError::from_io)
 }
 
 fn project(point: impl AsRef<[f32]>) -> [f32; 3] {
@@ -1274,5 +1382,99 @@ mod tests {
             }
             fs::write(path, png).unwrap();
         }
+    }
+    fn terminal_errors() -> Vec<ProcessingError> {
+        vec![
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::InputLimitExceeded),
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
+            ProcessingError::AllocationFailed,
+        ]
+    }
+    #[test]
+    fn typed_preview_stop_never_starts_raster_but_ordinary_preview_failure_does() {
+        let source = binary_triangle();
+        let hash = hex_digest(&source);
+        for error in terminal_errors() {
+            let expected = error.to_string();
+            let calls = std::cell::Cell::new(0);
+            let result = render_source_with_preview(
+                &source,
+                &hash,
+                source.len() as u64,
+                &settings(),
+                |_| Err(error),
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(Vec::new())
+                },
+            );
+            let error = result.unwrap_err();
+            assert!(error.is_terminal());
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(calls.get(), 0);
+        }
+        let calls = std::cell::Cell::new(0);
+        let result = render_source_with_preview(
+            &source,
+            &hash,
+            source.len() as u64,
+            &settings(),
+            |_| Err("ordinary invalid preview".into()),
+            |model, settings| {
+                calls.set(calls.get() + 1);
+                render_png_typed(model, settings)
+            },
+        );
+        assert!(matches!(
+            result.unwrap(),
+            SourceThumbnail::RasterGenerated(_)
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+    #[test]
+    fn typed_render_stop_creates_no_stage_and_preserves_existing_thumbnail() {
+        for error in terminal_errors() {
+            let root = temp_root("typed-stop");
+            let source = binary_triangle();
+            let hash = hex_digest(&source);
+            let relative = thumbnail_relative_path(&hash, &settings());
+            let output = root.join(&relative);
+            fs::write(&output, b"unknown existing thumbnail").unwrap();
+            let before = fs::read_dir(root.join("thumbnails"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            let expected = error.to_string();
+            let result = ensure_from_bytes_with_render(
+                &root,
+                &source,
+                &hash,
+                source.len() as u64,
+                &settings(),
+                true,
+                || Err(error),
+            );
+            let error = result.unwrap_err();
+            assert!(error.is_terminal());
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(fs::read(&output).unwrap(), b"unknown existing thumbnail");
+            let after = fs::read_dir(root.join("thumbnails"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(before, after);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn typed_raster_sink_allocation_does_not_become_an_ordinary_render_failure() {
+        let error = render_png_with_output(
+            &one_triangle(),
+            &settings(),
+            BoundedPngOutput::allocation_failure_for_test(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessingError::AllocationFailed));
     }
 }

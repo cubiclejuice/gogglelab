@@ -101,6 +101,30 @@ impl From<library_protocol::RuntimeError> for AppError {
     }
 }
 
+impl From<library_runtime::ProcessingError> for AppError {
+    fn from(error: library_runtime::ProcessingError) -> Self {
+        AppError::Library {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<stl_core::zip_bounds::ZipOpenError> for AppError {
+    fn from(error: stl_core::zip_bounds::ZipOpenError) -> Self {
+        match error {
+            stl_core::zip_bounds::ZipOpenError::ResourceStopped(stop) => {
+                stl_core::StlError::ResourceStopped(stop).into()
+            }
+            stl_core::zip_bounds::ZipOpenError::AllocationFailed => {
+                stl_core::StlError::AllocationFailed.into()
+            }
+            stl_core::zip_bounds::ZipOpenError::Archive(error) => {
+                crate::archive::map_zip_open_error(error)
+            }
+        }
+    }
+}
+
 pub fn map_io_error(e: &std::io::Error) -> AppError {
     match e.kind() {
         std::io::ErrorKind::NotFound => AppError::NotFound,
@@ -111,6 +135,31 @@ pub fn map_io_error(e: &std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_runtime_errors_reach_the_native_boundary_without_changing_shape() {
+        for stop in [
+            stl_core::ResourceStop::InputLimitExceeded,
+            stl_core::ResourceStop::ReadWorkExceeded,
+            stl_core::ResourceStop::EnvelopeChanged,
+        ] {
+            let error = AppError::from(library_runtime::ProcessingError::ResourceStopped(stop));
+            assert_eq!(
+                serde_json::to_value(error).unwrap(),
+                serde_json::json!({ "kind": "Library", "message": stop.to_string() })
+            );
+        }
+        for error in [
+            library_runtime::ProcessingError::AllocationFailed,
+            library_runtime::ProcessingError::Ordinary("ordinary failure".into()),
+        ] {
+            let message = error.to_string();
+            assert_eq!(
+                serde_json::to_value(AppError::from(error)).unwrap(),
+                serde_json::json!({ "kind": "Library", "message": message })
+            );
+        }
+    }
 
     #[test]
     fn allocation_failure_keeps_the_existing_native_library_error_shape() {
