@@ -1513,6 +1513,7 @@ mod tests {
             ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
             ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
             ProcessingError::AllocationFailed,
+            ProcessingError::FundingBusy,
         ]
     }
     #[test]

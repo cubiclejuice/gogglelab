@@ -86,6 +86,9 @@ impl From<stl_core::StlError> for AppError {
             stl_core::StlError::ResourceStopped(stop) => AppError::Library {
                 message: stop.to_string(),
             },
+            stl_core::StlError::FundingBusy => AppError::Library {
+                message: "Model processing funding is temporarily unavailable".into(),
+            },
             stl_core::StlError::AllocationFailed => AppError::Library {
                 message: "Model processing could not allocate memory".into(),
             },
@@ -114,6 +117,9 @@ impl From<stl_core::zip_bounds::ZipOpenError> for AppError {
         match error {
             stl_core::zip_bounds::ZipOpenError::ResourceStopped(stop) => {
                 stl_core::StlError::ResourceStopped(stop).into()
+            }
+            stl_core::zip_bounds::ZipOpenError::FundingBusy => {
+                stl_core::StlError::FundingBusy.into()
             }
             stl_core::zip_bounds::ZipOpenError::AllocationFailed => {
                 stl_core::StlError::AllocationFailed.into()
@@ -151,12 +157,30 @@ mod tests {
         }
         for error in [
             library_runtime::ProcessingError::AllocationFailed,
+            library_runtime::ProcessingError::FundingBusy,
             library_runtime::ProcessingError::Ordinary("ordinary failure".into()),
         ] {
             let message = error.to_string();
             assert_eq!(
                 serde_json::to_value(AppError::from(error)).unwrap(),
                 serde_json::json!({ "kind": "Library", "message": message })
+            );
+        }
+    }
+
+    #[test]
+    fn funding_busy_keeps_the_existing_native_library_error_shape() {
+        for error in [
+            AppError::from(stl_core::StlError::FundingBusy),
+            AppError::from(stl_core::zip_bounds::ZipOpenError::FundingBusy),
+            AppError::from(library_runtime::ProcessingError::FundingBusy),
+        ] {
+            assert_eq!(
+                serde_json::to_value(error).unwrap(),
+                serde_json::json!({
+                    "kind": "Library",
+                    "message": "Model processing funding is temporarily unavailable"
+                })
             );
         }
     }

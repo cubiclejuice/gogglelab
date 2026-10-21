@@ -1746,6 +1746,7 @@ mod tests {
             crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
             crate::ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
             crate::ProcessingError::AllocationFailed,
+            crate::ProcessingError::FundingBusy,
         ];
         for error in failures {
             let f = fixture(3);
@@ -1755,6 +1756,7 @@ mod tests {
                     stl_core::ResourceStop::EnvelopeChanged,
                 ) => (RuntimeErrorCode::Stale, true),
                 crate::ProcessingError::AllocationFailed => (RuntimeErrorCode::Internal, false),
+                crate::ProcessingError::FundingBusy => (RuntimeErrorCode::Busy, true),
                 _ => (RuntimeErrorCode::Unsupported, false),
             };
             let before = f

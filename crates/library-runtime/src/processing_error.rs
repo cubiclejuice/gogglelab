@@ -9,6 +9,7 @@ use stl_core::{ResourceStop, StlError};
 pub enum ProcessingError {
     ResourceStopped(ResourceStop),
     AllocationFailed,
+    FundingBusy,
     Ordinary(String),
 }
 
@@ -18,6 +19,9 @@ impl fmt::Display for ProcessingError {
             Self::ResourceStopped(stop) => fmt::Display::fmt(stop, formatter),
             Self::AllocationFailed => {
                 formatter.write_str("Model processing could not allocate memory")
+            }
+            Self::FundingBusy => {
+                formatter.write_str("Model processing funding is temporarily unavailable")
             }
             Self::Ordinary(message) => formatter.write_str(message),
         }
@@ -31,6 +35,7 @@ impl From<ZipOpenError> for ProcessingError {
         match error {
             ZipOpenError::ResourceStopped(stop) => Self::ResourceStopped(stop),
             ZipOpenError::AllocationFailed => Self::AllocationFailed,
+            ZipOpenError::FundingBusy => Self::FundingBusy,
             ZipOpenError::Archive(error) => Self::Ordinary(error.to_string()),
         }
     }
@@ -41,6 +46,7 @@ impl From<StlError> for ProcessingError {
         match error {
             StlError::ResourceStopped(stop) => Self::ResourceStopped(stop),
             StlError::AllocationFailed => Self::AllocationFailed,
+            StlError::FundingBusy => Self::FundingBusy,
             ordinary => Self::Ordinary(ordinary.to_string()),
         }
     }
@@ -86,6 +92,7 @@ impl ProcessingError {
             Self::ResourceStopped(ResourceStop::EnvelopeChanged) => (RuntimeErrorCode::Stale, true),
             Self::ResourceStopped(_) => (RuntimeErrorCode::Unsupported, false),
             Self::AllocationFailed => (RuntimeErrorCode::Internal, false),
+            Self::FundingBusy => (RuntimeErrorCode::Busy, true),
         };
         RuntimeError {
             code,
@@ -143,8 +150,24 @@ mod tests {
     }
 
     #[test]
+    fn funding_busy_preserves_concrete_marker_and_rejects_message_lookalikes() {
+        use stl_core::zip_bounds::ZipFundingBusy;
+        assert!(matches!(
+            ProcessingError::from_io(ZipFundingBusy.into_io_error()),
+            ProcessingError::FundingBusy
+        ));
+        assert!(matches!(
+            ProcessingError::from(StlError::FundingBusy),
+            ProcessingError::FundingBusy
+        ));
+        let ordinary = std::io::Error::other("Model processing funding is temporarily unavailable");
+        assert!(!ProcessingError::from_io(ordinary).is_terminal());
+    }
+
+    #[test]
     fn typed_processing_error_terminal_runtime_mapping_does_not_relabel_ordinary_errors() {
         let cases = [
+            (ProcessingError::FundingBusy, RuntimeErrorCode::Busy, true),
             (
                 ProcessingError::ResourceStopped(ResourceStop::InputLimitExceeded),
                 RuntimeErrorCode::Unsupported,

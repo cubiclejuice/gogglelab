@@ -30,6 +30,20 @@ impl ZipAllocationFailed {
     }
 }
 
+/// Concrete temporary host-funding denial across IO-only processing boundaries.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[error("Model processing funding is temporarily unavailable")]
+pub struct ZipFundingBusy;
+
+impl ZipFundingBusy {
+    pub fn into_io_error(self) -> io::Error {
+        io::Error::other(self)
+    }
+    pub fn from_io_error(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
+
 /// A terminal resource/allocator failure or an unchanged ordinary archive error.
 #[derive(Debug, Error)]
 pub enum ZipOpenError {
@@ -39,6 +53,9 @@ pub enum ZipOpenError {
     /// Operational allocator failure, distinct from deterministic input allowances.
     #[error("Model processing could not allocate memory")]
     AllocationFailed,
+    /// Temporary contention in the host's existing allocation funding.
+    #[error("Model processing funding is temporarily unavailable")]
+    FundingBusy,
     /// Ordinary ZIP failures retain their SDK identity for contextual adaptation.
     #[error(transparent)]
     Archive(ZipError),
@@ -48,6 +65,7 @@ pub enum ZipOpenError {
 enum TerminalFailure {
     ResourceStopped(ResourceStop),
     AllocationFailed,
+    FundingBusy,
 }
 impl TerminalFailure {
     fn from_io(error: &io::Error) -> Option<Self> {
@@ -67,18 +85,23 @@ impl TerminalFailure {
         {
             return Some(Self::AllocationFailed);
         }
+        if ZipFundingBusy::from_io_error(error).is_some() {
+            return Some(Self::FundingBusy);
+        }
         None
     }
     fn error(self) -> ZipOpenError {
         match self {
             Self::ResourceStopped(stop) => ZipOpenError::ResourceStopped(stop),
             Self::AllocationFailed => ZipOpenError::AllocationFailed,
+            Self::FundingBusy => ZipOpenError::FundingBusy,
         }
     }
     fn io_error(self) -> io::Error {
         match self {
             Self::ResourceStopped(stop) => stop.into_io_error(),
             Self::AllocationFailed => ZipAllocationFailed.into_io_error(),
+            Self::FundingBusy => ZipFundingBusy.into_io_error(),
         }
     }
 }
@@ -172,6 +195,14 @@ impl ZipResourceObserver {
             .expect("terminal cause was recorded")
             .io_error()
     }
+    /// Record temporary host-funding denial in the same first-cause latch.
+    #[doc(hidden)]
+    pub fn funding_busy_io(&self) -> io::Error {
+        self.record(TerminalFailure::FundingBusy);
+        self.failure()
+            .expect("terminal cause was recorded")
+            .io_error()
+    }
     /// Reject even buffered IO after a terminal cause, without touching input.
     #[doc(hidden)]
     pub fn check_io(&self) -> io::Result<()> {
@@ -194,6 +225,7 @@ impl ZipResourceObserver {
                     self.record(TerminalFailure::ResourceStopped(*stop));
                 }
                 ZipOpenError::AllocationFailed => self.record(TerminalFailure::AllocationFailed),
+                ZipOpenError::FundingBusy => self.record(TerminalFailure::FundingBusy),
                 ZipOpenError::Archive(_) => {}
             }
         }
@@ -367,11 +399,12 @@ mod tests {
     use std::io::{Cursor, Write};
     use std::rc::Rc;
 
-    const FAILURES: [TerminalFailure; 4] = [
+    const FAILURES: [TerminalFailure; 5] = [
         TerminalFailure::ResourceStopped(ResourceStop::InputLimitExceeded),
         TerminalFailure::ResourceStopped(ResourceStop::ReadWorkExceeded),
         TerminalFailure::ResourceStopped(ResourceStop::EnvelopeChanged),
         TerminalFailure::AllocationFailed,
+        TerminalFailure::FundingBusy,
     ];
     fn assert_failure(error: ZipOpenError, expected: TerminalFailure) {
         match (error, expected) {
@@ -379,6 +412,7 @@ mod tests {
                 assert_eq!(actual, expected)
             }
             (ZipOpenError::AllocationFailed, TerminalFailure::AllocationFailed) => {}
+            (ZipOpenError::FundingBusy, TerminalFailure::FundingBusy) => {}
             (actual, expected) => panic!("expected {expected:?}, got {actual:?}"),
         }
     }
@@ -386,6 +420,7 @@ mod tests {
         match failure {
             TerminalFailure::ResourceStopped(stop) => observer.stop_io(stop),
             TerminalFailure::AllocationFailed => observer.allocation_failed_io(),
+            TerminalFailure::FundingBusy => observer.funding_busy_io(),
         }
     }
 

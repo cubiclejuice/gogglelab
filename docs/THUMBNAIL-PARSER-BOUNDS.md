@@ -1,6 +1,65 @@
 # Thumbnail parser resource prerequisite
 
-## Current checkpoint: metadata projections (2026-10-20)
+## Current implementation: shared path funding (2026-10-20)
+
+The selected-model geometry route creates a funded context before verified-source
+acquisition. An indexed archive's hidden validation and the visible model parse
+use that same context. Internal root/reference paths, model-part paths, cache keys
+and diagnostic path sets use immutable shared backing. The complete requested
+header/payload layout is admitted before its allocation; clones share that block,
+and its final owner deallocates it before returning the credit.
+
+Admission competes with existing Owned, Geometry and Bundle reservations on the
+same runtime state and current limits. It introduces no separate allowance.
+An accounting underflow persistently marks that state uncertain and denies later
+admission in those categories; a later refund does not reopen authority. Upload
+accounting remains separate. The funding handle retains state and limits, without
+retaining the runtime. Its once-created control allocations are explicit bootstrap
+terms. Retained-file inventory refresh occurs at operation entry, not per path.
+
+Funding refusal uses the named operational `FundingBusy` category through the
+existing single first-cause observer. It maps to retryable runtime Busy and is
+never ordinary malformed metadata, allocator failure or a deterministic input
+limit. Adding variants to exhaustive `StlError`, `ZipOpenError` and
+`ProcessingError` enums requires external Rust exhaustive matches to be updated;
+unchanged result signatures and wire fields do not remove that source impact.
+
+The public compatibility context remains explicitly unfunded. Public output
+strings, maps/array capacities, SDK scratch and controls, independent bundle
+previews, other parser routes and native response ownership are not covered by
+this path-backing increment. It selects neither a 16 MiB metadata policy nor a
+producer profile and does not prove allocator/RSS bounds. Test instrumentation
+enlarges the owner header; normal-artifact allocation evidence is tracked
+separately. Verification and review records are in `output/owned-metadata-service/`.
+
+Parent-observed behavioral failures preceded both the admission implementation and
+the persistent-underflow fix. Final serial workspace verification passes 339
+non-doc core tests plus two doctests (one existing ignored fixture), 387 runtime,
+211 native, 65 server-library and five CLI tests. All 152 compiled Rust/Cargo inputs
+remain frozen. Stored/Deflate indexed sources reject funding during hidden
+validation before the visible parser/derivative, preserving source and catalog.
+Independent path, allocation-safety and runtime reviews are closed.
+
+A newly compiled normal-artifact probe observes a 40-byte header, eight-byte
+alignment, and a 72-byte requested block for a 29-byte path on this toolchain.
+The last clone outlives its context; actual system deallocation completes before
+credit release. A targeted null allocation returns AllocationFailed with one
+refund and no null deallocation; Busy performs no targeted block allocation.
+These local layout observations are neither public ABI nor allocator/RSS bounds.
+
+Workspace Clippy exits successfully with 46 inherited actionable diagnostics:
+45 retain identical source identities; one existing eight-argument warning has
+only the required String-to-SharedPath signature-span change, independently
+matched exactly. The strict raw delta and supplemental proof are both preserved;
+no warning suppression was added. Formatting and whitespace checks pass.
+
+The unchanged normal-artifact corpus driver also passes all four preserved
+long-path/distinct-label Stored/Deflate fixtures, with 1,024 parts, materials and
+triangles and the original borrowed row/string identities. Its result log matches
+the prior accepted run. Explicit public owned-copy controls still exceed 16 MiB;
+the new private path ownership does not remove that separate output-copy term.
+
+## Accepted checkpoint: metadata projections (2026-10-20)
 
 A validated borrowed plate-part view is shared by the runtime and native summary
 consumer. It checks every range before yielding, keeps source ordering and the

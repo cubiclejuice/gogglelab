@@ -30,6 +30,7 @@ use derived_maps::BuildIndex;
 
 use crate::error::{ResourceStop, StlError};
 use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
+use crate::metadata_owned::{PathAllocator, SharedPath};
 use crate::model::{
     MaterialSource, ParsedFilament, ParsedMaterial, ParsedModel, ParsedPart, Plate,
 };
@@ -117,7 +118,7 @@ fn unit_to_mm(unit: &str) -> Option<f32> {
 struct Component {
     /// `p:path` from the production extension: the part holding the target
     /// object, or `None` for "this part".
-    path: Option<String>,
+    path: Option<SharedPath>,
     object_id: u32,
     transform: Mat,
 }
@@ -141,7 +142,7 @@ struct Object {
 }
 
 struct BuildItem {
-    path: Option<String>,
+    path: Option<SharedPath>,
     object_id: u32,
     transform: Mat,
     /// Bambu/Orca write `printable="0"` on items the user disabled. Not core
@@ -151,7 +152,7 @@ struct BuildItem {
 
 struct ModelPart {
     /// Normalized zip entry name, without an OPC leading slash.
-    path: String,
+    path: SharedPath,
     /// Multiplier from this part's `unit` to millimetres.
     scale: f32,
     objects: HashMap<u32, Object>,
@@ -171,6 +172,7 @@ fn preserve_terminal<T>(result: &Result<T, StlError>) -> Result<(), StlError> {
     match result {
         Err(StlError::ResourceStopped(stop)) => Err(StlError::ResourceStopped(*stop)),
         Err(StlError::AllocationFailed) => Err(StlError::AllocationFailed),
+        Err(StlError::FundingBusy) => Err(StlError::FundingBusy),
         _ => Ok(()),
     }
 }
@@ -180,6 +182,7 @@ fn preserve_terminal<T>(result: &Result<T, StlError>) -> Result<(), StlError> {
 enum ParserTestFailure {
     Stop(ResourceStop),
     Allocation,
+    Funding,
 }
 
 #[cfg(test)]
@@ -188,6 +191,7 @@ impl ParserTestFailure {
         match self {
             Self::Stop(stop) => stop.into_io_error(),
             Self::Allocation => crate::zip_bounds::ZipAllocationFailed.into_io_error(),
+            Self::Funding => crate::zip_bounds::ZipFundingBusy.into_io_error(),
         }
     }
 
@@ -195,6 +199,7 @@ impl ParserTestFailure {
         match self {
             Self::Stop(stop) => StlError::ResourceStopped(stop),
             Self::Allocation => StlError::AllocationFailed,
+            Self::Funding => StlError::FundingBusy,
         }
     }
 }
@@ -646,6 +651,9 @@ fn sidecar_latch(observer: &ZipResourceObserver, failure: Option<ParserTestFailu
         Some(ParserTestFailure::Allocation) => {
             let _ = observer.allocation_failed_io();
         }
+        Some(ParserTestFailure::Funding) => {
+            let _ = observer.funding_busy_io();
+        }
         None => {}
     }
 }
@@ -729,7 +737,7 @@ struct Package<'a, 'context> {
     #[cfg(test)]
     sidecar_test: Option<Rc<SidecarTestProfile>>,
     collections: InputCollections,
-    parts: HashMap<String, Rc<ModelPart>>,
+    parts: HashMap<SharedPath, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
     context: &'context mut PackageProcessingContext,
     component_visits_remaining: u64,
@@ -837,7 +845,9 @@ impl<'a, 'context> Package<'a, 'context> {
         self.context
             .collect_text(file, role)
             .map_err(|error| match error {
-                error @ (StlError::ResourceStopped(_) | StlError::AllocationFailed) => error,
+                error @ (StlError::ResourceStopped(_)
+                | StlError::AllocationFailed
+                | StlError::FundingBusy) => error,
                 _ => malformed(ordinary_message),
             })
     }
@@ -866,6 +876,7 @@ impl<'a, 'context> Package<'a, 'context> {
                 probe.state.borrow_mut().armed = true;
             }
         }
+        let allocator = self.context.path_allocator();
         let parsed = {
             let member = self
                 .archive
@@ -874,10 +885,13 @@ impl<'a, 'context> Package<'a, 'context> {
             if member.size() > MAX_FILE_BYTES {
                 return input_stop(&observer);
             }
+            let owned_path = allocator.copy_path(key)?;
             let reader = BufReader::new(self.context.model_reader(member));
             parse_model_part(
                 reader,
                 path,
+                owned_path,
+                &allocator,
                 &observer,
                 &mut self.collections,
                 #[cfg(test)]
@@ -894,7 +908,7 @@ impl<'a, 'context> Package<'a, 'context> {
             self.material_owned_test.as_deref(),
         )?;
         // Cache keys are owned only on misses; bucket growth is fallible.
-        let key = key.to_string();
+        let key = parsed.path.clone();
         reserve_input_map(
             &mut self.parts,
             &key,
@@ -949,16 +963,18 @@ impl<'a, 'context> Package<'a, 'context> {
 
     /// The root model part per `_rels/.rels`; falls back to the conventional
     /// path when the relationships part is absent or does not name one.
-    fn root_model_path(&mut self) -> Result<String, StlError> {
+    fn root_model_path(&mut self) -> Result<SharedPath, StlError> {
         self.observer.check()?;
         if self.has("_rels/.rels") {
             let text = self.collect_text("_rels/.rels", TextRole::Relationships)?;
-            if let Some(target) = model_relationship_target(&text, &self.observer)? {
+            if let Some(target) =
+                model_relationship_target(&text, &self.observer, &self.context.path_allocator())?
+            {
                 return Ok(target);
             }
         }
         if self.has(ROOT_MODEL_FALLBACK) {
-            return Ok(ROOT_MODEL_FALLBACK.to_string());
+            return self.context.copy_path(ROOT_MODEL_FALLBACK);
         }
         Err(malformed("no 3D model part in the package"))
     }
@@ -1305,12 +1321,12 @@ fn component_part_metadata_paths(
     pkg: &mut Package<'_, '_>,
     root: &ModelPart,
     root_path: &str,
-) -> Result<HashMap<u32, HashSet<String>>, StlError> {
+) -> Result<HashMap<u32, HashSet<SharedPath>>, StlError> {
     derived_maps::diagnostic_paths(pkg, root, root_path)
 }
 
 fn component_part_metadata_ambiguous(
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     object_id: u32,
 ) -> bool {
     component_paths
@@ -1387,7 +1403,8 @@ fn object_has_geometry(
 fn model_relationship_target(
     rels: &str,
     observer: &ZipResourceObserver,
-) -> Result<Option<String>, StlError> {
+    allocator: &PathAllocator,
+) -> Result<Option<SharedPath>, StlError> {
     let mut reader = XmlEventReader::new(rels.as_bytes(), observer.clone())?;
     let target = (|| loop {
         match reader.next_event() {
@@ -1398,22 +1415,44 @@ fn model_relationship_target(
                 let mut target = None;
                 let mut is_model = false;
                 for attr in e.attributes().flatten() {
-                    let value = attr.normalized_value(XmlVersion::Implicit1_0).ok()?;
+                    observer.check()?;
+                    let Ok(value) = attr.normalized_value(XmlVersion::Implicit1_0) else {
+                        return Ok(None);
+                    };
                     match attr.key.local_name().as_ref() {
-                        b"Target" => target = Some(value.into_owned()),
+                        b"Target" => target = Some(allocator.copy_path(&value)?),
                         b"Type" => is_model = value.ends_with("/3dmodel"),
                         _ => {}
                     }
                 }
                 if is_model {
-                    return target;
+                    return Ok(target);
                 }
             }
-            Ok(Event::Eof) | Err(_) => return None,
+            Ok(Event::Eof) | Err(_) => return Ok(None),
             _ => {}
         }
     })();
-    observer.finish(Ok(target))
+    observer.finish(target)
+}
+
+fn attr_path(
+    e: &BytesStart,
+    allocator: &PathAllocator,
+    observer: &ZipResourceObserver,
+) -> Result<Option<SharedPath>, StlError> {
+    observer.check()?;
+    for attr in e.attributes() {
+        let attr = attr.map_err(|_| malformed("malformed XML attribute"))?;
+        if attr.key.local_name().as_ref() == b"path" {
+            observer.check()?;
+            let value = attr
+                .normalized_value(XmlVersion::Implicit1_0)
+                .map_err(|_| malformed("malformed XML attribute value"))?;
+            return allocator.copy_path(&value).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn attr_str(e: &BytesStart, name: &[u8]) -> Result<Option<String>, StlError> {
@@ -1522,6 +1561,8 @@ struct OpenObject {
 fn parse_model_part<R: Read>(
     reader: R,
     path: &str,
+    owned_path: SharedPath,
+    allocator: &PathAllocator,
     observer: &ZipResourceObserver,
     collections: &mut InputCollections,
     #[cfg(test)] material_probe: Option<&MaterialOwnedTestProfile>,
@@ -1530,7 +1571,7 @@ fn parse_model_part<R: Read>(
     xml.set_trim_text(true);
 
     let mut part = ModelPart {
-        path: Package::entry_name(path).to_string(),
+        path: owned_path,
         scale: 1.0,
         objects: HashMap::new(),
         build: Vec::new(),
@@ -1703,7 +1744,7 @@ fn parse_model_part<R: Read>(
                         };
                         collections.admit(InputKind::Component)?;
                         let component = Component {
-                            path: attr_str(e, b"path")?,
+                            path: attr_path(e, allocator, observer)?,
                             object_id: attr_u32(e, "objectid", "component")?,
                             transform: attr_transform(e)?,
                         };
@@ -1731,7 +1772,7 @@ fn parse_model_part<R: Read>(
                             .map(|p| p.trim() != "0" && !p.trim().eq_ignore_ascii_case("false"))
                             .unwrap_or(true);
                         let item = BuildItem {
-                            path: attr_str(e, b"path")?,
+                            path: attr_path(e, allocator, observer)?,
                             object_id: attr_u32(e, "objectid", "build item")?,
                             transform: attr_transform(e)?,
                             printable,
@@ -2184,7 +2225,7 @@ fn emit_build_item(
     item: &BuildItem,
     occurrence: u32,
     slicer: &SlicerMetadata,
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     out: &mut Out,
     parts: &mut PartOutput,
 ) -> Result<(), StlError> {
@@ -2377,7 +2418,7 @@ fn whole_build(
     pkg: &mut Package,
     build: &BuildView<'_>,
     slicer: &SlicerMetadata,
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     filaments: Vec<ParsedFilament>,
     warning: String,
 ) -> Result<ParsedModel, StlError> {
@@ -2531,6 +2572,9 @@ fn parse_3mf_with_context(
             ParserTestFailure::Allocation => {
                 let _ = pkg.observer.allocation_failed_io();
             }
+            ParserTestFailure::Funding => {
+                let _ = pkg.observer.funding_busy_io();
+            }
         }
     }
     pkg.observer.check()?;
@@ -2593,7 +2637,9 @@ fn parse_3mf_with_context(
             match result {
                 Ok(specs) => Some(specs),
                 Err(PlateResolutionError::Source(
-                    error @ (StlError::ResourceStopped(_) | StlError::AllocationFailed),
+                    error @ (StlError::ResourceStopped(_)
+                    | StlError::AllocationFailed
+                    | StlError::FundingBusy),
                 )) => return Err(error),
                 Err(detail) => {
                     return whole_build(
@@ -2618,7 +2664,9 @@ fn parse_3mf_with_context(
             );
         }
         PreparedSettings::Unreadable(
-            err @ (StlError::ResourceStopped(_) | StlError::AllocationFailed),
+            err @ (StlError::ResourceStopped(_)
+            | StlError::AllocationFailed
+            | StlError::FundingBusy),
         ) => {
             return Err(err);
         }
@@ -2698,11 +2746,12 @@ mod tests {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
-    const PARSER_TEST_FAILURES: [ParserTestFailure; 4] = [
+    const PARSER_TEST_FAILURES: [ParserTestFailure; 5] = [
         ParserTestFailure::Stop(ResourceStop::InputLimitExceeded),
         ParserTestFailure::Stop(ResourceStop::ReadWorkExceeded),
         ParserTestFailure::Stop(ResourceStop::EnvelopeChanged),
         ParserTestFailure::Allocation,
+        ParserTestFailure::Funding,
     ];
 
     struct ParserProbeGuard(Option<Rc<ParserTestProbe>>);
@@ -3007,6 +3056,7 @@ mod tests {
                 assert_eq!(actual, expected)
             }
             (Err(StlError::AllocationFailed), ParserTestFailure::Allocation) => {}
+            (Err(StlError::FundingBusy), ParserTestFailure::Funding) => {}
             (actual, _) => panic!("wrong terminal result: {actual:?}"),
         }
     }
@@ -3285,7 +3335,7 @@ mod tests {
                 map.try_reserve(1).unwrap();
                 map.capacity()
             } else {
-                let mut map = HashMap::<String, Rc<ModelPart>>::new();
+                let mut map = HashMap::<SharedPath, Rc<ModelPart>>::new();
                 map.try_reserve(1).unwrap();
                 map.capacity()
             };
@@ -3325,7 +3375,7 @@ mod tests {
                 let pending = &names[initial_capacity];
                 assert!(matches!(pkg.part(pending), Err(StlError::AllocationFailed)));
                 assert_eq!(pkg.parts.len(), initial_capacity);
-                assert!(!pkg.parts.contains_key(pending));
+                assert!(!pkg.parts.contains_key(pending.as_str()));
             }
             assert_eq!(profile.reserves.borrow()[site as usize], 2);
         }
@@ -6572,6 +6622,7 @@ mod tests {
                             ParserTestFailure::Allocation => {
                                 ParserTestFailure::Stop(ResourceStop::EnvelopeChanged)
                             }
+                            ParserTestFailure::Funding => ParserTestFailure::Allocation,
                         }));
                         let _guard = SettingsOwnedProfileGuard::install(profile.clone());
                         let observer = ZipResourceObserver::new();
@@ -7088,6 +7139,154 @@ mod tests {
                 StlError::from(observer.check().unwrap_err()),
                 failure.error()
             );
+        }
+    }
+
+    #[derive(Default)]
+    struct PathTestFunding {
+        calls: std::sync::atomic::AtomicUsize,
+        live: std::sync::atomic::AtomicUsize,
+        deny_call: usize,
+    }
+    impl crate::metadata_owned::HostOwnedFunding for PathTestFunding {
+        fn try_acquire(&self, bytes: usize) -> Result<(), crate::zip_bounds::ZipFundingBusy> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let call = self.calls.fetch_add(1, SeqCst) + 1;
+            if call == self.deny_call {
+                return Err(crate::zip_bounds::ZipFundingBusy);
+            }
+            self.live.fetch_add(bytes, SeqCst);
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert!(self.live.fetch_sub(bytes, SeqCst) >= bytes);
+        }
+    }
+
+    fn funded_path_fixture(deflate: bool) -> Vec<u8> {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components>
+<component p:path="/3D/Objects/a.model" objectid="2"/>
+<component p:path="3D/Objects/a.model" objectid="2"/>
+</components></object>"#,
+            r#"<item objectid="10" p:path="/3D/3dmodel.model"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let settings = plate_settings(&plate_xml(1, "Both", &[(10, 0)]));
+        package(
+            &[
+                ("_rels/.rels", RELS),
+                (ROOT_MODEL_FALLBACK, &root),
+                ("3D/Objects/a.model", &child),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            deflate,
+        )
+    }
+
+    #[test]
+    fn funded_path_cache_keys_share_original_part_owner_and_cache_hits_do_not_acquire() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = funded_path_fixture(deflate);
+            let funding = Arc::new(PathTestFunding::default());
+            let mut context =
+                PackageProcessingContext::new_funded(ZipResourceObserver::new(), funding.clone());
+            let mut pkg = Package::open(&bytes, &mut context).unwrap();
+            let root_path = pkg.root_model_path().unwrap();
+            let root = pkg.part(&root_path).unwrap();
+            let child = pkg.part("/3D/Objects/a.model").unwrap();
+            let key = pkg.parts.get_key_value("3D/Objects/a.model").unwrap().0;
+            assert_eq!(key.as_str().as_ptr(), child.path.as_str().as_ptr());
+            let calls = funding.calls.load(SeqCst);
+            let cached = pkg.part("3D/Objects/a.model").unwrap();
+            assert!(Rc::ptr_eq(&child, &cached));
+            assert_eq!(funding.calls.load(SeqCst), calls);
+            let ObjectKind::Components(components) = &root.objects.get(&10).unwrap().kind else {
+                panic!("fixture must retain repeated actual component paths");
+            };
+            assert_eq!(components[0].path.as_deref(), Some("/3D/Objects/a.model"));
+            assert_eq!(components[1].path.as_deref(), Some("3D/Objects/a.model"));
+            assert_eq!(root.build[0].path.as_deref(), Some("/3D/3dmodel.model"));
+            let retained = child.path.clone();
+            assert_eq!(funding.calls.load(SeqCst), calls);
+            drop(cached);
+            drop(child);
+            drop(root);
+            drop(root_path);
+            drop(pkg);
+            drop(context);
+            assert!(
+                funding.live.load(SeqCst) > 0,
+                "actual path outlives package/context"
+            );
+            assert_eq!(retained.as_str(), "3D/Objects/a.model");
+            drop(retained);
+            assert_eq!(funding.live.load(SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn funded_path_real_parse_preserves_public_result_and_package_usage() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = funded_path_fixture(deflate);
+            let mut external = PackageProcessingContext::new(ZipResourceObserver::new());
+            let expected =
+                crate::parse_model_with_plates_in_context(&bytes, &mut external).unwrap();
+            let funding = Arc::new(PathTestFunding::default());
+            let mut context =
+                PackageProcessingContext::new_funded(ZipResourceObserver::new(), funding.clone());
+            let actual = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.model.triangle_count, 24);
+            assert_eq!(actual.parts.len(), 2);
+            assert_eq!(context.usage(), external.usage());
+            assert!(
+                funding.calls.load(SeqCst) >= 6,
+                "actual root/reference/cache/diagnostic sites"
+            );
+            assert_eq!(
+                funding.live.load(SeqCst),
+                0,
+                "public output does not retain private paths"
+            );
+        }
+    }
+
+    #[test]
+    fn funded_path_denial_is_terminal_at_every_actual_path_site_without_leaked_credit() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = funded_path_fixture(deflate);
+            let healthy = Arc::new(PathTestFunding::default());
+            let mut context =
+                PackageProcessingContext::new_funded(ZipResourceObserver::new(), healthy.clone());
+            crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            let sites = healthy.calls.load(SeqCst);
+            assert!(sites >= 6);
+            for deny_call in 1..=sites {
+                let funding = Arc::new(PathTestFunding {
+                    deny_call,
+                    ..Default::default()
+                });
+                let observer = ZipResourceObserver::new();
+                let mut context =
+                    PackageProcessingContext::new_funded(observer.clone(), funding.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(StlError::FundingBusy)
+                );
+                assert!(matches!(observer.check(), Err(ZipOpenError::FundingBusy)));
+                assert_eq!(
+                    funding.calls.load(SeqCst),
+                    deny_call,
+                    "no later funded copy after denial"
+                );
+                assert_eq!(funding.live.load(SeqCst), 0);
+            }
         }
     }
 }

@@ -62,6 +62,9 @@ impl Control<'_> {
                         ParserTestFailure::Allocation => {
                             let _ = self.observer.allocation_failed_io();
                         }
+                        ParserTestFailure::Funding => {
+                            let _ = self.observer.funding_busy_io();
+                        }
                     }
                 }
             }

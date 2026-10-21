@@ -16,7 +16,9 @@ pub(super) enum SettingsError {
 impl From<StlError> for SettingsError {
     fn from(error: StlError) -> Self {
         match error {
-            StlError::ResourceStopped(_) | StlError::AllocationFailed => Self::Source(error),
+            StlError::ResourceStopped(_) | StlError::AllocationFailed | StlError::FundingBusy => {
+                Self::Source(error)
+            }
             ordinary => Self::Metadata(ordinary.to_string()),
         }
     }
@@ -63,6 +65,9 @@ impl Control<'_> {
             }
             ParserTestFailure::Allocation => {
                 let _ = self.observer.allocation_failed_io();
+            }
+            ParserTestFailure::Funding => {
+                let _ = self.observer.funding_busy_io();
             }
         }
     }
@@ -233,7 +238,7 @@ pub(super) fn parse_slicer_metadata(
     text: &str,
     observer: &ZipResourceObserver,
     objects: &HashMap<u32, Object>,
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     #[cfg(test)] probe: Option<&SettingsOwnedTestProfile>,
 ) -> Result<SlicerMetadata, SettingsError> {
     observer.check()?;
@@ -253,7 +258,7 @@ pub(super) fn parse_slicer_metadata(
 fn parse_inner(
     text: &str,
     objects: &HashMap<u32, Object>,
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     control: &Control<'_>,
 ) -> Result<SlicerMetadata, SettingsError> {
     let mut xml = XmlEventReader::new(text.as_bytes(), control.observer.clone())?;

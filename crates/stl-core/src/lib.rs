@@ -8,6 +8,8 @@ pub mod error;
 pub mod integrity;
 pub mod limits;
 pub mod measure;
+#[doc(hidden)]
+pub mod metadata_owned;
 pub mod model;
 #[doc(hidden)]
 pub mod package_bounds;

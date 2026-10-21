@@ -89,8 +89,11 @@ impl Control<'_> {
         set.try_reserve(1).map_err(|_| self.allocation())?;
         self.after(site)
     }
-    fn text(&self, text: &str) -> Result<String, StlError> {
-        self.text_at(text, ReserveSite::Path)
+    fn path(&self, text: &str, allocator: &PathAllocator) -> Result<SharedPath, StlError> {
+        self.before(ReserveSite::Path)?;
+        let owned = allocator.copy_path(text)?;
+        self.after(ReserveSite::Path)?;
+        Ok(owned)
     }
     fn text_at(&self, text: &str, site: ReserveSite) -> Result<String, StlError> {
         if text.len() > isize::MAX as usize {
@@ -143,6 +146,9 @@ fn latch(observer: &ZipResourceObserver, failure: ParserTestFailure) {
         }
         ParserTestFailure::Allocation => {
             let _ = observer.allocation_failed_io();
+        }
+        ParserTestFailure::Funding => {
+            let _ = observer.funding_busy_io();
         }
     }
 }
@@ -604,7 +610,7 @@ pub(super) fn diagnostic_paths(
     pkg: &mut Package<'_, '_>,
     root: &ModelPart,
     root_path: &str,
-) -> Result<HashMap<u32, HashSet<String>>, StlError> {
+) -> Result<HashMap<u32, HashSet<SharedPath>>, StlError> {
     let root_path = Package::entry_name(root_path);
     let observer = pkg.observer.clone();
     #[cfg(test)]
@@ -614,7 +620,7 @@ pub(super) fn diagnostic_paths(
         #[cfg(test)]
         probe: probe.as_deref(),
     };
-    let mut paths: HashMap<u32, HashSet<String>> = HashMap::new();
+    let mut paths: HashMap<u32, HashSet<SharedPath>> = HashMap::new();
     for item in &root.build {
         pkg.charge_component_work()?;
         if !item.printable {
@@ -643,7 +649,7 @@ pub(super) fn diagnostic_paths(
             control.map(&mut paths, &component.object_id, ReserveSite::DiagnosticMap)?;
             let set = paths.entry(component.object_id).or_default();
             control.set(set, ReserveSite::DiagnosticSet)?;
-            let owned = control.text(path)?;
+            let owned = control.path(path, &pkg.context.path_allocator())?;
             #[cfg(test)]
             if let Some(probe) = &probe {
                 probe

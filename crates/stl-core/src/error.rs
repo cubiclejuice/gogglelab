@@ -57,6 +57,9 @@ pub enum StlError {
     /// Operational allocator failure, separate from deterministic parsing limits.
     #[error("Model processing could not allocate memory")]
     AllocationFailed,
+    /// Temporary contention in the host's existing allocation funding.
+    #[error("Model processing funding is temporarily unavailable")]
+    FundingBusy,
     #[error(transparent)]
     ResourceStopped(#[from] ResourceStop),
 }
@@ -66,6 +69,7 @@ impl From<crate::zip_bounds::ZipOpenError> for StlError {
         match error {
             crate::zip_bounds::ZipOpenError::ResourceStopped(stop) => Self::ResourceStopped(stop),
             crate::zip_bounds::ZipOpenError::AllocationFailed => Self::AllocationFailed,
+            crate::zip_bounds::ZipOpenError::FundingBusy => Self::FundingBusy,
             crate::zip_bounds::ZipOpenError::Archive(error) => Self::Malformed3mf {
                 detail: format!("not a readable zip package ({error})"),
             },
@@ -83,6 +87,37 @@ mod tests {
         ResourceStop::ReadWorkExceeded,
         ResourceStop::EnvelopeChanged,
     ];
+
+    #[test]
+    fn funding_busy_marker_keeps_its_concrete_category_through_io_wrappers() {
+        use crate::zip_bounds::{classify_zip_error, ZipFundingBusy, ZipOpenError};
+        let error = ZipFundingBusy.into_io_error();
+        assert_eq!(ZipFundingBusy::from_io_error(&error), Some(ZipFundingBusy));
+        let wrapped = quick_xml::Error::from(error);
+        let quick_xml::Error::Io(error) = wrapped else {
+            panic!("expected IO wrapper")
+        };
+        assert_eq!(ZipFundingBusy::from_io_error(&error), Some(ZipFundingBusy));
+        assert!(matches!(
+            classify_zip_error(zip::result::ZipError::Io(ZipFundingBusy.into_io_error())),
+            ZipOpenError::FundingBusy
+        ));
+        assert_eq!(
+            StlError::from(ZipOpenError::FundingBusy),
+            StlError::FundingBusy
+        );
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(ZipFundingBusy::from_io_error(&io::Error::new(
+                kind,
+                ZipFundingBusy.to_string()
+            ))
+            .is_none());
+        }
+    }
 
     #[test]
     fn resource_stop_io_roundtrip_preserves_each_concrete_reason() {

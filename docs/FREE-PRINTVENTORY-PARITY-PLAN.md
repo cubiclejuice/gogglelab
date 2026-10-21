@@ -2,7 +2,18 @@
 
 Date: 2026-10-15 (updated 2026-10-20)
 
-## Current checkpoint: metadata projections (2026-10-20)
+## Current implementation: shared path funding (2026-10-20)
+
+The selected-model geometry parser now admits immutable internal path backing on
+the existing shared Owned ledger, including indexed-archive hidden validation.
+Last-owner deallocation precedes refund; temporary funding refusal remains typed
+through optional metadata handling. Uncertain accounting persistently denies
+further Owned/Geometry/Bundle admission. No new quota is selected. This changes
+exhaustive Rust error enums while preserving existing wire fields. Full metadata,
+SDK/native response and producer ownership remain open; see
+[the scope and verification notes](THUMBNAIL-PARSER-BOUNDS.md#current-implementation-shared-path-funding-2026-10-20).
+
+## Accepted checkpoint: metadata projections (2026-10-20)
 
 A validated borrowed plate-part view is shared by the runtime and native summary
 consumer. It checks every range before yielding, keeps source ordering and the

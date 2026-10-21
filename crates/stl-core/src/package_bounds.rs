@@ -58,6 +58,7 @@ pub struct PackageProcessingContext {
     inflation: PackageInflationBudget,
     observer: ZipResourceObserver,
     retained_input: usize,
+    paths: crate::metadata_owned::PathAllocator,
     #[cfg(test)]
     limits: PackageTestLimits,
     #[cfg(test)]
@@ -76,8 +77,23 @@ pub struct PackageUsage {
 
 impl PackageProcessingContext {
     pub fn new(observer: ZipResourceObserver) -> Self {
+        Self::with_funding(observer, None)
+    }
+
+    pub fn new_funded(
+        observer: ZipResourceObserver,
+        host: std::sync::Arc<dyn crate::metadata_owned::HostOwnedFunding>,
+    ) -> Self {
+        Self::with_funding(observer, Some(host))
+    }
+
+    fn with_funding(
+        observer: ZipResourceObserver,
+        host: Option<std::sync::Arc<dyn crate::metadata_owned::HostOwnedFunding>>,
+    ) -> Self {
         Self {
             inflation: PackageInflationBudget::new(observer.clone()),
+            paths: crate::metadata_owned::PathAllocator::new(observer.clone(), host),
             observer,
             retained_input: 0,
             #[cfg(test)]
@@ -85,6 +101,18 @@ impl PackageProcessingContext {
             #[cfg(test)]
             collector_test: CollectorTestState::default(),
         }
+    }
+
+    /// Split allocation from the unique inflation-reader borrow without resetting either.
+    pub fn path_allocator(&self) -> crate::metadata_owned::PathAllocator {
+        self.paths.clone()
+    }
+
+    pub fn copy_path(
+        &self,
+        text: &str,
+    ) -> Result<crate::metadata_owned::SharedPath, crate::StlError> {
+        self.paths.copy_path(text)
     }
 
     pub fn observer(&self) -> ZipResourceObserver {
@@ -213,6 +241,7 @@ impl PackageProcessingContext {
     ) -> Self {
         Self {
             inflation: PackageInflationBudget::with_limit(observer.clone(), limits.inflation),
+            paths: crate::metadata_owned::PathAllocator::new(observer.clone(), None),
             observer,
             retained_input: 0,
             limits,
@@ -1631,6 +1660,10 @@ mod tests {
                 io::Error::new(io::ErrorKind::Interrupted, ResourceStop::ReadWorkExceeded),
                 io::Error::new(io::ErrorKind::Interrupted, ResourceStop::EnvelopeChanged),
                 io::Error::new(io::ErrorKind::Interrupted, ZipAllocationFailed),
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    crate::zip_bounds::ZipFundingBusy,
+                ),
             ] {
                 let expected = payload.to_string();
                 let mut context = tiny_context(tiny_limits());
@@ -1647,7 +1680,9 @@ mod tests {
                 assert_eq!(error.to_string(), expected);
                 assert!(matches!(
                     error,
-                    crate::StlError::ResourceStopped(_) | crate::StlError::AllocationFailed
+                    crate::StlError::ResourceStopped(_)
+                        | crate::StlError::AllocationFailed
+                        | crate::StlError::FundingBusy
                 ));
                 assert_eq!(stats.lock().unwrap().requests.len(), interrupt_call);
                 let requests = stats.lock().unwrap().requests.len();

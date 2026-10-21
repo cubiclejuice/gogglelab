@@ -69,6 +69,7 @@ pub mod geometry;
 pub mod images;
 pub mod integration_state;
 pub mod integrations;
+mod model_operation;
 mod png_output;
 pub mod printer_network;
 pub mod printer_network_api;
@@ -1073,6 +1074,7 @@ impl Default for TempResourceLimits {
 struct TempResourceState {
     owned_bytes: u64,
     reserved_owned_bytes: u64,
+    owned_accounting_uncertain: bool,
     staged_upload_bytes: u64,
     reserved_upload_bytes: u64,
     active_bundle_builds: usize,
@@ -2048,8 +2050,9 @@ pub struct LibraryRuntime {
     uploads: Mutex<HashMap<String, UploadEntry>>,
     scan: Arc<scanner::ScanControl>,
     bundle_previews: bundles::BundlePreviewStore,
-    temp_limits: Mutex<TempResourceLimits>,
+    temp_limits: Arc<Mutex<TempResourceLimits>>,
     temp_resources: Arc<Mutex<TempResourceState>>,
+    model_funding: Arc<model_operation::RuntimeOwnedFunding>,
     actions: Mutex<HashMap<String, PlannedAction>>,
     thumbnail_cleanup: thumbnail_cleanup::Store,
     #[cfg(test)]
@@ -2095,6 +2098,12 @@ impl LibraryRuntime {
             )?;
             (Some(db), root)
         };
+        let temp_limits = Arc::new(Mutex::new(TempResourceLimits::default()));
+        let temp_resources = Arc::new(Mutex::new(TempResourceState::default()));
+        let model_funding = Arc::new(model_operation::RuntimeOwnedFunding::new(
+            Arc::clone(&temp_resources),
+            Arc::clone(&temp_limits),
+        ));
         let runtime = Arc::new(Self {
             db: Mutex::new(db),
             root,
@@ -2117,8 +2126,9 @@ impl LibraryRuntime {
             uploads: Mutex::new(HashMap::new()),
             scan: Arc::new(scanner::ScanControl::new()),
             bundle_previews: bundles::BundlePreviewStore::default(),
-            temp_limits: Mutex::new(TempResourceLimits::default()),
-            temp_resources: Arc::new(Mutex::new(TempResourceState::default())),
+            temp_limits,
+            temp_resources,
+            model_funding,
             actions: Mutex::new(HashMap::new()),
             thumbnail_cleanup: thumbnail_cleanup::Store::default(),
             #[cfg(test)]
@@ -2659,6 +2669,20 @@ impl LibraryRuntime {
             if let Some(error) = &state.geometry_inventory_error {
                 return Err(error.clone());
             }
+        }
+        if state.owned_accounting_uncertain
+            && matches!(
+                kind,
+                ReservationKind::Owned | ReservationKind::Geometry | ReservationKind::Bundle
+            )
+        {
+            return Err(RuntimeError {
+                code: RuntimeErrorCode::Busy,
+                message: "Generated content accounting is unavailable".into(),
+                retryable: true,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
         }
         match kind {
             ReservationKind::Bundle => {

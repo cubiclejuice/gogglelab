@@ -649,6 +649,7 @@ mod tests {
             ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
             ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
             ProcessingError::AllocationFailed,
+            ProcessingError::FundingBusy,
         ]
     }
     #[test]
@@ -730,6 +731,9 @@ mod tests {
                 ProcessingError::ResourceStopped(stop) => stop.into_io_error(),
                 ProcessingError::AllocationFailed => {
                     stl_core::zip_bounds::ZipAllocationFailed.into_io_error()
+                }
+                ProcessingError::FundingBusy => {
+                    stl_core::zip_bounds::ZipFundingBusy.into_io_error()
                 }
                 _ => unreachable!(),
             };

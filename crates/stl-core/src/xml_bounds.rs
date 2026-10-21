@@ -1328,6 +1328,44 @@ mod tests {
             assert_eq!(calls.get(), reads, "no source IO after final-gate stop");
         }
     }
+    #[test]
+    fn xml_funding_denial_after_inspection_blocks_event_and_later_reads() {
+        use crate::zip_bounds::{ZipFundingBusy, ZipOpenError};
+        let calls = Rc::new(Cell::new(0));
+        let observer = ZipResourceObserver::new();
+        let mut guarded = XmlEventReader::new(
+            Fragmented {
+                bytes: b"<a x='v'/><b/>",
+                chunk: 1,
+                calls: calls.clone(),
+            },
+            observer.clone(),
+        )
+        .unwrap();
+        let reached = Cell::new(false);
+        let result = guarded.next_event_after_inspection(|observer| {
+            reached.set(true);
+            let _ = observer.funding_busy_io();
+            let _ = observer.stop_io(ResourceStop::EnvelopeChanged);
+            let _ = observer.allocation_failed_io();
+        });
+        assert!(reached.get());
+        let Err(quick_xml::Error::Io(error)) = result else {
+            panic!("funding denial must prevent event publication");
+        };
+        assert!(ZipFundingBusy::from_io_error(&error).is_some());
+        assert!(matches!(observer.check(), Err(ZipOpenError::FundingBusy)));
+        let reads = calls.get();
+        for _ in 0..3 {
+            assert!(guarded.next_event().is_err());
+        }
+        assert_eq!(calls.get(), reads);
+        assert_eq!(
+            observer.finish::<(), StlError>(Ok(())),
+            Err(StlError::FundingBusy)
+        );
+    }
+
     fn deferred_fixed(
         bytes: &[u8],
         limits: Limits,

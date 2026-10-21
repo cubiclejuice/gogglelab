@@ -10,6 +10,7 @@ use library_protocol::{
 use crate::secure_fs::{Directory, SealedGeometryFile};
 use crate::{LibraryRuntime, ProcessingError};
 use stl_core::package_bounds::PackageProcessingContext;
+#[cfg(test)]
 use stl_core::zip_bounds::ZipResourceObserver;
 
 pub(crate) const MAX_GEOMETRY_PACKET_BYTES: u64 = crate::secure_fs::MAX_GEOMETRY_PACKET_BYTES;
@@ -79,7 +80,7 @@ fn prepare_model_geometry_with_parser(
         &mut PackageProcessingContext,
     ) -> Result<stl_core::ParsedModel, stl_core::StlError>,
 ) -> Result<PreparedGeometry, RuntimeError> {
-    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    let mut context = runtime.model_processing_context();
     prepare_model_geometry_with_parser_in_context(
         runtime,
         model,
@@ -382,6 +383,190 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes
     }
+    #[test]
+    fn funded_archived_geometry_denial_happens_in_hidden_validation_before_visible_parse() {
+        use sha2::Digest;
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, model, inner, _) = crate::tests::nested_package_fixture(&temp, method);
+            let outer = temp.path().join("nested-sources/models.zip");
+            let original_outer = fs::read(&outer).unwrap();
+            assert_eq!(model.source_kind, "indexed");
+            assert_eq!(model.source_archive_member.as_deref(), Some("part.3mf"));
+            assert_eq!(
+                model.content_hash.as_deref(),
+                Some(format!("{:x}", sha2::Sha256::digest(&inner)).as_str())
+            );
+            assert_eq!(
+                stl_core::parse_model_with_plates(&inner)
+                    .unwrap()
+                    .model
+                    .triangle_count,
+                1
+            );
+            runtime.set_temp_limits_for_test(52, 52);
+            let visible_parser_entered = std::cell::Cell::new(false);
+            let derivative_entered = std::cell::Cell::new(false);
+            let result = prepare_model_geometry_with_parser(
+                &runtime,
+                &model,
+                None,
+                || derivative_entered.set(true),
+                |bytes, context| {
+                    visible_parser_entered.set(true);
+                    stl_core::parse_model_with_plates_in_context(bytes, context)
+                },
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("funding denial must terminate archived hidden validation"),
+            };
+            assert_eq!(error.code, RuntimeErrorCode::Busy);
+            assert!(error.retryable);
+            assert_eq!(
+                error.message,
+                "Model processing funding is temporarily unavailable"
+            );
+            assert!(!visible_parser_entered.get());
+            assert!(!derivative_entered.get());
+            assert!(runtime.leases.lock().unwrap().is_empty());
+            assert_eq!(fs::read(&outer).unwrap(), original_outer);
+            assert_eq!(
+                runtime.read_db(|db| db.get_model(&model.id)).unwrap(),
+                Some(model)
+            );
+            let state = runtime.temp_resources.lock().unwrap();
+            assert_eq!(state.owned_bytes, 0);
+            assert_eq!(state.reserved_owned_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn funded_geometry_preserves_first_cause_before_and_after_real_path_denial() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("first-cause.3mf");
+        let xml = r#"<model unit="millimeter"><resources><object id="1"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources><build><item objectid="1"/></build></model>"#;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive
+            .start_file("3D/3dmodel.model", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(xml.as_bytes()).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        fs::write(&source, &bytes).unwrap();
+        let runtime = LibraryRuntime::open(crate::RuntimeConfig::desktop(
+            temp.path().join("library"),
+            temp.path().join("integrations.json"),
+        ))
+        .unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|r| r.model))
+            .unwrap();
+        runtime.set_temp_limits_for_test(52, 52);
+        for prior in [true, false] {
+            for stop in [
+                Some(stl_core::ResourceStop::InputLimitExceeded),
+                Some(stl_core::ResourceStop::ReadWorkExceeded),
+                Some(stl_core::ResourceStop::EnvelopeChanged),
+                None,
+            ] {
+                let mut context = runtime.model_processing_context();
+                let observer = context.observer();
+                let latch = || match stop {
+                    Some(stop) => {
+                        let _ = observer.stop_io(stop);
+                    }
+                    None => {
+                        let _ = observer.allocation_failed_io();
+                    }
+                };
+                if prior {
+                    latch();
+                }
+                let reached = std::cell::Cell::new(false);
+                let result = prepare_model_geometry_with_parser_in_context(
+                    &runtime,
+                    &model,
+                    None,
+                    || panic!("packet allocation must not start"),
+                    |bytes, context| {
+                        let result = stl_core::parse_model_with_plates_in_context(bytes, context);
+                        assert!(matches!(result, Err(stl_core::StlError::FundingBusy)));
+                        reached.set(true);
+                        latch();
+                        result
+                    },
+                    &mut context,
+                );
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("terminal cause lost"),
+                };
+                let expected = if !prior {
+                    RuntimeErrorCode::Busy
+                } else {
+                    match stop {
+                        Some(stl_core::ResourceStop::EnvelopeChanged) => RuntimeErrorCode::Stale,
+                        Some(_) => RuntimeErrorCode::Unsupported,
+                        None => RuntimeErrorCode::Internal,
+                    }
+                };
+                assert_eq!(error.code, expected);
+                assert_eq!(reached.get(), !prior);
+                assert!(runtime.leases.lock().unwrap().is_empty());
+                let state = runtime.temp_resources.lock().unwrap();
+                assert_eq!(state.owned_bytes, 0);
+                assert_eq!(state.reserved_owned_bytes, 0);
+            }
+        }
+        assert_eq!(fs::read(source).unwrap(), bytes);
+    }
+
+    #[test]
+    fn funded_geometry_path_denial_precedes_packet_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("funded.3mf");
+        let xml = r#"<model unit="millimeter"><resources><object id="1"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object></resources><build><item objectid="1"/></build></model>"#;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive
+            .start_file("3D/3dmodel.model", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(xml.as_bytes()).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        fs::write(&source, &bytes).unwrap();
+        let runtime = LibraryRuntime::open(crate::RuntimeConfig::desktop(
+            temp.path().join("library"),
+            temp.path().join("integrations.json"),
+        ))
+        .unwrap();
+        let model = runtime
+            .mutate_db(|db| {
+                db.import_file(&source, None, None)
+                    .map(|result| result.model)
+            })
+            .unwrap();
+        runtime.set_temp_limits_for_test(52, 52);
+        let derivative = std::cell::Cell::new(false);
+        let error = match prepare_model_geometry_with_hook(&runtime, &model, None, || {
+            derivative.set(true);
+        }) {
+            Ok(_) => {
+                panic!("Host-funded path denial must precede the otherwise fitting 52-byte packet")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.code, RuntimeErrorCode::Busy);
+        assert!(error.retryable);
+        assert!(!derivative.get());
+        assert!(runtime.leases.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        let state = runtime.temp_resources.lock().unwrap();
+        assert_eq!(state.owned_bytes, 0);
+        assert_eq!(state.reserved_owned_bytes, 0);
+    }
+
     fn assert_part_backing_is_moved(selected: Option<u32>) {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("triangle.stl");
