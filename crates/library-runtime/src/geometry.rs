@@ -925,4 +925,258 @@ mod tests {
             assert_eq!(prepared.triangle_count, 1);
         }
     }
+
+    #[derive(Clone, Copy, Debug)]
+    enum OwnedInputRuntimeTarget {
+        Vertices,
+        Triangles,
+        Components,
+        Build,
+    }
+
+    impl OwnedInputRuntimeTarget {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Vertices => "vertices",
+                Self::Triangles => "triangles",
+                Self::Components => "components",
+                Self::Build => "build",
+            }
+        }
+    }
+
+    fn owned_input_runtime_source(target: OwnedInputRuntimeTarget, deflate: bool) -> Vec<u8> {
+        let vertices =
+            r#"<vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>"#;
+        let triangle = r#"<triangle v1="0" v2="1" v3="2"/>"#;
+        let active = format!(
+            "<object id=\"1\"><mesh><vertices>{vertices}</vertices><triangles>{triangle}</triangles></mesh></object>"
+        );
+        let extra = match target {
+            OwnedInputRuntimeTarget::Vertices => format!(
+                "<object id=\"2\"><mesh><vertices>{}</vertices><triangles/></mesh></object>",
+                r#"<vertex x="0" y="0" z="0"/>"#.repeat(100)
+            ),
+            OwnedInputRuntimeTarget::Triangles => format!(
+                "<object id=\"2\"><mesh><vertices>{vertices}</vertices><triangles>{}</triangles></mesh></object>",
+                triangle.repeat(100)
+            ),
+            OwnedInputRuntimeTarget::Components => format!(
+                "<object id=\"2\"><components>{}</components></object>",
+                r#"<component objectid="1"/>"#.repeat(100)
+            ),
+            OwnedInputRuntimeTarget::Build => String::new(),
+        };
+        let disabled = if matches!(target, OwnedInputRuntimeTarget::Build) {
+            r#"<item objectid="1" printable="0"/>"#.repeat(100)
+        } else {
+            String::new()
+        };
+        let xml = format!(
+            "<model unit=\"millimeter\"><resources>{active}{extra}</resources><build>{disabled}<item objectid=\"1\"/></build></model>"
+        );
+        assert_eq!(
+            xml.matches("<vertex ").count(),
+            match target {
+                OwnedInputRuntimeTarget::Vertices => 103,
+                OwnedInputRuntimeTarget::Triangles => 6,
+                _ => 3,
+            }
+        );
+        assert_eq!(
+            xml.matches("<triangle ").count(),
+            if matches!(target, OwnedInputRuntimeTarget::Triangles) {
+                101
+            } else {
+                1
+            }
+        );
+        assert_eq!(
+            xml.matches("<component ").count(),
+            if matches!(target, OwnedInputRuntimeTarget::Components) {
+                100
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            xml.matches("<item ").count(),
+            if matches!(target, OwnedInputRuntimeTarget::Build) {
+                101
+            } else {
+                1
+            }
+        );
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "3D/3dmodel.model",
+                zip::write::SimpleFileOptions::default().compression_method(if deflate {
+                    zip::CompressionMethod::Deflated
+                } else {
+                    zip::CompressionMethod::Stored
+                }),
+            )
+            .unwrap();
+        archive.write_all(xml.as_bytes()).unwrap();
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn assert_owned_input_runtime_case(
+        target: OwnedInputRuntimeTarget,
+        deflate: bool,
+        expect_denial: bool,
+    ) {
+        use sha2::Digest;
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = owned_input_runtime_source(target, deflate);
+        let source = temp.path().join(format!("{}.3mf", target.name()));
+        fs::write(&source, &bytes).unwrap();
+        let runtime = LibraryRuntime::open(crate::RuntimeConfig::desktop(
+            temp.path().join("library"),
+            temp.path().join("integrations.json"),
+        ))
+        .unwrap();
+        let model = runtime
+            .mutate_db(|db| db.import_file(&source, None, None).map(|r| r.model))
+            .unwrap();
+        assert_eq!(model.bytes, bytes.len() as u64);
+        assert_eq!(
+            model.content_hash.as_deref(),
+            Some(format!("{:x}", sha2::Sha256::digest(&bytes)).as_str())
+        );
+        let original_model = runtime.read_db(|db| db.get_model(&model.id)).unwrap();
+        assert_eq!(original_model, Some(model.clone()));
+
+        // The default host allowance first proves the real fixture and exact output.
+        let derivative = std::cell::Cell::new(false);
+        let healthy =
+            prepare_model_geometry_with_hook(&runtime, &model, None, || derivative.set(true))
+                .unwrap();
+        assert!(derivative.get());
+        assert_eq!(healthy.model_format, "3mf");
+        assert_eq!(healthy.triangle_count, 1);
+        assert_eq!(healthy.plates.len(), 1);
+        assert_eq!(
+            (
+                healthy.plates[0].id,
+                healthy.plates[0].name.as_str(),
+                healthy.plates[0].triangle_start,
+                healthy.plates[0].triangle_count
+            ),
+            (0, "Whole build", 0, 1)
+        );
+        assert_eq!(healthy.parts.len(), 1);
+        assert_eq!(
+            (
+                healthy.parts[0].triangle_start,
+                healthy.parts[0].triangle_count
+            ),
+            (0, 1)
+        );
+        assert_eq!(healthy.part_warning, None);
+        let mut packet = Vec::new();
+        healthy.packet.stream_to(&mut packet).unwrap();
+        assert_eq!(packet.len(), 52);
+        assert_eq!(&packet[..4], b"STL2");
+        assert_eq!(u32::from_le_bytes(packet[4..8].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(packet[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(packet[12..16].try_into().unwrap()), 0);
+        let positions = packet[16..]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(positions, vec![0., 0., 0., 1., 0., 0., 0., 1., 0.]);
+        assert!(
+            fs::read_dir(runtime.host_library_root().join("staging/geometry"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        drop(healthy);
+        assert!(runtime.leases.lock().unwrap().is_empty());
+        {
+            let state = runtime.temp_resources.lock().unwrap();
+            assert_eq!(state.owned_bytes, 0);
+            assert_eq!(state.reserved_owned_bytes, 0);
+        }
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(
+            runtime.read_db(|db| db.get_model(&model.id)).unwrap(),
+            original_model
+        );
+        if !expect_denial {
+            return;
+        }
+
+        // Current path-only backing and the eventual52-byte packet fit this allowance.
+        runtime.set_temp_limits_for_test(1024, 1024);
+        let denied_derivative = std::cell::Cell::new(false);
+        let result = prepare_model_geometry_with_hook(&runtime, &model, None, || {
+            denied_derivative.set(true)
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(prepared) => panic!(
+                "expected Owned input-buffer denial for {:?}; old route succeeded: triangles={}, packetBytes={}, derivative={}",
+                target, prepared.triangle_count, prepared.packet.bytes(), denied_derivative.get()),
+        };
+        assert_eq!(error.code, RuntimeErrorCode::Busy);
+        assert!(error.retryable);
+        assert!(!denied_derivative.get());
+        assert!(runtime.leases.lock().unwrap().is_empty());
+        assert!(
+            fs::read_dir(runtime.host_library_root().join("staging/geometry"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(
+            runtime.read_db(|db| db.get_model(&model.id)).unwrap(),
+            original_model
+        );
+        let state = runtime.temp_resources.lock().unwrap();
+        assert_eq!(state.owned_bytes, 0);
+        assert_eq!(state.reserved_owned_bytes, 0);
+    }
+
+    #[test]
+    fn owned_input_buffers_runtime_healthy_controls() {
+        for target in [
+            OwnedInputRuntimeTarget::Vertices,
+            OwnedInputRuntimeTarget::Triangles,
+            OwnedInputRuntimeTarget::Components,
+            OwnedInputRuntimeTarget::Build,
+        ] {
+            for deflate in [false, true] {
+                assert_owned_input_runtime_case(target, deflate, false);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_input_buffers_runtime_vertices_denied_before_packet() {
+        for deflate in [false, true] {
+            assert_owned_input_runtime_case(OwnedInputRuntimeTarget::Vertices, deflate, true);
+        }
+    }
+    #[test]
+    fn owned_input_buffers_runtime_triangles_denied_before_packet() {
+        for deflate in [false, true] {
+            assert_owned_input_runtime_case(OwnedInputRuntimeTarget::Triangles, deflate, true);
+        }
+    }
+    #[test]
+    fn owned_input_buffers_runtime_components_denied_before_packet() {
+        for deflate in [false, true] {
+            assert_owned_input_runtime_case(OwnedInputRuntimeTarget::Components, deflate, true);
+        }
+    }
+    #[test]
+    fn owned_input_buffers_runtime_build_denied_before_packet() {
+        for deflate in [false, true] {
+            assert_owned_input_runtime_case(OwnedInputRuntimeTarget::Build, deflate, true);
+        }
+    }
 }

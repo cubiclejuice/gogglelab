@@ -29,6 +29,7 @@ mod settings;
 use derived_maps::BuildIndex;
 
 use crate::error::{ResourceStop, StlError};
+use crate::input_owned::{InputElement, OwnedInputBuffer};
 use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
 use crate::metadata_owned::{PathAllocator, SharedPath};
 use crate::model::{
@@ -123,12 +124,14 @@ struct Component {
     transform: Mat,
 }
 
+impl InputElement for Component {}
+
 enum ObjectKind {
     Mesh {
-        vertices: Vec<V3>,
-        triangles: Vec<[u32; 3]>,
+        vertices: OwnedInputBuffer<V3>,
+        triangles: OwnedInputBuffer<[u32; 3]>,
     },
-    Components(Vec<Component>),
+    Components(OwnedInputBuffer<Component>),
 }
 
 struct Object {
@@ -150,15 +153,32 @@ struct BuildItem {
     printable: bool,
 }
 
+impl InputElement for BuildItem {}
+
 struct ModelPart {
     /// Normalized zip entry name, without an OPC leading slash.
     path: SharedPath,
     /// Multiplier from this part's `unit` to millimetres.
     scale: f32,
     objects: HashMap<u32, Object>,
-    build: Vec<BuildItem>,
+    build: OwnedInputBuffer<BuildItem>,
     materials: Vec<ParsedMaterial>,
     material_lookup: HashMap<(u32, u32), usize>,
+}
+
+/// Inspect the actual compiled backing layout for one private input category.
+#[doc(hidden)]
+pub fn input_buffer_layout_profile(
+    kind: crate::InputBufferKind,
+    capacity: usize,
+) -> Option<crate::InputBufferLayoutProfile> {
+    use crate::input_owned::input_buffer_layout;
+    match kind {
+        crate::InputBufferKind::Vertices => input_buffer_layout::<V3>(capacity),
+        crate::InputBufferKind::Triangles => input_buffer_layout::<[u32; 3]>(capacity),
+        crate::InputBufferKind::Components => input_buffer_layout::<Component>(capacity),
+        crate::InputBufferKind::Build => input_buffer_layout::<BuildItem>(capacity),
+    }
 }
 
 fn missing_part_error(error: ZipOpenError, path: &str) -> StlError {
@@ -352,7 +372,7 @@ fn reserve_input(
     observer: &ZipResourceObserver,
     _site: InputReserveSite,
     #[cfg(test)] test: Option<&InputCollectionsTestSession>,
-    reserve: impl FnOnce() -> Result<(), std::collections::TryReserveError>,
+    reserve: impl FnOnce() -> Result<(), StlError>,
 ) -> Result<(), StlError> {
     observer.check()?;
     #[cfg(test)]
@@ -368,10 +388,18 @@ fn reserve_input(
             observer.check()?;
         }
     }
-    if reserve().is_err() {
-        let _ = observer.allocation_failed_io();
-        observer.check()?;
-    }
+    let reserved = {
+        #[cfg(test)]
+        let _funding_site = test.and_then(|test| {
+            test.profile
+                .funding_site
+                .as_ref()
+                .map(|probe| InputFundingSiteGuard::arm(probe, _site))
+        });
+        reserve()
+    };
+    observer.check()?;
+    reserved?;
     #[cfg(test)]
     if let Some(test) = test {
         if let Some((site, at, failure)) = test.profile.stop_after_reserve {
@@ -382,6 +410,46 @@ fn reserve_input(
     }
     observer.check()?;
     Ok(())
+}
+
+fn input_allocation_error(observer: &ZipResourceObserver) -> StlError {
+    let _ = observer.allocation_failed_io();
+    observer
+        .check()
+        .expect_err("allocation failure is latched")
+        .into()
+}
+
+fn reserve_input_buffer<T: InputElement>(
+    values: &mut OwnedInputBuffer<T>,
+    additional: usize,
+    ceiling: usize,
+    allocator: &PathAllocator,
+    observer: &ZipResourceObserver,
+    site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+) -> Result<(), StlError> {
+    let prospective = values
+        .len()
+        .checked_add(additional)
+        .filter(|&n| n <= ceiling)
+        .ok_or_else(|| input_error(observer))?;
+    if prospective <= values.capacity() {
+        return Ok(());
+    }
+    let target = values
+        .capacity()
+        .checked_mul(2)
+        .unwrap_or(ceiling)
+        .max(prospective)
+        .min(ceiling);
+    reserve_input(
+        observer,
+        site,
+        #[cfg(test)]
+        test,
+        || values.reserve_capacity(target, allocator),
+    )
 }
 
 fn reserve_input_vec<T>(
@@ -415,7 +483,11 @@ fn reserve_input_vec<T>(
         site,
         #[cfg(test)]
         test,
-        || values.try_reserve_exact(target - values.len()),
+        || {
+            values
+                .try_reserve_exact(target - values.len())
+                .map_err(|_| input_allocation_error(observer))
+        },
     )
 }
 
@@ -440,7 +512,11 @@ fn reserve_input_map<K: std::hash::Hash + Eq, V>(
         site,
         #[cfg(test)]
         test,
-        || values.try_reserve(1),
+        || {
+            values
+                .try_reserve(1)
+                .map_err(|_| input_allocation_error(observer))
+        },
     )
 }
 
@@ -454,6 +530,7 @@ struct InputCollectionsTestProfile {
     fail_reserve: Option<(InputReserveSite, usize)>,
     stop_after_reserve: Option<(InputReserveSite, usize, ParserTestFailure)>,
     appended: std::cell::RefCell<[usize; 8]>,
+    funding_site: Option<std::sync::Arc<InputFundingSiteProbe>>,
 }
 
 #[cfg(test)]
@@ -466,7 +543,54 @@ impl InputCollectionsTestProfile {
             fail_reserve: None,
             stop_after_reserve: None,
             appended: std::cell::RefCell::new([0; 8]),
+            funding_site: None,
         }
+    }
+}
+
+#[cfg(test)]
+struct InputFundingSiteProbe {
+    active: std::sync::atomic::AtomicUsize,
+    acquires: [std::sync::atomic::AtomicUsize; 9],
+    denied: std::sync::atomic::AtomicBool,
+    late_acquires: std::sync::atomic::AtomicUsize,
+    live: std::sync::atomic::AtomicUsize,
+    deny_site: usize,
+}
+#[cfg(test)]
+impl InputFundingSiteProbe {
+    fn new(site: Option<InputReserveSite>) -> Self {
+        Self {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            acquires: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)),
+            denied: std::sync::atomic::AtomicBool::new(false),
+            late_acquires: std::sync::atomic::AtomicUsize::new(0),
+            live: std::sync::atomic::AtomicUsize::new(0),
+            deny_site: site.map_or(0, |site| site as usize + 1),
+        }
+    }
+}
+#[cfg(test)]
+struct InputFundingSiteGuard<'a> {
+    probe: &'a InputFundingSiteProbe,
+    previous: usize,
+}
+#[cfg(test)]
+impl<'a> InputFundingSiteGuard<'a> {
+    fn arm(probe: &'a InputFundingSiteProbe, site: InputReserveSite) -> Self {
+        let previous = probe
+            .active
+            .swap(site as usize + 1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(previous, 0, "input reserve site scopes must not overlap");
+        Self { probe, previous }
+    }
+}
+#[cfg(test)]
+impl Drop for InputFundingSiteGuard<'_> {
+    fn drop(&mut self) {
+        self.probe
+            .active
+            .store(self.previous, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1552,9 +1676,9 @@ struct OpenObject {
     name: Option<String>,
     material: Option<(u32, u32)>,
     has_triangle_properties: bool,
-    vertices: Vec<V3>,
-    triangles: Vec<[u32; 3]>,
-    components: Vec<Component>,
+    vertices: OwnedInputBuffer<V3>,
+    triangles: OwnedInputBuffer<[u32; 3]>,
+    components: OwnedInputBuffer<Component>,
 }
 
 /// Streams one `.model` part into its objects and build items.
@@ -1574,7 +1698,7 @@ fn parse_model_part<R: Read>(
         path: owned_path,
         scale: 1.0,
         objects: HashMap::new(),
-        build: Vec::new(),
+        build: OwnedInputBuffer::empty(),
         materials: Vec::new(),
         material_lookup: HashMap::new(),
     };
@@ -1656,8 +1780,8 @@ fn parse_model_part<R: Read>(
                                 id,
                                 Object {
                                     kind: ObjectKind::Mesh {
-                                        vertices: vec![],
-                                        triangles: vec![],
+                                        vertices: OwnedInputBuffer::empty(),
+                                        triangles: OwnedInputBuffer::empty(),
                                     },
                                     printed,
                                     name,
@@ -1676,9 +1800,9 @@ fn parse_model_part<R: Read>(
                                 name,
                                 material,
                                 has_triangle_properties: false,
-                                vertices: Vec::new(),
-                                triangles: Vec::new(),
-                                components: Vec::new(),
+                                vertices: OwnedInputBuffer::empty(),
+                                triangles: OwnedInputBuffer::empty(),
+                                components: OwnedInputBuffer::empty(),
                             });
                         }
                     }
@@ -1694,16 +1818,17 @@ fn parse_model_part<R: Read>(
                         ];
                         let ceiling =
                             collections.ceiling(InputKind::Vertex, cur.vertices.len() + 1)?;
-                        reserve_input_vec(
+                        reserve_input_buffer(
                             &mut cur.vertices,
                             1,
                             ceiling,
+                            allocator,
                             observer,
                             InputReserveSite::Vertices,
                             #[cfg(test)]
                             collections.test.as_ref(),
                         )?;
-                        cur.vertices.push(v);
+                        cur.vertices.push_reserved(v);
                         #[cfg(test)]
                         if let Some(test) = &collections.test {
                             test.appended(InputReserveSite::Vertices, 1);
@@ -1723,16 +1848,17 @@ fn parse_model_part<R: Read>(
                         ];
                         let ceiling =
                             collections.ceiling(InputKind::Triangle, cur.triangles.len() + 1)?;
-                        reserve_input_vec(
+                        reserve_input_buffer(
                             &mut cur.triangles,
                             1,
                             ceiling,
+                            allocator,
                             observer,
                             InputReserveSite::Triangles,
                             #[cfg(test)]
                             collections.test.as_ref(),
                         )?;
-                        cur.triangles.push(triangle);
+                        cur.triangles.push_reserved(triangle);
                         #[cfg(test)]
                         if let Some(test) = &collections.test {
                             test.appended(InputReserveSite::Triangles, 1);
@@ -1750,16 +1876,17 @@ fn parse_model_part<R: Read>(
                         };
                         let ceiling =
                             collections.ceiling(InputKind::Component, cur.components.len() + 1)?;
-                        reserve_input_vec(
+                        reserve_input_buffer(
                             &mut cur.components,
                             1,
                             ceiling,
+                            allocator,
                             observer,
                             InputReserveSite::Components,
                             #[cfg(test)]
                             collections.test.as_ref(),
                         )?;
-                        cur.components.push(component);
+                        cur.components.push_reserved(component);
                         #[cfg(test)]
                         if let Some(test) = &collections.test {
                             test.appended(InputReserveSite::Components, 1);
@@ -1779,16 +1906,17 @@ fn parse_model_part<R: Read>(
                         };
                         let ceiling =
                             collections.ceiling(InputKind::BuildItem, part.build.len() + 1)?;
-                        reserve_input_vec(
+                        reserve_input_buffer(
                             &mut part.build,
                             1,
                             ceiling,
+                            allocator,
                             observer,
                             InputReserveSite::Build,
                             #[cfg(test)]
                             collections.test.as_ref(),
                         )?;
-                        part.build.push(item);
+                        part.build.push_reserved(item);
                         #[cfg(test)]
                         if let Some(test) = &collections.test {
                             test.appended(InputReserveSite::Build, 1);
@@ -2528,7 +2656,7 @@ fn parse_3mf_with_context(
     let root = pkg.part(&root_path)?;
     let component_paths = component_part_metadata_paths(&mut pkg, &root, &root_path)?;
     let build_index = BuildIndex::new(
-        &root.build,
+        root.build.as_slice(),
         &pkg.observer,
         #[cfg(test)]
         pkg.derived_maps_test.as_deref(),
@@ -7287,6 +7415,397 @@ mod tests {
                 );
                 assert_eq!(funding.live.load(SeqCst), 0);
             }
+        }
+    }
+
+    struct InputSiteHost(std::sync::Arc<InputFundingSiteProbe>);
+    impl crate::metadata_owned::HostOwnedFunding for InputSiteHost {
+        fn try_acquire(&self, bytes: usize) -> Result<(), crate::zip_bounds::ZipFundingBusy> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let site = self.0.active.load(SeqCst);
+            self.0.acquires[site].fetch_add(1, SeqCst);
+            if self.0.denied.load(SeqCst) {
+                self.0.late_acquires.fetch_add(1, SeqCst);
+            }
+            if site != 0 && site == self.0.deny_site {
+                self.0.denied.store(true, SeqCst);
+                return Err(crate::zip_bounds::ZipFundingBusy);
+            }
+            self.0.live.fetch_add(bytes, SeqCst);
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert!(self.0.live.fetch_sub(bytes, SeqCst) >= bytes);
+        }
+    }
+
+    fn owned_input_site_fixture(site: InputReserveSite, deflate: bool) -> Vec<u8> {
+        let extra = match site {
+            InputReserveSite::Vertices => format!(
+                "<object id=\"2\"><mesh><vertices>{}</vertices><triangles/></mesh></object>",
+                r#"<vertex x="0" y="0" z="0"/>"#.repeat(100)),
+            InputReserveSite::Triangles => format!(
+                "<object id=\"2\"><mesh><vertices><vertex x=\"0\" y=\"0\" z=\"0\"/><vertex x=\"1\" y=\"0\" z=\"0\"/><vertex x=\"0\" y=\"1\" z=\"0\"/></vertices><triangles>{}</triangles></mesh></object>",
+                r#"<triangle v1="0" v2="1" v3="2"/>"#.repeat(100)),
+            InputReserveSite::Components => format!(
+                "<object id=\"2\"><components>{}</components></object>",
+                r#"<component objectid="1"/>"#.repeat(100)),
+            InputReserveSite::Build => String::new(),
+            _ => panic!("only four private input customers are in this fixture"),
+        };
+        let disabled = if site == InputReserveSite::Build {
+            r#"<item objectid="1" printable="0"/>"#.repeat(100)
+        } else {
+            String::new()
+        };
+        let model = model_xml(
+            "millimeter",
+            &(part_retention_triangle().to_owned() + &extra),
+            &(disabled + r#"<item objectid="1"/>"#),
+        );
+        package(&[(ROOT_MODEL_FALLBACK, &model)], deflate)
+    }
+
+    fn assert_owned_input_site_denial(site: InputReserveSite) {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = owned_input_site_fixture(site, deflate);
+            let healthy = crate::parse_model_with_plates(&bytes).unwrap();
+            assert_eq!(healthy.model.triangle_count, 1);
+            assert_eq!(healthy.parts.len(), 1);
+            assert_eq!(
+                healthy.model.positions,
+                vec![0., 0., 0., 1., 0., 0., 0., 1., 0.]
+            );
+            let probe = Arc::new(InputFundingSiteProbe::new(Some(site)));
+            let mut profile = InputCollectionsTestProfile::new([1000; 5]);
+            profile.funding_site = Some(probe.clone());
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new_funded(
+                observer.clone(),
+                Arc::new(InputSiteHost(probe.clone())),
+            );
+            let result = crate::parse_model_with_plates_in_context(&bytes, &mut context);
+            assert_eq!(
+                result,
+                Err(StlError::FundingBusy),
+                "target customer {site:?} must ask the host before growing"
+            );
+            assert!(
+                probe.denied.load(SeqCst),
+                "actual host denial must be reached"
+            );
+            assert_eq!(probe.acquires[site as usize + 1].load(SeqCst), 1);
+            assert!(
+                probe.acquires[0].load(SeqCst) > 0,
+                "ordinary path backing was admitted first"
+            );
+            assert_eq!(profile.reserves.borrow()[site as usize], 1);
+            assert_eq!(profile.appended.borrow()[site as usize], 0);
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Parts as usize],
+                0
+            );
+            assert_eq!(
+                probe.active.load(SeqCst),
+                0,
+                "site guard must clear on failure"
+            );
+            assert_eq!(probe.late_acquires.load(SeqCst), 0);
+            assert_eq!(probe.live.load(SeqCst), 0);
+            assert!(matches!(observer.check(), Err(ZipOpenError::FundingBusy)));
+        }
+    }
+
+    #[test]
+    fn owned_input_customer_vertices_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Vertices);
+    }
+    #[test]
+    fn owned_input_customer_triangles_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Triangles);
+    }
+    #[test]
+    fn owned_input_customer_components_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Components);
+    }
+    #[test]
+    fn owned_input_customer_build_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Build);
+    }
+
+    #[test]
+    fn owned_input_cached_part_preserves_all_four_backings_after_package_and_context_drop() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let vertices = r#"<vertex x="0" y="0" z="0"/>"#.repeat(65);
+            let triangles = r#"<triangle v1="0" v2="0" v3="0"/>"#.repeat(65);
+            let components = format!(
+                r#"<component objectid="1" p:path="/3D/3dmodel.model"/>{}"#,
+                r#"<component objectid="1"/>"#.repeat(64)
+            );
+            let resources = format!("<object id=\"1\"><mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh></object><object id=\"2\"><components>{components}</components></object>");
+            let build = format!(
+                r#"<item objectid="2" p:path="/3D/3dmodel.model"/>{}"#,
+                r#"<item objectid="2" printable="0"/>"#.repeat(64)
+            );
+            let model = model_xml("millimeter", &resources, &build);
+            let bytes = package(&[(ROOT_MODEL_FALLBACK, &model)], deflate);
+            let probe = Arc::new(InputFundingSiteProbe::new(None));
+            let mut profile = InputCollectionsTestProfile::new([1000; 5]);
+            profile.funding_site = Some(probe.clone());
+            let _guard = InputCollectionsProfileGuard::install(Rc::new(profile));
+            let mut context = PackageProcessingContext::new_funded(
+                ZipResourceObserver::new(),
+                Arc::new(InputSiteHost(probe.clone())),
+            );
+            let mut pkg = Package::open(&bytes, &mut context).unwrap();
+            let part = pkg.part(ROOT_MODEL_FALLBACK).unwrap();
+            let ObjectKind::Mesh {
+                vertices,
+                triangles,
+            } = &part.objects[&1].kind
+            else {
+                panic!("mesh fixture");
+            };
+            let ObjectKind::Components(components) = &part.objects[&2].kind else {
+                panic!("component fixture");
+            };
+            assert_eq!(
+                (
+                    vertices.len(),
+                    triangles.len(),
+                    components.len(),
+                    part.build.len()
+                ),
+                (65, 65, 65, 65)
+            );
+            assert_eq!(
+                (
+                    vertices.capacity(),
+                    triangles.capacity(),
+                    components.capacity(),
+                    part.build.capacity()
+                ),
+                (128, 128, 128, 128)
+            );
+            let array_addresses = (
+                vertices.as_ptr(),
+                triangles.as_ptr(),
+                components.as_ptr(),
+                part.build.as_ptr(),
+            );
+            let component_path = components[0].path.as_ref().unwrap().as_str().as_ptr();
+            let build_path = part.build[0].path.as_ref().unwrap().as_str().as_ptr();
+            let charges = probe.live.load(SeqCst);
+            assert!(charges > 0);
+            let calls = probe
+                .acquires
+                .iter()
+                .map(|n| n.load(SeqCst))
+                .collect::<Vec<_>>();
+            for site in [
+                InputReserveSite::Vertices,
+                InputReserveSite::Triangles,
+                InputReserveSite::Components,
+                InputReserveSite::Build,
+            ] {
+                assert!(
+                    calls[site as usize + 1] >= 7,
+                    "actual category must grow repeatedly"
+                );
+            }
+            let cached = pkg.part("/3D/3dmodel.model").unwrap();
+            assert!(Rc::ptr_eq(&part, &cached));
+            assert_eq!(
+                probe
+                    .acquires
+                    .iter()
+                    .map(|n| n.load(SeqCst))
+                    .collect::<Vec<_>>(),
+                calls
+            );
+            drop(pkg);
+            drop(context);
+            assert_eq!(probe.live.load(SeqCst), charges);
+            drop(part);
+            assert_eq!(probe.live.load(SeqCst), charges);
+            let ObjectKind::Mesh {
+                vertices,
+                triangles,
+            } = &cached.objects[&1].kind
+            else {
+                panic!("mesh retained");
+            };
+            let ObjectKind::Components(components) = &cached.objects[&2].kind else {
+                panic!("components retained");
+            };
+            assert_eq!(
+                (
+                    vertices.as_ptr(),
+                    triangles.as_ptr(),
+                    components.as_ptr(),
+                    cached.build.as_ptr()
+                ),
+                array_addresses
+            );
+            assert_eq!(
+                components[0].path.as_ref().unwrap().as_str().as_ptr(),
+                component_path
+            );
+            assert_eq!(
+                cached.build[0].path.as_ref().unwrap().as_str().as_ptr(),
+                build_path
+            );
+            assert_eq!(components[0].path.as_deref(), Some("/3D/3dmodel.model"));
+            drop(cached);
+            assert_eq!(probe.live.load(SeqCst), 0);
+        }
+    }
+
+    fn assert_owned_noncopy_growth<T: InputElement>(
+        make: fn(SharedPath) -> T,
+        path: for<'a> fn(&'a T) -> &'a SharedPath,
+    ) {
+        use crate::input_owned::{input_buffer_layout, InputReserveStage};
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for stage in [
+            InputReserveStage::AfterAcquire,
+            InputReserveStage::AfterAllocate,
+            InputReserveStage::AfterCopyBeforeCommit,
+            InputReserveStage::Committed,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let probe = Arc::new(InputFundingSiteProbe::new(None));
+                let observer = ZipResourceObserver::new();
+                let context = PackageProcessingContext::new_funded(
+                    observer.clone(),
+                    Arc::new(InputSiteHost(probe.clone())),
+                );
+                let allocator = context.path_allocator();
+                let element_path = allocator.copy_path("3D/unchanged.model").unwrap();
+                let path_address = element_path.as_str().as_ptr();
+                let mut buffer = OwnedInputBuffer::<T>::empty();
+                buffer.reserve_capacity(1, &allocator).unwrap();
+                buffer.push_reserved(make(element_path));
+                let old_address = buffer.as_ptr();
+                let old_charge = probe.live.load(SeqCst);
+                let old_layout = input_buffer_layout::<T>(1).unwrap().allocation_size;
+                let new_layout = input_buffer_layout::<T>(2).unwrap().allocation_size;
+                let reached = std::cell::Cell::new(false);
+                let result = buffer.reserve_capacity_with_hook(2, &allocator, |at| {
+                    if at == InputReserveStage::AfterAcquire {
+                        assert_eq!(
+                            probe.live.load(SeqCst),
+                            old_charge + new_layout,
+                            "old and full new backing coexist"
+                        );
+                    }
+                    if at == stage {
+                        reached.set(true);
+                        observer.observe_io(&failure.io_error());
+                    }
+                });
+                assert!(reached.get());
+                assert_eq!(result, Err(failure.error()));
+                assert_eq!(buffer.len(), 1);
+                assert_eq!(path(&buffer[0]).as_str().as_ptr(), path_address);
+                if stage == InputReserveStage::Committed {
+                    assert_eq!(buffer.capacity(), 2);
+                    assert_ne!(buffer.as_ptr(), old_address);
+                    assert_eq!(
+                        probe.live.load(SeqCst),
+                        old_charge - old_layout + new_layout
+                    );
+                } else {
+                    assert_eq!(buffer.capacity(), 1);
+                    assert_eq!(buffer.as_ptr(), old_address);
+                    assert_eq!(probe.live.load(SeqCst), old_charge);
+                }
+                assert_eq!(
+                    probe.acquires[0].load(SeqCst),
+                    3,
+                    "one path and exactly two buffer acquisitions; no path copy"
+                );
+                drop(context);
+                drop(allocator);
+                assert!(probe.live.load(SeqCst) > 0);
+                drop(buffer);
+                assert_eq!(probe.live.load(SeqCst), 0);
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+            }
+        }
+    }
+    #[test]
+    fn owned_input_real_component_noncopy_growth_preserves_ownership_at_every_failure_stage() {
+        assert_owned_noncopy_growth(
+            |path| Component {
+                path: Some(path),
+                object_id: 1,
+                transform: IDENTITY,
+            },
+            |v| v.path.as_ref().unwrap(),
+        );
+    }
+    #[test]
+    fn owned_input_real_build_noncopy_growth_preserves_ownership_at_every_failure_stage() {
+        assert_owned_noncopy_growth(
+            |path| BuildItem {
+                path: Some(path),
+                object_id: 1,
+                transform: IDENTITY,
+                printable: true,
+            },
+            |v| v.path.as_ref().unwrap(),
+        );
+    }
+
+    #[test]
+    fn owned_input_actual_private_type_layout_profiles_are_read_only_and_checked() {
+        use crate::InputBufferKind::*;
+        for (kind, size, align) in [
+            (
+                Vertices,
+                std::mem::size_of::<V3>(),
+                std::mem::align_of::<V3>(),
+            ),
+            (
+                Triangles,
+                std::mem::size_of::<[u32; 3]>(),
+                std::mem::align_of::<[u32; 3]>(),
+            ),
+            (
+                Components,
+                std::mem::size_of::<Component>(),
+                std::mem::align_of::<Component>(),
+            ),
+            (
+                Build,
+                std::mem::size_of::<BuildItem>(),
+                std::mem::align_of::<BuildItem>(),
+            ),
+        ] {
+            assert!(input_buffer_layout_profile(kind, 0).is_none());
+            assert!(input_buffer_layout_profile(kind, usize::MAX).is_none());
+            let profile = input_buffer_layout_profile(kind, 128).unwrap();
+            assert_eq!(
+                (
+                    profile.element_size,
+                    profile.element_align,
+                    profile.capacity
+                ),
+                (size, align, 128)
+            );
+            assert!(profile.payload_offset >= profile.header_size);
+            assert_eq!(profile.payload_offset % align, 0);
+            assert!(profile.allocation_size >= profile.payload_offset + 128 * size);
+            assert!(profile.allocation_align >= align);
         }
     }
 }

@@ -5,6 +5,7 @@
 //! integrity() and the IPC geometry buffer never know which file they came from.
 
 pub mod error;
+mod input_owned;
 pub mod integrity;
 pub mod limits;
 pub mod measure;
@@ -21,6 +22,8 @@ pub mod xml_bounds;
 pub mod zip_bounds;
 
 pub use error::{ResourceStop, StlError};
+#[doc(hidden)]
+pub use input_owned::{InputBufferKind, InputBufferLayoutProfile};
 pub use integrity::{integrity, Integrity, IntegrityResult};
 pub use measure::{measure, Bbox, GeometryStats};
 pub use model::{
@@ -28,6 +31,8 @@ pub use model::{
     ParsedMaterial, ParsedModel, ParsedPart, Plate,
 };
 pub use parse::{parse, ParsedStl, StlFormat};
+#[doc(hidden)]
+pub use threemf::input_buffer_layout_profile;
 pub use threemf::parse_3mf;
 
 /// Parse a model file of either supported format. A 3MF is a zip package, so

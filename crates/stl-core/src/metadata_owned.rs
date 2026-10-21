@@ -53,18 +53,7 @@ impl PathAllocator {
         };
         control.stage(CopyStage::BeforeAcquire, &self.observer);
         self.observer.check()?;
-        if let Some(host) = &self.host {
-            if host.try_acquire(layout.size()).is_err() {
-                let _ = self.observer.funding_busy_io();
-                return Err(self.recorded_error());
-            }
-        }
-        let credit = AllocationCredit {
-            host: self.host.clone(),
-            bytes: layout.size(),
-            #[cfg(test)]
-            probe: control.probe.clone(),
-        };
+        let credit = control.attach_probe(self.acquire_layout(layout)?);
         control.stage(CopyStage::AfterAcquire, &self.observer);
         self.observer.check()?;
         // Layout includes the entire header and payload, and is never zero-sized.
@@ -97,6 +86,38 @@ impl PathAllocator {
         Ok(owned)
     }
 
+    pub(crate) fn check(&self) -> Result<(), StlError> {
+        self.observer.check().map_err(Into::into)
+    }
+
+    pub(crate) fn acquire_layout(&self, layout: Layout) -> Result<AllocationCredit, StlError> {
+        self.check()?;
+        if let Some(host) = &self.host {
+            if host.try_acquire(layout.size()).is_err() {
+                let _ = self.observer.funding_busy_io();
+                return Err(self.recorded_error());
+            }
+        }
+        let credit = AllocationCredit {
+            host: self.host.clone(),
+            bytes: layout.size(),
+            #[cfg(test)]
+            probe: None,
+        };
+        self.check()?;
+        Ok(credit)
+    }
+
+    pub(crate) fn input_error(&self) -> StlError {
+        let _ = self.observer.stop_io(ResourceStop::InputLimitExceeded);
+        self.recorded_error()
+    }
+
+    pub(crate) fn allocation_error(&self) -> StlError {
+        let _ = self.observer.allocation_failed_io();
+        self.recorded_error()
+    }
+
     fn recorded_error(&self) -> StlError {
         self.observer
             .check()
@@ -105,11 +126,19 @@ impl PathAllocator {
     }
 }
 
-struct AllocationCredit {
+pub(crate) struct AllocationCredit {
     host: Option<Arc<dyn HostOwnedFunding>>,
     bytes: usize,
     #[cfg(test)]
     probe: Option<Arc<CopyProbe>>,
+}
+impl AllocationCredit {
+    pub(crate) fn note_deallocated(&self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.deallocated.store(true, Ordering::SeqCst);
+        }
+    }
 }
 impl Drop for AllocationCredit {
     fn drop(&mut self) {
@@ -194,10 +223,7 @@ impl Drop for SharedPath {
         // are scalar/atomic. Never drop an already-deallocated header or payload.
         let credit = unsafe { ptr::read(&header.credit) };
         unsafe { dealloc(self.pointer.as_ptr().cast::<u8>(), layout) };
-        #[cfg(test)]
-        if let Some(probe) = &credit.probe {
-            probe.deallocated.store(true, Ordering::SeqCst);
-        }
+        credit.note_deallocated();
         drop(credit);
     }
 }
@@ -254,6 +280,15 @@ struct CopyControl {
     probe: Option<Arc<CopyProbe>>,
 }
 impl CopyControl {
+    #[cfg(test)]
+    fn attach_probe(&self, mut credit: AllocationCredit) -> AllocationCredit {
+        credit.probe = self.probe.clone();
+        credit
+    }
+    #[cfg(not(test))]
+    fn attach_probe(&self, credit: AllocationCredit) -> AllocationCredit {
+        credit
+    }
     fn stage(&self, stage: CopyStage, observer: &ZipResourceObserver) {
         #[cfg(not(test))]
         let _ = (stage, observer);

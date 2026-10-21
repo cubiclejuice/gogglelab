@@ -2,7 +2,24 @@
 
 Date: 2026-10-15 (updated 2026-10-20)
 
-## Current implementation: shared path funding (2026-10-20)
+## Current implementation: four private input buffers (2026-10-20)
+
+All four private source arrays—vertices, triangles, components and build items—
+now fund complete backing before growth on the existing shared Owned ledger.
+Old/new overlap, non-Copy movement, final cache ownership and panic cleanup have
+focused execution evidence, including twelve normal-artifact parses of the actual
+types. Public model/native shapes remain unchanged. Full metadata/SDK/output and
+producer ownership remain open; no new quota is selected. See
+[scope and verification](THUMBNAIL-PARSER-BOUNDS.md#current-implementation-four-private-input-buffers-2026-10-20).
+
+Final verification against the current source freeze passed: the serial workspace
+suite, formatting, and Clippy (46 baseline diagnostics, no additions or removals).
+The normal artifact passed twelve real success, Busy and null-allocation parses.
+The preserved 1024-part Stored/Deflate corpus passed all four fixtures with
+borrowed rows intact. The 153 compiled inputs, normal probe fixtures, corpus
+driver and corpus fixtures remained hash-identical during their respective runs.
+
+## Accepted checkpoint: shared path funding (2026-10-20)
 
 The selected-model geometry parser now admits immutable internal path backing on
 the existing shared Owned ledger, including indexed-archive hidden validation.
@@ -11,7 +28,7 @@ through optional metadata handling. Uncertain accounting persistently denies
 further Owned/Geometry/Bundle admission. No new quota is selected. This changes
 exhaustive Rust error enums while preserving existing wire fields. Full metadata,
 SDK/native response and producer ownership remain open; see
-[the scope and verification notes](THUMBNAIL-PARSER-BOUNDS.md#current-implementation-shared-path-funding-2026-10-20).
+[the scope and verification notes](THUMBNAIL-PARSER-BOUNDS.md#accepted-checkpoint-shared-path-funding-2026-10-20).
 
 ## Accepted checkpoint: metadata projections (2026-10-20)
 

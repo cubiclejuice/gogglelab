@@ -1,6 +1,56 @@
 # Thumbnail parser resource prerequisite
 
-## Current implementation: shared path funding (2026-10-20)
+## Current implementation: four private input buffers (2026-10-20)
+
+Source vertices, source triangles, components and build items now use one unique
+owned buffer implementation. Each growth funds the complete new header/payload
+layout on the existing host ledger while the old block remains charged. Elements
+move without cloning; a provisional block owns no elements until the infallible
+ownership transfer. Cleanup drops the initialized prefix and frees the block
+before refund, including when an element destructor unwinds.
+
+All four private fields, construction/push sites and borrowed consumers migrate
+together. Existing physical ceilings, cumulative counts, eight reserve-site
+probes and validation priority remain in place. Temporary funding refusal stays
+typed through the existing observer. Cached ModelPart Rc owners retain backing
+and credits past package/context drop. Public model fields, cloning, field moves
+and native Arc shapes remain unchanged. The exported layout diagnostic is
+read-only; it provides no allocation, funding or policy override.
+
+Eight parent-observed behavioral failures preceded implementation: four runtime
+requests reached a fitting packet without input-buffer funding, and four core
+tests proved the exact input reserve site never called the host. Those tests now
+pass. Core verification passes 354 non-doc tests and two doctests (one existing
+ignored fixture); five runtime checks cover healthy and denied Stored/Deflate
+fixtures for every category. Seven owner tests cover growth overlap, null
+allocation, ordered stops, non-Copy relocation, destructor unwinding, capacity
+bounds and alignment. Independent owner and normal-probe reviews are recorded.
+
+The final normal artifact passes twelve real parses: success, Busy and one
+targeted null allocation for each actual private type. On the verified toolchain,
+vertex/triangle elements occupy 12 bytes, component/build elements 64 bytes, and
+the heap header 40 bytes. Capacity128 requests are 1,576 and 8,232 bytes,
+respectively. The trace verifies old/new overlap and physical free before refund;
+distinct child geometry verifies component path use after growth. These are
+local requested-layout observations, not public ABI, allocator/RSS or private
+field/refcount introspection. The unchanged preserved corpus also passes all four
+1024-part Stored/Deflate fixtures, retaining borrowed rows and the 20,635,304-byte
+legacy-copy lower bound. The probe driver, four fixtures and all 153 compiled
+inputs remained hash-identical during these checks.
+
+Final serial workspace verification passes with 1,219 top-level tests and one
+existing ignored test: 392 runtime, 211 native,
+65 server-library and five CLI tests, alongside the core results above. The
+Clippy has exactly the same 46 actionable diagnostics as the accepted baseline,
+with no additions or removals; formatting passes. The 153 compiled Rust/Cargo
+inputs stayed unchanged throughout each final check.
+
+Maps, Rc controls, semantic strings, public output/geometry backing, other parser
+routes, SDK/native frames, producer sizing and immutable publication remain open.
+No 16 MiB policy or producer profile is selected. Verification evidence and the
+preserved first compiler/probe findings are in `output/owned-input-buffers/`.
+
+## Accepted checkpoint: shared path funding (2026-10-20)
 
 The selected-model geometry route creates a funded context before verified-source
 acquisition. An indexed archive's hidden validation and the visible model parse
