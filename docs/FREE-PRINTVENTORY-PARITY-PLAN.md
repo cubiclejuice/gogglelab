@@ -2,7 +2,24 @@
 
 Date: 2026-10-15 (updated 2026-10-20)
 
-## Current implementation: four private input buffers (2026-10-20)
+## Current implementation: funded private parser maps (2026-10-21)
+
+`ModelPart.objects` and the package part cache now fund the complete hash-table
+bucket layout through the existing Owned ledger. Rehash admits the new block
+while the old one remains charged; the combined block is physically freed before
+refund. The object map detaches parser observer state before its part enters the
+`Rc` cache, while its block credit remains valid after package/context drop.
+The maps retain `RandomState`, current limits and source-ordered output. No new
+quota is selected. Other map/metadata/output owners remain open; see
+[scope and verification](THUMBNAIL-PARSER-BOUNDS.md#current-implementation-funded-private-parser-maps-2026-10-21).
+
+The serial workspace suite, formatting and Clippy pass locally. Clippy retains
+the same 46 baseline diagnostics. A normal non-test artifact parser probe shows
+additional map growth admissions for a 32-object model, a 7,240-byte funded peak
+and balanced release. Composed downstream and current-source hosted/container
+acceptance remain open for this checkpoint.
+
+## Accepted checkpoint: four private input buffers (2026-10-20)
 
 All four private source arrays—vertices, triangles, components and build items—
 now fund complete backing before growth on the existing shared Owned ledger.
@@ -10,7 +27,7 @@ Old/new overlap, non-Copy movement, final cache ownership and panic cleanup have
 focused execution evidence, including twelve normal-artifact parses of the actual
 types. Public model/native shapes remain unchanged. Full metadata/SDK/output and
 producer ownership remain open; no new quota is selected. See
-[scope and verification](THUMBNAIL-PARSER-BOUNDS.md#current-implementation-four-private-input-buffers-2026-10-20).
+[scope and verification](THUMBNAIL-PARSER-BOUNDS.md#accepted-checkpoint-four-private-input-buffers-2026-10-20).
 
 Final verification against the current source freeze passed: the serial workspace
 suite, formatting, and Clippy (46 baseline diagnostics, no additions or removals).

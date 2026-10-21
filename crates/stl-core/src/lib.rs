@@ -8,6 +8,7 @@ pub mod error;
 mod input_owned;
 pub mod integrity;
 pub mod limits;
+mod map_owned;
 pub mod measure;
 #[doc(hidden)]
 pub mod metadata_owned;

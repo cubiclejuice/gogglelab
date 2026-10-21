@@ -31,6 +31,7 @@ use derived_maps::BuildIndex;
 use crate::error::{ResourceStop, StlError};
 use crate::input_owned::{InputElement, OwnedInputBuffer};
 use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
+use crate::map_owned::{OwnedHashMap, SealedHashMap};
 use crate::metadata_owned::{PathAllocator, SharedPath};
 use crate::model::{
     MaterialSource, ParsedFilament, ParsedMaterial, ParsedModel, ParsedPart, Plate,
@@ -160,10 +161,32 @@ struct ModelPart {
     path: SharedPath,
     /// Multiplier from this part's `unit` to millimetres.
     scale: f32,
-    objects: HashMap<u32, Object>,
+    objects: SealedHashMap<u32, Object>,
     build: OwnedInputBuffer<BuildItem>,
     materials: Vec<ParsedMaterial>,
     material_lookup: HashMap<(u32, u32), usize>,
+}
+
+struct ModelPartBuilder {
+    path: SharedPath,
+    scale: f32,
+    objects: OwnedHashMap<u32, Object>,
+    build: OwnedInputBuffer<BuildItem>,
+    materials: Vec<ParsedMaterial>,
+    material_lookup: HashMap<(u32, u32), usize>,
+}
+
+impl ModelPartBuilder {
+    fn seal(self) -> ModelPart {
+        ModelPart {
+            path: self.path,
+            scale: self.scale,
+            objects: self.objects.seal(),
+            build: self.build,
+            materials: self.materials,
+            material_lookup: self.material_lookup,
+        }
+    }
 }
 
 /// Inspect the actual compiled backing layout for one private input category.
@@ -492,7 +515,7 @@ fn reserve_input_vec<T>(
 }
 
 fn reserve_input_map<K: std::hash::Hash + Eq, V>(
-    values: &mut HashMap<K, V>,
+    values: &mut OwnedHashMap<K, V>,
     key: &K,
     observer: &ZipResourceObserver,
     site: InputReserveSite,
@@ -513,9 +536,10 @@ fn reserve_input_map<K: std::hash::Hash + Eq, V>(
         #[cfg(test)]
         test,
         || {
-            values
-                .try_reserve(1)
-                .map_err(|_| input_allocation_error(observer))
+            values.try_reserve(1).map_err(|_| match observer.check() {
+                Err(error) => error.into(),
+                Ok(()) => input_allocation_error(observer),
+            })
         },
     )
 }
@@ -861,7 +885,7 @@ struct Package<'a, 'context> {
     #[cfg(test)]
     sidecar_test: Option<Rc<SidecarTestProfile>>,
     collections: InputCollections,
-    parts: HashMap<SharedPath, Rc<ModelPart>>,
+    parts: OwnedHashMap<SharedPath, Rc<ModelPart>>,
     materials: Vec<ParsedMaterial>,
     context: &'context mut PackageProcessingContext,
     component_visits_remaining: u64,
@@ -892,6 +916,7 @@ impl<'a, 'context> Package<'a, 'context> {
             #[cfg(test)]
             input_test.clone(),
         );
+        let parts = OwnedHashMap::new(context.path_allocator().map_allocator());
         Ok(Package {
             archive,
             observer,
@@ -910,7 +935,7 @@ impl<'a, 'context> Package<'a, 'context> {
             #[cfg(test)]
             sidecar_test: SIDECAR_TEST_PROFILE.with(|slot| slot.borrow().clone()),
             collections,
-            parts: HashMap::new(),
+            parts,
             materials: Vec::new(),
             context,
             component_visits_remaining: MAX_COMPONENT_VISITS,
@@ -1042,7 +1067,7 @@ impl<'a, 'context> Package<'a, 'context> {
             self.input_test.as_ref(),
         )?;
         let rc = Rc::new(parsed);
-        self.parts.insert(key, rc.clone());
+        self.parts.insert_reserved(key, rc.clone());
         #[cfg(test)]
         if let Some(test) = &self.input_test {
             test.appended(InputReserveSite::Parts, 1);
@@ -1694,10 +1719,10 @@ fn parse_model_part<R: Read>(
     let mut xml = XmlEventReader::new(reader, observer.clone())?;
     xml.set_trim_text(true);
 
-    let mut part = ModelPart {
+    let mut part = ModelPartBuilder {
         path: owned_path,
         scale: 1.0,
-        objects: HashMap::new(),
+        objects: OwnedHashMap::new(allocator.map_allocator()),
         build: OwnedInputBuffer::empty(),
         materials: Vec::new(),
         material_lookup: HashMap::new(),
@@ -1776,7 +1801,7 @@ fn parse_model_part<R: Read>(
                                 #[cfg(test)]
                                 collections.test.as_ref(),
                             )?;
-                            part.objects.insert(
+                            part.objects.insert_reserved(
                                 id,
                                 Object {
                                     kind: ObjectKind::Mesh {
@@ -1962,7 +1987,7 @@ fn parse_model_part<R: Read>(
                         #[cfg(test)]
                         collections.test.as_ref(),
                     )?;
-                    part.objects.insert(
+                    part.objects.insert_reserved(
                         id,
                         Object {
                             kind,
@@ -1985,7 +2010,7 @@ fn parse_model_part<R: Read>(
             _ => {}
         }
     }
-    Ok(part)
+    Ok(part.seal())
 }
 
 /// Flattened output accumulated across the whole build.
@@ -7567,11 +7592,11 @@ mod tests {
             let ObjectKind::Mesh {
                 vertices,
                 triangles,
-            } = &part.objects[&1].kind
+            } = &part.objects.get(&1).unwrap().kind
             else {
                 panic!("mesh fixture");
             };
-            let ObjectKind::Components(components) = &part.objects[&2].kind else {
+            let ObjectKind::Components(components) = &part.objects.get(&2).unwrap().kind else {
                 panic!("component fixture");
             };
             assert_eq!(
@@ -7630,17 +7655,18 @@ mod tests {
             );
             drop(pkg);
             drop(context);
-            assert_eq!(probe.live.load(SeqCst), charges);
+            let cached_charge = probe.live.load(SeqCst);
+            assert!(cached_charge > 0 && cached_charge < charges);
             drop(part);
-            assert_eq!(probe.live.load(SeqCst), charges);
+            assert_eq!(probe.live.load(SeqCst), cached_charge);
             let ObjectKind::Mesh {
                 vertices,
                 triangles,
-            } = &cached.objects[&1].kind
+            } = &cached.objects.get(&1).unwrap().kind
             else {
                 panic!("mesh retained");
             };
-            let ObjectKind::Components(components) = &cached.objects[&2].kind else {
+            let ObjectKind::Components(components) = &cached.objects.get(&2).unwrap().kind else {
                 panic!("components retained");
             };
             assert_eq!(
@@ -7807,5 +7833,53 @@ mod tests {
             assert!(profile.allocation_size >= profile.payload_offset + 128 * size);
             assert!(profile.allocation_align >= align);
         }
+    }
+
+    fn assert_owned_map_growth_is_funded(site: InputReserveSite) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let resources = match site {
+            InputReserveSite::Objects => (1..=24)
+                .map(|id| format!("<object id=\"{id}\"/>"))
+                .collect::<String>(),
+            InputReserveSite::Parts => "<object id=\"1\"/>".to_owned(),
+            _ => panic!("only the private object and part maps are covered here"),
+        };
+        let xml = model_xml("millimeter", &resources, "");
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+        let observer = ZipResourceObserver::new();
+        let probe = std::sync::Arc::new(InputFundingSiteProbe::new(Some(site)));
+        let mut profile = InputCollectionsTestProfile::new([1000; 5]);
+        profile.funding_site = Some(probe.clone());
+        let profile = std::rc::Rc::new(profile);
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new_funded(
+            observer.clone(),
+            std::sync::Arc::new(InputSiteHost(probe.clone())),
+        );
+
+        let result = parse_3mf_with_plates_in_context(&bytes, &mut context);
+        let error = result.expect_err("map growth must ask the host before acquiring buckets");
+        assert_eq!(error, StlError::FundingBusy);
+        assert!(
+            probe.denied.load(SeqCst),
+            "target map must reach host refusal"
+        );
+        assert_eq!(probe.acquires[site as usize + 1].load(SeqCst), 1);
+        assert_eq!(profile.reserves.borrow()[site as usize], 1);
+        assert_eq!(profile.appended.borrow()[site as usize], 0);
+        assert_eq!(probe.active.load(SeqCst), 0);
+        assert_eq!(probe.late_acquires.load(SeqCst), 0);
+        assert_eq!(probe.live.load(SeqCst), 0);
+        assert!(matches!(observer.check(), Err(ZipOpenError::FundingBusy)));
+    }
+
+    #[test]
+    fn owned_object_map_bucket_growth_is_host_funded_before_insert() {
+        assert_owned_map_growth_is_funded(InputReserveSite::Objects);
+    }
+
+    #[test]
+    fn owned_part_map_bucket_growth_is_host_funded_before_cache_insert() {
+        assert_owned_map_growth_is_funded(InputReserveSite::Parts);
     }
 }

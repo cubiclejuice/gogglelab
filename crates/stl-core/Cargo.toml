@@ -5,6 +5,8 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+allocator-api2 = { version = "=0.2.21", default-features = false, features = ["alloc"] }
+hashbrown = { version = "=0.16.1", default-features = false, features = ["allocator-api2"] }
 thiserror = "2"
 # 3MF is an OPC zip package with an XML model part. Reading only needs an
 # inflater, so the zip crate is trimmed to deflate via the pure-Rust zlib-rs

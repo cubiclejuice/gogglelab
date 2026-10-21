@@ -237,7 +237,7 @@ struct OpenRecord {
 pub(super) fn parse_slicer_metadata(
     text: &str,
     observer: &ZipResourceObserver,
-    objects: &HashMap<u32, Object>,
+    objects: &SealedHashMap<u32, Object>,
     component_paths: &HashMap<u32, HashSet<SharedPath>>,
     #[cfg(test)] probe: Option<&SettingsOwnedTestProfile>,
 ) -> Result<SlicerMetadata, SettingsError> {
@@ -257,7 +257,7 @@ pub(super) fn parse_slicer_metadata(
 
 fn parse_inner(
     text: &str,
-    objects: &HashMap<u32, Object>,
+    objects: &SealedHashMap<u32, Object>,
     component_paths: &HashMap<u32, HashSet<SharedPath>>,
     control: &Control<'_>,
 ) -> Result<SlicerMetadata, SettingsError> {

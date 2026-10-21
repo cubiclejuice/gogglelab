@@ -216,7 +216,7 @@ fn classify<'a>(node: &'a BytesStart<'_>, kind: MaterialGroupKind) -> Option<Can
 }
 
 pub(super) fn retain(
-    part: &mut ModelPart,
+    part: &mut ModelPartBuilder,
     node: &BytesStart<'_>,
     kind: MaterialGroupKind,
     group: u32,

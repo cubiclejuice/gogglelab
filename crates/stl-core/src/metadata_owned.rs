@@ -2,6 +2,7 @@
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -118,11 +119,184 @@ impl PathAllocator {
         self.recorded_error()
     }
 
+    pub(crate) fn map_allocator(&self) -> MapAllocator {
+        MapAllocator::new(self.host.clone(), self.observer.clone())
+    }
+
     fn recorded_error(&self) -> StlError {
         self.observer
             .check()
             .expect_err("a terminal cause was recorded")
             .into()
+    }
+}
+
+struct MapBlockHeader {
+    block_layout: Layout,
+    payload_offset: usize,
+    credit: AllocationCredit,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct MapAllocationLayout {
+    bucket: Layout,
+    block: Layout,
+    payload_offset: usize,
+    returned_len: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MapAllocatorProbe {
+    layouts: std::sync::Mutex<Vec<MapAllocationLayout>>,
+    fail_allocation: std::sync::atomic::AtomicBool,
+    deallocated: std::sync::atomic::AtomicBool,
+}
+
+fn map_block_layout(bucket_layout: Layout) -> Option<(Layout, usize)> {
+    let (layout, offset) = Layout::new::<MapBlockHeader>().extend(bucket_layout).ok()?;
+    Some((layout.pad_to_align(), offset))
+}
+
+/// Hash table allocator whose bucket blocks share the package's existing Owned funding.
+pub(crate) struct MapAllocator {
+    host: RefCell<Option<Arc<dyn HostOwnedFunding>>>,
+    observer: RefCell<Option<ZipResourceObserver>>,
+    #[cfg(test)]
+    probe: Option<Arc<MapAllocatorProbe>>,
+}
+
+impl MapAllocator {
+    fn new(host: Option<Arc<dyn HostOwnedFunding>>, observer: ZipResourceObserver) -> Self {
+        Self {
+            host: RefCell::new(host),
+            observer: RefCell::new(Some(observer)),
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_probe(
+        host: Option<Arc<dyn HostOwnedFunding>>,
+        observer: ZipResourceObserver,
+        probe: Arc<MapAllocatorProbe>,
+    ) -> Self {
+        Self {
+            host: RefCell::new(host),
+            observer: RefCell::new(Some(observer)),
+            probe: Some(probe),
+        }
+    }
+
+    /// Detach parser state before an immutable object map can outlive its package.
+    pub(crate) fn seal(&self) {
+        self.observer.borrow_mut().take();
+        self.host.borrow_mut().take();
+    }
+}
+
+impl Clone for MapAllocator {
+    fn clone(&self) -> Self {
+        Self {
+            host: RefCell::new(self.host.borrow().clone()),
+            observer: RefCell::new(self.observer.borrow().clone()),
+            #[cfg(test)]
+            probe: self.probe.clone(),
+        }
+    }
+}
+
+unsafe impl allocator_api2::alloc::Allocator for MapAllocator {
+    fn allocate(
+        &self,
+        bucket_layout: Layout,
+    ) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        use allocator_api2::alloc::AllocError;
+
+        let observer = self.observer.borrow().clone().ok_or(AllocError)?;
+        if observer.check().is_err() {
+            return Err(AllocError);
+        }
+        let Some((block_layout, payload_offset)) = map_block_layout(bucket_layout) else {
+            let _ = observer.stop_io(ResourceStop::InputLimitExceeded);
+            return Err(AllocError);
+        };
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.layouts.lock().unwrap().push(MapAllocationLayout {
+                bucket: bucket_layout,
+                block: block_layout,
+                payload_offset,
+                returned_len: bucket_layout.size(),
+            });
+        }
+        let host = self.host.borrow().clone();
+        if let Some(host) = &host {
+            if host.try_acquire(block_layout.size()).is_err() {
+                let _ = observer.funding_busy_io();
+                return Err(AllocError);
+            }
+        }
+        let credit = AllocationCredit {
+            host,
+            bytes: block_layout.size(),
+            #[cfg(test)]
+            probe: None,
+        };
+        if observer.check().is_err() {
+            drop(credit);
+            return Err(AllocError);
+        }
+        #[cfg(test)]
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.fail_allocation.load(Ordering::SeqCst))
+        {
+            let _ = observer.allocation_failed_io();
+            drop(credit);
+            return Err(AllocError);
+        }
+        let raw = unsafe { alloc(block_layout) };
+        let Some(base) = NonNull::new(raw) else {
+            let _ = observer.allocation_failed_io();
+            drop(credit);
+            return Err(AllocError);
+        };
+        unsafe {
+            base.cast::<MapBlockHeader>()
+                .as_ptr()
+                .write(MapBlockHeader {
+                    block_layout,
+                    payload_offset,
+                    credit,
+                });
+        }
+        let payload = unsafe { base.as_ptr().add(payload_offset) };
+        let payload = NonNull::new(payload).expect("non-null map allocation remains non-null");
+        Ok(NonNull::slice_from_raw_parts(payload, bucket_layout.size()))
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bucket_layout: Layout) {
+        let (expected_block_layout, expected_offset) =
+            map_block_layout(bucket_layout).expect("hashbrown returns its original valid layout");
+        let base = unsafe { ptr.as_ptr().sub(expected_offset) };
+        let header = unsafe { base.cast::<MapBlockHeader>().read() };
+        assert_eq!(header.block_layout, expected_block_layout);
+        assert_eq!(header.payload_offset, expected_offset);
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.deallocated.store(false, Ordering::SeqCst);
+        }
+        unsafe { dealloc(base, header.block_layout) };
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.deallocated.store(true, Ordering::SeqCst);
+        }
+        header.credit.note_deallocated();
+        drop(header.credit);
     }
 }
 
@@ -363,6 +537,7 @@ struct CopyProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zip_bounds::ZipOpenError;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -410,6 +585,125 @@ mod tests {
     }
     fn allocator(host: &Arc<Host>, observer: ZipResourceObserver) -> PathAllocator {
         PathAllocator::new(observer, Some(host.clone()))
+    }
+
+    #[derive(Default)]
+    struct MapHostState {
+        active: usize,
+        peak: usize,
+        acquired: usize,
+        released: usize,
+        active_before_acquire: Vec<usize>,
+    }
+
+    struct MapHost {
+        limit: usize,
+        state: Mutex<MapHostState>,
+        probe: Arc<MapAllocatorProbe>,
+    }
+
+    impl HostOwnedFunding for MapHost {
+        fn try_acquire(&self, bytes: usize) -> Result<(), ZipFundingBusy> {
+            let mut state = self.state.lock().unwrap();
+            let active = state.active;
+            state.active_before_acquire.push(active);
+            state.acquired += 1;
+            let next = state.active.checked_add(bytes).ok_or(ZipFundingBusy)?;
+            if next > self.limit {
+                return Err(ZipFundingBusy);
+            }
+            state.active = next;
+            state.peak = state.peak.max(next);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            if !self.probe.fail_allocation.load(Ordering::SeqCst) {
+                assert!(
+                    self.probe.deallocated.load(Ordering::SeqCst),
+                    "map buckets must be physically deallocated before refund"
+                );
+            }
+            let mut state = self.state.lock().unwrap();
+            state.active = state.active.checked_sub(bytes).unwrap();
+            state.released += 1;
+        }
+    }
+
+    fn test_hash_map(
+        host: &Arc<MapHost>,
+        observer: ZipResourceObserver,
+    ) -> hashbrown::HashMap<u32, u32, std::collections::hash_map::RandomState, MapAllocator> {
+        let allocator =
+            MapAllocator::with_test_probe(Some(host.clone()), observer, host.probe.clone());
+        hashbrown::HashMap::with_hasher_in(
+            std::collections::hash_map::RandomState::new(),
+            allocator,
+        )
+    }
+
+    #[test]
+    fn map_rehash_admits_the_actual_complete_layout_while_old_buckets_remain_live() {
+        let probe = Arc::new(MapAllocatorProbe::default());
+        let host = Arc::new(MapHost {
+            limit: usize::MAX,
+            state: Mutex::new(MapHostState::default()),
+            probe: probe.clone(),
+        });
+        let mut map = test_hash_map(&host, ZipResourceObserver::new());
+        map.try_reserve(1).unwrap();
+        let first_capacity = map.capacity();
+        for key in 0..first_capacity as u32 {
+            assert!(map.insert(key, key).is_none());
+        }
+
+        let first = probe.layouts.lock().unwrap()[0];
+        let (expected_layout, expected_offset) = Layout::new::<MapBlockHeader>()
+            .extend(first.bucket)
+            .unwrap();
+        assert_eq!(first.block, expected_layout.pad_to_align());
+        assert_eq!(first.payload_offset, expected_offset);
+        assert_eq!(first.returned_len, first.bucket.size());
+        assert_eq!(host.state.lock().unwrap().active, first.block.size());
+
+        map.try_reserve(1).unwrap();
+
+        let layouts = probe.layouts.lock().unwrap();
+        assert_eq!(layouts.len(), 2);
+        let second = layouts[1];
+        let state = host.state.lock().unwrap();
+        assert_eq!(state.active_before_acquire[1], first.block.size());
+        assert!(state.peak >= first.block.size() + second.block.size());
+        assert_eq!(state.active, second.block.size());
+        assert_eq!(state.released, 1);
+        assert!(probe.deallocated.load(Ordering::SeqCst));
+        drop(state);
+        drop(layouts);
+        drop(map);
+        let state = host.state.lock().unwrap();
+        assert_eq!((state.active, state.acquired, state.released), (0, 2, 2));
+    }
+
+    #[test]
+    fn map_allocation_failure_refunds_without_a_physical_free() {
+        let probe = Arc::new(MapAllocatorProbe::default());
+        probe.fail_allocation.store(true, Ordering::SeqCst);
+        let host = Arc::new(MapHost {
+            limit: usize::MAX,
+            state: Mutex::new(MapHostState::default()),
+            probe: probe.clone(),
+        });
+        let observer = ZipResourceObserver::new();
+        let mut map = test_hash_map(&host, observer.clone());
+        assert!(map.try_reserve(1).is_err());
+        assert!(matches!(
+            observer.check(),
+            Err(ZipOpenError::AllocationFailed)
+        ));
+        assert!(!probe.deallocated.load(Ordering::SeqCst));
+        let state = host.state.lock().unwrap();
+        assert_eq!((state.active, state.acquired, state.released), (0, 1, 1));
+        assert_eq!(map.capacity(), 0);
     }
     fn probed(probe: &Arc<CopyProbe>) -> CopyControl {
         CopyControl {

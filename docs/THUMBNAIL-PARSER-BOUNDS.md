@@ -1,6 +1,54 @@
 # Thumbnail parser resource prerequisite
 
-## Current implementation: four private input buffers (2026-10-20)
+## Current implementation: funded private parser maps (2026-10-21)
+
+`ModelPart.objects` and the package part cache now reserve every hash-table
+bucket through the package's existing `Owned` funding host. The allocator receives
+hashbrown's actual bucket `Layout`; the charged block includes an aligned credit
+header and all bucket/control bytes. `try_reserve` runs before insertion, and a
+funding refusal is latched as the existing retryable `FundingBusy` cause before
+the collection error is returned. Object and part counts still use the existing
+physical admission rules; this adds no quota.
+
+Rehash keeps the old bucket block charged while the new complete layout is
+acquired. The returned slice matches the requested layout exactly. Deallocation
+frees the combined block before its credit is refunded. `ModelPart.objects` is
+sealed before the part enters its `Rc` cache; sealing drops parser observer and
+host handles from the map control while each retained block keeps only the
+funding host needed for its eventual refund. The mutable package cache dies with
+the package. Both maps retain the existing `RandomState` hasher and borrowed
+`SharedPath` lookup behavior. Source vectors still control emitted order.
+
+`hashbrown` 0.16.1 and `stl-core` resolve the pinned crates.io
+`allocator-api2` 0.2.21 package. Sharing that registry package identity keeps
+the allocator trait type consistent when `stl-core` is consumed from a parent
+workspace. Only its `alloc` feature is enabled, and `Cargo.lock` records the
+resolved checksum. Its upstream MIT/Apache license texts remain included in
+the generated notice inventory.
+
+Focused tests prove actual host denial at both map growth sites, full old/new
+layout overlap, deallocation before refund, and null-allocation accounting. The
+normal non-test artifact was also exercised with one and 32 empty objects: the
+larger map issued more host admissions, reached a 7,240-byte peak, and released
+all acquired bytes after parsing. These requested-byte observations do not bound
+allocator size classes or process RSS. All 258 `stl-core` unit tests pass, with
+one existing ignored test; workspace Clippy, formatting and whitespace checks
+pass. The GoggleLab library target passed 207 tests, while four unchanged
+`folder_watch` event tests timed out, including a standalone rerun on this macOS
+host. Using a task-specific temporary directory cleared other initialization
+failures caused by the shared test directory's 16,882 entries exceeding the
+existing 4,096-entry recovery bound. The offline composed-consumer check now
+passes for all 374 public inputs. It preserved 1,410 unaffected candidate
+entries and all 112 original directories, then restored the private root lock
+byte-for-byte after adding only the pinned registry allocator. Hosted workflow
+and current-source container acceptance remain open for this phase.
+
+Other settings/material maps, `Rc` control blocks, semantic strings, public
+output/geometry backing, other parser routes, SDK/native frames, producer sizing
+and immutable publication remain open. No 16 MiB policy or producer profile is
+selected. Evidence is preserved in `output/owned-private-maps/`.
+
+## Accepted checkpoint: four private input buffers (2026-10-20)
 
 Source vertices, source triangles, components and build items now use one unique
 owned buffer implementation. Each growth funds the complete new header/payload
