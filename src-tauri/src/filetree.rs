@@ -2,17 +2,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn renameatx_np(
-        from_directory: i32,
-        from: *const std::os::raw::c_char,
-        to_directory: i32,
-        to: *const std::os::raw::c_char,
-        flags: u32,
-    ) -> i32;
-}
-
 use crate::error::AppError;
 
 /// The file types the sidebar lists and the app can open. Matched on
@@ -238,12 +227,43 @@ pub fn move_tree_entry(
     })
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn move_tree_entry_under_root(
     selected: &crate::folder_watch::SelectedRootHandle,
     requested_root: &Path,
     requested_source: &Path,
     requested_destination_directory: &Path,
 ) -> Result<(), String> {
+    move_tree_entry_under_root_with_hook(
+        selected,
+        requested_root,
+        requested_source,
+        requested_destination_directory,
+        || {},
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn move_tree_entry_under_root(
+    _selected: &crate::folder_watch::SelectedRootHandle,
+    _requested_root: &Path,
+    _requested_source: &Path,
+    _requested_destination_directory: &Path,
+) -> Result<(), String> {
+    Err("Safe file-tree moves are unavailable because handle-relative verified rename is unsupported on this platform".into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn move_tree_entry_under_root_with_hook<F>(
+    selected: &crate::folder_watch::SelectedRootHandle,
+    requested_root: &Path,
+    requested_source: &Path,
+    requested_destination_directory: &Path,
+    before_mutation: F,
+) -> Result<(), String>
+where
+    F: FnOnce(),
+{
     selected.verify_current()?;
     let root = canonical_mutation_root(selected.path())?;
     let requested_root = requested_root
@@ -260,6 +280,10 @@ fn move_tree_entry_under_root(
     let source_parent = requested_source
         .parent()
         .ok_or_else(|| "The source path is invalid.".to_string())?
+        .to_path_buf();
+    let source_parent_handle = library_runtime::GuardedDirectoryParent::open(&source_parent)
+        .map_err(|_| "Symbolic links cannot be used as source parent folders.".to_string())?;
+    let source_parent = source_parent
         .canonicalize()
         .map_err(|_| "The source folder no longer exists or cannot be read.".to_string())?;
     if !source_parent.starts_with(&root) {
@@ -281,9 +305,6 @@ fn move_tree_entry_under_root(
     if contains_hidden_component(&root, &source) {
         return Err("Hidden items cannot be moved from the file tree.".into());
     }
-    let source = source
-        .canonicalize()
-        .map_err(|_| "The source no longer exists or cannot be read.".to_string())?;
     if source == root || !source.starts_with(&root) {
         return Err("The source must be inside the selected folder.".into());
     }
@@ -296,6 +317,9 @@ fn move_tree_entry_under_root(
     if !destination_link_metadata.is_dir() {
         return Err("Choose a folder as the move destination.".into());
     }
+    let destination_parent_handle =
+        library_runtime::GuardedDirectoryParent::open(requested_destination_directory)
+            .map_err(|_| "Symbolic links cannot be used as destination folders.".to_string())?;
     let destination_directory = requested_destination_directory
         .canonicalize()
         .map_err(|_| "The destination folder no longer exists.".to_string())?;
@@ -308,12 +332,9 @@ fn move_tree_entry_under_root(
     if source == destination_directory {
         return Err("A folder cannot be moved into itself.".into());
     }
-    if source.is_dir() && destination_directory.starts_with(&source) {
+    if source_type.is_dir() && destination_directory.starts_with(&source) {
         return Err("A folder cannot be moved into one of its own subfolders.".into());
     }
-    let source_parent = source
-        .parent()
-        .expect("validated source is not the selected root");
     if source_parent == destination_directory {
         return Ok(());
     }
@@ -324,33 +345,80 @@ fn move_tree_entry_under_root(
     let destination = destination_directory.join(destination_name);
     match std::fs::symlink_metadata(&destination) {
         Ok(_) => {
-            return Err("A file or folder with that name already exists in the destination.".into())
+            return Err(
+                "A file or folder with that name already exists in the destination.".into(),
+            );
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err("The destination cannot be checked for name conflicts.".into()),
     }
 
-    // Re-resolve both directories immediately before renaming so the operation
-    // cannot follow a swapped parent symlink out of the selected root.
-    let rechecked_source_parent = source_parent
-        .canonicalize()
-        .map_err(|_| "The source folder changed before the move.".to_string())?;
-    let rechecked_destination_directory = requested_destination_directory
-        .canonicalize()
-        .map_err(|_| "The destination folder changed before the move.".to_string())?;
-    if rechecked_source_parent != source_parent
-        || rechecked_destination_directory != destination_directory
-        || !rechecked_source_parent.starts_with(&root)
-        || !rechecked_destination_directory.starts_with(&root)
+    // Keep the opened parents pinned and check that neither path was replaced
+    // before the handle-relative transaction starts. A later path swap cannot
+    // redirect the rename through a symlink because the runtime uses the
+    // already-open directory handles.
+    if !source_parent_handle
+        .matches_path(&source_parent)
+        .map_err(|_| "The source folder changed before the move.".to_string())?
+        || !destination_parent_handle
+            .matches_path(&destination_directory)
+            .map_err(|_| "The destination folder changed before the move.".to_string())?
     {
         return Err("A folder changed before the move could complete.".into());
     }
-    match rename_without_replacing(selected, &source, &destination) {
-        Ok(()) => Ok(()),
+    before_mutation();
+    selected.verify_current()?;
+    if !source_parent_handle
+        .matches_path(&source_parent)
+        .map_err(|_| "The source folder changed before the move.".to_string())?
+        || !destination_parent_handle
+            .matches_path(&destination_directory)
+            .map_err(|_| "The destination folder changed before the move.".to_string())?
+    {
+        return Err("A folder changed before the move could complete.".into());
+    }
+    let result = if source_type.is_file() {
+        let (bytes, sha256) = source_parent_handle
+            .hash_file(source.file_name().unwrap(), u64::MAX)
+            .map_err(|error| format!("Could not verify the source before moving it: {error}"))?;
+        source_parent_handle.move_verified_file_to(
+            source.file_name().unwrap(),
+            &destination_parent_handle,
+            destination_name,
+            bytes,
+            &sha256,
+            u64::MAX,
+        )
+    } else {
+        source_parent_handle.move_entry_to(
+            source.file_name().unwrap(),
+            &destination_parent_handle,
+            destination_name,
+        )
+    };
+    match result {
+        Ok(moved) => {
+            if !source_parent_handle
+                .matches_path(&source_parent)
+                .map_err(|error| error.to_string())?
+                || !destination_parent_handle
+                    .matches_path(&destination_directory)
+                    .map_err(|error| error.to_string())?
+                || selected.verify_current().is_err()
+            {
+                return Err(format!(
+                    "The item moved, but a selected folder changed during the operation. The move journal {} remains beside the original location.",
+                    source_parent.join(moved.journal_name).display()
+                ));
+            }
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err("A file or folder with that name already exists in the destination.".into())
         }
-        Err(error) => Err(format!("Could not move the item into that folder: {error}")),
+        Err(error) => Err(format!(
+            "Could not move the item safely. Any retained bytes remain recoverable through the source-directory journal: {error}"
+        )),
     }
 }
 
@@ -395,120 +463,6 @@ fn is_filesystem_root(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_filesystem_root(path: &Path) -> bool {
     path.parent().is_none()
-}
-
-#[cfg(target_os = "macos")]
-fn rename_without_replacing(
-    selected: &crate::folder_watch::SelectedRootHandle,
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    const RENAME_EXCL: u32 = 0x0000_0004;
-    const RENAME_NOFOLLOW_ANY: u32 = 0x0000_0010;
-
-    selected.verify_current().map_err(std::io::Error::other)?;
-    let root = selected.path();
-    let source = source.strip_prefix(root).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "source is outside selected root",
-        )
-    })?;
-    let destination = destination.strip_prefix(root).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "destination is outside selected root",
-        )
-    })?;
-    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
-    })?;
-    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "destination path contains NUL",
-        )
-    })?;
-    let directory = selected.directory();
-    // SAFETY: the directory descriptor is bound to the selected root; both
-    // paths are relative to it. RENAME_EXCL prevents overwrites and
-    // RENAME_NOFOLLOW_ANY rejects symlinks while resolving the paths.
-    let result = unsafe {
-        renameatx_np(
-            directory.as_raw_fd(),
-            source.as_ptr(),
-            directory.as_raw_fd(),
-            destination.as_ptr(),
-            RENAME_EXCL | RENAME_NOFOLLOW_ANY,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn rename_without_replacing(
-    selected: &crate::folder_watch::SelectedRootHandle,
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    selected.verify_current().map_err(std::io::Error::other)?;
-    let root = selected.path();
-    if source.parent() != Some(root) || destination.parent() != Some(root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Moving items into or out of nested folders is not yet supported on Linux",
-        ));
-    }
-    let source = source.strip_prefix(root).map_err(std::io::Error::other)?;
-    let destination = destination
-        .strip_prefix(root)
-        .map_err(std::io::Error::other)?;
-    let from = crate::fs_portability::linux_parent(selected.directory(), source.parent().unwrap())?;
-    let to =
-        crate::fs_portability::linux_parent(selected.directory(), destination.parent().unwrap())?;
-    selected.verify_current().map_err(std::io::Error::other)?;
-    crate::fs_portability::linux_rename_at(
-        &from,
-        Path::new(source.file_name().unwrap()),
-        &to,
-        Path::new(destination.file_name().unwrap()),
-    )
-}
-
-#[cfg(windows)]
-fn rename_without_replacing(
-    selected: &crate::folder_watch::SelectedRootHandle,
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    selected.verify_current().map_err(std::io::Error::other)?;
-    // Holding each ancestor without FILE_SHARE_DELETE prevents substitution.
-    let _source_ancestors =
-        crate::fs_portability::lock_ancestors(selected.path(), source.parent().unwrap())?;
-    let _destination_ancestors =
-        crate::fs_portability::lock_ancestors(selected.path(), destination.parent().unwrap())?;
-    selected.verify_current().map_err(std::io::Error::other)?;
-    crate::fs_portability::rename_no_replace(source, destination)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn rename_without_replacing(
-    _: &crate::folder_watch::SelectedRootHandle,
-    _: &Path,
-    _: &Path,
-) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Secure moves are unavailable on this platform",
-    ))
 }
 
 /// `ancestor_matched`: some directory above `dir` already matched, so every
@@ -648,7 +602,37 @@ mod tests {
             .contains("Symbolic links"));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(unix)]
+    #[test]
+    fn move_rejects_destination_parent_swapped_to_outside_symlink_before_commit() {
+        let root = tmp("move-parent-race-root");
+        let outside = tmp("move-parent-race-outside");
+        let destination = root.join("destination");
+        let displaced_destination = root.join("destination-held");
+        let source = root.join("part.stl");
+        let outside_part = outside.join("part.stl");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::write(&outside_part, b"outside bytes").unwrap();
+
+        let state = crate::folder_watch::FolderWatchState::default();
+        state.select_root_for_test(&root);
+        let result = state.with_selected_root(&root, |selected| {
+            move_tree_entry_under_root_with_hook(selected, &root, &source, &destination, || {
+                std::fs::rename(&destination, &displaced_destination).unwrap();
+                std::os::unix::fs::symlink(&outside, &destination).unwrap();
+            })
+        });
+
+        assert!(result.unwrap_err().contains("destination folder changed"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&outside_part).unwrap(), b"outside bytes");
+        assert!(!displaced_destination.join("part.stl").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn moves_unicode_file_and_folder_without_overwriting() {
         let root = tmp("move-success");
@@ -672,17 +656,17 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
-    fn linux_nested_moves_fail_closed_without_mutation() {
-        let root = tmp("linux-nested-move");
+    fn moves_fail_closed_without_handle_relative_support() {
+        let root = tmp("unsupported-platform-move");
         let destination = root.join("destination");
         let source = root.join("part.stl");
         std::fs::create_dir(&destination).unwrap();
         std::fs::write(&source, b"original").unwrap();
 
         let error = move_for_test(&root, &source, &destination).unwrap_err();
-        assert!(error.contains("not yet supported on Linux"));
+        assert!(error.contains("handle-relative verified rename"));
         assert_eq!(std::fs::read(&source).unwrap(), b"original");
         assert!(!destination.join("part.stl").exists());
     }

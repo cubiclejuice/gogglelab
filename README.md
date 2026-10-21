@@ -13,12 +13,25 @@ contain the Community features listed below. Private Pro source stays in its sep
 - STEP/STP tessellated previews; F3D viewing through the optional local Autodesk Fusion bridge.
 - Multi-plate selection and overview, embedded/authored 3MF colors, and appearance controls.
 - Folder browsing, search, watching, ZIP extraction, drag/drop moves and confirmed Trash actions.
-- Installed slicer discovery and printer-profile detection for inspection.
+- Installed slicer discovery, printer-profile detection, and handoff of the loaded original STL/3MF.
+- Managed Library import, folder catalog, search and model opening without a license.
+- Multiple indexed folders with startup/periodic scans, cancellation and configurable size limits.
+- Cached STL/3MF thumbnail gallery with source/status filters, search, sorting and preview regeneration.
+- Designer, notes, source URLs, model license, tags/categories, status and versioned batch edits.
+- Print history, parent/child links, collections, folder bundles and opt-in in-place ZIP indexing.
+- Exact-filter duplicate review, recoverable removal/Trash/restore, source reveal and full Library backup/restore.
+- Multipart bundle preview and all-member slicer handoff, filtered roulette and safe cache maintenance.
+- Custom PNG/JPEG previews and embedded 3MF images; indexed directory tree and resizable source sidebar.
+- Local filament catalog, ordered model assignments, filament filters and print-history selections.
+- Explicit pull-only Spoolman sync with stable filament-type/spool identities and retained unavailable references.
+- Reviewed AI tagging through compatible, Anthropic and Gemini APIs; session-only credentials and no automatic apply.
 - Read-only recovery of existing Library data and raw saved colorway records.
 
-Community does not contain managed Library, editable/saved colorway or slicer-launch implementations.
+Community owns managed Library and basic slicer handoff. Editable/saved colorways and slicer palette access remain Pro.
 The official app composes this core with private Pro source and unlocks paid functionality through signed entitlements.
 Custom preview colors are not exported into models. STEP/F3D previews do not add slicer handoff.
+
+See the [Free parity plan](docs/FREE-PRINTVENTORY-PARITY-PLAN.md) for the remaining server, MCP and browser-capture capabilities. Local validation does not establish cross-platform release parity.
 
 ## Build and develop
 
@@ -56,3 +69,12 @@ CAD previews preserve the original source and derive measurements from tessellat
 The Fusion bridge requires an installed, running Autodesk Fusion with its local add-in enabled.
 ZIP extraction rejects unsafe paths, encrypted/unsupported entries and collisions.
 Slicer discovery checks `/Applications` and `~/Applications`.
+
+## Reviewed AI tagging
+Configure a provider and model in Library integrations, then explicitly select models
+and generate suggestions. Local OpenAI-compatible vision servers can run without a key.
+Credentials last only for the app session; saving configuration makes no provider request.
+Review each model, accept or reject, and choose append, replace or category-aware merge.
+Current requests share a normalized preview, display name and assigned tag names.
+Categories remain local and are validated before applying; provider costs are separate
+from GoggleLab Free. Category sharing defaults to local. A user can opt in to sharing category labels with the configured provider when generating suggestions.

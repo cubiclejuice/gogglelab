@@ -14,21 +14,33 @@
 //! DOM: a real project's mesh part is tens of megabytes of `<vertex>` lines.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, Cursor, Read};
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
 use quick_xml::XmlVersion;
+#[cfg(test)]
 use serde_json::Value;
 
-use crate::error::StlError;
-use crate::limits::{MAX_3MF_INFLATED_BYTES, MAX_TRIANGLES};
+mod derived_maps;
+mod materials;
+mod project_json;
+mod settings;
+use derived_maps::BuildIndex;
+
+use crate::error::{ResourceStop, StlError};
+use crate::input_owned::{InputElement, OwnedInputBuffer};
+use crate::limits::{MAX_FILE_BYTES, MAX_TRIANGLES};
+use crate::map_owned::{OwnedHashMap, SealedHashMap};
+use crate::metadata_owned::{PathAllocator, SharedPath};
 use crate::model::{
     MaterialSource, ParsedFilament, ParsedMaterial, ParsedModel, ParsedPart, Plate,
 };
+use crate::package_bounds::{PackageProcessingContext, TextRole};
 use crate::parse::{ParsedStl, StlFormat};
 use crate::vec3::{cross, dot, sub, V3};
+use crate::xml_bounds::XmlEventReader;
+use crate::zip_bounds::{BoundedZipArchive, ZipOpenError, ZipResourceObserver};
 
 /// Zip local-file-header signature. Every 3MF (and every other OPC package)
 /// starts with it; no STL can, so this is the format discriminator.
@@ -41,6 +53,9 @@ const ROOT_MODEL_FALLBACK: &str = "3D/3dmodel.model";
 /// deeper than this is a cycle or a hostile file, and is refused rather than
 /// recursed into.
 const MAX_COMPONENT_DEPTH: u32 = 32;
+// Bounds traversal work, including shared subgraphs with no output triangles.
+// This is not a bound on parser memory or process RSS.
+const MAX_COMPONENT_VISITS: u64 = 10_000_000;
 
 /// Row-major 4x3 affine matrix in the order 3MF writes it:
 /// `m00 m01 m02 m10 m11 m12 m20 m21 m22 m30 m31 m32`, applied to row vectors
@@ -105,17 +120,19 @@ fn unit_to_mm(unit: &str) -> Option<f32> {
 struct Component {
     /// `p:path` from the production extension: the part holding the target
     /// object, or `None` for "this part".
-    path: Option<String>,
+    path: Option<SharedPath>,
     object_id: u32,
     transform: Mat,
 }
 
+impl InputElement for Component {}
+
 enum ObjectKind {
     Mesh {
-        vertices: Vec<V3>,
-        triangles: Vec<[u32; 3]>,
+        vertices: OwnedInputBuffer<V3>,
+        triangles: OwnedInputBuffer<[u32; 3]>,
     },
-    Components(Vec<Component>),
+    Components(OwnedInputBuffer<Component>),
 }
 
 struct Object {
@@ -129,7 +146,7 @@ struct Object {
 }
 
 struct BuildItem {
-    path: Option<String>,
+    path: Option<SharedPath>,
     object_id: u32,
     transform: Mat,
     /// Bambu/Orca write `printable="0"` on items the user disabled. Not core
@@ -137,36 +154,800 @@ struct BuildItem {
     printable: bool,
 }
 
+impl InputElement for BuildItem {}
+
 struct ModelPart {
     /// Normalized zip entry name, without an OPC leading slash.
-    path: String,
+    path: SharedPath,
     /// Multiplier from this part's `unit` to millimetres.
     scale: f32,
-    objects: HashMap<u32, Object>,
-    build: Vec<BuildItem>,
+    objects: SealedHashMap<u32, Object>,
+    build: OwnedInputBuffer<BuildItem>,
     materials: Vec<ParsedMaterial>,
     material_lookup: HashMap<(u32, u32), usize>,
 }
 
-/// The open package plus a cache of parsed parts, so a part referenced by
-/// several components is parsed once.
-struct Package<'a> {
-    archive: zip::ZipArchive<Cursor<&'a [u8]>>,
-    parts: HashMap<String, Rc<ModelPart>>,
+struct ModelPartBuilder {
+    path: SharedPath,
+    scale: f32,
+    objects: OwnedHashMap<u32, Object>,
+    build: OwnedInputBuffer<BuildItem>,
     materials: Vec<ParsedMaterial>,
-    inflated: u64,
+    material_lookup: HashMap<(u32, u32), usize>,
 }
 
-impl<'a> Package<'a> {
-    fn open(bytes: &'a [u8]) -> Result<Self, StlError> {
-        let archive = zip::ZipArchive::new(Cursor::new(bytes))
-            .map_err(|e| malformed(format!("not a readable zip package ({e})")))?;
+impl ModelPartBuilder {
+    fn seal(self) -> ModelPart {
+        ModelPart {
+            path: self.path,
+            scale: self.scale,
+            objects: self.objects.seal(),
+            build: self.build,
+            materials: self.materials,
+            material_lookup: self.material_lookup,
+        }
+    }
+}
+
+/// Inspect the actual compiled backing layout for one private input category.
+#[doc(hidden)]
+pub fn input_buffer_layout_profile(
+    kind: crate::InputBufferKind,
+    capacity: usize,
+) -> Option<crate::InputBufferLayoutProfile> {
+    use crate::input_owned::input_buffer_layout;
+    match kind {
+        crate::InputBufferKind::Vertices => input_buffer_layout::<V3>(capacity),
+        crate::InputBufferKind::Triangles => input_buffer_layout::<[u32; 3]>(capacity),
+        crate::InputBufferKind::Components => input_buffer_layout::<Component>(capacity),
+        crate::InputBufferKind::Build => input_buffer_layout::<BuildItem>(capacity),
+    }
+}
+
+fn missing_part_error(error: ZipOpenError, path: &str) -> StlError {
+    match error {
+        ZipOpenError::Archive(_) => malformed(format!("missing part {path}")),
+        terminal => terminal.into(),
+    }
+}
+
+fn preserve_terminal<T>(result: &Result<T, StlError>) -> Result<(), StlError> {
+    match result {
+        Err(StlError::ResourceStopped(stop)) => Err(StlError::ResourceStopped(*stop)),
+        Err(StlError::AllocationFailed) => Err(StlError::AllocationFailed),
+        Err(StlError::FundingBusy) => Err(StlError::FundingBusy),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ParserTestFailure {
+    Stop(ResourceStop),
+    Allocation,
+    Funding,
+}
+
+#[cfg(test)]
+impl ParserTestFailure {
+    fn io_error(self) -> io::Error {
+        match self {
+            Self::Stop(stop) => stop.into_io_error(),
+            Self::Allocation => crate::zip_bounds::ZipAllocationFailed.into_io_error(),
+            Self::Funding => crate::zip_bounds::ZipFundingBusy.into_io_error(),
+        }
+    }
+
+    fn error(self) -> StlError {
+        match self {
+            Self::Stop(stop) => StlError::ResourceStopped(stop),
+            Self::Allocation => StlError::AllocationFailed,
+            Self::Funding => StlError::FundingBusy,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ParserTestState {
+    constructor_completed: bool,
+    armed: bool,
+    fired: bool,
+    after_io: usize,
+    work_after_stop: usize,
+    total_work: usize,
+    root_cached: bool,
+}
+
+#[cfg(test)]
+struct ParserTestProbe {
+    member: &'static str,
+    failure: ParserTestFailure,
+    state: std::cell::RefCell<ParserTestState>,
+    guard_observer: Option<ZipResourceObserver>,
+}
+
+#[cfg(test)]
+impl ParserTestProbe {
+    fn before_io(&self, read: bool) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.fired
+            || self
+                .guard_observer
+                .as_ref()
+                .is_some_and(|observer| observer.check().is_err())
+        {
+            state.after_io += 1;
+        } else if state.armed && read {
+            state.fired = true;
+            return Err(self.failure.io_error());
+        }
+        Ok(())
+    }
+
+    fn record_work(&self) {
+        let mut state = self.state.borrow_mut();
+        state.total_work += 1;
+        if state.fired
+            || self
+                .guard_observer
+                .as_ref()
+                .is_some_and(|observer| observer.check().is_err())
+        {
+            state.work_after_stop += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARSER_TEST_PROBE: std::cell::RefCell<Option<Rc<ParserTestProbe>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum InputKind {
+    Vertex,
+    Triangle,
+    Object,
+    Component,
+    BuildItem,
+}
+
+const INPUT_LIMITS: [usize; 5] = [6_000_000, 2_000_000, 10_000, 100_000, 100_000];
+
+// Physical source records belong to one Package, not the shared read context.
+struct InputCollections {
+    counts: [usize; 5],
+    limits: [usize; 5],
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    test: Option<InputCollectionsTestSession>,
+}
+
+impl InputCollections {
+    fn new(
+        observer: ZipResourceObserver,
+        #[cfg(test)] test: Option<InputCollectionsTestSession>,
+    ) -> Self {
+        #[cfg(not(test))]
+        let limits = INPUT_LIMITS;
+        #[cfg(test)]
+        let limits = test
+            .as_ref()
+            .map_or(INPUT_LIMITS, |test| test.profile.limits);
+        Self {
+            counts: [0; 5],
+            limits,
+            observer,
+            #[cfg(test)]
+            test,
+        }
+    }
+
+    fn admit(&mut self, kind: InputKind) -> Result<(), StlError> {
+        let index = kind as usize;
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.record(index);
+        }
+        let next = self.counts[index]
+            .checked_add(1)
+            .filter(|&next| next <= self.limits[index]);
+        let Some(next) = next else {
+            return input_stop(&self.observer);
+        };
+        self.counts[index] = next;
+        Ok(())
+    }
+
+    fn ceiling(&self, kind: InputKind, prospective: usize) -> Result<usize, StlError> {
+        prospective
+            .checked_add(self.limits[kind as usize] - self.counts[kind as usize])
+            .ok_or_else(|| input_error(&self.observer))
+    }
+}
+
+fn input_error(observer: &ZipResourceObserver) -> StlError {
+    let _ = observer.stop_io(ResourceStop::InputLimitExceeded);
+    observer.check().expect_err("terminal input stop").into()
+}
+fn input_stop<T>(observer: &ZipResourceObserver) -> Result<T, StlError> {
+    Err(input_error(observer))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum InputReserveSite {
+    Vertices,
+    Triangles,
+    Components,
+    Build,
+    Objects,
+    Parts,
+    Positions,
+    Normals,
+}
+
+fn reserve_input(
+    observer: &ZipResourceObserver,
+    _site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+    reserve: impl FnOnce() -> Result<(), StlError>,
+) -> Result<(), StlError> {
+    observer.check()?;
+    #[cfg(test)]
+    let attempt = test.map(|test| {
+        let mut attempts = test.profile.reserves.borrow_mut();
+        attempts[_site as usize] += 1;
+        attempts[_site as usize]
+    });
+    #[cfg(test)]
+    if let Some(test) = test {
+        if test.profile.fail_reserve == Some((_site, attempt.unwrap())) {
+            let _ = observer.allocation_failed_io();
+            observer.check()?;
+        }
+    }
+    let reserved = {
+        #[cfg(test)]
+        let _funding_site = test.and_then(|test| {
+            test.profile
+                .funding_site
+                .as_ref()
+                .map(|probe| InputFundingSiteGuard::arm(probe, _site))
+        });
+        reserve()
+    };
+    observer.check()?;
+    reserved?;
+    #[cfg(test)]
+    if let Some(test) = test {
+        if let Some((site, at, failure)) = test.profile.stop_after_reserve {
+            if site == _site && Some(at) == attempt {
+                observer.observe_io(&failure.io_error());
+            }
+        }
+    }
+    observer.check()?;
+    Ok(())
+}
+
+fn input_allocation_error(observer: &ZipResourceObserver) -> StlError {
+    let _ = observer.allocation_failed_io();
+    observer
+        .check()
+        .expect_err("allocation failure is latched")
+        .into()
+}
+
+fn reserve_input_buffer<T: InputElement>(
+    values: &mut OwnedInputBuffer<T>,
+    additional: usize,
+    ceiling: usize,
+    allocator: &PathAllocator,
+    observer: &ZipResourceObserver,
+    site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+) -> Result<(), StlError> {
+    let prospective = values
+        .len()
+        .checked_add(additional)
+        .filter(|&n| n <= ceiling)
+        .ok_or_else(|| input_error(observer))?;
+    if prospective <= values.capacity() {
+        return Ok(());
+    }
+    let target = values
+        .capacity()
+        .checked_mul(2)
+        .unwrap_or(ceiling)
+        .max(prospective)
+        .min(ceiling);
+    reserve_input(
+        observer,
+        site,
+        #[cfg(test)]
+        test,
+        || values.reserve_capacity(target, allocator),
+    )
+}
+
+fn reserve_input_vec<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    ceiling: usize,
+    observer: &ZipResourceObserver,
+    site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+) -> Result<(), StlError> {
+    let prospective = values
+        .len()
+        .checked_add(additional)
+        .filter(|&n| n <= ceiling)
+        .ok_or_else(|| input_error(observer))?;
+    if prospective <= values.capacity() {
+        return Ok(());
+    }
+    let target = values
+        .capacity()
+        .checked_mul(2)
+        .unwrap_or(ceiling)
+        .max(prospective)
+        .min(ceiling);
+    let _bytes = target
+        .checked_mul(std::mem::size_of::<T>())
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or_else(|| input_error(observer))?;
+    reserve_input(
+        observer,
+        site,
+        #[cfg(test)]
+        test,
+        || {
+            values
+                .try_reserve_exact(target - values.len())
+                .map_err(|_| input_allocation_error(observer))
+        },
+    )
+}
+
+fn reserve_input_map<K: std::hash::Hash + Eq, V>(
+    values: &mut OwnedHashMap<K, V>,
+    key: &K,
+    observer: &ZipResourceObserver,
+    site: InputReserveSite,
+    #[cfg(test)] test: Option<&InputCollectionsTestSession>,
+) -> Result<(), StlError> {
+    if values.contains_key(key) || values.len() < values.capacity() {
+        return Ok(());
+    }
+    values
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(std::mem::size_of::<(K, V)>()))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| input_error(observer))?;
+    reserve_input(
+        observer,
+        site,
+        #[cfg(test)]
+        test,
+        || {
+            values.try_reserve(1).map_err(|_| match observer.check() {
+                Err(error) => error.into(),
+                Ok(()) => input_allocation_error(observer),
+            })
+        },
+    )
+}
+
+// Private scoped test policy captured once at Package entry, with causal record
+// and reserve observations. Production always uses the fixed supported-input caps.
+#[cfg(test)]
+struct InputCollectionsTestProfile {
+    limits: [usize; 5],
+    packages: std::cell::RefCell<Vec<[usize; 5]>>,
+    reserves: std::cell::RefCell<[usize; 8]>,
+    fail_reserve: Option<(InputReserveSite, usize)>,
+    stop_after_reserve: Option<(InputReserveSite, usize, ParserTestFailure)>,
+    appended: std::cell::RefCell<[usize; 8]>,
+    funding_site: Option<std::sync::Arc<InputFundingSiteProbe>>,
+}
+
+#[cfg(test)]
+impl InputCollectionsTestProfile {
+    fn new(limits: [usize; 5]) -> Self {
+        Self {
+            limits,
+            packages: std::cell::RefCell::new(Vec::new()),
+            reserves: std::cell::RefCell::new([0; 8]),
+            fail_reserve: None,
+            stop_after_reserve: None,
+            appended: std::cell::RefCell::new([0; 8]),
+            funding_site: None,
+        }
+    }
+}
+
+#[cfg(test)]
+struct InputFundingSiteProbe {
+    active: std::sync::atomic::AtomicUsize,
+    acquires: [std::sync::atomic::AtomicUsize; 9],
+    denied: std::sync::atomic::AtomicBool,
+    late_acquires: std::sync::atomic::AtomicUsize,
+    live: std::sync::atomic::AtomicUsize,
+    deny_site: usize,
+}
+#[cfg(test)]
+impl InputFundingSiteProbe {
+    fn new(site: Option<InputReserveSite>) -> Self {
+        Self {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            acquires: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)),
+            denied: std::sync::atomic::AtomicBool::new(false),
+            late_acquires: std::sync::atomic::AtomicUsize::new(0),
+            live: std::sync::atomic::AtomicUsize::new(0),
+            deny_site: site.map_or(0, |site| site as usize + 1),
+        }
+    }
+}
+#[cfg(test)]
+struct InputFundingSiteGuard<'a> {
+    probe: &'a InputFundingSiteProbe,
+    previous: usize,
+}
+#[cfg(test)]
+impl<'a> InputFundingSiteGuard<'a> {
+    fn arm(probe: &'a InputFundingSiteProbe, site: InputReserveSite) -> Self {
+        let previous = probe
+            .active
+            .swap(site as usize + 1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(previous, 0, "input reserve site scopes must not overlap");
+        Self { probe, previous }
+    }
+}
+#[cfg(test)]
+impl Drop for InputFundingSiteGuard<'_> {
+    fn drop(&mut self) {
+        self.probe
+            .active
+            .store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InputCollectionsTestSession {
+    profile: Rc<InputCollectionsTestProfile>,
+    package: usize,
+}
+
+#[cfg(test)]
+impl InputCollectionsTestSession {
+    fn capture() -> Option<Self> {
+        INPUT_COLLECTIONS_TEST_PROFILE.with(|slot| {
+            let profile = slot.borrow().clone()?;
+            let package = {
+                let mut packages = profile.packages.borrow_mut();
+                let package = packages.len();
+                packages.push([0; 5]);
+                package
+            };
+            Some(Self { profile, package })
+        })
+    }
+
+    fn record(&self, kind: usize) {
+        self.profile.packages.borrow_mut()[self.package][kind] += 1;
+    }
+    fn appended(&self, site: InputReserveSite, count: usize) {
+        self.profile.appended.borrow_mut()[site as usize] += count;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPUT_COLLECTIONS_TEST_PROFILE:
+        std::cell::RefCell<Option<Rc<InputCollectionsTestProfile>>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+#[cfg(test)]
+struct PartRetentionTestProfile {
+    limit: usize,
+    high_water: std::cell::Cell<usize>,
+    name_builders: std::cell::Cell<usize>,
+    id_builders: std::cell::Cell<usize>,
+    appearance_copies: std::cell::Cell<usize>,
+    reserves: std::cell::Cell<usize>,
+    requested_capacity: std::cell::RefCell<Vec<usize>>,
+    fail_reserve_at: Option<usize>,
+    stop_after_reserve: Option<(usize, ParserTestFailure)>,
+}
+
+#[cfg(test)]
+impl PartRetentionTestProfile {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            high_water: std::cell::Cell::new(0),
+            name_builders: std::cell::Cell::new(0),
+            id_builders: std::cell::Cell::new(0),
+            appearance_copies: std::cell::Cell::new(0),
+            reserves: std::cell::Cell::new(0),
+            requested_capacity: std::cell::RefCell::new(Vec::new()),
+            fail_reserve_at: None,
+            stop_after_reserve: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartRetentionTestProfile {
+    fn record_retained(&self, len: usize) {
+        self.high_water.set(self.high_water.get().max(len));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PART_RETENTION_TEST_PROFILE: std::cell::RefCell<Option<Rc<PartRetentionTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DerivedMapsTestProfile {
+    plate_parser_entries: std::cell::Cell<usize>,
+    retained_assignments: std::cell::Cell<usize>,
+    assignment_high_water: std::cell::Cell<usize>,
+    diagnostic_path_copies: std::cell::Cell<usize>,
+    diagnostic_unique_pairs: std::cell::Cell<usize>,
+    reserves: std::cell::Cell<usize>,
+    fail_site: std::cell::Cell<Option<derived_maps::ReserveSite>>,
+    stop_site: std::cell::Cell<Option<(derived_maps::ReserveSite, ParserTestFailure)>>,
+    before_stop_site: std::cell::Cell<Option<(derived_maps::ReserveSite, ParserTestFailure)>>,
+    after_invalid: std::cell::Cell<Option<ParserTestFailure>>,
+    membership_invalid: std::cell::Cell<usize>,
+    invalid_tail_events: std::cell::Cell<usize>,
+    invalid_stop_at: std::cell::Cell<usize>,
+    fallback_entries: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DERIVED_MAPS_TEST_PROFILE: std::cell::RefCell<Option<Rc<DerivedMapsTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MaterialOwnedTestProfile {
+    normalized_names: std::cell::Cell<usize>,
+    normalized_colors: std::cell::Cell<usize>,
+    requests: std::cell::RefCell<Vec<(materials::ReserveSite, usize)>>,
+    fail_site: std::cell::Cell<Option<materials::ReserveSite>>,
+    stop_site: std::cell::Cell<Option<(materials::ReserveSite, ParserTestFailure)>>,
+    local_commits: std::cell::Cell<usize>,
+    global_commits: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MATERIAL_OWNED_TEST_PROFILE: std::cell::RefCell<Option<Rc<MaterialOwnedTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SettingsOwnedTestProfile {
+    name_copies: std::cell::Cell<usize>,
+    object_inserts: std::cell::Cell<usize>,
+    part_inserts: std::cell::Cell<usize>,
+    requests: std::cell::RefCell<Vec<(settings::ReserveSite, usize)>>,
+    before_site: std::cell::Cell<Option<(settings::ReserveSite, ParserTestFailure)>>,
+    after_site: std::cell::Cell<Option<(settings::ReserveSite, ParserTestFailure)>>,
+    finish_failure: std::cell::Cell<Option<ParserTestFailure>>,
+    entries: std::cell::Cell<usize>,
+    ordinary_fallbacks: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SETTINGS_OWNED_TEST_PROFILE: std::cell::RefCell<Option<Rc<SettingsOwnedTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SidecarTestProfile {
+    raw_live: std::cell::Cell<usize>,
+    raw_capacity: std::cell::Cell<usize>,
+    project_entered: std::cell::Cell<usize>,
+    raw_live_at_project: std::cell::Cell<usize>,
+    events: std::cell::RefCell<Vec<&'static str>>,
+    workspace_before: std::cell::Cell<Option<ParserTestFailure>>,
+    workspace_after: std::cell::Cell<Option<ParserTestFailure>>,
+    workspace_entered: std::cell::Cell<usize>,
+    after_prepare: std::cell::Cell<Option<ParserTestFailure>>,
+    before_activation: std::cell::Cell<Option<ParserTestFailure>>,
+    fixed_prepared: std::cell::Cell<usize>,
+    project_completed: std::cell::Cell<bool>,
+    child_entered: std::cell::Cell<usize>,
+    child_before_project: std::cell::Cell<usize>,
+}
+#[cfg(test)]
+thread_local! {
+    static SIDECAR_TEST_PROFILE: std::cell::RefCell<Option<Rc<SidecarTestProfile>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+#[cfg(test)]
+fn sidecar_latch(observer: &ZipResourceObserver, failure: Option<ParserTestFailure>) {
+    match failure {
+        Some(ParserTestFailure::Stop(stop)) => {
+            let _ = observer.stop_io(stop);
+        }
+        Some(ParserTestFailure::Allocation) => {
+            let _ = observer.allocation_failed_io();
+        }
+        Some(ParserTestFailure::Funding) => {
+            let _ = observer.funding_busy_io();
+        }
+        None => {}
+    }
+}
+#[cfg(test)]
+struct SidecarRawText {
+    text: String,
+    probe: Option<Rc<SidecarTestProfile>>,
+}
+#[cfg(test)]
+impl SidecarRawText {
+    fn new(text: String, probe: Option<Rc<SidecarTestProfile>>) -> Self {
+        if let Some(probe) = &probe {
+            probe.raw_live.set(probe.raw_live.get() + 1);
+            probe.raw_capacity.set(text.capacity());
+            probe.events.borrow_mut().push("model_raw_created");
+        }
+        Self { text, probe }
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for SidecarRawText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+#[cfg(test)]
+impl Drop for SidecarRawText {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.probe {
+            probe.events.borrow_mut().push("model_raw_drop");
+            probe.raw_live.set(probe.raw_live.get() - 1);
+        }
+    }
+}
+
+/// Original input cursor; its private fault seam exists only in parser tests.
+struct PackageInput<'a> {
+    inner: Cursor<&'a [u8]>,
+    #[cfg(test)]
+    probe: Option<Rc<ParserTestProbe>>,
+}
+
+impl Read for PackageInput<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.before_io(true)?;
+        }
+        self.inner.read(output)
+    }
+}
+
+impl Seek for PackageInput<'_> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.before_io(false)?;
+        }
+        self.inner.seek(from)
+    }
+}
+
+/// The open package plus a cache of parsed parts, so a part referenced by
+/// several components is parsed once.
+struct Package<'a, 'context> {
+    archive: BoundedZipArchive<PackageInput<'a>>,
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    probe: Option<Rc<ParserTestProbe>>,
+    #[cfg(test)]
+    input_test: Option<InputCollectionsTestSession>,
+    #[cfg(test)]
+    part_retention_test: Option<Rc<PartRetentionTestProfile>>,
+    #[cfg(test)]
+    derived_maps_test: Option<Rc<DerivedMapsTestProfile>>,
+    #[cfg(test)]
+    material_owned_test: Option<Rc<MaterialOwnedTestProfile>>,
+    #[cfg(test)]
+    settings_owned_test: Option<Rc<SettingsOwnedTestProfile>>,
+    #[cfg(test)]
+    sidecar_test: Option<Rc<SidecarTestProfile>>,
+    collections: InputCollections,
+    parts: OwnedHashMap<SharedPath, Rc<ModelPart>>,
+    materials: Vec<ParsedMaterial>,
+    context: &'context mut PackageProcessingContext,
+    component_visits_remaining: u64,
+}
+
+impl<'a, 'context> Package<'a, 'context> {
+    fn open(
+        bytes: &'a [u8],
+        context: &'context mut PackageProcessingContext,
+    ) -> Result<Self, StlError> {
+        let observer = context.observer();
+        #[cfg(test)]
+        let probe = PARSER_TEST_PROBE.with(|probe| probe.borrow().clone());
+        let input = PackageInput {
+            inner: Cursor::new(bytes),
+            #[cfg(test)]
+            probe: probe.clone(),
+        };
+        let archive = observer.open_bounded_zip(input)?;
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.state.borrow_mut().constructor_completed = true;
+        }
+        #[cfg(test)]
+        let input_test = InputCollectionsTestSession::capture();
+        let collections = InputCollections::new(
+            observer.clone(),
+            #[cfg(test)]
+            input_test.clone(),
+        );
+        let parts = OwnedHashMap::new(context.path_allocator().map_allocator());
         Ok(Package {
             archive,
-            parts: HashMap::new(),
+            observer,
+            #[cfg(test)]
+            probe,
+            #[cfg(test)]
+            input_test,
+            #[cfg(test)]
+            part_retention_test: PART_RETENTION_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            derived_maps_test: DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            material_owned_test: MATERIAL_OWNED_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            settings_owned_test: SETTINGS_OWNED_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            sidecar_test: SIDECAR_TEST_PROFILE.with(|slot| slot.borrow().clone()),
+            collections,
+            parts,
             materials: Vec::new(),
-            inflated: 0,
+            context,
+            component_visits_remaining: MAX_COMPONENT_VISITS,
         })
+    }
+
+    fn charge_component_work(&mut self) -> Result<(), StlError> {
+        self.component_visits_remaining = self
+            .component_visits_remaining
+            .checked_sub(1)
+            .ok_or(ResourceStop::InputLimitExceeded)?;
+        Ok(())
     }
 
     /// Zip entry names never carry the leading slash that OPC part URIs do.
@@ -179,57 +960,133 @@ impl<'a> Package<'a> {
         self.archive.file_names().any(|n| n == name)
     }
 
-    /// Opens a part for streaming, charging its declared inflated size
-    /// against the package-wide cap first.
-    fn reader(
-        &mut self,
-        path: &str,
-    ) -> Result<BufReader<zip::read::ZipFile<'_, Cursor<&'a [u8]>>>, StlError> {
+    fn collect_text(&mut self, path: &str, role: TextRole) -> Result<String, StlError> {
+        #[cfg(test)]
+        if path == PROJECT_SETTINGS_PATH {
+            if let Some(probe) = &self.sidecar_test {
+                probe.project_entered.set(probe.project_entered.get() + 1);
+                probe.raw_live_at_project.set(probe.raw_live.get());
+                probe.events.borrow_mut().push("project_collect_enter");
+            }
+        }
         let name = Self::entry_name(path).to_string();
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            if probe.member == name {
+                probe.state.borrow_mut().armed = true;
+            }
+        }
         let file = self
             .archive
             .by_name(&name)
-            .map_err(|_| malformed(format!("missing part {path}")))?;
-        self.inflated = self.inflated.saturating_add(file.size());
-        if self.inflated > MAX_3MF_INFLATED_BYTES {
-            return Err(malformed(format!(
-                "model parts expand to more than {} MB",
-                MAX_3MF_INFLATED_BYTES / (1024 * 1024)
-            )));
+            .map_err(|error| missing_part_error(error, path))?;
+        if file.size() > role.byte_limit() as u64 {
+            let error = self.observer.stop_io(ResourceStop::InputLimitExceeded);
+            self.observer.observe_io(&error);
+            self.observer.check()?;
         }
-        Ok(BufReader::new(file))
+        let ordinary_message = match role {
+            TextRole::Relationships => "_rels/.rels is not valid text".to_owned(),
+            TextRole::ModelSettings | TextRole::ProjectSettings => {
+                format!("{path} is not valid UTF-8 text")
+            }
+        };
+        self.context
+            .collect_text(file, role)
+            .map_err(|error| match error {
+                error @ (StlError::ResourceStopped(_)
+                | StlError::AllocationFailed
+                | StlError::FundingBusy) => error,
+                _ => malformed(ordinary_message),
+            })
     }
 
     fn part(&mut self, path: &str) -> Result<Rc<ModelPart>, StlError> {
-        let key = Self::entry_name(path).to_string();
-        if let Some(p) = self.parts.get(&key) {
+        self.observer.check()?;
+        let key = Self::entry_name(path);
+        if let Some(p) = self.parts.get(key) {
             return Ok(p.clone());
         }
+        #[cfg(test)]
+        if key == "3D/child.model" {
+            if let Some(probe) = &self.sidecar_test {
+                probe.child_entered.set(probe.child_entered.get() + 1);
+                if !probe.project_completed.get() {
+                    probe
+                        .child_before_project
+                        .set(probe.child_before_project.get() + 1);
+                }
+            }
+        }
+        let observer = self.observer.clone();
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            if probe.member == key {
+                probe.state.borrow_mut().armed = true;
+            }
+        }
+        let allocator = self.context.path_allocator();
         let parsed = {
-            let reader = self.reader(path)?;
-            parse_model_part(reader, path)?
+            let member = self
+                .archive
+                .by_name(key)
+                .map_err(|error| missing_part_error(error, path))?;
+            if member.size() > MAX_FILE_BYTES {
+                return input_stop(&observer);
+            }
+            let owned_path = allocator.copy_path(key)?;
+            let reader = BufReader::new(self.context.model_reader(member));
+            parse_model_part(
+                reader,
+                path,
+                owned_path,
+                &allocator,
+                &observer,
+                &mut self.collections,
+                #[cfg(test)]
+                self.material_owned_test.as_deref(),
+            )
         };
-        self.materials.extend(
-            parsed
-                .materials
-                .iter()
-                .take(MAX_STANDARD_MATERIALS.saturating_sub(self.materials.len()))
-                .cloned(),
-        );
+        observer.check()?;
+        let parsed = parsed?;
+        materials::copy_selected(
+            &mut self.materials,
+            &parsed.materials,
+            &observer,
+            #[cfg(test)]
+            self.material_owned_test.as_deref(),
+        )?;
+        // Cache keys are owned only on misses; bucket growth is fallible.
+        let key = parsed.path.clone();
+        reserve_input_map(
+            &mut self.parts,
+            &key,
+            &observer,
+            InputReserveSite::Parts,
+            #[cfg(test)]
+            self.input_test.as_ref(),
+        )?;
         let rc = Rc::new(parsed);
-        self.parts.insert(key, rc.clone());
+        self.parts.insert_reserved(key, rc.clone());
+        #[cfg(test)]
+        if let Some(test) = &self.input_test {
+            test.appended(InputReserveSite::Parts, 1);
+        }
+        #[cfg(test)]
+        if path == ROOT_MODEL_FALLBACK {
+            if let Some(probe) = &self.probe {
+                probe.state.borrow_mut().root_cached = true;
+            }
+        }
         Ok(rc)
     }
 
-    fn optional_text(&mut self, path: &str) -> Result<Option<String>, StlError> {
+    fn optional_text(&mut self, path: &str, role: TextRole) -> Result<Option<String>, StlError> {
+        self.observer.check()?;
         if !self.has(path) {
             return Ok(None);
         }
-        let mut text = String::new();
-        self.reader(path)?
-            .read_to_string(&mut text)
-            .map_err(|_| malformed(format!("{path} is not valid UTF-8 text")))?;
-        Ok(Some(text))
+        self.collect_text(path, role).map(Some)
     }
 
     fn optional_bounded_text(
@@ -237,6 +1094,7 @@ impl<'a> Package<'a> {
         path: &str,
         max_bytes: u64,
     ) -> Result<Option<String>, StlError> {
+        self.observer.check()?;
         if !self.has(path) {
             return Ok(None);
         }
@@ -244,28 +1102,28 @@ impl<'a> Package<'a> {
         let size = self
             .archive
             .by_name(&name)
-            .map_err(|_| malformed(format!("missing part {path}")))?
+            .map_err(|error| missing_part_error(error, path))?
             .size();
         if size > max_bytes {
             return Ok(None);
         }
-        self.optional_text(path)
+        self.optional_text(path, TextRole::ProjectSettings)
     }
 
     /// The root model part per `_rels/.rels`; falls back to the conventional
     /// path when the relationships part is absent or does not name one.
-    fn root_model_path(&mut self) -> Result<String, StlError> {
+    fn root_model_path(&mut self) -> Result<SharedPath, StlError> {
+        self.observer.check()?;
         if self.has("_rels/.rels") {
-            let mut text = String::new();
-            self.reader("_rels/.rels")?
-                .read_to_string(&mut text)
-                .map_err(|_| malformed("_rels/.rels is not valid text"))?;
-            if let Some(target) = model_relationship_target(&text) {
+            let text = self.collect_text("_rels/.rels", TextRole::Relationships)?;
+            if let Some(target) =
+                model_relationship_target(&text, &self.observer, &self.context.path_allocator())?
+            {
                 return Ok(target);
             }
         }
         if self.has(ROOT_MODEL_FALLBACK) {
-            return Ok(ROOT_MODEL_FALLBACK.to_string());
+            return self.context.copy_path(ROOT_MODEL_FALLBACK);
         }
         Err(malformed("no 3D model part in the package"))
     }
@@ -300,24 +1158,18 @@ struct SlicerMetadata {
 const NO_PLATE_METADATA_WARNING: &str =
     "This 3MF has no usable plate metadata; showing the whole build.";
 
-#[derive(Debug)]
-struct PlateAssignment {
-    object_id: u32,
-    instance_id: u32,
-}
-
+#[cfg(test)]
 #[derive(Debug)]
 struct PlateSpec {
     slicer_id: u32,
     name: String,
-    assignments: Vec<PlateAssignment>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct OpenPlate {
     slicer_id: Option<u32>,
     name: Option<String>,
-    assignments: Vec<PlateAssignment>,
 }
 
 #[derive(Default)]
@@ -337,16 +1189,26 @@ fn set_once<T: PartialEq>(slot: &mut Option<T>, value: T, what: &str) -> Result<
     }
 }
 
+#[cfg(test)]
 fn parse_plate_settings(text: &str) -> Result<Vec<PlateSpec>, String> {
-    let mut xml = Reader::from_str(text);
-    xml.config_mut().trim_text(true);
+    parse_plate_settings_observed(text, &ZipResourceObserver::new())
+}
+
+#[cfg(test)]
+fn parse_plate_settings_observed(
+    text: &str,
+    observer: &ZipResourceObserver,
+) -> Result<Vec<PlateSpec>, String> {
+    let mut xml = XmlEventReader::new(text.as_bytes(), observer.clone())
+        .map_err(|error| error.to_string())?;
+    xml.set_trim_text(true);
     let mut plates = Vec::new();
     let mut plate: Option<OpenPlate> = None;
     let mut instance: Option<OpenInstance> = None;
 
     loop {
         let event = xml
-            .read_event()
+            .next_event()
             .map_err(|e| format!("invalid plate metadata XML ({e})"))?;
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
@@ -423,14 +1285,10 @@ fn parse_plate_settings(text: &str) -> Result<Vec<PlateSpec>, String> {
                     let open = instance
                         .take()
                         .ok_or_else(|| "unbalanced model instance metadata".to_string())?;
-                    plate.as_mut().unwrap().assignments.push(PlateAssignment {
-                        object_id: open
-                            .object_id
-                            .ok_or_else(|| "model instance has no object_id".to_string())?,
-                        instance_id: open
-                            .instance_id
-                            .ok_or_else(|| "model instance has no instance_id".to_string())?,
-                    });
+                    open.object_id
+                        .ok_or_else(|| "model instance has no object_id".to_string())?;
+                    open.instance_id
+                        .ok_or_else(|| "model instance has no instance_id".to_string())?;
                 }
                 b"plate" => {
                     if instance.is_some() {
@@ -450,7 +1308,6 @@ fn parse_plate_settings(text: &str) -> Result<Vec<PlateSpec>, String> {
                             .name
                             .filter(|name| !name.is_empty())
                             .unwrap_or_else(|| format!("Plate {}", plates.len() + 1)),
-                        assignments: open.assignments,
                     });
                 }
                 _ => {}
@@ -472,152 +1329,6 @@ fn parse_plate_settings(text: &str) -> Result<Vec<PlateSpec>, String> {
     Ok(plates)
 }
 
-fn update_settings_record(record: &mut SettingsRecord, key: &str, value: &str) {
-    match key {
-        "name" => {
-            if record.name_invalid || record.name.is_some() {
-                record.name = None;
-                record.name_invalid = true;
-            } else if let Some(name) = normalize_label(value) {
-                record.name = Some(name);
-            } else {
-                record.name_invalid = true;
-            }
-        }
-        "extruder" => {
-            if record.extruder_invalid || record.extruder.is_some() {
-                record.extruder = None;
-                record.extruder_invalid = true;
-            } else if let Ok(slot) = value.trim().parse::<u32>() {
-                if slot > 0 {
-                    record.extruder = Some(slot);
-                } else {
-                    record.extruder_invalid = true;
-                }
-            } else {
-                record.extruder_invalid = true;
-            }
-        }
-        _ => {}
-    }
-}
-fn merge_settings_record(
-    records: &mut HashMap<u32, SettingsRecord>,
-    id: u32,
-    record: SettingsRecord,
-) {
-    let Some(existing) = records.get_mut(&id) else {
-        records.insert(id, record);
-        return;
-    };
-    if existing.name_invalid
-        || record.name_invalid
-        || (existing.name.is_some() && record.name.is_some())
-    {
-        existing.name = None;
-        existing.name_invalid = true;
-    } else if existing.name.is_none() {
-        existing.name = record.name;
-    }
-    if existing.extruder_invalid
-        || record.extruder_invalid
-        || (existing.extruder.is_some() && record.extruder.is_some())
-    {
-        existing.extruder = None;
-        existing.extruder_invalid = true;
-    } else if existing.extruder.is_none() {
-        existing.extruder = record.extruder;
-    }
-}
-
-fn parse_slicer_metadata(text: &str) -> Result<SlicerMetadata, String> {
-    let mut xml = Reader::from_str(text);
-    xml.config_mut().trim_text(true);
-    let mut metadata = SlicerMetadata::default();
-    let mut object: Option<(u32, SettingsRecord)> = None;
-    let mut part: Option<(u32, SettingsRecord)> = None;
-    let mut ignored_part_depth = 0u32;
-    loop {
-        match xml
-            .read_event()
-            .map_err(|e| format!("invalid slicer metadata XML ({e})"))?
-        {
-            Event::Start(e) => match e.local_name().as_ref() {
-                b"object" if object.is_none() && part.is_none() && ignored_part_depth == 0 => {
-                    let Some(id) = attr_str(&e, b"id")
-                        .map_err(|e| e.to_string())?
-                        .and_then(|v| v.trim().parse().ok())
-                    else {
-                        continue;
-                    };
-                    object = Some((id, SettingsRecord::default()));
-                }
-                b"part" if object.is_some() => {
-                    if ignored_part_depth > 0 {
-                        ignored_part_depth = ignored_part_depth.saturating_add(1);
-                    } else if part.is_some() {
-                        ignored_part_depth = 1;
-                    } else if let Some(id) = attr_str(&e, b"id")
-                        .map_err(|e| e.to_string())?
-                        .and_then(|v| v.trim().parse().ok())
-                    {
-                        part = Some((id, SettingsRecord::default()));
-                    } else {
-                        ignored_part_depth = 1;
-                    }
-                }
-                b"metadata" if ignored_part_depth == 0 => {
-                    let key = attr_str(&e, b"key").map_err(|e| e.to_string())?;
-                    let value = attr_str(&e, b"value").map_err(|e| e.to_string())?;
-                    if let (Some(key), Some(value)) = (key, value) {
-                        if let Some((_, record)) = part.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        } else if let Some((_, record)) = object.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Event::Empty(e) => match e.local_name().as_ref() {
-                b"metadata" if ignored_part_depth == 0 => {
-                    let key = attr_str(&e, b"key").map_err(|e| e.to_string())?;
-                    let value = attr_str(&e, b"value").map_err(|e| e.to_string())?;
-                    if let (Some(key), Some(value)) = (key, value) {
-                        if let Some((_, record)) = part.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        } else if let Some((_, record)) = object.as_mut() {
-                            update_settings_record(record, &key, &value);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Event::End(e) => match e.local_name().as_ref() {
-                b"part" => {
-                    if ignored_part_depth > 0 {
-                        ignored_part_depth -= 1;
-                    } else if let Some((id, record)) = part.take() {
-                        merge_settings_record(&mut metadata.parts, id, record);
-                    }
-                }
-                b"object" => {
-                    if part.is_some() || ignored_part_depth > 0 {
-                        return Err("unclosed slicer metadata part".into());
-                    }
-                    if let Some((id, record)) = object.take() {
-                        merge_settings_record(&mut metadata.objects, id, record);
-                    }
-                }
-                _ => {}
-            },
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    Ok(metadata)
-}
-
 fn normalize_label(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -626,6 +1337,21 @@ fn normalize_label(value: &str) -> Option<String> {
     Some(value.chars().take(256).collect())
 }
 
+#[cfg(test)]
+thread_local! {
+    static PROJECT_AUX_NORMALIZATION_PROBE: std::cell::RefCell<Option<Rc<std::cell::Cell<usize>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_project_aux_normalization() {
+    // Copy the handle, releasing the TLS borrow before normalization/work.
+    let probe = PROJECT_AUX_NORMALIZATION_PROBE.with(|slot| slot.borrow().clone());
+    if let Some(probe) = probe {
+        probe.set(probe.get() + 1);
+    }
+}
+
+#[cfg(test)]
 fn json_string_array(value: Option<&Value>) -> Option<Vec<Option<String>>> {
     let Value::Array(values) = value? else {
         return None;
@@ -633,12 +1359,19 @@ fn json_string_array(value: Option<&Value>) -> Option<Vec<Option<String>>> {
     Some(
         values
             .iter()
-            .map(|value| value.as_str().and_then(normalize_label))
+            .map(|value| {
+                value.as_str().and_then(|value| {
+                    #[cfg(test)]
+                    record_project_aux_normalization();
+                    normalize_label(value)
+                })
+            })
             .collect(),
     )
 }
 
-fn parse_project_filaments(text: &str) -> Option<Vec<ParsedFilament>> {
+#[cfg(test)]
+fn parse_project_filaments_reference(text: &str) -> Option<Vec<ParsedFilament>> {
     let value: Value = serde_json::from_str(text).ok()?;
     let colors = value.get("filament_colour")?.as_array()?;
     let settings = json_string_array(value.get("filament_settings_id"));
@@ -688,6 +1421,11 @@ fn parse_project_filaments(text: &str) -> Option<Vec<ParsedFilament>> {
     Some(filaments)
 }
 
+#[cfg(test)]
+fn parse_project_filaments(text: &str) -> Option<Vec<ParsedFilament>> {
+    project_json::parse(text, &ZipResourceObserver::new()).expect("bounded fixture must not stop")
+}
+
 fn setting_name(record: Option<&SettingsRecord>) -> Option<&str> {
     record
         .filter(|record| !record.name_invalid)
@@ -706,7 +1444,12 @@ fn boundary_name(
     slicer_object: Option<&SettingsRecord>,
     slicer_part: Option<&SettingsRecord>,
     object_id: u32,
+    #[cfg(test)] probe: Option<&PartRetentionTestProfile>,
 ) -> String {
+    #[cfg(test)]
+    if let Some(probe) = probe {
+        probe.name_builders.set(probe.name_builders.get() + 1);
+    }
     let object_name = setting_name(slicer_object);
     let part_name = setting_name(slicer_part);
     if let (Some(object_name), Some(part_name)) = (object_name, part_name) {
@@ -724,40 +1467,15 @@ fn boundary_name(
 }
 
 fn component_part_metadata_paths(
+    pkg: &mut Package<'_, '_>,
     root: &ModelPart,
     root_path: &str,
-) -> HashMap<u32, HashSet<String>> {
-    let root_path = Package::entry_name(root_path);
-    let mut paths = HashMap::new();
-    for item in &root.build {
-        if !item.printable {
-            continue;
-        }
-        let item_path = item.path.as_deref().unwrap_or(root_path);
-        if Package::entry_name(item_path) != root_path {
-            continue;
-        }
-        let Some(Object {
-            kind: ObjectKind::Components(components),
-            ..
-        }) = root.objects.get(&item.object_id)
-        else {
-            continue;
-        };
-        for component in components {
-            let path =
-                Package::entry_name(component.path.as_deref().unwrap_or(item_path)).to_owned();
-            paths
-                .entry(component.object_id)
-                .or_insert_with(HashSet::new)
-                .insert(path);
-        }
-    }
-    paths
+) -> Result<HashMap<u32, HashSet<SharedPath>>, StlError> {
+    derived_maps::diagnostic_paths(pkg, root, root_path)
 }
 
 fn component_part_metadata_ambiguous(
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     object_id: u32,
 ) -> bool {
     component_paths
@@ -765,63 +1483,31 @@ fn component_part_metadata_ambiguous(
         .is_some_and(|paths| paths.len() > 1)
 }
 
-fn resolve_plate_items(
-    pkg: &mut Package,
-    root_path: &str,
-    root: &ModelPart,
-    specs: &[PlateSpec],
-) -> Result<Vec<Vec<usize>>, String> {
-    // Slicer instance ids are occurrence numbers for a given object id. Count
-    // every build entry, including disabled entries, before geometry filtering.
-    let mut occurrences: HashMap<u32, u32> = HashMap::new();
-    let mut items = HashMap::with_capacity(root.build.len());
-    for (index, item) in root.build.iter().enumerate() {
-        let occurrence = occurrences.entry(item.object_id).or_default();
-        items.insert((item.object_id, *occurrence), index);
-        *occurrence = occurrence
-            .checked_add(1)
-            .ok_or_else(|| "too many instances for one object".to_string())?;
-    }
+#[derive(Debug)]
+enum PlateResolutionError {
+    Metadata(String),
+    Source(StlError),
+}
 
-    let mut claimed = HashSet::with_capacity(root.build.len());
-    let mut resolved = Vec::with_capacity(specs.len());
-    for plate in specs {
-        let mut plate_items = Vec::with_capacity(plate.assignments.len());
-        for assignment in &plate.assignments {
-            let index = *items
-                .get(&(assignment.object_id, assignment.instance_id))
-                .ok_or_else(|| {
-                    format!(
-                        "plate references unknown object {} instance {}",
-                        assignment.object_id, assignment.instance_id
-                    )
-                })?;
-            if !claimed.insert(index) {
-                return Err(format!(
-                    "object {} instance {} is assigned more than once",
-                    assignment.object_id, assignment.instance_id
-                ));
-            }
-            plate_items.push(index);
-        }
-        resolved.push(plate_items);
+impl From<String> for PlateResolutionError {
+    fn from(detail: String) -> Self {
+        Self::Metadata(detail)
     }
+}
 
-    for (index, item) in root.build.iter().enumerate() {
-        if item.printable
-            && !claimed.contains(&index)
-            && object_has_geometry(
-                pkg,
-                item.path.as_deref().unwrap_or(root_path),
-                item.object_id,
-                0,
-            )
-            .map_err(|e| e.to_string())?
-        {
-            return Err("plate metadata does not assign every printable build item".into());
+impl From<&str> for PlateResolutionError {
+    fn from(detail: &str) -> Self {
+        Self::Metadata(detail.to_owned())
+    }
+}
+
+impl std::fmt::Display for PlateResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Metadata(detail) => formatter.write_str(detail),
+            Self::Source(error) => std::fmt::Display::fmt(error, formatter),
         }
     }
-    Ok(resolved)
 }
 
 /// Membership is required only for build items that contribute printed triangles.
@@ -831,6 +1517,7 @@ fn object_has_geometry(
     id: u32,
     depth: u32,
 ) -> Result<bool, StlError> {
+    pkg.charge_component_work()?;
     if depth > MAX_COMPONENT_DEPTH {
         return Err(malformed("component nesting is too deep or cyclic"));
     }
@@ -862,10 +1549,14 @@ fn object_has_geometry(
 
 /// Finds the `Relationship` whose `Type` is the 3dmodel relationship and
 /// returns its `Target`. Small file, so a DOM-free attribute scan is enough.
-fn model_relationship_target(rels: &str) -> Option<String> {
-    let mut reader = Reader::from_str(rels);
-    loop {
-        match reader.read_event() {
+fn model_relationship_target(
+    rels: &str,
+    observer: &ZipResourceObserver,
+    allocator: &PathAllocator,
+) -> Result<Option<SharedPath>, StlError> {
+    let mut reader = XmlEventReader::new(rels.as_bytes(), observer.clone())?;
+    let target = (|| loop {
+        match reader.next_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 if e.local_name().as_ref() != b"Relationship" {
                     continue;
@@ -873,21 +1564,44 @@ fn model_relationship_target(rels: &str) -> Option<String> {
                 let mut target = None;
                 let mut is_model = false;
                 for attr in e.attributes().flatten() {
-                    let value = attr.normalized_value(XmlVersion::Implicit1_0).ok()?;
+                    observer.check()?;
+                    let Ok(value) = attr.normalized_value(XmlVersion::Implicit1_0) else {
+                        return Ok(None);
+                    };
                     match attr.key.local_name().as_ref() {
-                        b"Target" => target = Some(value.into_owned()),
+                        b"Target" => target = Some(allocator.copy_path(&value)?),
                         b"Type" => is_model = value.ends_with("/3dmodel"),
                         _ => {}
                     }
                 }
                 if is_model {
-                    return target;
+                    return Ok(target);
                 }
             }
-            Ok(Event::Eof) | Err(_) => return None,
+            Ok(Event::Eof) | Err(_) => return Ok(None),
             _ => {}
         }
+    })();
+    observer.finish(target)
+}
+
+fn attr_path(
+    e: &BytesStart,
+    allocator: &PathAllocator,
+    observer: &ZipResourceObserver,
+) -> Result<Option<SharedPath>, StlError> {
+    observer.check()?;
+    for attr in e.attributes() {
+        let attr = attr.map_err(|_| malformed("malformed XML attribute"))?;
+        if attr.key.local_name().as_ref() == b"path" {
+            observer.check()?;
+            let value = attr
+                .normalized_value(XmlVersion::Implicit1_0)
+                .map_err(|_| malformed("malformed XML attribute value"))?;
+            return allocator.copy_path(&value).map(Some);
+        }
     }
+    Ok(None)
 }
 
 fn attr_str(e: &BytesStart, name: &[u8]) -> Result<Option<String>, StlError> {
@@ -930,6 +1644,7 @@ fn has_any_attr(e: &BytesStart, names: &[&[u8]]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn normalize_standard_color(value: &str) -> Option<String> {
     let hex = value.trim().strip_prefix('#')?;
     if !matches!(hex.len(), 6 | 8) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -947,14 +1662,20 @@ fn attr_transform(e: &BytesStart) -> Result<Mat, StlError> {
     let Some(s) = attr_str(e, b"transform")? else {
         return Ok(IDENTITY);
     };
-    let values: Vec<f32> = s
-        .split_ascii_whitespace()
-        .map(|t| t.parse::<f32>())
-        .collect::<Result<_, _>>()
-        .map_err(|_| malformed("transform has a non-numeric entry"))?;
-    let m: Mat = values
-        .try_into()
-        .map_err(|_| malformed("transform must have 12 entries"))?;
+    let mut m = [0.0; 12];
+    let mut count = 0usize;
+    for token in s.split_ascii_whitespace() {
+        let value = token
+            .parse::<f32>()
+            .map_err(|_| malformed("transform has a non-numeric entry"))?;
+        if count < m.len() {
+            m[count] = value;
+        }
+        count += 1;
+    }
+    if count != m.len() {
+        return Err(malformed("transform must have 12 entries"));
+    }
     if m.iter().any(|v| !v.is_finite()) {
         return Err(malformed("transform has a non-finite entry"));
     }
@@ -980,22 +1701,29 @@ struct OpenObject {
     name: Option<String>,
     material: Option<(u32, u32)>,
     has_triangle_properties: bool,
-    vertices: Vec<V3>,
-    triangles: Vec<[u32; 3]>,
-    components: Vec<Component>,
+    vertices: OwnedInputBuffer<V3>,
+    triangles: OwnedInputBuffer<[u32; 3]>,
+    components: OwnedInputBuffer<Component>,
 }
 
 /// Streams one `.model` part into its objects and build items.
-fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelPart, StlError> {
-    let mut xml = Reader::from_reader(reader);
-    xml.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+fn parse_model_part<R: Read>(
+    reader: R,
+    path: &str,
+    owned_path: SharedPath,
+    allocator: &PathAllocator,
+    observer: &ZipResourceObserver,
+    collections: &mut InputCollections,
+    #[cfg(test)] material_probe: Option<&MaterialOwnedTestProfile>,
+) -> Result<ModelPart, StlError> {
+    let mut xml = XmlEventReader::new(reader, observer.clone())?;
+    xml.set_trim_text(true);
 
-    let mut part = ModelPart {
-        path: Package::entry_name(path).to_string(),
+    let mut part = ModelPartBuilder {
+        path: owned_path,
         scale: 1.0,
-        objects: HashMap::new(),
-        build: Vec::new(),
+        objects: OwnedHashMap::new(allocator.map_allocator()),
+        build: OwnedInputBuffer::empty(),
         materials: Vec::new(),
         material_lookup: HashMap::new(),
     };
@@ -1004,9 +1732,9 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
     let mut in_build = false;
 
     loop {
-        let event = xml
-            .read_event_into(&mut buf)
-            .map_err(|e| malformed(format!("{path}: invalid XML ({e})")))?;
+        let event = xml.next_event();
+        observer.check()?;
+        let event = event.map_err(|e| malformed(format!("{path}: invalid XML ({e})")))?;
         match &event {
             Event::Start(e) | Event::Empty(e) => {
                 let is_empty = matches!(&event, Event::Empty(_));
@@ -1031,67 +1759,30 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
                             })
                         };
                     }
-                    b"base" => {
-                        if let Some(group) = material_group
-                            .as_mut()
-                            .filter(|group| matches!(group.kind, MaterialGroupKind::Base))
-                        {
+                    b"base" | b"color" => {
+                        if let Some(group) = material_group.as_mut().filter(|group| {
+                            matches!(
+                                (e.local_name().as_ref(), group.kind),
+                                (b"base", MaterialGroupKind::Base)
+                                    | (b"color", MaterialGroupKind::Color)
+                            )
+                        }) {
                             let index = group.next_index;
                             group.next_index = group.next_index.saturating_add(1);
-                            let name = attr_str(e, b"name")
-                                .ok()
-                                .flatten()
-                                .and_then(|name| normalize_label(&name));
-                            let color = attr_str(e, b"displaycolor")
-                                .ok()
-                                .flatten()
-                                .and_then(|color| normalize_standard_color(&color));
-                            if let (Some(name), Some(color)) = (name, color) {
-                                let key = (group.id, index);
-                                if !part.material_lookup.contains_key(&key) {
-                                    if part.materials.len() < MAX_STANDARD_MATERIALS {
-                                        let material_index = part.materials.len();
-                                        part.materials.push(ParsedMaterial {
-                                            id: format!("3mf:{}:{}:{}", part.path, group.id, index),
-                                            name: Some(name),
-                                            color: Some(color),
-                                            source: MaterialSource::ThreeMfBaseMaterial,
-                                        });
-                                        part.material_lookup.insert(key, material_index);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    b"color" => {
-                        if let Some(group) = material_group
-                            .as_mut()
-                            .filter(|group| matches!(group.kind, MaterialGroupKind::Color))
-                        {
-                            let index = group.next_index;
-                            group.next_index = group.next_index.saturating_add(1);
-                            let color = attr_str(e, b"color")
-                                .ok()
-                                .flatten()
-                                .and_then(|color| normalize_standard_color(&color));
-                            if let Some(color) = color {
-                                let key = (group.id, index);
-                                if !part.material_lookup.contains_key(&key) {
-                                    if part.materials.len() < MAX_STANDARD_MATERIALS {
-                                        let material_index = part.materials.len();
-                                        part.materials.push(ParsedMaterial {
-                                            id: format!("3mf:{}:{}:{}", part.path, group.id, index),
-                                            name: None,
-                                            color: Some(color),
-                                            source: MaterialSource::ThreeMfColorGroup,
-                                        });
-                                        part.material_lookup.insert(key, material_index);
-                                    }
-                                }
-                            }
+                            materials::retain(
+                                &mut part,
+                                e,
+                                group.kind,
+                                group.id,
+                                index,
+                                observer,
+                                #[cfg(test)]
+                                material_probe,
+                            )?;
                         }
                     }
                     b"object" => {
+                        collections.admit(InputKind::Object)?;
                         let id = attr_u32(e, "id", "object")?;
                         let kind = attr_str(e, b"type")?.unwrap_or_else(|| "model".into());
                         let printed = matches!(kind.as_str(), "model" | "solidsupport");
@@ -1102,12 +1793,20 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
                         let material = optional_appearance_u32(e, b"pid")
                             .zip(optional_appearance_u32(e, b"pindex"));
                         if is_empty {
-                            part.objects.insert(
+                            reserve_input_map(
+                                &mut part.objects,
+                                &id,
+                                observer,
+                                InputReserveSite::Objects,
+                                #[cfg(test)]
+                                collections.test.as_ref(),
+                            )?;
+                            part.objects.insert_reserved(
                                 id,
                                 Object {
                                     kind: ObjectKind::Mesh {
-                                        vertices: vec![],
-                                        triangles: vec![],
+                                        vertices: OwnedInputBuffer::empty(),
+                                        triangles: OwnedInputBuffer::empty(),
                                     },
                                     printed,
                                     name,
@@ -1115,6 +1814,10 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
                                     has_triangle_properties: false,
                                 },
                             );
+                            #[cfg(test)]
+                            if let Some(test) = &collections.test {
+                                test.appended(InputReserveSite::Objects, 1);
+                            }
                         } else {
                             current = Some(OpenObject {
                                 id,
@@ -1122,9 +1825,9 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
                                 name,
                                 material,
                                 has_triangle_properties: false,
-                                vertices: Vec::new(),
-                                triangles: Vec::new(),
-                                components: Vec::new(),
+                                vertices: OwnedInputBuffer::empty(),
+                                triangles: OwnedInputBuffer::empty(),
+                                components: OwnedInputBuffer::empty(),
                             });
                         }
                     }
@@ -1132,46 +1835,117 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
                         let Some(cur) = current.as_mut() else {
                             return Err(malformed("vertex outside of an object"));
                         };
+                        collections.admit(InputKind::Vertex)?;
                         let v = [
                             attr_f32(e, "x", "vertex")?,
                             attr_f32(e, "y", "vertex")?,
                             attr_f32(e, "z", "vertex")?,
                         ];
-                        cur.vertices.push(v);
+                        let ceiling =
+                            collections.ceiling(InputKind::Vertex, cur.vertices.len() + 1)?;
+                        reserve_input_buffer(
+                            &mut cur.vertices,
+                            1,
+                            ceiling,
+                            allocator,
+                            observer,
+                            InputReserveSite::Vertices,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
+                        cur.vertices.push_reserved(v);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Vertices, 1);
+                        }
                     }
                     b"triangle" => {
                         let Some(cur) = current.as_mut() else {
                             return Err(malformed("triangle outside of an object"));
                         };
+                        collections.admit(InputKind::Triangle)?;
                         cur.has_triangle_properties |=
                             has_any_attr(e, &[b"pid", b"p1", b"p2", b"p3"]);
-                        cur.triangles.push([
+                        let triangle = [
                             attr_u32(e, "v1", "triangle")?,
                             attr_u32(e, "v2", "triangle")?,
                             attr_u32(e, "v3", "triangle")?,
-                        ]);
+                        ];
+                        let ceiling =
+                            collections.ceiling(InputKind::Triangle, cur.triangles.len() + 1)?;
+                        reserve_input_buffer(
+                            &mut cur.triangles,
+                            1,
+                            ceiling,
+                            allocator,
+                            observer,
+                            InputReserveSite::Triangles,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
+                        cur.triangles.push_reserved(triangle);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Triangles, 1);
+                        }
                     }
                     b"component" => {
                         let Some(cur) = current.as_mut() else {
                             return Err(malformed("component outside of an object"));
                         };
-                        cur.components.push(Component {
-                            path: attr_str(e, b"path")?,
+                        collections.admit(InputKind::Component)?;
+                        let component = Component {
+                            path: attr_path(e, allocator, observer)?,
                             object_id: attr_u32(e, "objectid", "component")?,
                             transform: attr_transform(e)?,
-                        });
+                        };
+                        let ceiling =
+                            collections.ceiling(InputKind::Component, cur.components.len() + 1)?;
+                        reserve_input_buffer(
+                            &mut cur.components,
+                            1,
+                            ceiling,
+                            allocator,
+                            observer,
+                            InputReserveSite::Components,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
+                        cur.components.push_reserved(component);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Components, 1);
+                        }
                     }
                     b"build" => in_build = true,
                     b"item" if in_build => {
+                        collections.admit(InputKind::BuildItem)?;
                         let printable = attr_str(e, b"printable")?
                             .map(|p| p.trim() != "0" && !p.trim().eq_ignore_ascii_case("false"))
                             .unwrap_or(true);
-                        part.build.push(BuildItem {
-                            path: attr_str(e, b"path")?,
+                        let item = BuildItem {
+                            path: attr_path(e, allocator, observer)?,
                             object_id: attr_u32(e, "objectid", "build item")?,
                             transform: attr_transform(e)?,
                             printable,
-                        });
+                        };
+                        let ceiling =
+                            collections.ceiling(InputKind::BuildItem, part.build.len() + 1)?;
+                        reserve_input_buffer(
+                            &mut part.build,
+                            1,
+                            ceiling,
+                            allocator,
+                            observer,
+                            InputReserveSite::Build,
+                            #[cfg(test)]
+                            collections.test.as_ref(),
+                        )?;
+                        part.build.push_reserved(item);
+                        #[cfg(test)]
+                        if let Some(test) = &collections.test {
+                            test.appended(InputReserveSite::Build, 1);
+                        }
                     }
                     _ => {}
                 }
@@ -1205,7 +1979,15 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
                             triangles,
                         }
                     };
-                    part.objects.insert(
+                    reserve_input_map(
+                        &mut part.objects,
+                        &id,
+                        observer,
+                        InputReserveSite::Objects,
+                        #[cfg(test)]
+                        collections.test.as_ref(),
+                    )?;
+                    part.objects.insert_reserved(
                         id,
                         Object {
                             kind,
@@ -1215,6 +1997,10 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
                             has_triangle_properties,
                         },
                     );
+                    #[cfg(test)]
+                    if let Some(test) = &collections.test {
+                        test.appended(InputReserveSite::Objects, 1);
+                    }
                 }
                 b"basematerials" | b"colorgroup" => material_group = None,
                 b"build" => in_build = false,
@@ -1223,13 +2009,15 @@ fn parse_model_part<R: std::io::BufRead>(reader: R, path: &str) -> Result<ModelP
             Event::Eof => break,
             _ => {}
         }
-        buf.clear();
     }
-    Ok(part)
+    Ok(part.seal())
 }
 
 /// Flattened output accumulated across the whole build.
 struct Out {
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    test: Option<InputCollectionsTestSession>,
     positions: Vec<f32>,
     normals: Vec<f32>,
     triangle_count: u32,
@@ -1253,6 +2041,24 @@ impl Out {
                 }
             }
         }
+        reserve_input_vec(
+            &mut self.positions,
+            9,
+            MAX_TRIANGLES as usize * 9,
+            &self.observer,
+            InputReserveSite::Positions,
+            #[cfg(test)]
+            self.test.as_ref(),
+        )?;
+        reserve_input_vec(
+            &mut self.normals,
+            3,
+            MAX_TRIANGLES as usize * 3,
+            &self.observer,
+            InputReserveSite::Normals,
+            #[cfg(test)]
+            self.test.as_ref(),
+        )?;
         for v in &verts {
             self.positions.extend_from_slice(v);
         }
@@ -1268,6 +2074,11 @@ impl Out {
             self.normals.extend_from_slice(&[0.0, 0.0, 0.0]);
         }
         self.triangle_count += 1;
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.appended(InputReserveSite::Positions, 9);
+            test.appended(InputReserveSite::Normals, 3);
+        }
         Ok(())
     }
 }
@@ -1279,7 +2090,11 @@ enum StandardAppearance {
 }
 
 impl StandardAppearance {
-    fn observe(&mut self, material_id: Option<&str>) {
+    fn observe(
+        &mut self,
+        material_id: Option<&str>,
+        #[cfg(test)] probe: Option<&PartRetentionTestProfile>,
+    ) {
         if matches!(self, Self::NonUniform) {
             return;
         }
@@ -1288,7 +2103,15 @@ impl StandardAppearance {
             return;
         };
         match self {
-            Self::Empty => *self = Self::Uniform(material_id.to_string()),
+            Self::Empty => {
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe
+                        .appearance_copies
+                        .set(probe.appearance_copies.get() + 1);
+                }
+                *self = Self::Uniform(material_id.to_string());
+            }
             Self::Uniform(current) if current.as_str() != material_id => {
                 *self = Self::NonUniform;
             }
@@ -1305,7 +2128,7 @@ impl StandardAppearance {
 }
 
 fn standard_material_id<'a>(
-    pkg: &Package<'_>,
+    pkg: &Package<'_, '_>,
     part: &'a ModelPart,
     object: &Object,
 ) -> Option<&'a str> {
@@ -1327,6 +2150,7 @@ fn emit_object(
     out: &mut Out,
     appearance: &mut StandardAppearance,
 ) -> Result<(), StlError> {
+    pkg.charge_component_work()?;
     if depth > MAX_COMPONENT_DEPTH {
         return Err(malformed("component nesting is too deep or cyclic"));
     }
@@ -1349,7 +2173,11 @@ fn emit_object(
                 } else {
                     standard_material_id(pkg, &part, object)
                 };
-                appearance.observe(material_id);
+                appearance.observe(
+                    material_id,
+                    #[cfg(test)]
+                    pkg.part_retention_test.as_deref(),
+                );
             }
             let flip = is_mirror(transform);
             for t in triangles {
@@ -1388,12 +2216,159 @@ fn emit_object(
     Ok(())
 }
 
-fn new_out(scale: f32) -> Out {
+fn new_out(scale: f32, collections: &InputCollections) -> Out {
     Out {
+        observer: collections.observer.clone(),
+        #[cfg(test)]
+        test: collections.test.clone(),
         positions: Vec::new(),
         normals: Vec::new(),
         triangle_count: 0,
         scale,
+    }
+}
+
+// Optional viewer rows may be omitted without omitting any geometry work.
+// The state is shared across all authored plates, and cannot revive after overflow.
+enum PartRows {
+    Collecting(Vec<ParsedPart>),
+    Omitted,
+}
+
+struct PartOutput {
+    rows: PartRows,
+    limit: usize,
+    observer: ZipResourceObserver,
+    #[cfg(test)]
+    test: Option<Rc<PartRetentionTestProfile>>,
+}
+
+impl PartOutput {
+    fn new(pkg: &Package<'_, '_>) -> Self {
+        #[cfg(not(test))]
+        let limit = MAX_VIEWER_PARTS;
+        #[cfg(test)]
+        let limit = pkg
+            .part_retention_test
+            .as_ref()
+            .map_or(MAX_VIEWER_PARTS, |test| test.limit);
+        Self {
+            rows: PartRows::Collecting(Vec::new()),
+            limit,
+            observer: pkg.observer.clone(),
+            #[cfg(test)]
+            test: pkg.part_retention_test.clone(),
+        }
+    }
+
+    fn can_collect_next(&self) -> bool {
+        matches!(&self.rows, PartRows::Collecting(parts) if parts.len() < self.limit)
+    }
+
+    fn appearance(&self) -> StandardAppearance {
+        // Below capacity one in-flight Uniform ID remains a separate scratch
+        // contribution. At capacity/after omission it need not be constructed.
+        if self.can_collect_next() {
+            StandardAppearance::Empty
+        } else {
+            StandardAppearance::NonUniform
+        }
+    }
+
+    // Called only AFTER a candidate emitted nonzero geometry.
+    fn admit_nonempty(&mut self) -> Result<bool, StlError> {
+        self.observer.check()?;
+        let PartRows::Collecting(parts) = &mut self.rows else {
+            return Ok(false);
+        };
+        if parts.len() == self.limit {
+            self.rows = PartRows::Omitted; // drop retained text and backing permanently
+            return Ok(false);
+        }
+        let needed = parts
+            .len()
+            .checked_add(1)
+            .filter(|&n| n <= self.limit)
+            .ok_or_else(|| input_error(&self.observer))?;
+        if needed > parts.capacity() {
+            let target = parts
+                .capacity()
+                .checked_mul(2)
+                .unwrap_or(self.limit)
+                .max(needed)
+                .min(self.limit);
+            target
+                .checked_mul(std::mem::size_of::<ParsedPart>())
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+                .ok_or_else(|| input_error(&self.observer))?;
+            self.observer.check()?;
+            #[cfg(test)]
+            let attempt = self.test.as_ref().map(|test| {
+                let n = test.reserves.get() + 1;
+                test.reserves.set(n);
+                test.requested_capacity.borrow_mut().push(target);
+                n
+            });
+            #[cfg(test)]
+            if let Some(test) = &self.test {
+                if test.fail_reserve_at == attempt {
+                    let _ = self.observer.allocation_failed_io();
+                    self.observer.check()?;
+                }
+            }
+            if parts.try_reserve_exact(target - parts.len()).is_err() {
+                let _ = self.observer.allocation_failed_io();
+                self.observer.check()?;
+            }
+            #[cfg(test)]
+            if let Some(test) = &self.test {
+                if let Some((at, failure)) = test.stop_after_reserve {
+                    if Some(at) == attempt {
+                        self.observer.observe_io(&failure.io_error());
+                    }
+                }
+            }
+            self.observer.check()?;
+        }
+        Ok(true)
+    }
+
+    // Admission has already reserved a slot; this append cannot grow the Vec.
+    fn push_admitted(&mut self, part: ParsedPart) {
+        let PartRows::Collecting(parts) = &mut self.rows else {
+            unreachable!("admitted part output");
+        };
+        debug_assert!(parts.len() < self.limit && parts.len() < parts.capacity());
+        parts.push(part);
+        #[cfg(test)]
+        if let Some(test) = &self.test {
+            test.record_retained(parts.len());
+        }
+    }
+
+    fn finish(
+        self,
+        plates: &[Plate],
+        total: u32,
+    ) -> Result<(Vec<ParsedPart>, Option<String>), StlError> {
+        self.observer.check()?;
+        match self.rows {
+            PartRows::Omitted => Ok((Vec::new(), Some(PART_WARNING.into()))),
+            PartRows::Collecting(mut parts) => {
+                if validate_parts(
+                    &parts,
+                    plates,
+                    total,
+                    #[cfg(test)]
+                    self.limit,
+                ) {
+                    Ok((parts, None))
+                } else {
+                    parts.clear();
+                    Ok((parts, Some(PART_WARNING.into())))
+                }
+            }
+        }
     }
 }
 
@@ -1403,13 +2378,20 @@ fn emit_build_item(
     item: &BuildItem,
     occurrence: u32,
     slicer: &SlicerMetadata,
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     out: &mut Out,
-    parts: &mut Vec<ParsedPart>,
+    parts: &mut PartOutput,
 ) -> Result<(), StlError> {
+    #[cfg(test)]
+    if let Some(probe) = &pkg.probe {
+        probe.record_work();
+    }
     if !item.printable {
         return Ok(());
     }
+    // Build-item emission handles a component root directly instead of calling
+    // emit_object for it. Charge that lookup against the same package budget.
+    pkg.charge_component_work()?;
     let path = item.path.as_deref().unwrap_or(root_path);
     let source_part = pkg.part(path)?;
     let object = source_part
@@ -1426,7 +2408,7 @@ fn emit_build_item(
     match &object.kind {
         ObjectKind::Mesh { .. } => {
             let triangle_start = out.triangle_count;
-            let mut appearance = StandardAppearance::Empty;
+            let mut appearance = parts.appearance();
             emit_object(
                 pkg,
                 path,
@@ -1437,10 +2419,22 @@ fn emit_build_item(
                 &mut appearance,
             )?;
             let triangle_count = out.triangle_count - triangle_start;
-            if triangle_count != 0 {
-                parts.push(ParsedPart {
+            if triangle_count != 0 && parts.admit_nonempty()? {
+                #[cfg(test)]
+                if let Some(probe) = &pkg.part_retention_test {
+                    probe.id_builders.set(probe.id_builders.get() + 1);
+                }
+                parts.push_admitted(ParsedPart {
                     id: format!("object:{}:instance:{occurrence}", item.object_id),
-                    name: boundary_name(object, None, root_metadata, None, item.object_id),
+                    name: boundary_name(
+                        object,
+                        None,
+                        root_metadata,
+                        None,
+                        item.object_id,
+                        #[cfg(test)]
+                        pkg.part_retention_test.as_deref(),
+                    ),
                     triangle_start,
                     triangle_count,
                     material_id: appearance.into_material_id(),
@@ -1466,18 +2460,9 @@ fn emit_build_item(
                     && !component_part_metadata_ambiguous(component_paths, component.object_id))
                 .then(|| slicer.parts.get(&component.object_id))
                 .flatten();
-                let name = boundary_name(
-                    object,
-                    Some(child_object),
-                    root_metadata,
-                    part_metadata,
-                    component.object_id,
-                );
-                let filament_slot =
-                    setting_extruder(part_metadata).or_else(|| setting_extruder(root_metadata));
                 let child_transform = compose(&component.transform, &item.transform);
                 let triangle_start = out.triangle_count;
-                let mut appearance = StandardAppearance::Empty;
+                let mut appearance = parts.appearance();
                 emit_object(
                     pkg,
                     child_path,
@@ -1488,8 +2473,23 @@ fn emit_build_item(
                     &mut appearance,
                 )?;
                 let triangle_count = out.triangle_count - triangle_start;
-                if triangle_count != 0 {
-                    parts.push(ParsedPart {
+                if triangle_count != 0 && parts.admit_nonempty()? {
+                    let name = boundary_name(
+                        object,
+                        Some(child_object),
+                        root_metadata,
+                        part_metadata,
+                        component.object_id,
+                        #[cfg(test)]
+                        pkg.part_retention_test.as_deref(),
+                    );
+                    let filament_slot =
+                        setting_extruder(part_metadata).or_else(|| setting_extruder(root_metadata));
+                    #[cfg(test)]
+                    if let Some(probe) = &pkg.part_retention_test {
+                        probe.id_builders.set(probe.id_builders.get() + 1);
+                    }
+                    parts.push_admitted(ParsedPart {
                         id: format!(
                             "object:{}:instance:{occurrence}/component:{component_index}:object:{}",
                             item.object_id, component.object_id
@@ -1507,19 +2507,6 @@ fn emit_build_item(
     Ok(())
 }
 
-fn build_item_occurrences(build: &[BuildItem]) -> Result<Vec<u32>, StlError> {
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-    let mut occurrences = Vec::with_capacity(build.len());
-    for item in build {
-        let occurrence = counts.entry(item.object_id).or_default();
-        occurrences.push(*occurrence);
-        *occurrence = (*occurrence)
-            .checked_add(1)
-            .ok_or_else(|| malformed("too many instances for one object"))?;
-    }
-    Ok(occurrences)
-}
-
 fn finish_model(out: Out) -> ParsedStl {
     ParsedStl {
         format: StlFormat::ThreeMf,
@@ -1529,8 +2516,15 @@ fn finish_model(out: Out) -> ParsedStl {
     }
 }
 
-fn validate_parts(parts: &[ParsedPart], plates: &[Plate], total: u32) -> bool {
-    if parts.len() > MAX_VIEWER_PARTS {
+fn validate_parts(
+    parts: &[ParsedPart],
+    plates: &[Plate],
+    total: u32,
+    #[cfg(test)] limit: usize,
+) -> bool {
+    #[cfg(not(test))]
+    let limit = MAX_VIEWER_PARTS;
+    if parts.len() > limit {
         return false;
     }
     let mut index = 0;
@@ -1567,18 +2561,34 @@ fn validate_parts(parts: &[ParsedPart], plates: &[Plate], total: u32) -> bool {
         })
 }
 
+struct BuildView<'a> {
+    root_path: &'a str,
+    root: &'a ModelPart,
+    index: &'a BuildIndex,
+}
+
 fn whole_build(
     pkg: &mut Package,
-    root_path: &str,
-    root: &ModelPart,
+    build: &BuildView<'_>,
     slicer: &SlicerMetadata,
-    component_paths: &HashMap<u32, HashSet<String>>,
+    component_paths: &HashMap<u32, HashSet<SharedPath>>,
     filaments: Vec<ParsedFilament>,
     warning: String,
 ) -> Result<ParsedModel, StlError> {
-    let mut out = new_out(root.scale);
-    let mut parts = Vec::new();
-    let occurrences = build_item_occurrences(&root.build)?;
+    let root_path = build.root_path;
+    let root = build.root;
+    let index = build.index;
+    #[cfg(test)]
+    if let Some(probe) = &pkg.derived_maps_test {
+        probe.fallback_entries.set(probe.fallback_entries.get() + 1);
+    }
+    #[cfg(test)]
+    if let Some(probe) = &pkg.probe {
+        probe.record_work();
+    }
+    let mut out = new_out(root.scale, &pkg.collections);
+    let mut parts = PartOutput::new(pkg);
+    let occurrences = &index.occurrences;
     for (index, item) in root.build.iter().enumerate() {
         emit_build_item(
             pkg,
@@ -1592,18 +2602,23 @@ fn whole_build(
         )?;
     }
     let triangle_count = out.triangle_count;
-    let plates = vec![Plate {
+    let mut plates = Vec::new();
+    derived_maps::reserve_vec(
+        &mut plates,
+        1,
+        MAX_VIEWER_PLATES,
+        &pkg.observer,
+        derived_maps::ReserveSite::OutputPlates,
+        #[cfg(test)]
+        pkg.derived_maps_test.as_deref(),
+    )?;
+    plates.push(Plate {
         id: 0,
         name: "Whole build".into(),
         triangle_start: 0,
         triangle_count,
-    }];
-    let part_warning = if validate_parts(&parts, &plates, triangle_count) {
-        None
-    } else {
-        parts.clear();
-        Some(PART_WARNING.into())
-    };
+    });
+    let (parts, part_warning) = parts.finish(&plates, triangle_count)?;
     Ok(ParsedModel {
         model: finish_model(out),
         plates,
@@ -1620,59 +2635,198 @@ fn whole_build(
 /// Geometry is emitted once, grouped in display order so each plate is a
 /// contiguous range of the aggregate model.
 pub fn parse_3mf_with_plates(bytes: &[u8]) -> Result<ParsedModel, StlError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    parse_3mf_with_plates_in_context(bytes, &mut context)
+}
+
+#[doc(hidden)]
+pub fn parse_3mf_with_plates_in_context(
+    bytes: &[u8],
+    context: &mut PackageProcessingContext,
+) -> Result<ParsedModel, StlError> {
+    parse_3mf_in_context_with_component_visit_limit(bytes, MAX_COMPONENT_VISITS, context)
+}
+
+#[cfg(test)]
+fn parse_3mf_with_component_visit_limit(
+    bytes: &[u8],
+    component_visit_limit: u64,
+) -> Result<ParsedModel, StlError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    parse_3mf_in_context_with_component_visit_limit(bytes, component_visit_limit, &mut context)
+}
+
+fn parse_3mf_in_context_with_component_visit_limit(
+    bytes: &[u8],
+    component_visit_limit: u64,
+    context: &mut PackageProcessingContext,
+) -> Result<ParsedModel, StlError> {
+    let observer = context.observer();
+    observer.check()?;
+    let result = parse_3mf_with_context(bytes, component_visit_limit, context);
+    observer.finish(result)
+}
+
+fn parse_3mf_with_context(
+    bytes: &[u8],
+    component_visit_limit: u64,
+    context: &mut PackageProcessingContext,
+) -> Result<ParsedModel, StlError> {
     if bytes.is_empty() {
         return Err(StlError::EmptyFile);
     }
-    let mut pkg = Package::open(bytes)?;
+    let mut pkg = Package::open(bytes, context)?;
+    pkg.component_visits_remaining = component_visit_limit;
     let root_path = pkg.root_model_path()?;
     let root = pkg.part(&root_path)?;
-    let component_paths = component_part_metadata_paths(&root, &root_path);
+    let component_paths = component_part_metadata_paths(&mut pkg, &root, &root_path)?;
+    let build_index = BuildIndex::new(
+        root.build.as_slice(),
+        &pkg.observer,
+        #[cfg(test)]
+        pkg.derived_maps_test.as_deref(),
+    )?;
+    let build_view = BuildView {
+        root_path: &root_path,
+        root: &root,
+        index: &build_index,
+    };
 
-    let settings_result = pkg.optional_text(MODEL_SETTINGS_PATH);
-    let slicer = settings_result
+    let settings_result = pkg.optional_text(MODEL_SETTINGS_PATH, TextRole::ModelSettings);
+    #[cfg(test)]
+    let settings_result = settings_result
+        .map(|text| text.map(|text| SidecarRawText::new(text, pkg.sidecar_test.clone())));
+    pkg.observer.check()?;
+    preserve_terminal(&settings_result)?;
+    let slicer_result = settings_result
         .as_ref()
         .ok()
         .and_then(|text| text.as_deref())
-        .and_then(|text| parse_slicer_metadata(text).ok())
-        .unwrap_or_default();
-    let filaments = pkg
-        .optional_bounded_text(PROJECT_SETTINGS_PATH, MAX_APPEARANCE_METADATA_BYTES)
-        .ok()
-        .flatten()
-        .and_then(|text| parse_project_filaments(&text))
-        .unwrap_or_default();
-
-    let settings = match settings_result {
-        Ok(Some(text)) => match parse_plate_settings(&text) {
-            Ok(specs) => Some(specs),
-            Err(detail) => {
-                return whole_build(
-                    &mut pkg,
-                    &root_path,
-                    &root,
-                    &slicer,
-                    &component_paths,
-                    filaments,
-                    format!("Plate metadata is unusable ({detail}); showing the whole build."),
-                );
+        .map(|text| {
+            settings::parse_slicer_metadata(
+                text,
+                &pkg.observer,
+                &root.objects,
+                &component_paths,
+                #[cfg(test)]
+                pkg.settings_owned_test.as_deref(),
+            )
+        });
+    #[cfg(test)]
+    if let Some(failure) = pkg
+        .settings_owned_test
+        .as_ref()
+        .and_then(|probe| probe.finish_failure.take())
+    {
+        match failure {
+            ParserTestFailure::Stop(stop) => {
+                let _ = pkg.observer.stop_io(stop);
             }
-        },
-        Ok(None) => {
+            ParserTestFailure::Allocation => {
+                let _ = pkg.observer.allocation_failed_io();
+            }
+            ParserTestFailure::Funding => {
+                let _ = pkg.observer.funding_busy_io();
+            }
+        }
+    }
+    pkg.observer.check()?;
+    let slicer = match slicer_result {
+        Some(Ok(metadata)) => metadata,
+        Some(Err(settings::SettingsError::Source(error))) => return Err(error),
+        Some(Err(settings::SettingsError::Metadata(_))) => {
+            #[cfg(test)]
+            if let Some(probe) = &pkg.settings_owned_test {
+                probe
+                    .ordinary_fallbacks
+                    .set(probe.ordinary_fallbacks.get() + 1);
+            }
+            SlicerMetadata::default()
+        }
+        None => SlicerMetadata::default(),
+    };
+    enum PreparedSettings {
+        Collected(derived_maps::PreparedPlateOutcome),
+        Missing,
+        Unreadable(StlError),
+    }
+    let prepared_settings = match settings_result {
+        Ok(Some(text)) => {
+            let prepared = derived_maps::prepare_plates(
+                &text,
+                &root,
+                &build_index,
+                &pkg.observer,
+                #[cfg(test)]
+                pkg.derived_maps_test.as_deref(),
+                #[cfg(test)]
+                pkg.sidecar_test.as_deref(),
+            )?;
+            drop(text);
+            PreparedSettings::Collected(prepared)
+        }
+        Ok(None) => PreparedSettings::Missing,
+        Err(error) => PreparedSettings::Unreadable(error),
+    };
+    let project_result =
+        pkg.optional_bounded_text(PROJECT_SETTINGS_PATH, MAX_APPEARANCE_METADATA_BYTES);
+    pkg.observer.check()?;
+    preserve_terminal(&project_result)?;
+    let filaments = match project_result {
+        Ok(Some(text)) => project_json::parse(&text, &pkg.observer)?.unwrap_or_default(),
+        Ok(None) | Err(_) => Vec::new(), // terminal errors were preserved above
+    };
+
+    #[cfg(test)]
+    if let Some(probe) = &pkg.sidecar_test {
+        probe.project_completed.set(true);
+        sidecar_latch(&pkg.observer, probe.before_activation.take());
+    }
+    pkg.observer.check()?;
+    let settings = match prepared_settings {
+        PreparedSettings::Collected(prepared) => {
+            let result = prepared.finish(&root_path, &root, &mut pkg);
+            pkg.observer.check()?;
+            match result {
+                Ok(specs) => Some(specs),
+                Err(PlateResolutionError::Source(
+                    error @ (StlError::ResourceStopped(_)
+                    | StlError::AllocationFailed
+                    | StlError::FundingBusy),
+                )) => return Err(error),
+                Err(detail) => {
+                    return whole_build(
+                        &mut pkg,
+                        &build_view,
+                        &slicer,
+                        &component_paths,
+                        filaments,
+                        format!("Plate metadata is unusable ({detail}); showing the whole build."),
+                    );
+                }
+            }
+        }
+        PreparedSettings::Missing => {
             return whole_build(
                 &mut pkg,
-                &root_path,
-                &root,
+                &build_view,
                 &slicer,
                 &component_paths,
                 filaments,
                 NO_PLATE_METADATA_WARNING.into(),
             );
         }
-        Err(err) => {
+        PreparedSettings::Unreadable(
+            err @ (StlError::ResourceStopped(_)
+            | StlError::AllocationFailed
+            | StlError::FundingBusy),
+        ) => {
+            return Err(err);
+        }
+        PreparedSettings::Unreadable(err) => {
             return whole_build(
                 &mut pkg,
-                &root_path,
-                &root,
+                &build_view,
                 &slicer,
                 &component_paths,
                 filaments,
@@ -1681,31 +2835,17 @@ pub fn parse_3mf_with_plates(bytes: &[u8]) -> Result<ParsedModel, StlError> {
         }
     };
 
-    let specs = settings.expect("all other metadata branches return");
-    let resolved = match resolve_plate_items(&mut pkg, &root_path, &root, &specs) {
-        Ok(resolved) => resolved,
-        Err(detail) => {
-            return whole_build(
-                &mut pkg,
-                &root_path,
-                &root,
-                &slicer,
-                &component_paths,
-                filaments,
-                format!("Plate metadata is unusable ({detail}); showing the whole build."),
-            );
-        }
-    };
+    let resolved = settings.expect("all other metadata branches return");
 
     // Transforms are expressed in the model's unit, so unit conversion is
     // applied last, to already-placed coordinates.
-    let mut out = new_out(root.scale);
-    let mut parts = Vec::new();
-    let occurrences = build_item_occurrences(&root.build)?;
-    let mut plates = Vec::with_capacity(specs.len());
-    for (plate_index, (spec, item_indices)) in specs.iter().zip(&resolved).enumerate() {
+    let mut out = new_out(root.scale, &pkg.collections);
+    let mut parts = PartOutput::new(&pkg);
+    let occurrences = &build_index.occurrences;
+    let mut plates = Vec::new();
+    for (plate_index, spec) in resolved.into_iter().enumerate() {
         let triangle_start = out.triangle_count;
-        for &item_index in item_indices {
+        for &item_index in &spec.items {
             emit_build_item(
                 &mut pkg,
                 &root_path,
@@ -1717,20 +2857,24 @@ pub fn parse_3mf_with_plates(bytes: &[u8]) -> Result<ParsedModel, StlError> {
                 &mut parts,
             )?;
         }
+        derived_maps::reserve_vec(
+            &mut plates,
+            1,
+            MAX_VIEWER_PLATES,
+            &pkg.observer,
+            derived_maps::ReserveSite::OutputPlates,
+            #[cfg(test)]
+            pkg.derived_maps_test.as_deref(),
+        )?;
         plates.push(Plate {
             id: u32::try_from(plate_index).map_err(|_| malformed("too many plates in metadata"))?,
-            name: spec.name.clone(),
+            name: spec.name,
             triangle_start,
             triangle_count: out.triangle_count - triangle_start,
         });
     }
 
-    let part_warning = if validate_parts(&parts, &plates, out.triangle_count) {
-        None
-    } else {
-        parts.clear();
-        Some(PART_WARNING.into())
-    };
+    let (parts, part_warning) = parts.finish(&plates, out.triangle_count)?;
     Ok(ParsedModel {
         model: finish_model(out),
         plates,
@@ -1755,11 +2899,757 @@ mod tests {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
+    const PARSER_TEST_FAILURES: [ParserTestFailure; 5] = [
+        ParserTestFailure::Stop(ResourceStop::InputLimitExceeded),
+        ParserTestFailure::Stop(ResourceStop::ReadWorkExceeded),
+        ParserTestFailure::Stop(ResourceStop::EnvelopeChanged),
+        ParserTestFailure::Allocation,
+        ParserTestFailure::Funding,
+    ];
+
+    struct ParserProbeGuard(Option<Rc<ParserTestProbe>>);
+
+    impl ParserProbeGuard {
+        fn install(probe: Rc<ParserTestProbe>) -> Self {
+            Self(PARSER_TEST_PROBE.with(|slot| slot.replace(Some(probe))))
+        }
+    }
+
+    impl Drop for ParserProbeGuard {
+        fn drop(&mut self) {
+            drop(PARSER_TEST_PROBE.with(|slot| slot.replace(self.0.take())));
+        }
+    }
+
+    fn assert_public_parser_stop(
+        bytes: &[u8],
+        member: &'static str,
+        failure: ParserTestFailure,
+        aggregate: bool,
+        root_cached: bool,
+    ) {
+        let probe = Rc::new(ParserTestProbe {
+            member,
+            failure,
+            state: std::cell::RefCell::new(ParserTestState::default()),
+            guard_observer: None,
+        });
+        let _guard = ParserProbeGuard::install(probe.clone());
+        let result = if aggregate {
+            parse_3mf(bytes).map(|_| ())
+        } else {
+            parse_3mf_with_plates(bytes).map(|_| ())
+        };
+        assert_eq!(result, Err(failure.error()));
+        let state = probe.state.borrow();
+        assert!(state.constructor_completed);
+        assert!(
+            state.fired,
+            "the selected member payload fault must be reached"
+        );
+        assert_eq!(state.root_cached, root_cached);
+        assert_eq!(
+            state.after_io, 0,
+            "no underlying IO after the observed stop"
+        );
+        assert_eq!(
+            state.work_after_stop, 0,
+            "no fallback or emission after stop"
+        );
+    }
+
+    #[test]
+    fn typed_zip_parser_last_settings_stop_never_enters_cached_whole_build() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, "<config/>"),
+                ],
+                deflate,
+            );
+            // Without the fault, the empty plate configuration falls back to
+            // the already parsed root and succeeds with all twelve triangles.
+            assert_eq!(
+                parse_3mf_with_plates(&bytes).unwrap().model.triangle_count,
+                12
+            );
+            for failure in PARSER_TEST_FAILURES {
+                for aggregate in [false, true] {
+                    assert_public_parser_stop(
+                        &bytes,
+                        MODEL_SETTINGS_PATH,
+                        failure,
+                        aggregate,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_last_project_stop_never_becomes_empty_metadata() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[(ROOT_MODEL_FALLBACK, &root), (PROJECT_SETTINGS_PATH, "{}")],
+                deflate,
+            );
+            let normal = parse_3mf_with_plates(&bytes).unwrap();
+            assert_eq!(normal.model.triangle_count, 12);
+            assert_eq!(
+                normal.plate_warning.as_deref(),
+                Some(NO_PLATE_METADATA_WARNING)
+            );
+            for failure in PARSER_TEST_FAILURES {
+                for aggregate in [false, true] {
+                    assert_public_parser_stop(
+                        &bytes,
+                        PROJECT_SETTINGS_PATH,
+                        failure,
+                        aggregate,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_preserves_stops_erased_by_xml_error_context() {
+        for deflate in [false, true] {
+            let bytes = simple_cube("millimeter", deflate);
+            for failure in PARSER_TEST_FAILURES {
+                assert_public_parser_stop(&bytes, ROOT_MODEL_FALLBACK, failure, false, false);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_plate_resolution_stop_never_enters_fallback() {
+        const CHILD: &str = "3D/Objects/child.model";
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1" type="model"><components><component objectid="2" p:path="/3D/Objects/child.model"/></components></object>"#,
+            r#"<item objectid="1"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let settings = plate_settings(&plate_xml(1, "Unassigned", &[]));
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (CHILD, &child),
+                    (MODEL_SETTINGS_PATH, &settings),
+                ],
+                deflate,
+            );
+            let normal = parse_3mf_with_plates(&bytes).unwrap();
+            assert_eq!(normal.model.triangle_count, 12);
+            assert!(!normal.plate_metadata);
+            for failure in PARSER_TEST_FAILURES {
+                assert_public_parser_stop(&bytes, CHILD, failure, false, true);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_zip_parser_constructor_limit_is_not_formatted_as_malformed() {
+        let mut bytes = simple_cube("millimeter", false);
+        let footer = bytes
+            .windows(4)
+            .rposition(|value| value == b"PK\x05\x06")
+            .unwrap();
+        bytes[footer + 8..footer + 10].copy_from_slice(&10_001u16.to_le_bytes());
+        bytes[footer + 10..footer + 12].copy_from_slice(&10_001u16.to_le_bytes());
+        assert!(matches!(
+            parse_3mf_with_plates(&bytes),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+    }
+
+    #[test]
+    fn typed_zip_parser_keeps_ordinary_optional_metadata_fallback() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, "<config><plate>"),
+                    (PROJECT_SETTINGS_PATH, "{"),
+                ],
+                deflate,
+            );
+            let parsed = parse_3mf_with_plates(&bytes).unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert!(!parsed.plate_metadata);
+            assert!(parsed
+                .plate_warning
+                .unwrap()
+                .starts_with("Plate metadata is unusable ("));
+            assert!(parsed.embedded_filaments.is_empty());
+        }
+    }
+
     const RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
  <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
  <Relationship Target="/Metadata/thumb.png" Id="rel-2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"/>
 </Relationships>"#;
+
+    struct InputCollectionsProfileGuard(Option<Rc<InputCollectionsTestProfile>>);
+
+    impl InputCollectionsProfileGuard {
+        fn install(profile: Rc<InputCollectionsTestProfile>) -> Self {
+            Self(INPUT_COLLECTIONS_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+
+    impl Drop for InputCollectionsProfileGuard {
+        fn drop(&mut self) {
+            INPUT_COLLECTIONS_TEST_PROFILE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    fn input_collection_fixture(kind: usize, count: usize) -> Vec<u8> {
+        let (resources, build) = match kind {
+            0 => (format!("<object id=\"1\" type=\"support\"><mesh><vertices>{}</vertices></mesh></object>",
+                "<vertex x=\"0\" y=\"0\" z=\"0\"/>".repeat(count)), String::new()),
+            1 => (format!("<object id=\"1\" type=\"support\"><mesh><vertices><vertex x=\"0\" y=\"0\" z=\"0\"/></vertices><triangles>{}</triangles></mesh></object>",
+                "<triangle v1=\"0\" v2=\"0\" v3=\"0\"/>".repeat(count)), String::new()),
+            2 => ((0..count).map(|id| format!("<object id=\"{}\"/>", id + 1)).collect::<String>(), String::new()),
+            3 => (format!("<object id=\"2\"/><object id=\"1\"><components>{}</components></object>",
+                "<component objectid=\"2\"/>".repeat(count)), String::new()),
+            4 => ("<object id=\"1\"/>".into(), "<item objectid=\"1\" printable=\"0\"/>".repeat(count)),
+            _ => unreachable!(),
+        };
+        let model = model_xml("millimeter", &resources, &build);
+        package(&[(ROOT_MODEL_FALLBACK, &model)], false)
+    }
+
+    fn assert_input_collection_boundary(kind: usize) {
+        let mut limits = [100; 5];
+        limits[kind] = 2;
+        let profile = Rc::new(InputCollectionsTestProfile::new(limits));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let exact = parse_3mf(&input_collection_fixture(kind, 2)).unwrap();
+        assert_eq!(exact.triangle_count, 0, "records are unused or disabled");
+        assert_eq!(profile.packages.borrow()[0][kind], profile.limits[kind]);
+        let exact_reserves = *profile.reserves.borrow();
+        let exact_appended = *profile.appended.borrow();
+        let excess = parse_3mf(&input_collection_fixture(kind, 3));
+        assert_eq!(profile.packages.borrow().len(), 2, "fresh Package snapshot");
+        assert_eq!(
+            profile.packages.borrow()[1][kind],
+            3,
+            "physical branch reached"
+        );
+        assert!(
+            matches!(
+                excess,
+                Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+            ),
+            "physical input category {kind} must stop at its captured limit; got {excess:?}"
+        );
+        let site = [
+            InputReserveSite::Vertices,
+            InputReserveSite::Triangles,
+            InputReserveSite::Objects,
+            InputReserveSite::Components,
+            InputReserveSite::Build,
+        ][kind] as usize;
+        assert_eq!(
+            profile.reserves.borrow()[site] - exact_reserves[site],
+            exact_reserves[site],
+            "rejected third record must not start another category reserve"
+        );
+        assert_eq!(
+            profile.appended.borrow()[site] - exact_appended[site],
+            exact_appended[site],
+            "rejected third record must not append"
+        );
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            exact_appended[InputReserveSite::Parts as usize],
+            "failed parse must not commit its part"
+        );
+        assert_eq!(
+            profile.reserves.borrow()[InputReserveSite::Parts as usize],
+            exact_reserves[InputReserveSite::Parts as usize],
+            "failed parse must not reserve a cache slot"
+        );
+    }
+
+    #[test]
+    fn input_collections_vertices_exact_and_one_over() {
+        assert_input_collection_boundary(0);
+    }
+    #[test]
+    fn input_collections_triangles_exact_and_one_over() {
+        assert_input_collection_boundary(1);
+    }
+    #[test]
+    fn input_collections_objects_exact_and_one_over() {
+        assert_input_collection_boundary(2);
+    }
+    #[test]
+    fn input_collections_components_exact_and_one_over() {
+        assert_input_collection_boundary(3);
+    }
+    #[test]
+    fn input_collections_build_items_exact_and_one_over() {
+        assert_input_collection_boundary(4);
+    }
+
+    fn assert_input_failure(result: Result<ParsedStl, StlError>, failure: ParserTestFailure) {
+        match (result, failure) {
+            (Err(StlError::ResourceStopped(actual)), ParserTestFailure::Stop(expected)) => {
+                assert_eq!(actual, expected)
+            }
+            (Err(StlError::AllocationFailed), ParserTestFailure::Allocation) => {}
+            (Err(StlError::FundingBusy), ParserTestFailure::Funding) => {}
+            (actual, _) => panic!("wrong terminal result: {actual:?}"),
+        }
+    }
+
+    fn input_fault_fixture(site: InputReserveSite) -> Vec<u8> {
+        match site {
+            InputReserveSite::Vertices => input_collection_fixture(0, 3),
+            InputReserveSite::Triangles => input_collection_fixture(1, 3),
+            InputReserveSite::Components => input_collection_fixture(3, 3),
+            InputReserveSite::Build => input_collection_fixture(4, 3),
+            InputReserveSite::Objects | InputReserveSite::Parts => input_collection_fixture(2, 4),
+            InputReserveSite::Positions | InputReserveSite::Normals => {
+                simple_cube("millimeter", false)
+            }
+        }
+    }
+
+    const INPUT_RESERVE_SITES: [InputReserveSite; 8] = [
+        InputReserveSite::Vertices,
+        InputReserveSite::Triangles,
+        InputReserveSite::Components,
+        InputReserveSite::Build,
+        InputReserveSite::Objects,
+        InputReserveSite::Parts,
+        InputReserveSite::Positions,
+        InputReserveSite::Normals,
+    ];
+
+    #[test]
+    fn input_collections_all_reserve_sites_fail_before_commit() {
+        for site in INPUT_RESERVE_SITES {
+            let mut profile = InputCollectionsTestProfile::new([100; 5]);
+            profile.fail_reserve = Some((site, 1));
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert_input_failure(
+                parse_3mf(&input_fault_fixture(site)),
+                ParserTestFailure::Allocation,
+            );
+            assert_eq!(profile.reserves.borrow()[site as usize], 1, "{site:?}");
+            assert_eq!(profile.appended.borrow()[site as usize], 0, "{site:?}");
+            if matches!(site, InputReserveSite::Normals) {
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Positions as usize],
+                    0
+                );
+            }
+            if !matches!(
+                site,
+                InputReserveSite::Positions | InputReserveSite::Normals
+            ) {
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Parts as usize],
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_collections_post_reserve_first_cause_stops_before_append() {
+        for site in INPUT_RESERVE_SITES {
+            for failure in PARSER_TEST_FAILURES {
+                let mut profile = InputCollectionsTestProfile::new([100; 5]);
+                profile.stop_after_reserve = Some((site, 1, failure));
+                let profile = Rc::new(profile);
+                let _guard = InputCollectionsProfileGuard::install(profile.clone());
+                assert_input_failure(parse_3mf(&input_fault_fixture(site)), failure);
+                assert_eq!(profile.reserves.borrow()[site as usize], 1);
+                assert_eq!(profile.appended.borrow()[site as usize], 0);
+                if site == InputReserveSite::Positions {
+                    assert_eq!(
+                        profile.reserves.borrow()[InputReserveSite::Normals as usize],
+                        0
+                    );
+                }
+                if site == InputReserveSite::Normals {
+                    assert_eq!(
+                        profile.appended.borrow()[InputReserveSite::Positions as usize],
+                        0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_collections_second_source_growth_keeps_only_previous_records() {
+        for (site, previous) in [
+            (InputReserveSite::Vertices, 1),
+            (InputReserveSite::Triangles, 1),
+            (InputReserveSite::Components, 1),
+            (InputReserveSite::Build, 1),
+        ] {
+            let mut profile = InputCollectionsTestProfile::new([100; 5]);
+            profile.fail_reserve = Some((site, 2));
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert_input_failure(
+                parse_3mf(&input_fault_fixture(site)),
+                ParserTestFailure::Allocation,
+            );
+            assert_eq!(profile.reserves.borrow()[site as usize], 2);
+            assert_eq!(profile.appended.borrow()[site as usize], previous);
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Parts as usize],
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn input_collections_cross_part_cache_and_fresh_package_share_read_context_only() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1"><components><component objectid="2" path="/3D/child.model"/><component objectid="2" path="3D/child.model"/></components></object>"#,
+            r#"<item objectid="1"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        );
+        let profile = Rc::new(InputCollectionsTestProfile::new([8, 12, 2, 2, 1]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let first = parse_3mf_with_plates_in_context(&bytes, &mut context).unwrap();
+        let first_usage = context.usage();
+        assert_eq!(first.model.triangle_count, 24);
+        let second = parse_3mf_with_plates_in_context(&bytes, &mut context).unwrap();
+        assert_eq!(second.model.triangle_count, 24);
+        assert_eq!(
+            context.usage().inflation_bytes,
+            first_usage.inflation_bytes * 2
+        );
+        assert_eq!(*profile.packages.borrow(), vec![[8, 12, 2, 2, 1]; 2]);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            4
+        );
+    }
+
+    #[test]
+    fn input_collections_distinct_parts_cumulate_before_geometry() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1"><mesh><vertices><vertex x="0" y="0" z="0"/></vertices></mesh><components><component objectid="2" path="/3D/child.model"/></components></object>"#,
+            r#"<item objectid="1"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            false,
+        );
+        let profile = Rc::new(InputCollectionsTestProfile::new([8, 100, 100, 100, 100]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        assert_input_failure(
+            parse_3mf(&bytes),
+            ParserTestFailure::Stop(ResourceStop::InputLimitExceeded),
+        );
+        assert_eq!(profile.packages.borrow()[0][0], 9);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Positions as usize],
+            0
+        );
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn input_collections_discarded_mesh_duplicates_and_disabled_records_still_count() {
+        let xml = model_xml(
+            "millimeter",
+            r#"<object id="1"><mesh><vertices><vertex x="NaN" y="0" z="0"/></vertices><triangles><triangle v1="99" v2="99" v3="99"/></triangles></mesh><components><component objectid="2"/></components></object><object id="1"/><object id="2"/>"#,
+            r#"<item objectid="1" printable="0" path="missing.model"/>"#,
+        );
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+        let profile = Rc::new(InputCollectionsTestProfile::new([1, 1, 3, 1, 1]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        assert_eq!(parse_3mf(&bytes).unwrap().triangle_count, 0);
+        assert_eq!(profile.packages.borrow()[0], [1, 1, 3, 1, 1]);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Parts as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn input_collections_nested_open_object_overwrite_does_not_refund_physical_records() {
+        let xml = model_xml(
+            "millimeter",
+            r#"<object id="1"><mesh><vertices><vertex x="0" y="0" z="0"/></vertices></mesh><object id="2"><mesh><vertices><vertex x="1" y="0" z="0"/></vertices></mesh></object></object>"#,
+            "",
+        );
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+        let profile = Rc::new(InputCollectionsTestProfile::new([2, 0, 2, 0, 0]));
+        {
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            // Existing permissive opening behavior overwrites OpenObject; the
+            // final outer close still reports its existing unbalanced error.
+            let result = parse_3mf(&bytes);
+            assert!(
+                matches!(result, Err(StlError::Malformed3mf { ref detail }) if detail == "unbalanced </object>")
+            );
+            assert_eq!(profile.packages.borrow()[0], [2, 0, 2, 0, 0]);
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Vertices as usize],
+                2
+            );
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Objects as usize],
+                1
+            );
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Parts as usize],
+                0
+            );
+        }
+        let profile = Rc::new(InputCollectionsTestProfile::new([2, 0, 1, 0, 0]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        assert_input_failure(
+            parse_3mf(&bytes),
+            ParserTestFailure::Stop(ResourceStop::InputLimitExceeded),
+        );
+        assert_eq!(profile.packages.borrow()[0], [1, 0, 2, 0, 0]);
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Vertices as usize],
+            1
+        );
+        assert_eq!(
+            profile.appended.borrow()[InputReserveSite::Objects as usize],
+            0
+        );
+    }
+
+    #[test]
+    fn input_collections_overcap_attributes_stop_but_structural_errors_keep_priority() {
+        for (kind, resources, build) in [
+            (0, "<object id=\"1\"><mesh><vertices><vertex x=\"bad\"/></vertices></mesh></object>", ""),
+            (1, "<object id=\"1\"><mesh><triangles><triangle v1=\"bad\"/></triangles></mesh></object>", ""),
+            (2, "<object id=\"bad\"/>", ""),
+            (3, "<object id=\"1\"><components><component objectid=\"bad\"/></components></object>", ""),
+            (4, "<object id=\"1\"/>", "<item objectid=\"bad\"/>"),
+        ] {
+            let xml = model_xml("millimeter", resources, build);
+            let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+            assert!(matches!(parse_3mf(&bytes), Err(StlError::Malformed3mf { .. })));
+            let mut limits = [100; 5]; limits[kind] = 0;
+            let profile = Rc::new(InputCollectionsTestProfile::new(limits));
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert_input_failure(parse_3mf(&bytes), ParserTestFailure::Stop(ResourceStop::InputLimitExceeded));
+            assert_eq!(profile.packages.borrow()[0][kind], 1);
+        }
+        for record in ["<vertex/>", "<triangle/>", "<component/>"] {
+            let xml = model_xml("millimeter", record, "");
+            let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+            let profile = Rc::new(InputCollectionsTestProfile::new([0; 5]));
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            assert!(matches!(
+                parse_3mf(&bytes),
+                Err(StlError::Malformed3mf { .. })
+            ));
+            assert_eq!(profile.packages.borrow()[0], [0; 5]);
+        }
+    }
+
+    #[test]
+    fn input_collections_second_map_growth_is_fallible_without_committing_pending_key() {
+        for site in [InputReserveSite::Objects, InputReserveSite::Parts] {
+            // Discover the current standard library layout using the actual map
+            // types. Bucket capacity is not part of the supported-input policy.
+            let initial_capacity = if site == InputReserveSite::Objects {
+                let mut map = HashMap::<u32, Object>::new();
+                map.try_reserve(1).unwrap();
+                map.capacity()
+            } else {
+                let mut map = HashMap::<SharedPath, Rc<ModelPart>>::new();
+                map.try_reserve(1).unwrap();
+                map.capacity()
+            };
+            assert!(
+                (1..=32).contains(&initial_capacity),
+                "keep this a tiny fixture"
+            );
+            let mut profile = InputCollectionsTestProfile::new([100; 5]);
+            profile.fail_reserve = Some((site, 2));
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            if site == InputReserveSite::Objects {
+                assert_input_failure(
+                    parse_3mf(&input_collection_fixture(2, initial_capacity + 1)),
+                    ParserTestFailure::Allocation,
+                );
+                assert_eq!(profile.appended.borrow()[site as usize], initial_capacity);
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Parts as usize],
+                    0
+                );
+            } else {
+                let model = model_xml("millimeter", "<object id=\"1\"/>", "");
+                let names = (0..=initial_capacity)
+                    .map(|index| format!("part-{index}.model"))
+                    .collect::<Vec<_>>();
+                let entries = names
+                    .iter()
+                    .map(|name| (name.as_str(), model.as_str()))
+                    .collect::<Vec<_>>();
+                let bytes = package(&entries, false);
+                let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+                let mut pkg = Package::open(&bytes, &mut context).unwrap();
+                for path in &names[..initial_capacity] {
+                    pkg.part(path).unwrap();
+                }
+                let pending = &names[initial_capacity];
+                assert!(matches!(pkg.part(pending), Err(StlError::AllocationFailed)));
+                assert_eq!(pkg.parts.len(), initial_capacity);
+                assert!(!pkg.parts.contains_key(pending.as_str()));
+            }
+            assert_eq!(profile.reserves.borrow()[site as usize], 2);
+        }
+    }
+
+    #[test]
+    fn input_collections_output_pair_never_partially_appends_on_first_or_second_reserve() {
+        for site in [InputReserveSite::Positions, InputReserveSite::Normals] {
+            for failure in PARSER_TEST_FAILURES {
+                let mut profile = InputCollectionsTestProfile::new([100; 5]);
+                profile.stop_after_reserve = Some((site, 1, failure));
+                let profile = Rc::new(profile);
+                let _guard = InputCollectionsProfileGuard::install(profile.clone());
+                let collections = InputCollections::new(
+                    ZipResourceObserver::new(),
+                    InputCollectionsTestSession::capture(),
+                );
+                let mut out = new_out(1.0, &collections);
+                let result = out.push_triangle([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
+                assert!(out.positions.is_empty());
+                assert!(out.normals.is_empty());
+                assert_eq!(out.triangle_count, 0);
+                assert_input_failure(result.map(|()| finish_model(out)), failure);
+                // Probe lengths reflect the actual append sites, not capacity changes.
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Positions as usize],
+                    0
+                );
+                assert_eq!(
+                    profile.appended.borrow()[InputReserveSite::Normals as usize],
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_collections_prior_stop_starts_no_package_or_reserve_work() {
+        for failure in PARSER_TEST_FAILURES {
+            let observer = ZipResourceObserver::new();
+            observer.observe_io(&failure.io_error());
+            let profile = Rc::new(InputCollectionsTestProfile::new([100; 5]));
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            let mut context = PackageProcessingContext::new(observer);
+            assert_input_failure(
+                parse_3mf_with_plates_in_context(&simple_cube("millimeter", false), &mut context)
+                    .map(|model| model.model),
+                failure,
+            );
+            assert_eq!(*profile.reserves.borrow(), [0; 8]);
+            assert!(profile.packages.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn input_collections_failed_part_keeps_admissions_and_cache_hits_charge_nothing() {
+        let invalid = model_xml(
+            "millimeter",
+            "<object id=\"1\"><mesh><vertices><vertex x=\"bad\"/></vertices></mesh></object>",
+            "",
+        );
+        let valid = model_xml("millimeter", "<object id=\"1\"><mesh><vertices><vertex x=\"0\" y=\"0\" z=\"0\"/></vertices></mesh></object>", "");
+        let bytes = package(&[("bad.model", &invalid), ("good.model", &valid)], false);
+        let profile = Rc::new(InputCollectionsTestProfile::new([1, 10, 10, 10, 10]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        assert!(matches!(
+            pkg.part("bad.model"),
+            Err(StlError::Malformed3mf { .. })
+        ));
+        assert_eq!(pkg.collections.counts[0], 1);
+        assert!(pkg.parts.is_empty());
+        assert!(matches!(
+            pkg.part("good.model"),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        assert!(pkg.parts.is_empty());
+        assert_eq!(profile.packages.borrow()[0][0], 2);
+
+        let profile = Rc::new(InputCollectionsTestProfile::new([1, 10, 10, 10, 10]));
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        let first = pkg.part("good.model").unwrap();
+        let usage = pkg.context.usage();
+        let second = pkg.part("/good.model").unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(pkg.context.usage().inflation_bytes, usage.inflation_bytes);
+        assert_eq!(profile.packages.borrow()[0][0], 1);
+    }
+
+    #[test]
+    fn input_collections_local_growth_ceiling_includes_pending_and_remaining() {
+        let observer = ZipResourceObserver::new();
+        let mut collections = InputCollections::new(observer.clone(), None);
+        collections.limits[InputKind::Vertex as usize] = 3;
+        let mut vertices = Vec::<[f32; 3]>::new();
+        for _ in 0..3 {
+            collections.admit(InputKind::Vertex).unwrap();
+            let ceiling = collections
+                .ceiling(InputKind::Vertex, vertices.len() + 1)
+                .unwrap();
+            assert_eq!(ceiling, 3);
+            reserve_input_vec(
+                &mut vertices,
+                1,
+                ceiling,
+                &observer,
+                InputReserveSite::Vertices,
+                None,
+            )
+            .unwrap();
+            vertices.push([0.0; 3]);
+        }
+        assert_eq!(vertices.len(), 3);
+        assert!(matches!(
+            collections.admit(InputKind::Vertex),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+    }
 
     /// Axis-aligned 10 mm cube with outward-consistent winding, as a 3MF mesh.
     fn cube_mesh_xml(id: u32) -> String {
@@ -1830,6 +3720,246 @@ mod tests {
         format!(
             r#"<plate><metadata key="plater_id" value="{id}"/><metadata key="plater_name" value="{name}"/>{instances}</plate>"#
         )
+    }
+
+    // Seven stored objects/twelve edges, but 127 visits when expanded. Keep
+    // this small; never exercise a depth-32 exponential fixture.
+    fn shared_binary_dag(depth: u32, geometry: bool) -> String {
+        let mut resources = String::new();
+        for id in 1..=depth {
+            let child = id + 1;
+            resources.push_str(&format!(
+                r#"<object id="{id}" type="model"><components><component objectid="{child}"/><component objectid="{child}"/></components></object>"#
+            ));
+        }
+        let leaf = depth + 1;
+        if geometry {
+            resources.push_str(&cube_mesh_xml(leaf));
+        } else {
+            resources.push_str(&format!(
+                r#"<object id="{leaf}" type="model"><mesh><vertices/><triangles/></mesh></object>"#
+            ));
+        }
+        resources
+    }
+
+    fn assert_visit_stop(result: Result<ParsedModel, StlError>) {
+        assert!(matches!(
+            result,
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+    }
+
+    #[test]
+    fn component_visit_budget_bounds_empty_dag_whole_build_and_plate_emission() {
+        let root = model_xml(
+            "millimeter",
+            &shared_binary_dag(6, false),
+            r#"<item objectid="1"/>"#,
+        );
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let parsed = parse_3mf_with_component_visit_limit(&bytes, 130).unwrap();
+        assert!(!parsed.plate_metadata);
+        assert_eq!(parsed.model.triangle_count, 0);
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 64));
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 129));
+
+        let settings = plate_settings(&plate_xml(1, "Assigned", &[(1, 0)]));
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &root),
+                (MODEL_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        assert!(
+            parse_3mf_with_component_visit_limit(&bytes, 130)
+                .unwrap()
+                .plate_metadata
+        );
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 64));
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 129));
+    }
+
+    #[test]
+    fn component_visit_budget_membership_stop_is_terminal_not_plate_fallback() {
+        let root = model_xml(
+            "millimeter",
+            &shared_binary_dag(6, false),
+            r#"<item objectid="1"/>"#,
+        );
+        let settings = plate_settings(&plate_xml(1, "Empty", &[]));
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &root),
+                (MODEL_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        let parsed = parse_3mf_with_component_visit_limit(&bytes, 130).unwrap();
+        assert!(parsed.plate_metadata);
+        assert_eq!(parsed.model.triangle_count, 0);
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 64));
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 129));
+    }
+
+    #[test]
+    fn component_visit_budget_is_shared_across_parts_build_items_and_plates() {
+        let child = model_xml("millimeter", &shared_binary_dag(4, false), "");
+        let item = r#"<item p:path="/3D/Objects/child.model" objectid="1"/>"#;
+        let single = model_xml("millimeter", "", item);
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &single),
+                ("3D/Objects/child.model", &child),
+            ],
+            false,
+        );
+        parse_3mf_with_component_visit_limit(&bytes, 32).unwrap();
+        let root = model_xml("millimeter", "", &item.repeat(2));
+        let settings = plate_settings(&format!(
+            "{}{}",
+            plate_xml(1, "First", &[(1, 0)]),
+            plate_xml(2, "Second", &[(1, 1)])
+        ));
+        for with_plates in [false, true] {
+            let mut entries = vec![
+                ("3D/3dmodel.model", root.as_str()),
+                ("3D/Objects/child.model", child.as_str()),
+            ];
+            if with_plates {
+                entries.push((MODEL_SETTINGS_PATH, settings.as_str()));
+            }
+            let bytes = package(&entries, false);
+            let parsed = parse_3mf_with_component_visit_limit(&bytes, 64).unwrap();
+            assert_eq!(parsed.plate_metadata, with_plates);
+            assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 50));
+            assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 63));
+        }
+    }
+
+    #[test]
+    fn component_visit_budget_is_not_reset_between_membership_and_fallback() {
+        let root = model_xml(
+            "millimeter",
+            &shared_binary_dag(6, true),
+            r#"<item objectid="1"/>"#,
+        );
+        let settings = plate_settings(&plate_xml(1, "Unassigned", &[]));
+        let bytes = package(
+            &[
+                ("3D/3dmodel.model", &root),
+                (MODEL_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        // Diagnostics charge three units; membership visits seven; fallback emits 127.
+        let parsed = parse_3mf_with_component_visit_limit(&bytes, 137).unwrap();
+        assert!(!parsed.plate_metadata);
+        assert_eq!(parsed.model.triangle_count, 64 * 12);
+        assert_eq!(
+            parsed.plate_warning.as_deref(),
+            Some("Plate metadata is unusable (plate metadata does not assign every printable build item); showing the whole build.")
+        );
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 136));
+    }
+
+    #[test]
+    fn component_visit_budget_bounds_repeated_diagnostic_component_edges() {
+        let components = r#"<component objectid="2"/>"#.repeat(4);
+        let resources = format!(
+            r#"<object id="1" type="model"><components>{components}</components></object><object id="2" type="model"><mesh><vertices/><triangles/></mesh></object>"#
+        );
+        let root = model_xml(
+            "millimeter",
+            &resources,
+            &r#"<item objectid="1"/>"#.repeat(4),
+        );
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        let root = pkg.part("3D/3dmodel.model").unwrap();
+        // Four build roots plus sixteen diagnostic edge iterations. Repeated
+        // paths still cost work even though the resulting set contains one path.
+        pkg.component_visits_remaining = 19;
+        assert!(matches!(
+            component_part_metadata_paths(&mut pkg, &root, "3D/3dmodel.model"),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        pkg.component_visits_remaining = 20;
+        let paths = component_part_metadata_paths(&mut pkg, &root, "3D/3dmodel.model").unwrap();
+        assert_eq!(paths[&2].len(), 1);
+        assert_eq!(pkg.component_visits_remaining, 0);
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 19));
+        // The same budget must also fund four five-visit emissions afterward.
+        parse_3mf_with_component_visit_limit(&bytes, 40).unwrap();
+        assert_visit_stop(parse_3mf_with_component_visit_limit(&bytes, 39));
+    }
+
+    #[test]
+    fn component_visit_budget_direct_walk_exact_boundary_is_127() {
+        let root = model_xml("millimeter", &shared_binary_dag(6, false), "");
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        pkg.component_visits_remaining = 127;
+        assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());
+        assert_eq!(pkg.component_visits_remaining, 0);
+        pkg.component_visits_remaining = 126;
+        assert!(matches!(
+            object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        pkg.component_visits_remaining = 127;
+        emit_object(
+            &mut pkg,
+            "3D/3dmodel.model",
+            1,
+            &IDENTITY,
+            0,
+            &mut new_out(
+                1.0,
+                &InputCollections::new(ZipResourceObserver::new(), None),
+            ),
+            &mut StandardAppearance::Empty,
+        )
+        .unwrap();
+        assert_eq!(pkg.component_visits_remaining, 0);
+    }
+
+    #[test]
+    fn component_visit_budget_debits_before_lookup_and_counts_cached_empty_objects() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="1" type="support"><mesh><vertices/><triangles/></mesh></object>"#,
+            "",
+        );
+        let bytes = package(&[("3D/3dmodel.model", &root)], false);
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        pkg.part("3D/3dmodel.model").unwrap();
+        pkg.component_visits_remaining = 1;
+        assert!(!object_has_geometry(&mut pkg, "3D/3dmodel.model", 1, 0).unwrap());
+        assert_eq!(pkg.component_visits_remaining, 0);
+        assert!(matches!(
+            object_has_geometry(&mut pkg, "missing.model", 999, 0),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
+        assert!(matches!(
+            emit_object(
+                &mut pkg,
+                "missing.model",
+                999,
+                &IDENTITY,
+                0,
+                &mut new_out(
+                    1.0,
+                    &InputCollections::new(ZipResourceObserver::new(), None)
+                ),
+                &mut StandardAppearance::Empty,
+            ),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        ));
     }
 
     fn cube_mesh_with_object_attrs_xml(id: u32, attrs: &str) -> String {
@@ -2588,6 +4718,419 @@ mod tests {
         assert!(parsed.embedded_filaments.is_empty());
     }
 
+    struct DerivedMapsProfileGuard(Option<Rc<DerivedMapsTestProfile>>);
+
+    impl DerivedMapsProfileGuard {
+        fn install(profile: Rc<DerivedMapsTestProfile>) -> Self {
+            Self(DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for DerivedMapsProfileGuard {
+        fn drop(&mut self) {
+            DERIVED_MAPS_TEST_PROFILE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    #[test]
+    fn derived_maps_assignment_retention_never_exceeds_physical_build_membership() {
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(10, "Duplicates", &[(1, 0), (1, 1), (1, 0)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        let profile = Rc::new(DerivedMapsTestProfile::default());
+        let _guard = DerivedMapsProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&bytes).unwrap();
+        assert_eq!(parsed.model.triangle_count, 2);
+        assert_eq!(parsed.model.positions.len(), 18);
+        assert_eq!(parsed.parts.len(), 2);
+        assert!(parsed.part_warning.is_none());
+        assert!(!parsed.plate_metadata);
+        assert_eq!(parsed.plates.len(), 1);
+        assert_eq!(parsed.plates[0].triangle_count, 2);
+        assert_eq!(parsed.plate_warning.as_deref(), Some("Plate metadata is unusable (object 1 instance 0 is assigned more than once); showing the whole build."));
+        assert_eq!(
+            profile.plate_parser_entries.get(),
+            1,
+            "reached actual plate parser"
+        );
+        assert!(
+            profile.assignment_high_water.get() <= 2,
+            "retained {} assignments for only2 physical build members",
+            profile.assignment_high_water.get()
+        );
+    }
+
+    #[test]
+    fn derived_maps_diagnostic_paths_copy_each_normalized_pair_only_once() {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="/3D/child.model"/><component objectid="2" path="3D/child.model"/></components></object>"#,
+            &r#"<item objectid="10"/>"#.repeat(2),
+        );
+        let child = model_xml(
+            "millimeter",
+            &part_retention_triangle().replacen("id=\"1\"", "id=\"2\"", 1),
+            "",
+        );
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        );
+        let profile = Rc::new(DerivedMapsTestProfile::default());
+        let _guard = DerivedMapsProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&bytes).unwrap();
+        assert_eq!(parsed.model.triangle_count, 4);
+        assert_eq!(parsed.model.positions.len(), 36);
+        assert_eq!(parsed.parts.len(), 4);
+        assert!(parsed
+            .parts
+            .iter()
+            .all(|part| part.name == "triangle" && part.triangle_count == 1));
+        assert!(parsed.part_warning.is_none());
+        assert_eq!(
+            parsed.plate_warning.as_deref(),
+            Some(NO_PLATE_METADATA_WARNING)
+        );
+        assert_eq!(profile.diagnostic_unique_pairs.get(), 1);
+        assert!(
+            profile.diagnostic_path_copies.get() <= profile.diagnostic_unique_pairs.get(),
+            "copied {} paths for {} unique normalized pairs",
+            profile.diagnostic_path_copies.get(),
+            profile.diagnostic_unique_pairs.get()
+        );
+    }
+
+    struct PartRetentionProfileGuard(Option<Rc<PartRetentionTestProfile>>);
+
+    impl PartRetentionProfileGuard {
+        fn install(profile: Rc<PartRetentionTestProfile>) -> Self {
+            Self(PART_RETENTION_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for PartRetentionProfileGuard {
+        fn drop(&mut self) {
+            PART_RETENTION_TEST_PROFILE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    fn tiny_part_retention_fixture(assigned: bool) -> Vec<u8> {
+        let resources = r#"<object id="1" name="triangle"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>"#;
+        let model = model_xml(
+            "millimeter",
+            resources,
+            &r#"<item objectid="1"/>"#.repeat(3),
+        );
+        let settings = plate_settings(&format!(
+            "{}{}",
+            plate_xml(10, "First", &[(1, 0), (1, 2)]),
+            plate_xml(20, "Second", &[(1, 1)])
+        ));
+        let mut entries = vec![(ROOT_MODEL_FALLBACK, model.as_str())];
+        if assigned {
+            entries.push((PLATE_SETTINGS_PATH, settings.as_str()));
+        }
+        package(&entries, assigned)
+    }
+
+    fn assert_part_retention_high_water(assigned: bool) {
+        let profile = Rc::new(PartRetentionTestProfile::new(2));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let parsed =
+            crate::parse_model_with_plates(&tiny_part_retention_fixture(assigned)).unwrap();
+        assert_eq!(parsed.model.triangle_count, 3);
+        assert_eq!(parsed.model.positions.len(), 27);
+        assert!(parsed.parts.is_empty());
+        assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+        assert_eq!(parsed.plate_metadata, assigned);
+        if assigned {
+            assert!(parsed.plate_warning.is_none());
+            assert_eq!(
+                parsed
+                    .plates
+                    .iter()
+                    .map(|plate| (
+                        plate.name.as_str(),
+                        plate.triangle_start,
+                        plate.triangle_count
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![("First", 0, 2), ("Second", 2, 1)]
+            );
+        } else {
+            assert!(parsed.plate_warning.is_some());
+            assert_eq!(parsed.plates.len(), 1);
+            assert_eq!(parsed.plates[0].triangle_count, 3);
+        }
+        // Observe the actual retained-row high-water, not the already-cleared
+        // final output. Geometry/warning compatibility was asserted above.
+        assert!(
+            profile.high_water.get() <= profile.limit,
+            "actual retained high-water {} exceeds {} (name builders {})",
+            profile.high_water.get(),
+            profile.limit,
+            profile.name_builders.get()
+        );
+        assert_eq!(
+            profile.name_builders.get(),
+            2,
+            "third optional name must never be built"
+        );
+        assert_eq!(profile.id_builders.get(), 2);
+        assert!(!profile.requested_capacity.borrow().is_empty());
+        assert!(profile
+            .requested_capacity
+            .borrow()
+            .iter()
+            .all(|&target| target <= profile.limit));
+    }
+
+    #[test]
+    fn part_retention_whole_build_never_retains_third_optional_boundary() {
+        assert_part_retention_high_water(false);
+    }
+
+    #[test]
+    fn part_retention_assigned_plates_share_one_bounded_accumulator() {
+        assert_part_retention_high_water(true);
+    }
+
+    fn part_retention_triangle() -> &'static str {
+        r#"<object id="1" name="triangle"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>"#
+    }
+
+    fn part_retention_fixture_with_build(resources: &str, build: &str) -> Vec<u8> {
+        let model = model_xml("millimeter", resources, build);
+        package(&[(ROOT_MODEL_FALLBACK, &model)], false)
+    }
+
+    #[test]
+    fn part_retention_exact_capacity_empty_disabled_unprinted_do_not_omit() {
+        for later_overflow in [false, true] {
+            let resources = format!(
+                "{}<object id=\"2\"/>{}",
+                part_retention_triangle(),
+                part_retention_triangle().replace("id=\"1\"", "id=\"3\" type=\"support\"")
+            );
+            let mut build = format!(
+                "{}{}",
+                r#"<item objectid="1"/>"#.repeat(2),
+                r#"<item objectid="2"/><item objectid="1" printable="0"/><item objectid="3"/>"#
+            );
+            if later_overflow {
+                build.push_str(r#"<item objectid="1"/><item objectid="2"/><item objectid="1"/>"#);
+            }
+            let profile = Rc::new(PartRetentionTestProfile::new(2));
+            let _guard = PartRetentionProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+                &resources, &build,
+            ))
+            .unwrap();
+            assert_eq!(
+                parsed.model.triangle_count,
+                if later_overflow { 4 } else { 2 }
+            );
+            assert_eq!(profile.high_water.get(), 2);
+            assert_eq!(profile.name_builders.get(), 2);
+            assert_eq!(profile.id_builders.get(), 2);
+            if later_overflow {
+                assert!(parsed.parts.is_empty());
+                assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+            } else {
+                assert_eq!(parsed.parts.len(), 2);
+                assert!(parsed.part_warning.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn part_retention_component_boundaries_use_the_same_nonempty_admission() {
+        let resources = format!("{}<object id=\"2\"/><object id=\"3\"><components><component objectid=\"1\"/><component objectid=\"1\"/><component objectid=\"2\"/><component objectid=\"1\"/></components></object>", part_retention_triangle());
+        let profile = Rc::new(PartRetentionTestProfile::new(2));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+            &resources,
+            r#"<item objectid="3"/>"#,
+        ))
+        .unwrap();
+        assert_eq!(parsed.model.triangle_count, 3);
+        assert!(parsed.parts.is_empty());
+        assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+        assert_eq!(profile.high_water.get(), 2);
+        assert_eq!(
+            profile.name_builders.get(),
+            2,
+            "empty child and overflow do not build names"
+        );
+        assert_eq!(profile.id_builders.get(), 2);
+    }
+
+    #[test]
+    fn part_retention_capacity_and_omission_suppress_uniform_appearance_copies() {
+        let resources = format!(
+            "{}{}",
+            r##"<basematerials id="5"><base name="Red" displaycolor="#ff0000"/></basematerials>"##,
+            part_retention_triangle().replacen(
+                "<object id=\"1\"",
+                "<object id=\"1\" pid=\"5\" pindex=\"0\"",
+                1
+            )
+        );
+        let profile = Rc::new(PartRetentionTestProfile::new(2));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+            &resources,
+            &r#"<item objectid="1"/>"#.repeat(5),
+        ))
+        .unwrap();
+        assert_eq!(parsed.model.triangle_count, 5);
+        assert_eq!(
+            parsed.materials.len(),
+            1,
+            "global material behavior stays intact"
+        );
+        assert!(parsed.parts.is_empty());
+        assert_eq!(parsed.part_warning.as_deref(), Some(PART_WARNING));
+        assert_eq!(
+            profile.appearance_copies.get(),
+            2,
+            "only below-cap in-flight Uniform scratch remains"
+        );
+        assert_eq!(profile.name_builders.get(), 2);
+        assert_eq!(profile.id_builders.get(), 2);
+    }
+
+    #[test]
+    fn part_retention_row_reserve_failures_are_terminal_before_record_building() {
+        for assigned in [false, true] {
+            for attempt in [1, 2] {
+                let mut profile = PartRetentionTestProfile::new(2);
+                profile.fail_reserve_at = Some(attempt);
+                let profile = Rc::new(profile);
+                let _guard = PartRetentionProfileGuard::install(profile.clone());
+                assert_input_failure(
+                    parse_3mf(&tiny_part_retention_fixture(assigned)),
+                    ParserTestFailure::Allocation,
+                );
+                assert_eq!(profile.reserves.get(), attempt);
+                assert_eq!(profile.high_water.get(), attempt - 1);
+                assert_eq!(profile.name_builders.get(), attempt - 1);
+                assert_eq!(profile.id_builders.get(), attempt - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn part_retention_post_reserve_first_cause_is_not_optional_fallback() {
+        for assigned in [false, true] {
+            for attempt in [1, 2] {
+                for failure in PARSER_TEST_FAILURES {
+                    let mut profile = PartRetentionTestProfile::new(2);
+                    profile.stop_after_reserve = Some((attempt, failure));
+                    let profile = Rc::new(profile);
+                    let _guard = PartRetentionProfileGuard::install(profile.clone());
+                    assert_input_failure(
+                        parse_3mf(&tiny_part_retention_fixture(assigned)),
+                        failure,
+                    );
+                    assert_eq!(profile.reserves.get(), attempt);
+                    assert_eq!(profile.high_water.get(), attempt - 1);
+                    assert_eq!(profile.name_builders.get(), attempt - 1);
+                    assert_eq!(profile.id_builders.get(), attempt - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn part_retention_omitted_metadata_never_hides_later_geometry_errors() {
+        for nonfinite in [false, true] {
+            let resources = if nonfinite {
+                format!(
+                    "{}{}",
+                    part_retention_triangle(),
+                    part_retention_triangle()
+                        .replacen("id=\"1\"", "id=\"4\"", 1)
+                        .replacen("x=\"0\"", "x=\"NaN\"", 1)
+                )
+            } else {
+                part_retention_triangle().to_owned()
+            };
+            let build = format!(
+                "{}<item objectid=\"{}\"/>",
+                r#"<item objectid="1"/>"#.repeat(3),
+                if nonfinite { 4 } else { 999 }
+            );
+            let profile = Rc::new(PartRetentionTestProfile::new(2));
+            let _guard = PartRetentionProfileGuard::install(profile.clone());
+            let result = crate::parse_model_with_plates(&part_retention_fixture_with_build(
+                &resources, &build,
+            ));
+            if nonfinite {
+                assert!(matches!(
+                    result,
+                    Err(StlError::NonFiniteCoordinate { triangle_index: 3 })
+                ));
+            } else {
+                assert!(matches!(result, Err(StlError::Malformed3mf { .. })));
+            }
+            assert_eq!(profile.high_water.get(), 2);
+            assert_eq!(profile.name_builders.get(), 2);
+            assert_eq!(profile.id_builders.get(), 2);
+        }
+    }
+
+    #[test]
+    fn part_retention_omitted_state_still_obeys_existing_flattened_triangle_limit() {
+        let bytes =
+            part_retention_fixture_with_build(part_retention_triangle(), r#"<item objectid="1"/>"#);
+        let profile = Rc::new(PartRetentionTestProfile::new(0));
+        let _guard = PartRetentionProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        let root = pkg.part(ROOT_MODEL_FALLBACK).unwrap();
+        let mut rows = PartOutput::new(&pkg);
+        let mut out = new_out(1.0, &pkg.collections);
+        let slicer = SlicerMetadata::default();
+        let paths = HashMap::new();
+        emit_build_item(
+            &mut pkg,
+            ROOT_MODEL_FALLBACK,
+            &root.build[0],
+            0,
+            &slicer,
+            &paths,
+            &mut out,
+            &mut rows,
+        )
+        .unwrap();
+        assert!(matches!(rows.rows, PartRows::Omitted));
+        out.triangle_count = MAX_TRIANGLES; // tiny seam into existing output check
+        let error = emit_build_item(
+            &mut pkg,
+            ROOT_MODEL_FALLBACK,
+            &root.build[0],
+            1,
+            &slicer,
+            &paths,
+            &mut out,
+            &mut rows,
+        );
+        assert!(
+            matches!(error, Err(StlError::TooManyTriangles { count, limit }) if count == MAX_TRIANGLES + 1 && limit == MAX_TRIANGLES)
+        );
+        assert_eq!(profile.name_builders.get(), 0);
+        assert_eq!(profile.id_builders.get(), 0);
+    }
+
     #[test]
     fn excessive_structural_boundaries_clear_parts_with_exact_warning() {
         let build = (0..=MAX_VIEWER_PARTS)
@@ -2877,5 +5420,2466 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(4), Some(5)]
         );
+    }
+    fn guard_probe(observer: ZipResourceObserver) -> (Rc<ParserTestProbe>, ParserProbeGuard) {
+        let probe = Rc::new(ParserTestProbe {
+            member: "never-inject-a-source-fault",
+            failure: ParserTestFailure::Stop(ResourceStop::EnvelopeChanged),
+            state: std::cell::RefCell::new(ParserTestState::default()),
+            guard_observer: Some(observer),
+        });
+        let guard = ParserProbeGuard::install(probe.clone());
+        (probe, guard)
+    }
+
+    #[test]
+    fn guarded_core_public_settings_xml_stop_preserves_cached_root_without_fallback() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = format!(
+            "<config><metadata key='unused' value='{}'/></config>",
+            "x".repeat(4097)
+        );
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, &settings),
+                ],
+                deflate,
+            );
+            for aggregate in [false, true] {
+                let (probe, _guard) = guard_probe(ZipResourceObserver::new());
+                let result = if aggregate {
+                    crate::parse_model(&bytes).map(|_| ())
+                } else {
+                    crate::parse_model_with_plates(&bytes).map(|_| ())
+                };
+                assert_eq!(
+                    result,
+                    Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+                );
+                let state = probe.state.borrow();
+                assert!(state.root_cached);
+                assert_eq!(
+                    state.total_work, 0,
+                    "must not call cached whole-build fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_core_context_actual_inflation_and_retained_text_are_not_double_debited() {
+        use crate::package_bounds::PackageTestLimits;
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = "<config/>";
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    ("_rels/.rels", RELS),
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            );
+            let observer = ZipResourceObserver::new();
+            let (probe, _guard) = guard_probe(observer.clone());
+            let mut context = PackageProcessingContext::with_test_limits(
+                observer.clone(),
+                PackageTestLimits {
+                    inflation: (RELS.len() + root.len() + settings.len()) as u64,
+                    text_total: RELS.len() + settings.len(),
+                    ..Default::default()
+                },
+            );
+            let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert!(!parsed.plate_metadata);
+            assert!(observer.check().is_ok());
+            // A new parse really reinflates, so the same context is exhausted.
+            assert_eq!(
+                crate::parse_model_in_context(&bytes, &mut context),
+                Err(StlError::ResourceStopped(ResourceStop::ReadWorkExceeded))
+            );
+            assert_eq!(probe.state.borrow().after_io, 0);
+        }
+    }
+
+    #[test]
+    fn guarded_core_context_actual_model_part_and_last_text_limits_are_terminal() {
+        use crate::package_bounds::PackageTestLimits;
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = "<config/>";
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &root),
+                (MODEL_SETTINGS_PATH, settings),
+            ],
+            true,
+        );
+        for (limits, cached) in [
+            (
+                PackageTestLimits {
+                    model: root.len() as u64 - 1,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                PackageTestLimits {
+                    model_settings: settings.len() - 1,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                PackageTestLimits {
+                    text_total: settings.len() - 1,
+                    ..Default::default()
+                },
+                true,
+            ),
+        ] {
+            let observer = ZipResourceObserver::new();
+            let (probe, _guard) = guard_probe(observer.clone());
+            let mut context = PackageProcessingContext::with_test_limits(observer, limits);
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+            );
+            let state = probe.state.borrow();
+            assert_eq!(state.root_cached, cached);
+            assert_eq!(state.total_work, 0);
+            assert_eq!(state.after_io, 0);
+            assert_eq!(state.work_after_stop, 0);
+        }
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::with_test_limits(
+            observer,
+            PackageTestLimits {
+                model: root.len() as u64,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::parse_model_in_context(&bytes, &mut context)
+                .unwrap()
+                .triangle_count,
+            12
+        );
+    }
+
+    #[test]
+    fn guarded_core_relationship_xml_limit_never_becomes_conventional_root_fallback() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let rels = format!(
+            "<Relationships><Unknown ignored='{}'/></Relationships>",
+            "x".repeat(4097)
+        );
+        let bytes = package(
+            &[("_rels/.rels", &rels), (ROOT_MODEL_FALLBACK, &root)],
+            false,
+        );
+        let observer = ZipResourceObserver::new();
+        let (probe, _guard) = guard_probe(observer.clone());
+        let mut context = PackageProcessingContext::new(observer);
+        assert_eq!(
+            crate::parse_model_with_plates_in_context(&bytes, &mut context),
+            Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+        );
+        let state = probe.state.borrow();
+        assert!(!state.root_cached);
+        assert_eq!(state.total_work, 0);
+        assert_eq!(state.after_io, 0);
+    }
+
+    #[test]
+    fn guarded_core_retained_reserve_failure_is_terminal_not_optional_metadata() {
+        use crate::package_bounds::PackageTestLimits;
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &root),
+                (MODEL_SETTINGS_PATH, "<config/>"),
+            ],
+            false,
+        );
+        let observer = ZipResourceObserver::new();
+        let (probe, _guard) = guard_probe(observer.clone());
+        let mut context = PackageProcessingContext::with_test_limits(
+            observer,
+            PackageTestLimits {
+                fail_reserve: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::parse_model_with_plates_in_context(&bytes, &mut context),
+            Err(StlError::AllocationFailed)
+        );
+        let state = probe.state.borrow();
+        assert!(state.root_cached);
+        assert_eq!(state.total_work, 0);
+        assert_eq!(state.after_io, 0);
+    }
+    #[test]
+    fn guarded_core_declared_optional_project_oversize_stays_a_no_read_skip() {
+        let bytes = package(&[(PROJECT_SETTINGS_PATH, "{}")], false);
+        let probe = Rc::new(ParserTestProbe {
+            member: PROJECT_SETTINGS_PATH,
+            failure: ParserTestFailure::Stop(ResourceStop::EnvelopeChanged),
+            state: std::cell::RefCell::new(ParserTestState::default()),
+            guard_observer: None,
+        });
+        let _guard = ParserProbeGuard::install(probe.clone());
+        let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+        let mut pkg = Package::open(&bytes, &mut context).unwrap();
+        assert_eq!(
+            pkg.optional_bounded_text(PROJECT_SETTINGS_PATH, 1).unwrap(),
+            None
+        );
+        assert!(!probe.state.borrow().armed);
+        assert!(!probe.state.borrow().fired);
+    }
+    struct ProjectAuxProbeGuard(Option<Rc<std::cell::Cell<usize>>>);
+    impl ProjectAuxProbeGuard {
+        fn install() -> (Self, Rc<std::cell::Cell<usize>>) {
+            let probe = Rc::new(std::cell::Cell::new(0));
+            let previous =
+                PROJECT_AUX_NORMALIZATION_PROBE.with(|slot| slot.replace(Some(probe.clone())));
+            (Self(previous), probe)
+        }
+    }
+    impl Drop for ProjectAuxProbeGuard {
+        fn drop(&mut self) {
+            PROJECT_AUX_NORMALIZATION_PROBE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    #[test]
+    fn project_json_auxiliary_retention_stops_at_selected_256_position_prefix() {
+        let array = |label: &str| {
+            std::iter::repeat_n(format!("\"{label}\""), 257)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let text = format!(
+            r##"{{"filament_colour":["#123456"],"filament_settings_id":[{}],"filament_type":[{}],"filament_vendor":[{}]}}"##,
+            array(" Basic "),
+            array(" PLA "),
+            array(" Acme ")
+        );
+        let (_guard, probe) = ProjectAuxProbeGuard::install();
+        let parsed = parse_project_filaments(&text).unwrap();
+        // Preserve actual output while separately measuring the unwanted copy
+        // work. Output-only checks already passed before this correction.
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].slot, 1);
+        assert_eq!(parsed[0].color, "#123456");
+        assert_eq!(parsed[0].name.as_deref(), Some("Acme Basic"));
+        assert_eq!(parsed[0].material.as_deref(), Some("PLA"));
+        let normalized = probe.get();
+        assert!(
+            normalized >= 3,
+            "probe must observe actual auxiliary normalization"
+        );
+        assert!(normalized <= 3*MAX_EMBEDDED_FILAMENTS,
+            "only selected positional prefixes may be retained: normalized {normalized} labels, allowed {}", 3*MAX_EMBEDDED_FILAMENTS);
+    }
+    #[test]
+    fn derived_maps_reserve_failures_are_source_terminal_not_metadata_fallback() {
+        use derived_maps::ReserveSite;
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(1, "Complete", &[(1, 0), (1, 1)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            true,
+        );
+        for site in [
+            ReserveSite::Counts,
+            ReserveSite::Occurrences,
+            ReserveSite::Items,
+            ReserveSite::Claimed,
+            ReserveSite::Plates,
+            ReserveSite::Indices,
+            ReserveSite::OutputPlates,
+        ] {
+            let profile = Rc::new(DerivedMapsTestProfile::default());
+            profile.fail_site.set(Some(site));
+            let _guard = DerivedMapsProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(StlError::AllocationFailed)
+            );
+            assert!(matches!(
+                observer.check(),
+                Err(ZipOpenError::AllocationFailed)
+            ));
+            assert!(
+                profile.fail_site.get().is_none(),
+                "actual target reserve was reached"
+            );
+            assert_eq!(profile.fallback_entries.get(), 0);
+            assert!(profile.reserves.get() > 0);
+        }
+    }
+
+    #[test]
+    fn derived_maps_post_reserve_stops_preserve_first_cause_in_public_parser() {
+        use derived_maps::ReserveSite;
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(1, "Complete", &[(1, 0), (1, 1)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        for site in [
+            ReserveSite::Counts,
+            ReserveSite::Occurrences,
+            ReserveSite::Items,
+            ReserveSite::Claimed,
+            ReserveSite::Plates,
+            ReserveSite::Indices,
+            ReserveSite::OutputPlates,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let profile = Rc::new(DerivedMapsTestProfile::default());
+                profile.stop_site.set(Some((site, failure)));
+                let _guard = DerivedMapsProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(failure.error())
+                );
+                assert!(
+                    profile.stop_site.get().is_none(),
+                    "actual successful target reserve was reached"
+                );
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+                assert_eq!(profile.fallback_entries.get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn derived_maps_actual_plate_invalidity_observes_later_terminal_event_without_fallback() {
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            &r#"<item objectid="1"/>"#.repeat(2),
+        );
+        let settings = plate_settings(&plate_xml(1, "Duplicate", &[(1, 0), (1, 0)]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            true,
+        );
+        for failure in PARSER_TEST_FAILURES {
+            let profile = Rc::new(DerivedMapsTestProfile::default());
+            profile.after_invalid.set(Some(failure));
+            let _guard = DerivedMapsProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(failure.error())
+            );
+            assert_eq!(profile.plate_parser_entries.get(), 1);
+            assert_eq!(profile.membership_invalid.get(), 1);
+            assert_eq!(profile.invalid_tail_events.get(), 1);
+            assert!(profile.after_invalid.get().is_none());
+            assert_eq!(profile.fallback_entries.get(), 0);
+            assert_eq!(
+                StlError::from(observer.check().unwrap_err()),
+                failure.error()
+            );
+        }
+    }
+
+    #[test]
+    fn derived_maps_diagnostic_allocation_boundaries_are_terminal() {
+        use derived_maps::ReserveSite;
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="/3D/child.model"/></components></object>"#,
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &part_retention_triangle().replacen("id=\"1\"", "id=\"2\"", 1),
+            "",
+        );
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            false,
+        );
+        for site in [
+            ReserveSite::DiagnosticMap,
+            ReserveSite::DiagnosticSet,
+            ReserveSite::Path,
+        ] {
+            let profile = Rc::new(DerivedMapsTestProfile::default());
+            profile.fail_site.set(Some(site));
+            let _guard = DerivedMapsProfileGuard::install(profile.clone());
+            assert_eq!(
+                crate::parse_model_with_plates(&bytes),
+                Err(StlError::AllocationFailed)
+            );
+            assert!(profile.fail_site.get().is_none());
+            assert_eq!(profile.diagnostic_path_copies.get(), 0);
+            assert_eq!(profile.fallback_entries.get(), 0);
+        }
+    }
+    #[test]
+    fn derived_maps_immediate_structural_error_does_not_scan_to_later_terminal_hook() {
+        let model = model_xml(
+            "millimeter",
+            part_retention_triangle(),
+            r#"<item objectid="1"/>"#,
+        );
+        let settings = plate_settings(&format!(
+            "{}<plate><plate></plate></plate>",
+            plate_xml(1, "Unknown", &[(1, 99)])
+        ));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &model),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            false,
+        );
+        let profile = Rc::new(DerivedMapsTestProfile::default());
+        profile.after_invalid.set(Some(ParserTestFailure::Stop(
+            ResourceStop::ReadWorkExceeded,
+        )));
+        // End first plate, Start second plate, nested Start are the three old
+        // observed events. The armed fourth event must never be requested.
+        profile.invalid_stop_at.set(4);
+        let _guard = DerivedMapsProfileGuard::install(profile.clone());
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+        assert_eq!(
+            parsed.plate_warning.as_deref(),
+            Some("Plate metadata is unusable (nested plate metadata); showing the whole build.")
+        );
+        assert_eq!(profile.plate_parser_entries.get(), 1);
+        assert_eq!(profile.membership_invalid.get(), 1);
+        assert_eq!(profile.invalid_tail_events.get(), 3);
+        assert!(profile.after_invalid.get().is_some());
+        assert!(observer.check().is_ok());
+        assert_eq!(profile.fallback_entries.get(), 1);
+        assert_eq!(parsed.model.triangle_count, 1);
+    }
+
+    #[test]
+    fn derived_maps_diagnostic_post_reserve_stops_prevent_path_copy() {
+        use derived_maps::ReserveSite;
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="/3D/child.model"/></components></object>"#,
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &part_retention_triangle().replacen("id=\"1\"", "id=\"2\"", 1),
+            "",
+        );
+        let bytes = package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        );
+        for site in [
+            ReserveSite::DiagnosticMap,
+            ReserveSite::DiagnosticSet,
+            ReserveSite::Path,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let profile = Rc::new(DerivedMapsTestProfile::default());
+                profile.stop_site.set(Some((site, failure)));
+                let _guard = DerivedMapsProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(failure.error())
+                );
+                assert!(profile.stop_site.get().is_none());
+                assert_eq!(profile.diagnostic_path_copies.get(), 0);
+                assert_eq!(profile.fallback_entries.get(), 0);
+            }
+        }
+    }
+    struct SidecarProfileGuard(Option<Rc<SidecarTestProfile>>);
+    impl SidecarProfileGuard {
+        fn install(profile: Rc<SidecarTestProfile>) -> Self {
+            Self(SIDECAR_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for SidecarProfileGuard {
+        fn drop(&mut self) {
+            drop(SIDECAR_TEST_PROFILE.with(|slot| slot.replace(self.0.take())));
+        }
+    }
+    fn sidecar_late_guard_settings() -> String {
+        format!("<config><metadata key='unknown' broken=bad value='ignored'/><unused value='{}'/></config>", "x".repeat(4097))
+    }
+    #[test]
+    fn sidecar_baseline_project_source_stop_precedes_late_fixed_xml_guard() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = sidecar_late_guard_settings();
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, &settings),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            for failure in PARSER_TEST_FAILURES {
+                let profile = Rc::new(SidecarTestProfile::default());
+                let _sidecar = SidecarProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let probe = Rc::new(ParserTestProbe {
+                    member: PROJECT_SETTINGS_PATH,
+                    failure,
+                    state: Default::default(),
+                    guard_observer: Some(observer.clone()),
+                });
+                let _parser = ParserProbeGuard::install(probe.clone());
+                let mut context = PackageProcessingContext::new(observer.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context).map(|_| ()),
+                    Err(failure.error())
+                );
+                assert!(
+                    probe.state.borrow().fired,
+                    "actual project payload fault reached"
+                );
+                assert_eq!(probe.state.borrow().after_io, 0);
+                assert_eq!(profile.project_entered.get(), 1);
+                assert_eq!(profile.raw_live.get(), 0);
+                assert_eq!(
+                    observer.check().map_err(StlError::from),
+                    Err(failure.error())
+                );
+            }
+        }
+    }
+    #[test]
+    fn sidecar_baseline_healthy_project_then_late_fixed_xml_guard_activates() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = sidecar_late_guard_settings();
+        for deflate in [false, true] {
+            let profile = Rc::new(SidecarTestProfile::default());
+            let _guard = SidecarProfileGuard::install(profile.clone());
+            let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, &settings),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context).map(|_| ()),
+                Err(StlError::ResourceStopped(ResourceStop::InputLimitExceeded))
+            );
+            assert_eq!(profile.project_entered.get(), 1);
+            assert_eq!(
+                context.usage().inflation_bytes,
+                (root.len() + settings.len() + 2) as u64
+            );
+            assert_eq!(context.usage().retained_input_bytes, settings.len() + 2);
+            assert_eq!(profile.raw_live.get(), 0);
+        }
+    }
+    #[test]
+    fn sidecar_release_model_raw_backing_precedes_project_collection() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = "<config><plate><metadata key='plater_id' value='9'/><metadata key='plater_name' value='Authored'/><model_instance><metadata key='object_id' value='1'/><metadata key='instance_id' value='0'/></model_instance></plate></config>";
+        let project = r##"{"filament_colour":["#112233"],"filament_settings_id":["Label"]}"##;
+        for deflate in [false, true] {
+            let profile = Rc::new(SidecarTestProfile::default());
+            let _guard = SidecarProfileGuard::install(profile.clone());
+            let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+            let parsed = crate::parse_model_with_plates_in_context(
+                &package(
+                    &[
+                        (ROOT_MODEL_FALLBACK, &root),
+                        (MODEL_SETTINGS_PATH, settings),
+                        (PROJECT_SETTINGS_PATH, project),
+                    ],
+                    deflate,
+                ),
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.plates[0].name, "Authored");
+            assert_eq!(parsed.embedded_filaments[0].name.as_deref(), Some("Label"));
+            assert_eq!(parsed.embedded_filaments[0].color, "#112233");
+            assert_eq!(
+                context.usage().inflation_bytes,
+                (root.len() + settings.len() + project.len()) as u64
+            );
+            assert_eq!(
+                context.usage().retained_input_bytes,
+                settings.len() + project.len()
+            );
+            assert_eq!(profile.project_entered.get(), 1);
+            assert!(profile.raw_capacity.get() >= settings.len());
+            assert_eq!(profile.raw_live.get(), 0);
+            assert_eq!(
+                profile.raw_live_at_project.get(),
+                0,
+                "actual model-settings String backing must drop before project collection starts"
+            );
+            assert_eq!(
+                &*profile.events.borrow(),
+                &[
+                    "model_raw_created",
+                    "model_raw_drop",
+                    "project_collect_enter"
+                ]
+            );
+        }
+    }
+
+    fn sidecar_valid_settings() -> &'static str {
+        "<config><plate><metadata key='plater_id' value='9'/><metadata key='plater_name' value='Authored'/><model_instance><metadata key='object_id' value='1'/><metadata key='instance_id' value='0'/></model_instance></plate></config>"
+    }
+    #[test]
+    fn sidecar_workspace_real_failures_before_and_after_reserve_are_immediate() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, sidecar_valid_settings()),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            for after in [false, true] {
+                for failure in PARSER_TEST_FAILURES {
+                    let profile = Rc::new(SidecarTestProfile::default());
+                    if after {
+                        profile.workspace_after.set(Some(failure));
+                    } else {
+                        profile.workspace_before.set(Some(failure));
+                    }
+                    let _guard = SidecarProfileGuard::install(profile.clone());
+                    let observer = ZipResourceObserver::new();
+                    let mut context = PackageProcessingContext::new(observer.clone());
+                    assert_eq!(
+                        crate::parse_model_with_plates_in_context(&bytes, &mut context).map(|_| ()),
+                        Err(failure.error())
+                    );
+                    assert_eq!(
+                        observer.check().map_err(StlError::from),
+                        Err(failure.error())
+                    );
+                    assert_eq!(
+                        profile.workspace_entered.get(),
+                        1,
+                        "actual workspace acquisition hook reached"
+                    );
+                    assert!(
+                        profile.workspace_before.get().is_none()
+                            && profile.workspace_after.get().is_none()
+                    );
+                    assert_eq!(profile.project_entered.get(), 0);
+                    assert_eq!(profile.raw_live.get(), 0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn sidecar_semantic_acquisition_faults_are_not_deferred_fixed_validation() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, sidecar_valid_settings()),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            for site in [
+                derived_maps::ReserveSite::PlateName,
+                derived_maps::ReserveSite::Claimed,
+                derived_maps::ReserveSite::Indices,
+                derived_maps::ReserveSite::Plates,
+            ] {
+                for after in [false, true] {
+                    for failure in PARSER_TEST_FAILURES {
+                        let sidecar = Rc::new(SidecarTestProfile::default());
+                        let _sidecar = SidecarProfileGuard::install(sidecar.clone());
+                        let probe = Rc::new(DerivedMapsTestProfile::default());
+                        if after {
+                            probe.stop_site.set(Some((site, failure)));
+                        } else {
+                            probe.before_stop_site.set(Some((site, failure)));
+                        }
+                        let _derived = DerivedMapsProfileGuard::install(probe.clone());
+                        let observer = ZipResourceObserver::new();
+                        let mut context = PackageProcessingContext::new(observer.clone());
+                        assert_eq!(
+                            crate::parse_model_with_plates_in_context(&bytes, &mut context)
+                                .map(|_| ()),
+                            Err(failure.error())
+                        );
+                        assert_eq!(
+                            observer.check().map_err(StlError::from),
+                            Err(failure.error())
+                        );
+                        assert!(
+                            probe.before_stop_site.get().is_none()
+                                && probe.stop_site.get().is_none(),
+                            "actual selected reserve hook reached"
+                        );
+                        assert_eq!(probe.plate_parser_entries.get(), 1);
+                        assert_eq!(sidecar.project_entered.get(), 0);
+                        assert_eq!(sidecar.fixed_prepared.get(), 0);
+                        assert_eq!(sidecar.raw_live.get(), 0);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn sidecar_real_parent_stops_beat_pending_fixed_at_both_phase_boundaries() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = sidecar_late_guard_settings();
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, &settings),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            for after_project in [false, true] {
+                for failure in PARSER_TEST_FAILURES {
+                    let profile = Rc::new(SidecarTestProfile::default());
+                    if after_project {
+                        profile.before_activation.set(Some(failure));
+                    } else {
+                        profile.after_prepare.set(Some(failure));
+                    }
+                    let _guard = SidecarProfileGuard::install(profile.clone());
+                    let observer = ZipResourceObserver::new();
+                    let mut context = PackageProcessingContext::new(observer.clone());
+                    assert_eq!(
+                        crate::parse_model_with_plates_in_context(&bytes, &mut context).map(|_| ()),
+                        Err(failure.error())
+                    );
+                    assert_eq!(
+                        observer.check().map_err(StlError::from),
+                        Err(failure.error())
+                    );
+                    assert_eq!(
+                        profile.fixed_prepared.get(),
+                        1,
+                        "late fixed violation was actually prepared"
+                    );
+                    assert!(
+                        profile.after_prepare.get().is_none()
+                            && profile.before_activation.get().is_none()
+                    );
+                    assert_eq!(profile.project_entered.get(), usize::from(after_project));
+                    assert_eq!(profile.raw_live.get(), 0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn sidecar_immediate_structural_error_does_not_drain_late_fixed_tail() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = format!("<config><metadata key='unknown' broken=bad value='ignored'/><plate><plate></plate></plate><unused value='{}'/></config>", "x".repeat(4097));
+        for deflate in [false, true] {
+            let profile = Rc::new(SidecarTestProfile::default());
+            let _guard = SidecarProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, &settings),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(
+                parsed.plate_warning.as_deref(),
+                Some(
+                    "Plate metadata is unusable (nested plate metadata); showing the whole build."
+                )
+            );
+            assert_eq!(
+                profile.fixed_prepared.get(),
+                0,
+                "the later fixed violation must not be prepared"
+            );
+            assert_eq!(profile.project_entered.get(), 1);
+            assert!(observer.check().is_ok());
+        }
+    }
+    #[test]
+    fn sidecar_unassigned_child_validation_stays_after_project_and_is_not_reread() {
+        const CHILD: &str = "3D/child.model";
+        let resources = format!(
+            r#"{}<object id="2"><components><component objectid="7" path="/3D/child.model"/></components></object>"#,
+            cube_mesh_xml(1)
+        );
+        let root = model_xml(
+            "millimeter",
+            &resources,
+            r#"<item objectid="1"/><item objectid="2"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(7), "");
+        let settings = sidecar_valid_settings();
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (CHILD, &child),
+                    (MODEL_SETTINGS_PATH, settings),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            for member in [PROJECT_SETTINGS_PATH, CHILD] {
+                for failure in PARSER_TEST_FAILURES {
+                    let profile = Rc::new(SidecarTestProfile::default());
+                    let _sidecar = SidecarProfileGuard::install(profile.clone());
+                    let observer = ZipResourceObserver::new();
+                    let probe = Rc::new(ParserTestProbe {
+                        member,
+                        failure,
+                        state: Default::default(),
+                        guard_observer: Some(observer.clone()),
+                    });
+                    let _parser = ParserProbeGuard::install(probe.clone());
+                    let mut context = PackageProcessingContext::new(observer.clone());
+                    assert_eq!(
+                        crate::parse_model_with_plates_in_context(&bytes, &mut context).map(|_| ()),
+                        Err(failure.error())
+                    );
+                    assert!(probe.state.borrow().fired);
+                    assert_eq!(probe.state.borrow().after_io, 0);
+                    assert_eq!(profile.child_before_project.get(), 0);
+                    assert_eq!(profile.child_entered.get(), usize::from(member == CHILD));
+                    assert_eq!(profile.project_entered.get(), 1);
+                }
+            }
+            let profile = Rc::new(SidecarTestProfile::default());
+            let _guard = SidecarProfileGuard::install(profile.clone());
+            let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+            let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(parsed.model.triangle_count, 24);
+            assert_eq!(parsed.plate_warning.as_deref(), Some("Plate metadata is unusable (plate metadata does not assign every printable build item); showing the whole build."));
+            assert_eq!(profile.child_entered.get(), 1);
+            assert_eq!(profile.child_before_project.get(), 0);
+            assert_eq!(
+                context.usage().inflation_bytes,
+                (root.len() + child.len() + settings.len() + 2) as u64
+            );
+            assert_eq!(context.usage().retained_input_bytes, settings.len() + 2);
+        }
+    }
+    #[test]
+    fn sidecar_missing_invalid_duplicate_and_late_metadata_keep_project_palette() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let project = r##"{"filament_colour":["#112233"],"filament_settings_id":["Label"]}"##;
+        let plate = "<plate><metadata key='plater_id' value='1'/></plate>";
+        let duplicate = format!("<config>{plate}{plate}</config>");
+        for deflate in [false, true] {
+            for settings in [None, Some("<config/>"), Some("<config><plate/></config>"), Some(duplicate.as_str()), Some("<config><plate><model_instance><metadata key='object_id' value='999'/></model_instance></plate></config>")] {
+                let mut parts = vec![(ROOT_MODEL_FALLBACK, root.as_str()), (PROJECT_SETTINGS_PATH, project)];
+                if let Some(settings) = settings { parts.push((MODEL_SETTINGS_PATH, settings)); }
+                let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+                let parsed = crate::parse_model_with_plates_in_context(&package(&parts, deflate), &mut context).unwrap();
+                assert_eq!(parsed.model.triangle_count, 12);
+                assert!(!parsed.plate_metadata);
+                assert!(parsed.plate_warning.is_some());
+                assert_eq!(parsed.embedded_filaments[0].name.as_deref(), Some("Label"));
+                assert_eq!(parsed.embedded_filaments[0].color, "#112233");
+                assert_eq!(context.usage().inflation_bytes, (root.len() + project.len() + settings.map_or(0, str::len)) as u64);
+                assert_eq!(context.usage().retained_input_bytes, project.len() + settings.map_or(0, str::len));
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_project_utf8_crc_and_json_errors_keep_original_debits_and_plate_output() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = sidecar_valid_settings();
+        for deflate in [false, true] {
+            for (project, corrupt_crc) in [
+                (&b"\xff"[..], false),
+                (&b"{}"[..], true),
+                (&b"{\"filament_colour\":[\"#112233\"]} trailing"[..], false),
+            ] {
+                let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                let method = if deflate {
+                    zip::CompressionMethod::Deflated
+                } else {
+                    zip::CompressionMethod::Stored
+                };
+                for (name, body) in [
+                    (ROOT_MODEL_FALLBACK, root.as_bytes()),
+                    (MODEL_SETTINGS_PATH, settings.as_bytes()),
+                    (PROJECT_SETTINGS_PATH, project),
+                ] {
+                    writer
+                        .start_file(
+                            name,
+                            SimpleFileOptions::default().compression_method(method),
+                        )
+                        .unwrap();
+                    writer.write_all(body).unwrap();
+                }
+                let mut bytes = writer.finish().unwrap().into_inner();
+                if corrupt_crc {
+                    let mut patched = 0;
+                    for offset in 0..bytes.len().saturating_sub(46) {
+                        let header = match &bytes[offset..offset + 4] {
+                            b"PK\x03\x04" => Some((30, 26, 14)),
+                            b"PK\x01\x02" => Some((46, 28, 16)),
+                            _ => None,
+                        };
+                        if let Some((name_start, length_at, crc_at)) = header {
+                            let length = u16::from_le_bytes(
+                                bytes[offset + length_at..offset + length_at + 2]
+                                    .try_into()
+                                    .unwrap(),
+                            ) as usize;
+                            if bytes.get(offset + name_start..offset + name_start + length)
+                                == Some(PROJECT_SETTINGS_PATH.as_bytes())
+                            {
+                                bytes[offset + crc_at..offset + crc_at + 4]
+                                    .copy_from_slice(&0u32.to_le_bytes());
+                                patched += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(patched, 2, "both concrete CRC fields patched");
+                }
+                let profile = Rc::new(SidecarTestProfile::default());
+                let _guard = SidecarProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                let parsed =
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+                assert_eq!(parsed.model.triangle_count, 12);
+                assert!(parsed.embedded_filaments.is_empty());
+                assert!(parsed.plate_metadata);
+                assert_eq!(parsed.plates[0].name, "Authored");
+                assert!(parsed.plate_warning.is_none());
+                assert_eq!(
+                    context.usage().inflation_bytes,
+                    (root.len() + settings.len() + project.len()) as u64
+                );
+                assert_eq!(
+                    context.usage().retained_input_bytes,
+                    settings.len() + project.len()
+                );
+                assert_eq!(profile.raw_live_at_project.get(), 0);
+                assert!(observer.check().is_ok());
+            }
+        }
+    }
+
+    fn sidecar_missing_name_settings() -> &'static str {
+        "<config><plate><metadata key='plater_id' value='9'/><model_instance><metadata key='object_id' value='1'/><metadata key='instance_id' value='0'/></model_instance></plate></config>"
+    }
+    #[test]
+    fn sidecar_default_name_missing_and_blank_keep_exact_fields_and_usage() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let blank = "<config><plate><metadata key='plater_id' value='9'/><metadata key='plater_name' value='   '/><model_instance><metadata key='object_id' value='1'/><metadata key='instance_id' value='0'/></model_instance></plate></config>";
+        let project = r##"{"filament_colour":["#112233"],"filament_settings_id":["Label"]}"##;
+        assert!(!sidecar_missing_name_settings().contains("plater_name"));
+        for deflate in [false, true] {
+            for settings in [sidecar_missing_name_settings(), blank] {
+                let sidecar = Rc::new(SidecarTestProfile::default());
+                let _guard = SidecarProfileGuard::install(sidecar.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                let parsed = crate::parse_model_with_plates_in_context(
+                    &package(
+                        &[
+                            (ROOT_MODEL_FALLBACK, &root),
+                            (MODEL_SETTINGS_PATH, settings),
+                            (PROJECT_SETTINGS_PATH, project),
+                        ],
+                        deflate,
+                    ),
+                    &mut context,
+                )
+                .unwrap();
+                assert_eq!(parsed.model.triangle_count, 12);
+                assert_eq!(parsed.model.positions.len(), 108);
+                assert_eq!(
+                    &parsed.model.positions[..9],
+                    &[0., 0., 0., 10., 10., 0., 10., 0., 0.]
+                );
+                assert_eq!(parsed.plates.len(), 1);
+                assert_eq!(
+                    (
+                        parsed.plates[0].id,
+                        parsed.plates[0].name.as_str(),
+                        parsed.plates[0].triangle_start,
+                        parsed.plates[0].triangle_count
+                    ),
+                    (0, "Plate 1", 0, 12)
+                );
+                assert!(parsed.plate_metadata);
+                assert!(parsed.plate_warning.is_none() && parsed.part_warning.is_none());
+                assert_eq!(parsed.parts.len(), 1);
+                assert_eq!(
+                    (
+                        parsed.parts[0].id.as_str(),
+                        parsed.parts[0].name.as_str(),
+                        parsed.parts[0].triangle_start,
+                        parsed.parts[0].triangle_count
+                    ),
+                    ("object:1:instance:0", "Object 1", 0, 12)
+                );
+                assert_eq!(parsed.parts[0].material_id, None);
+                assert_eq!(parsed.parts[0].filament_slot, None);
+                assert_eq!(parsed.embedded_filaments.len(), 1);
+                assert_eq!(parsed.embedded_filaments[0].slot, 1);
+                assert_eq!(parsed.embedded_filaments[0].name.as_deref(), Some("Label"));
+                assert_eq!(parsed.embedded_filaments[0].color, "#112233");
+                assert_eq!(
+                    context.usage().inflation_bytes,
+                    (root.len() + settings.len() + project.len()) as u64
+                );
+                assert_eq!(
+                    context.usage().retained_input_bytes,
+                    settings.len() + project.len()
+                );
+                assert_eq!(sidecar.project_entered.get(), 1);
+                assert_eq!(sidecar.raw_live_at_project.get(), 0);
+                assert_eq!(
+                    &*sidecar.events.borrow(),
+                    &[
+                        "model_raw_created",
+                        "model_raw_drop",
+                        "project_collect_enter"
+                    ]
+                );
+                assert!(observer.check().is_ok());
+            }
+        }
+    }
+    #[test]
+    fn sidecar_default_name_absent_actual_reserve_pre_and_post_preserve_all_causes() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = sidecar_missing_name_settings();
+        assert!(
+            !settings.contains("plater_name"),
+            "no authored-name branch exists in this fixture"
+        );
+        assert!(!settings.contains("key='name'"));
+        for deflate in [false, true] {
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                    (PROJECT_SETTINGS_PATH, "{}"),
+                ],
+                deflate,
+            );
+            for after in [false, true] {
+                for failure in PARSER_TEST_FAILURES {
+                    let sidecar = Rc::new(SidecarTestProfile::default());
+                    sidecar.after_prepare.set(Some(match failure {
+                        ParserTestFailure::Allocation => {
+                            ParserTestFailure::Stop(ResourceStop::EnvelopeChanged)
+                        }
+                        _ => ParserTestFailure::Allocation,
+                    }));
+                    let _sidecar = SidecarProfileGuard::install(sidecar.clone());
+                    let derived = Rc::new(DerivedMapsTestProfile::default());
+                    if after {
+                        derived
+                            .stop_site
+                            .set(Some((derived_maps::ReserveSite::PlateName, failure)));
+                    } else {
+                        derived
+                            .before_stop_site
+                            .set(Some((derived_maps::ReserveSite::PlateName, failure)));
+                    }
+                    let _derived = DerivedMapsProfileGuard::install(derived.clone());
+                    let observer = ZipResourceObserver::new();
+                    let (source, _source_guard) = guard_probe(observer.clone());
+                    let mut context = PackageProcessingContext::new(observer.clone());
+                    assert_eq!(
+                        crate::parse_model_with_plates_in_context(&bytes, &mut context).map(|_| ()),
+                        Err(failure.error())
+                    );
+                    assert_eq!(
+                        observer.check().map_err(StlError::from),
+                        Err(failure.error())
+                    );
+                    assert!(
+                        derived.before_stop_site.get().is_none()
+                            && derived.stop_site.get().is_none(),
+                        "actual default-name acquisition hook reached"
+                    );
+                    assert!(
+                        sidecar.after_prepare.get().is_none(),
+                        "later competing caller cause reached"
+                    );
+                    assert_eq!(derived.plate_parser_entries.get(), 1);
+                    assert_eq!(derived.fallback_entries.get(), 0);
+                    assert_eq!(sidecar.project_entered.get(), 0);
+                    assert_eq!(sidecar.fixed_prepared.get(), 0);
+                    assert_eq!(sidecar.raw_live.get(), 0);
+                    assert_eq!(source.state.borrow().after_io, 0);
+                    assert_eq!(source.state.borrow().work_after_stop, 0);
+                    assert_eq!(
+                        context.usage().inflation_bytes,
+                        (root.len() + settings.len()) as u64
+                    );
+                    assert_eq!(context.usage().retained_input_bytes, settings.len());
+                }
+            }
+        }
+    }
+    #[test]
+    fn sidecar_default_name_and_authored_name_controlled_reserve_failure_is_terminal() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            for settings in [sidecar_missing_name_settings(), sidecar_valid_settings()] {
+                let sidecar = Rc::new(SidecarTestProfile::default());
+                sidecar
+                    .after_prepare
+                    .set(Some(ParserTestFailure::Stop(ResourceStop::EnvelopeChanged)));
+                let _sidecar = SidecarProfileGuard::install(sidecar.clone());
+                let derived = Rc::new(DerivedMapsTestProfile::default());
+                derived
+                    .fail_site
+                    .set(Some(derived_maps::ReserveSite::PlateName));
+                let _derived = DerivedMapsProfileGuard::install(derived.clone());
+                let observer = ZipResourceObserver::new();
+                let (source, _source_guard) = guard_probe(observer.clone());
+                let mut context = PackageProcessingContext::new(observer.clone());
+                let bytes = package(
+                    &[
+                        (ROOT_MODEL_FALLBACK, &root),
+                        (MODEL_SETTINGS_PATH, settings),
+                        (PROJECT_SETTINGS_PATH, "{}"),
+                    ],
+                    deflate,
+                );
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context).map(|_| ()),
+                    Err(StlError::AllocationFailed)
+                );
+                assert!(
+                    derived.fail_site.get().is_none(),
+                    "controlled reserve-failure branch reached"
+                );
+                assert!(sidecar.after_prepare.get().is_none());
+                assert_eq!(
+                    observer.check().map_err(StlError::from),
+                    Err(StlError::AllocationFailed)
+                );
+                assert_eq!(derived.plate_parser_entries.get(), 1);
+                assert_eq!(derived.fallback_entries.get(), 0);
+                assert_eq!(sidecar.project_entered.get(), 0);
+                assert_eq!(sidecar.raw_live.get(), 0);
+                assert_eq!(source.state.borrow().after_io, 0);
+                assert_eq!(source.state.borrow().work_after_stop, 0);
+            }
+        }
+    }
+
+    struct SettingsOwnedProfileGuard(Option<Rc<SettingsOwnedTestProfile>>);
+    impl SettingsOwnedProfileGuard {
+        fn install(profile: Rc<SettingsOwnedTestProfile>) -> Self {
+            Self(SETTINGS_OWNED_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for SettingsOwnedProfileGuard {
+        fn drop(&mut self) {
+            drop(SETTINGS_OWNED_TEST_PROFILE.with(|slot| slot.replace(self.0.take())));
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_irrelevant_object_names_and_rows_are_not_retained() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Useful"/><metadata key="extruder" value="2"/></object><object id="999"><metadata key="name" value="Unused A"/></object><object id="1000"><metadata key="name" value="Unused B"/></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            ))
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.model.positions.len(), 108);
+            assert_eq!(
+                &parsed.model.positions[..9],
+                &[0., 0., 0., 10., 10., 0., 10., 0., 0.]
+            );
+            assert_eq!(parsed.parts.len(), 1);
+            assert_eq!(parsed.parts[0].id, "object:1:instance:0");
+            assert_eq!(
+                (
+                    parsed.parts[0].triangle_start,
+                    parsed.parts[0].triangle_count
+                ),
+                (0, 12)
+            );
+            assert_eq!(parsed.parts[0].name, "Useful");
+            assert_eq!(parsed.parts[0].filament_slot, Some(2));
+            assert!(parsed.part_warning.is_none());
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (1, 1, 0),
+                "only the consumed root record needs retained name backing and a map slot"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_part_retention_is_independent_of_outer_object() {
+        let resources = format!(
+            r#"{}<object id="1"><components><component objectid="2"/></components></object>"#,
+            cube_mesh_xml(2)
+        );
+        let root = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Root label"/><metadata key="extruder" value="2"/></object><object id="999"><part id="2"><metadata key="name" value="Useful part"/><metadata key="extruder" value="3"/></part><part id="998"><metadata key="name" value="Unused A"/></part><part id="997"><metadata key="name" value="Unused B"/></part></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            ))
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.model.positions.len(), 108);
+            assert_eq!(
+                &parsed.model.positions[..9],
+                &[0., 0., 0., 10., 10., 0., 10., 0., 0.]
+            );
+            assert_eq!(parsed.parts.len(), 1);
+            assert_eq!(
+                parsed.parts[0].id,
+                "object:1:instance:0/component:0:object:2"
+            );
+            assert_eq!(
+                (
+                    parsed.parts[0].triangle_start,
+                    parsed.parts[0].triangle_count
+                ),
+                (0, 12)
+            );
+            assert_eq!(parsed.parts[0].name, "Root label · Useful part");
+            assert_eq!(parsed.parts[0].filament_slot, Some(3));
+            assert!(parsed.part_warning.is_none());
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (2, 1, 1),
+                "part relevance must not depend on its unrelated outer object record"
+            );
+        }
+    }
+
+    fn settings_owned_fault_fixture() -> (String, &'static str) {
+        let resources = format!(
+            r#"{}<object id="1"><components><component objectid="2"/></components></object>"#,
+            cube_mesh_xml(2)
+        );
+        let root = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Root label"/><metadata key="extruder" value="2"/></object><object id="999"><part id="2"><metadata key="name" value="Useful part"/><metadata key="extruder" value="3"/></part></object></config>"#;
+        (root, settings)
+    }
+
+    #[test]
+    fn settings_relevance_owned_actual_reserve_stops_remain_terminal_before_and_after() {
+        for deflate in [false, true] {
+            let (root, settings) = settings_owned_fault_fixture();
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            );
+            for site in [
+                settings::ReserveSite::Name,
+                settings::ReserveSite::Objects,
+                settings::ReserveSite::Parts,
+            ] {
+                for after in [false, true] {
+                    for failure in PARSER_TEST_FAILURES {
+                        let profile = Rc::new(SettingsOwnedTestProfile::default());
+                        if after {
+                            profile.after_site.set(Some((site, failure)));
+                        } else {
+                            profile.before_site.set(Some((site, failure)));
+                        }
+                        profile.finish_failure.set(Some(match failure {
+                            ParserTestFailure::Stop(_) => ParserTestFailure::Allocation,
+                            ParserTestFailure::Allocation => {
+                                ParserTestFailure::Stop(ResourceStop::EnvelopeChanged)
+                            }
+                            ParserTestFailure::Funding => ParserTestFailure::Allocation,
+                        }));
+                        let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+                        let observer = ZipResourceObserver::new();
+                        let mut context = PackageProcessingContext::new(observer.clone());
+                        assert_eq!(
+                            crate::parse_model_with_plates_in_context(&bytes, &mut context)
+                                .map(|_| ()),
+                            Err(failure.error())
+                        );
+                        assert_eq!(
+                            observer.check().map_err(StlError::from),
+                            Err(failure.error())
+                        );
+                        assert_eq!(profile.entries.get(), 1);
+                        assert_eq!(profile.ordinary_fallbacks.get(), 0);
+                        assert!(profile.before_site.get().is_none());
+                        assert!(profile.after_site.get().is_none());
+                        assert!(profile.finish_failure.get().is_none());
+                        let requests = profile.requests.borrow();
+                        assert_eq!(requests.last().map(|(actual, _)| *actual), Some(site));
+                        assert_eq!(
+                            requests.len(),
+                            match site {
+                                settings::ReserveSite::Name => 1,
+                                settings::ReserveSite::Objects => 2,
+                                settings::ReserveSite::Parts => 4,
+                            }
+                        );
+                        match site {
+                            settings::ReserveSite::Name => assert_eq!(profile.name_copies.get(), 0),
+                            settings::ReserveSite::Objects => {
+                                assert_eq!(profile.object_inserts.get(), 0)
+                            }
+                            settings::ReserveSite::Parts => {
+                                assert_eq!(profile.part_inserts.get(), 0)
+                            }
+                        }
+                        assert_eq!(
+                            context.usage().inflation_bytes,
+                            (root.len() + settings.len()) as u64
+                        );
+                        assert_eq!(context.usage().retained_input_bytes, settings.len());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_shared_context_usage_is_not_recharged() {
+        for deflate in [false, true] {
+            let (root, settings) = settings_owned_fault_fixture();
+            let bytes = package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            );
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+            let parsed = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.parts[0].name, "Root label · Useful part");
+            assert_eq!(parsed.parts[0].filament_slot, Some(3));
+            assert_eq!(
+                context.usage().inflation_bytes,
+                (root.len() + settings.len()) as u64
+            );
+            assert_eq!(context.usage().retained_input_bytes, settings.len());
+            assert_eq!(profile.entries.get(), 1);
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (2, 1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_duplicates_and_irrelevant_records_do_not_reserve_map_slots() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Useful"/><metadata key="extruder" value="2"/></object><object id="999"><metadata key="name" value="Unused A"/></object><object id="1"><metadata key="extruder" value="2"/></object><object id="1000"><metadata key="name" value="Unused B"/></object><object id="1"><metadata key="extruder" value="3"/></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let parsed = crate::parse_model_with_plates(&package(
+                &[
+                    (ROOT_MODEL_FALLBACK, &root),
+                    (MODEL_SETTINGS_PATH, settings),
+                ],
+                deflate,
+            ))
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.parts[0].name, "Useful");
+            assert_eq!(parsed.parts[0].filament_slot, None);
+            assert_eq!(
+                &*profile.requests.borrow(),
+                &[
+                    (settings::ReserveSite::Name, 6),
+                    (settings::ReserveSite::Objects, 1)
+                ]
+            );
+            assert_eq!(
+                (
+                    profile.name_copies.get(),
+                    profile.object_inserts.get(),
+                    profile.part_inserts.get()
+                ),
+                (1, 1, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_relevance_owned_ordinary_tail_still_discards_optional_settings() {
+        let root = model_xml("millimeter", &cube_mesh_xml(1), r#"<item objectid="1"/>"#);
+        let settings = r#"<config><object id="1"><metadata key="name" value="Useful"/><metadata key="extruder" value="2"/></object><object id="999"><part id="999"></object></config>"#;
+        for deflate in [false, true] {
+            let profile = Rc::new(SettingsOwnedTestProfile::default());
+            let _guard = SettingsOwnedProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            let parsed = crate::parse_model_with_plates_in_context(
+                &package(
+                    &[
+                        (ROOT_MODEL_FALLBACK, &root),
+                        (MODEL_SETTINGS_PATH, settings),
+                    ],
+                    deflate,
+                ),
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.parts[0].name, "Object 1");
+            assert_eq!(parsed.parts[0].filament_slot, None);
+            assert_eq!(profile.ordinary_fallbacks.get(), 1);
+            assert_eq!(profile.object_inserts.get(), 1);
+            assert!(observer.check().is_ok());
+        }
+    }
+
+    struct MaterialOwnedProfileGuard(Option<Rc<MaterialOwnedTestProfile>>);
+    impl MaterialOwnedProfileGuard {
+        fn install(profile: Rc<MaterialOwnedTestProfile>) -> Self {
+            Self(MATERIAL_OWNED_TEST_PROFILE.with(|slot| slot.replace(Some(profile))))
+        }
+    }
+    impl Drop for MaterialOwnedProfileGuard {
+        fn drop(&mut self) {
+            drop(MATERIAL_OWNED_TEST_PROFILE.with(|slot| slot.replace(self.0.take())));
+        }
+    }
+
+    #[test]
+    fn material_owned_duplicate_base_keys_do_not_construct_unretained_values() {
+        let resources = format!(
+            r##"<basematerials id="5"><base name="First" displaycolor="#112233"/></basematerials><basematerials id="5"><base name="DiscardedSecond" displaycolor="#abcdef"/></basematerials><basematerials id="5"><base name="DiscardedThird" displaycolor="#fedcba"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let parsed =
+                crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], deflate))
+                    .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.materials.len(), 1);
+            let material = &parsed.materials[0];
+            assert_eq!(material.id, "3mf:3D/3dmodel.model:5:0");
+            assert_eq!(material.name.as_deref(), Some("First"));
+            assert_eq!(material.color.as_deref(), Some("#112233"));
+            assert_eq!(material.source, MaterialSource::ThreeMfBaseMaterial);
+            assert_eq!(
+                parsed.parts[0].material_id.as_deref(),
+                Some(material.id.as_str())
+            );
+            assert_eq!((profile.normalized_names.get(), profile.normalized_colors.get()), (1, 1),
+                "only the accepted row needs owned normalized field backing; duplicate source rows still validate/advance");
+        }
+    }
+
+    #[test]
+    fn material_owned_base_tail_does_not_construct_values_after_local_1024_clip() {
+        let bases = (0..=MAX_STANDARD_MATERIALS)
+            .map(|index| format!(r##"<base name="M{index}" displaycolor="#112233"/>"##))
+            .collect::<String>();
+        let resources = format!(
+            r#"<basematerials id="5">{bases}</basematerials>{}"#,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="1023""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let parsed =
+                crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], deflate))
+                    .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+            let last = parsed.materials.last().unwrap();
+            assert_eq!(last.id, "3mf:3D/3dmodel.model:5:1023");
+            assert_eq!(last.name.as_deref(), Some("M1023"));
+            assert_eq!(last.color.as_deref(), Some("#112233"));
+            assert_eq!(
+                parsed.parts[0].material_id.as_deref(),
+                Some(last.id.as_str())
+            );
+            assert_eq!(
+                (
+                    profile.normalized_names.get(),
+                    profile.normalized_colors.get()
+                ),
+                (MAX_STANDARD_MATERIALS, MAX_STANDARD_MATERIALS),
+                "valid clipped source rows do not need owned normalized values"
+            );
+        }
+    }
+
+    #[test]
+    fn material_owned_color_tail_does_not_construct_values_after_local_1024_clip() {
+        let colors = r##"<color color="#11223380"/>"##.repeat(MAX_STANDARD_MATERIALS + 1);
+        let resources = format!(
+            r#"<colorgroup id="9">{colors}</colorgroup>{}"#,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="9" pindex="1023""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        for deflate in [false, true] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let parsed =
+                crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], deflate))
+                    .unwrap();
+            assert_eq!(parsed.model.triangle_count, 12);
+            assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+            let last = parsed.materials.last().unwrap();
+            assert_eq!(last.id, "3mf:3D/3dmodel.model:9:1023");
+            assert!(last.name.is_none());
+            assert_eq!(last.color.as_deref(), Some("#112233"));
+            assert_eq!(last.source, MaterialSource::ThreeMfColorGroup);
+            assert_eq!(
+                parsed.parts[0].material_id.as_deref(),
+                Some(last.id.as_str())
+            );
+            assert_eq!(
+                (
+                    profile.normalized_names.get(),
+                    profile.normalized_colors.get()
+                ),
+                (0, MAX_STANDARD_MATERIALS),
+                "color-only clipped rows do not need a normalized String result"
+            );
+        }
+    }
+    #[test]
+    fn material_owned_actual_reserve_sites_fail_terminally_before_commit() {
+        use materials::ReserveSite;
+        let resources = format!(
+            r##"<basematerials id="5"><base name="First" displaycolor="#112233"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &model)], false);
+        for site in [
+            ReserveSite::LocalRows,
+            ReserveSite::Lookup,
+            ReserveSite::Id,
+            ReserveSite::Name,
+            ReserveSite::Color,
+            ReserveSite::GlobalRows,
+            ReserveSite::GlobalId,
+            ReserveSite::GlobalName,
+            ReserveSite::GlobalColor,
+        ] {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            profile.fail_site.set(Some(site));
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(StlError::AllocationFailed)
+            );
+            assert!(
+                profile.fail_site.get().is_none(),
+                "actual allocation site reached"
+            );
+            assert!(matches!(
+                observer.check(),
+                Err(ZipOpenError::AllocationFailed)
+            ));
+            assert_eq!(profile.global_commits.get(), 0);
+            if matches!(
+                site,
+                ReserveSite::LocalRows
+                    | ReserveSite::Lookup
+                    | ReserveSite::Id
+                    | ReserveSite::Name
+                    | ReserveSite::Color
+            ) {
+                assert_eq!(profile.local_commits.get(), 0);
+            }
+            let requests = profile.requests.borrow();
+            assert_eq!(requests.last().map(|(site, _)| *site), Some(site));
+        }
+    }
+
+    #[test]
+    fn material_owned_post_reserve_stops_preserve_exact_first_cause() {
+        use materials::ReserveSite;
+        let resources = format!(
+            r##"<basematerials id="5"><base name="First" displaycolor="#112233"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &model)], true);
+        for site in [
+            ReserveSite::LocalRows,
+            ReserveSite::Lookup,
+            ReserveSite::Id,
+            ReserveSite::Name,
+            ReserveSite::Color,
+            ReserveSite::GlobalRows,
+            ReserveSite::GlobalId,
+            ReserveSite::GlobalName,
+            ReserveSite::GlobalColor,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let profile = Rc::new(MaterialOwnedTestProfile::default());
+                profile.stop_site.set(Some((site, failure)));
+                let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+                let observer = ZipResourceObserver::new();
+                let mut context = PackageProcessingContext::new(observer.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(failure.error())
+                );
+                assert!(
+                    profile.stop_site.get().is_none(),
+                    "actual successful reserve reached"
+                );
+                assert_eq!(profile.global_commits.get(), 0);
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+                let _ = observer.stop_io(ResourceStop::EnvelopeChanged);
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+                let requests = profile.requests.borrow();
+                assert_eq!(requests.last().map(|(site, _)| *site), Some(site));
+            }
+        }
+    }
+
+    #[test]
+    fn material_owned_duplicate_and_clipped_rows_do_not_request_final_fields() {
+        use materials::ReserveSite;
+        let bases = (0..=MAX_STANDARD_MATERIALS)
+            .map(|index| format!(r##"<base name="M{index}" displaycolor="#112233"/>"##))
+            .collect::<String>();
+        let resources = format!(
+            r##"<basematerials id="5">{bases}</basematerials><basematerials id="5"><base name="Duplicate" displaycolor="#abcdef"/></basematerials>{}"##,
+            cube_mesh_with_object_attrs_xml(1, r#"pid="5" pindex="0""#)
+        );
+        let model = model_xml("millimeter", &resources, r#"<item objectid="1"/>"#);
+        let profile = Rc::new(MaterialOwnedTestProfile::default());
+        let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+        let parsed =
+            crate::parse_model_with_plates(&package(&[(ROOT_MODEL_FALLBACK, &model)], true))
+                .unwrap();
+        assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+        assert_eq!(profile.local_commits.get(), MAX_STANDARD_MATERIALS);
+        assert_eq!(profile.global_commits.get(), MAX_STANDARD_MATERIALS);
+        let requests = profile.requests.borrow();
+        for site in [
+            ReserveSite::Id,
+            ReserveSite::Name,
+            ReserveSite::Color,
+            ReserveSite::GlobalId,
+            ReserveSite::GlobalName,
+            ReserveSite::GlobalColor,
+        ] {
+            assert_eq!(
+                requests.iter().filter(|(s, _)| *s == site).count(),
+                MAX_STANDARD_MATERIALS
+            );
+        }
+        for &(site, target) in requests.iter() {
+            match site {
+                ReserveSite::LocalRows | ReserveSite::GlobalRows => {
+                    assert!((1..=MAX_STANDARD_MATERIALS).contains(&target))
+                }
+                ReserveSite::Lookup => assert_eq!(target, 1),
+                ReserveSite::Color | ReserveSite::GlobalColor => assert_eq!(target, 7),
+                ReserveSite::Name | ReserveSite::GlobalName => assert!(target <= 1024),
+                ReserveSite::Id | ReserveSite::GlobalId => {
+                    assert!(target <= 4 + ROOT_MODEL_FALLBACK.len() + 2 + 10 + 10)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn material_owned_full_global_display_still_constructs_child_local_rows_only() {
+        use materials::ReserveSite;
+        let bases = (0..MAX_STANDARD_MATERIALS)
+            .map(|index| format!(r##"<base name="R{index}" displaycolor="#112233"/>"##))
+            .collect::<String>();
+        let root = model_xml(
+            "millimeter",
+            &format!(
+                r#"<basematerials id="5">{bases}</basematerials><object id="10"><components><component objectid="2" path="3D/child.model"/></components></object>"#
+            ),
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &format!(
+                r##"<basematerials id="6"><base name="Child" displaycolor="#abcdef"/></basematerials>{}"##,
+                cube_mesh_with_object_attrs_xml(2, r#"pid="6" pindex="0""#)
+            ),
+            "",
+        );
+        let profile = Rc::new(MaterialOwnedTestProfile::default());
+        let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+        let parsed = crate::parse_model_with_plates(&package(
+            &[(ROOT_MODEL_FALLBACK, &root), ("3D/child.model", &child)],
+            true,
+        ))
+        .unwrap();
+        assert_eq!(parsed.model.triangle_count, 12);
+        assert_eq!(parsed.materials.len(), MAX_STANDARD_MATERIALS);
+        assert_eq!(profile.local_commits.get(), MAX_STANDARD_MATERIALS + 1);
+        assert_eq!(profile.global_commits.get(), MAX_STANDARD_MATERIALS);
+        assert!(parsed.parts.iter().all(|part| part.material_id.is_none()));
+        let requests = profile.requests.borrow();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(site, _)| *site == ReserveSite::Id)
+                .count(),
+            MAX_STANDARD_MATERIALS + 1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(site, _)| *site == ReserveSite::GlobalId)
+                .count(),
+            MAX_STANDARD_MATERIALS
+        );
+    }
+
+    #[test]
+    fn material_owned_deferred_child_membership_failure_never_enters_fallback() {
+        use materials::ReserveSite;
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components><component objectid="2" path="3D/child.model"/></components></object>"#,
+            r#"<item objectid="10"/>"#,
+        );
+        let child = model_xml(
+            "millimeter",
+            &format!(
+                r##"<basematerials id="6"><base name="Child" displaycolor="#abcdef"/></basematerials>{}"##,
+                cube_mesh_with_object_attrs_xml(2, r#"pid="6" pindex="0""#)
+            ),
+            "",
+        );
+        let settings = plate_settings(&plate_xml(1, "Empty", &[]));
+        let bytes = package(
+            &[
+                (ROOT_MODEL_FALLBACK, &root),
+                ("3D/child.model", &child),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            true,
+        );
+        for failure in PARSER_TEST_FAILURES {
+            let profile = Rc::new(MaterialOwnedTestProfile::default());
+            profile.stop_site.set(Some((ReserveSite::Name, failure)));
+            let _guard = MaterialOwnedProfileGuard::install(profile.clone());
+            let derived = Rc::new(DerivedMapsTestProfile::default());
+            let _derived_guard = DerivedMapsProfileGuard::install(derived.clone());
+            let observer = ZipResourceObserver::new();
+            let probe = Rc::new(ParserTestProbe {
+                member: "do-not-inject",
+                failure: ParserTestFailure::Allocation,
+                state: std::cell::RefCell::new(ParserTestState::default()),
+                guard_observer: Some(observer.clone()),
+            });
+            let _parser_guard = ParserProbeGuard::install(probe.clone());
+            let mut context = PackageProcessingContext::new(observer.clone());
+            assert_eq!(
+                crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                Err(failure.error())
+            );
+            assert!(profile.stop_site.get().is_none());
+            assert!(probe.state.borrow().root_cached);
+            assert_eq!(derived.plate_parser_entries.get(), 1);
+            assert_eq!(derived.fallback_entries.get(), 0);
+            assert_eq!(profile.local_commits.get(), 0);
+            assert_eq!(profile.global_commits.get(), 0);
+            assert_eq!(
+                StlError::from(observer.check().unwrap_err()),
+                failure.error()
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct PathTestFunding {
+        calls: std::sync::atomic::AtomicUsize,
+        live: std::sync::atomic::AtomicUsize,
+        deny_call: usize,
+    }
+    impl crate::metadata_owned::HostOwnedFunding for PathTestFunding {
+        fn try_acquire(&self, bytes: usize) -> Result<(), crate::zip_bounds::ZipFundingBusy> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let call = self.calls.fetch_add(1, SeqCst) + 1;
+            if call == self.deny_call {
+                return Err(crate::zip_bounds::ZipFundingBusy);
+            }
+            self.live.fetch_add(bytes, SeqCst);
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert!(self.live.fetch_sub(bytes, SeqCst) >= bytes);
+        }
+    }
+
+    fn funded_path_fixture(deflate: bool) -> Vec<u8> {
+        let root = model_xml(
+            "millimeter",
+            r#"<object id="10"><components>
+<component p:path="/3D/Objects/a.model" objectid="2"/>
+<component p:path="3D/Objects/a.model" objectid="2"/>
+</components></object>"#,
+            r#"<item objectid="10" p:path="/3D/3dmodel.model"/>"#,
+        );
+        let child = model_xml("millimeter", &cube_mesh_xml(2), "");
+        let settings = plate_settings(&plate_xml(1, "Both", &[(10, 0)]));
+        package(
+            &[
+                ("_rels/.rels", RELS),
+                (ROOT_MODEL_FALLBACK, &root),
+                ("3D/Objects/a.model", &child),
+                (PLATE_SETTINGS_PATH, &settings),
+            ],
+            deflate,
+        )
+    }
+
+    #[test]
+    fn funded_path_cache_keys_share_original_part_owner_and_cache_hits_do_not_acquire() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = funded_path_fixture(deflate);
+            let funding = Arc::new(PathTestFunding::default());
+            let mut context =
+                PackageProcessingContext::new_funded(ZipResourceObserver::new(), funding.clone());
+            let mut pkg = Package::open(&bytes, &mut context).unwrap();
+            let root_path = pkg.root_model_path().unwrap();
+            let root = pkg.part(&root_path).unwrap();
+            let child = pkg.part("/3D/Objects/a.model").unwrap();
+            let key = pkg.parts.get_key_value("3D/Objects/a.model").unwrap().0;
+            assert_eq!(key.as_str().as_ptr(), child.path.as_str().as_ptr());
+            let calls = funding.calls.load(SeqCst);
+            let cached = pkg.part("3D/Objects/a.model").unwrap();
+            assert!(Rc::ptr_eq(&child, &cached));
+            assert_eq!(funding.calls.load(SeqCst), calls);
+            let ObjectKind::Components(components) = &root.objects.get(&10).unwrap().kind else {
+                panic!("fixture must retain repeated actual component paths");
+            };
+            assert_eq!(components[0].path.as_deref(), Some("/3D/Objects/a.model"));
+            assert_eq!(components[1].path.as_deref(), Some("3D/Objects/a.model"));
+            assert_eq!(root.build[0].path.as_deref(), Some("/3D/3dmodel.model"));
+            let retained = child.path.clone();
+            assert_eq!(funding.calls.load(SeqCst), calls);
+            drop(cached);
+            drop(child);
+            drop(root);
+            drop(root_path);
+            drop(pkg);
+            drop(context);
+            assert!(
+                funding.live.load(SeqCst) > 0,
+                "actual path outlives package/context"
+            );
+            assert_eq!(retained.as_str(), "3D/Objects/a.model");
+            drop(retained);
+            assert_eq!(funding.live.load(SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn funded_path_real_parse_preserves_public_result_and_package_usage() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = funded_path_fixture(deflate);
+            let mut external = PackageProcessingContext::new(ZipResourceObserver::new());
+            let expected =
+                crate::parse_model_with_plates_in_context(&bytes, &mut external).unwrap();
+            let funding = Arc::new(PathTestFunding::default());
+            let mut context =
+                PackageProcessingContext::new_funded(ZipResourceObserver::new(), funding.clone());
+            let actual = crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.model.triangle_count, 24);
+            assert_eq!(actual.parts.len(), 2);
+            assert_eq!(context.usage(), external.usage());
+            assert!(
+                funding.calls.load(SeqCst) >= 6,
+                "actual root/reference/cache/diagnostic sites"
+            );
+            assert_eq!(
+                funding.live.load(SeqCst),
+                0,
+                "public output does not retain private paths"
+            );
+        }
+    }
+
+    #[test]
+    fn funded_path_denial_is_terminal_at_every_actual_path_site_without_leaked_credit() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = funded_path_fixture(deflate);
+            let healthy = Arc::new(PathTestFunding::default());
+            let mut context =
+                PackageProcessingContext::new_funded(ZipResourceObserver::new(), healthy.clone());
+            crate::parse_model_with_plates_in_context(&bytes, &mut context).unwrap();
+            let sites = healthy.calls.load(SeqCst);
+            assert!(sites >= 6);
+            for deny_call in 1..=sites {
+                let funding = Arc::new(PathTestFunding {
+                    deny_call,
+                    ..Default::default()
+                });
+                let observer = ZipResourceObserver::new();
+                let mut context =
+                    PackageProcessingContext::new_funded(observer.clone(), funding.clone());
+                assert_eq!(
+                    crate::parse_model_with_plates_in_context(&bytes, &mut context),
+                    Err(StlError::FundingBusy)
+                );
+                assert!(matches!(observer.check(), Err(ZipOpenError::FundingBusy)));
+                assert_eq!(
+                    funding.calls.load(SeqCst),
+                    deny_call,
+                    "no later funded copy after denial"
+                );
+                assert_eq!(funding.live.load(SeqCst), 0);
+            }
+        }
+    }
+
+    struct InputSiteHost(std::sync::Arc<InputFundingSiteProbe>);
+    impl crate::metadata_owned::HostOwnedFunding for InputSiteHost {
+        fn try_acquire(&self, bytes: usize) -> Result<(), crate::zip_bounds::ZipFundingBusy> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let site = self.0.active.load(SeqCst);
+            self.0.acquires[site].fetch_add(1, SeqCst);
+            if self.0.denied.load(SeqCst) {
+                self.0.late_acquires.fetch_add(1, SeqCst);
+            }
+            if site != 0 && site == self.0.deny_site {
+                self.0.denied.store(true, SeqCst);
+                return Err(crate::zip_bounds::ZipFundingBusy);
+            }
+            self.0.live.fetch_add(bytes, SeqCst);
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert!(self.0.live.fetch_sub(bytes, SeqCst) >= bytes);
+        }
+    }
+
+    fn owned_input_site_fixture(site: InputReserveSite, deflate: bool) -> Vec<u8> {
+        let extra = match site {
+            InputReserveSite::Vertices => format!(
+                "<object id=\"2\"><mesh><vertices>{}</vertices><triangles/></mesh></object>",
+                r#"<vertex x="0" y="0" z="0"/>"#.repeat(100)),
+            InputReserveSite::Triangles => format!(
+                "<object id=\"2\"><mesh><vertices><vertex x=\"0\" y=\"0\" z=\"0\"/><vertex x=\"1\" y=\"0\" z=\"0\"/><vertex x=\"0\" y=\"1\" z=\"0\"/></vertices><triangles>{}</triangles></mesh></object>",
+                r#"<triangle v1="0" v2="1" v3="2"/>"#.repeat(100)),
+            InputReserveSite::Components => format!(
+                "<object id=\"2\"><components>{}</components></object>",
+                r#"<component objectid="1"/>"#.repeat(100)),
+            InputReserveSite::Build => String::new(),
+            _ => panic!("only four private input customers are in this fixture"),
+        };
+        let disabled = if site == InputReserveSite::Build {
+            r#"<item objectid="1" printable="0"/>"#.repeat(100)
+        } else {
+            String::new()
+        };
+        let model = model_xml(
+            "millimeter",
+            &(part_retention_triangle().to_owned() + &extra),
+            &(disabled + r#"<item objectid="1"/>"#),
+        );
+        package(&[(ROOT_MODEL_FALLBACK, &model)], deflate)
+    }
+
+    fn assert_owned_input_site_denial(site: InputReserveSite) {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let bytes = owned_input_site_fixture(site, deflate);
+            let healthy = crate::parse_model_with_plates(&bytes).unwrap();
+            assert_eq!(healthy.model.triangle_count, 1);
+            assert_eq!(healthy.parts.len(), 1);
+            assert_eq!(
+                healthy.model.positions,
+                vec![0., 0., 0., 1., 0., 0., 0., 1., 0.]
+            );
+            let probe = Arc::new(InputFundingSiteProbe::new(Some(site)));
+            let mut profile = InputCollectionsTestProfile::new([1000; 5]);
+            profile.funding_site = Some(probe.clone());
+            let profile = Rc::new(profile);
+            let _guard = InputCollectionsProfileGuard::install(profile.clone());
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new_funded(
+                observer.clone(),
+                Arc::new(InputSiteHost(probe.clone())),
+            );
+            let result = crate::parse_model_with_plates_in_context(&bytes, &mut context);
+            assert_eq!(
+                result,
+                Err(StlError::FundingBusy),
+                "target customer {site:?} must ask the host before growing"
+            );
+            assert!(
+                probe.denied.load(SeqCst),
+                "actual host denial must be reached"
+            );
+            assert_eq!(probe.acquires[site as usize + 1].load(SeqCst), 1);
+            assert!(
+                probe.acquires[0].load(SeqCst) > 0,
+                "ordinary path backing was admitted first"
+            );
+            assert_eq!(profile.reserves.borrow()[site as usize], 1);
+            assert_eq!(profile.appended.borrow()[site as usize], 0);
+            assert_eq!(
+                profile.appended.borrow()[InputReserveSite::Parts as usize],
+                0
+            );
+            assert_eq!(
+                probe.active.load(SeqCst),
+                0,
+                "site guard must clear on failure"
+            );
+            assert_eq!(probe.late_acquires.load(SeqCst), 0);
+            assert_eq!(probe.live.load(SeqCst), 0);
+            assert!(matches!(observer.check(), Err(ZipOpenError::FundingBusy)));
+        }
+    }
+
+    #[test]
+    fn owned_input_customer_vertices_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Vertices);
+    }
+    #[test]
+    fn owned_input_customer_triangles_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Triangles);
+    }
+    #[test]
+    fn owned_input_customer_components_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Components);
+    }
+    #[test]
+    fn owned_input_customer_build_denial_is_attributed_to_actual_host_acquire() {
+        assert_owned_input_site_denial(InputReserveSite::Build);
+    }
+
+    #[test]
+    fn owned_input_cached_part_preserves_all_four_backings_after_package_and_context_drop() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for deflate in [false, true] {
+            let vertices = r#"<vertex x="0" y="0" z="0"/>"#.repeat(65);
+            let triangles = r#"<triangle v1="0" v2="0" v3="0"/>"#.repeat(65);
+            let components = format!(
+                r#"<component objectid="1" p:path="/3D/3dmodel.model"/>{}"#,
+                r#"<component objectid="1"/>"#.repeat(64)
+            );
+            let resources = format!("<object id=\"1\"><mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh></object><object id=\"2\"><components>{components}</components></object>");
+            let build = format!(
+                r#"<item objectid="2" p:path="/3D/3dmodel.model"/>{}"#,
+                r#"<item objectid="2" printable="0"/>"#.repeat(64)
+            );
+            let model = model_xml("millimeter", &resources, &build);
+            let bytes = package(&[(ROOT_MODEL_FALLBACK, &model)], deflate);
+            let probe = Arc::new(InputFundingSiteProbe::new(None));
+            let mut profile = InputCollectionsTestProfile::new([1000; 5]);
+            profile.funding_site = Some(probe.clone());
+            let _guard = InputCollectionsProfileGuard::install(Rc::new(profile));
+            let mut context = PackageProcessingContext::new_funded(
+                ZipResourceObserver::new(),
+                Arc::new(InputSiteHost(probe.clone())),
+            );
+            let mut pkg = Package::open(&bytes, &mut context).unwrap();
+            let part = pkg.part(ROOT_MODEL_FALLBACK).unwrap();
+            let ObjectKind::Mesh {
+                vertices,
+                triangles,
+            } = &part.objects.get(&1).unwrap().kind
+            else {
+                panic!("mesh fixture");
+            };
+            let ObjectKind::Components(components) = &part.objects.get(&2).unwrap().kind else {
+                panic!("component fixture");
+            };
+            assert_eq!(
+                (
+                    vertices.len(),
+                    triangles.len(),
+                    components.len(),
+                    part.build.len()
+                ),
+                (65, 65, 65, 65)
+            );
+            assert_eq!(
+                (
+                    vertices.capacity(),
+                    triangles.capacity(),
+                    components.capacity(),
+                    part.build.capacity()
+                ),
+                (128, 128, 128, 128)
+            );
+            let array_addresses = (
+                vertices.as_ptr(),
+                triangles.as_ptr(),
+                components.as_ptr(),
+                part.build.as_ptr(),
+            );
+            let component_path = components[0].path.as_ref().unwrap().as_str().as_ptr();
+            let build_path = part.build[0].path.as_ref().unwrap().as_str().as_ptr();
+            let charges = probe.live.load(SeqCst);
+            assert!(charges > 0);
+            let calls = probe
+                .acquires
+                .iter()
+                .map(|n| n.load(SeqCst))
+                .collect::<Vec<_>>();
+            for site in [
+                InputReserveSite::Vertices,
+                InputReserveSite::Triangles,
+                InputReserveSite::Components,
+                InputReserveSite::Build,
+            ] {
+                assert!(
+                    calls[site as usize + 1] >= 7,
+                    "actual category must grow repeatedly"
+                );
+            }
+            let cached = pkg.part("/3D/3dmodel.model").unwrap();
+            assert!(Rc::ptr_eq(&part, &cached));
+            assert_eq!(
+                probe
+                    .acquires
+                    .iter()
+                    .map(|n| n.load(SeqCst))
+                    .collect::<Vec<_>>(),
+                calls
+            );
+            drop(pkg);
+            drop(context);
+            let cached_charge = probe.live.load(SeqCst);
+            assert!(cached_charge > 0 && cached_charge < charges);
+            drop(part);
+            assert_eq!(probe.live.load(SeqCst), cached_charge);
+            let ObjectKind::Mesh {
+                vertices,
+                triangles,
+            } = &cached.objects.get(&1).unwrap().kind
+            else {
+                panic!("mesh retained");
+            };
+            let ObjectKind::Components(components) = &cached.objects.get(&2).unwrap().kind else {
+                panic!("components retained");
+            };
+            assert_eq!(
+                (
+                    vertices.as_ptr(),
+                    triangles.as_ptr(),
+                    components.as_ptr(),
+                    cached.build.as_ptr()
+                ),
+                array_addresses
+            );
+            assert_eq!(
+                components[0].path.as_ref().unwrap().as_str().as_ptr(),
+                component_path
+            );
+            assert_eq!(
+                cached.build[0].path.as_ref().unwrap().as_str().as_ptr(),
+                build_path
+            );
+            assert_eq!(components[0].path.as_deref(), Some("/3D/3dmodel.model"));
+            drop(cached);
+            assert_eq!(probe.live.load(SeqCst), 0);
+        }
+    }
+
+    fn assert_owned_noncopy_growth<T: InputElement>(
+        make: fn(SharedPath) -> T,
+        path: for<'a> fn(&'a T) -> &'a SharedPath,
+    ) {
+        use crate::input_owned::{input_buffer_layout, InputReserveStage};
+        use std::sync::{atomic::Ordering::SeqCst, Arc};
+        for stage in [
+            InputReserveStage::AfterAcquire,
+            InputReserveStage::AfterAllocate,
+            InputReserveStage::AfterCopyBeforeCommit,
+            InputReserveStage::Committed,
+        ] {
+            for failure in PARSER_TEST_FAILURES {
+                let probe = Arc::new(InputFundingSiteProbe::new(None));
+                let observer = ZipResourceObserver::new();
+                let context = PackageProcessingContext::new_funded(
+                    observer.clone(),
+                    Arc::new(InputSiteHost(probe.clone())),
+                );
+                let allocator = context.path_allocator();
+                let element_path = allocator.copy_path("3D/unchanged.model").unwrap();
+                let path_address = element_path.as_str().as_ptr();
+                let mut buffer = OwnedInputBuffer::<T>::empty();
+                buffer.reserve_capacity(1, &allocator).unwrap();
+                buffer.push_reserved(make(element_path));
+                let old_address = buffer.as_ptr();
+                let old_charge = probe.live.load(SeqCst);
+                let old_layout = input_buffer_layout::<T>(1).unwrap().allocation_size;
+                let new_layout = input_buffer_layout::<T>(2).unwrap().allocation_size;
+                let reached = std::cell::Cell::new(false);
+                let result = buffer.reserve_capacity_with_hook(2, &allocator, |at| {
+                    if at == InputReserveStage::AfterAcquire {
+                        assert_eq!(
+                            probe.live.load(SeqCst),
+                            old_charge + new_layout,
+                            "old and full new backing coexist"
+                        );
+                    }
+                    if at == stage {
+                        reached.set(true);
+                        observer.observe_io(&failure.io_error());
+                    }
+                });
+                assert!(reached.get());
+                assert_eq!(result, Err(failure.error()));
+                assert_eq!(buffer.len(), 1);
+                assert_eq!(path(&buffer[0]).as_str().as_ptr(), path_address);
+                if stage == InputReserveStage::Committed {
+                    assert_eq!(buffer.capacity(), 2);
+                    assert_ne!(buffer.as_ptr(), old_address);
+                    assert_eq!(
+                        probe.live.load(SeqCst),
+                        old_charge - old_layout + new_layout
+                    );
+                } else {
+                    assert_eq!(buffer.capacity(), 1);
+                    assert_eq!(buffer.as_ptr(), old_address);
+                    assert_eq!(probe.live.load(SeqCst), old_charge);
+                }
+                assert_eq!(
+                    probe.acquires[0].load(SeqCst),
+                    3,
+                    "one path and exactly two buffer acquisitions; no path copy"
+                );
+                drop(context);
+                drop(allocator);
+                assert!(probe.live.load(SeqCst) > 0);
+                drop(buffer);
+                assert_eq!(probe.live.load(SeqCst), 0);
+                assert_eq!(
+                    StlError::from(observer.check().unwrap_err()),
+                    failure.error()
+                );
+            }
+        }
+    }
+    #[test]
+    fn owned_input_real_component_noncopy_growth_preserves_ownership_at_every_failure_stage() {
+        assert_owned_noncopy_growth(
+            |path| Component {
+                path: Some(path),
+                object_id: 1,
+                transform: IDENTITY,
+            },
+            |v| v.path.as_ref().unwrap(),
+        );
+    }
+    #[test]
+    fn owned_input_real_build_noncopy_growth_preserves_ownership_at_every_failure_stage() {
+        assert_owned_noncopy_growth(
+            |path| BuildItem {
+                path: Some(path),
+                object_id: 1,
+                transform: IDENTITY,
+                printable: true,
+            },
+            |v| v.path.as_ref().unwrap(),
+        );
+    }
+
+    #[test]
+    fn owned_input_actual_private_type_layout_profiles_are_read_only_and_checked() {
+        use crate::InputBufferKind::*;
+        for (kind, size, align) in [
+            (
+                Vertices,
+                std::mem::size_of::<V3>(),
+                std::mem::align_of::<V3>(),
+            ),
+            (
+                Triangles,
+                std::mem::size_of::<[u32; 3]>(),
+                std::mem::align_of::<[u32; 3]>(),
+            ),
+            (
+                Components,
+                std::mem::size_of::<Component>(),
+                std::mem::align_of::<Component>(),
+            ),
+            (
+                Build,
+                std::mem::size_of::<BuildItem>(),
+                std::mem::align_of::<BuildItem>(),
+            ),
+        ] {
+            assert!(input_buffer_layout_profile(kind, 0).is_none());
+            assert!(input_buffer_layout_profile(kind, usize::MAX).is_none());
+            let profile = input_buffer_layout_profile(kind, 128).unwrap();
+            assert_eq!(
+                (
+                    profile.element_size,
+                    profile.element_align,
+                    profile.capacity
+                ),
+                (size, align, 128)
+            );
+            assert!(profile.payload_offset >= profile.header_size);
+            assert_eq!(profile.payload_offset % align, 0);
+            assert!(profile.allocation_size >= profile.payload_offset + 128 * size);
+            assert!(profile.allocation_align >= align);
+        }
+    }
+
+    fn assert_owned_map_growth_is_funded(site: InputReserveSite) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let resources = match site {
+            InputReserveSite::Objects => (1..=24)
+                .map(|id| format!("<object id=\"{id}\"/>"))
+                .collect::<String>(),
+            InputReserveSite::Parts => "<object id=\"1\"/>".to_owned(),
+            _ => panic!("only the private object and part maps are covered here"),
+        };
+        let xml = model_xml("millimeter", &resources, "");
+        let bytes = package(&[(ROOT_MODEL_FALLBACK, &xml)], false);
+        let observer = ZipResourceObserver::new();
+        let probe = std::sync::Arc::new(InputFundingSiteProbe::new(Some(site)));
+        let mut profile = InputCollectionsTestProfile::new([1000; 5]);
+        profile.funding_site = Some(probe.clone());
+        let profile = std::rc::Rc::new(profile);
+        let _guard = InputCollectionsProfileGuard::install(profile.clone());
+        let mut context = PackageProcessingContext::new_funded(
+            observer.clone(),
+            std::sync::Arc::new(InputSiteHost(probe.clone())),
+        );
+
+        let result = parse_3mf_with_plates_in_context(&bytes, &mut context);
+        let error = result.expect_err("map growth must ask the host before acquiring buckets");
+        assert_eq!(error, StlError::FundingBusy);
+        assert!(
+            probe.denied.load(SeqCst),
+            "target map must reach host refusal"
+        );
+        assert_eq!(probe.acquires[site as usize + 1].load(SeqCst), 1);
+        assert_eq!(profile.reserves.borrow()[site as usize], 1);
+        assert_eq!(profile.appended.borrow()[site as usize], 0);
+        assert_eq!(probe.active.load(SeqCst), 0);
+        assert_eq!(probe.late_acquires.load(SeqCst), 0);
+        assert_eq!(probe.live.load(SeqCst), 0);
+        assert!(matches!(observer.check(), Err(ZipOpenError::FundingBusy)));
+    }
+
+    #[test]
+    fn owned_object_map_bucket_growth_is_host_funded_before_insert() {
+        assert_owned_map_growth_is_funded(InputReserveSite::Objects);
+    }
+
+    #[test]
+    fn owned_part_map_bucket_growth_is_host_funded_before_cache_insert() {
+        assert_owned_map_growth_is_funded(InputReserveSite::Parts);
     }
 }

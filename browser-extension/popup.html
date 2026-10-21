@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <title>Review capture for GoggleLab</title>
+    <link rel="stylesheet" href="extension.css">
+  </head>
+  <body>
+    <main>
+      <h1>Review model</h1>
+      <p>Check the details before queueing. Nothing is imported into GoggleLab until you choose Import in the app.</p>
+      <form id="capture-form" autocomplete="off" hidden>
+        <label class="field" for="title">
+          <span>Title</span>
+          <input id="title" name="title" type="text" maxlength="512" required>
+        </label>
+        <label class="field" for="designer">
+          <span>Designer</span>
+          <input id="designer" name="designer" type="text" maxlength="256">
+        </label>
+        <label class="field" for="license">
+          <span>License</span>
+          <input id="license" name="license" type="text" maxlength="256">
+        </label>
+        <label class="field" for="source-url">
+          <span>Source URL</span>
+          <input id="source-url" name="source-url" type="url" maxlength="2048" required>
+        </label>
+        <label class="field" for="notes">
+          <span>Notes</span>
+          <textarea id="notes" name="notes" rows="4" maxlength="4000"></textarea>
+        </label>
+        <button id="enrich" type="button" hidden>Enrich from catalog</button>
+        <button id="capture" type="submit" disabled>Queue for GoggleLab</button>
+      </form>
+      <button id="retry-preview" type="button" hidden>Retry loading details</button>
+      <a href="options.html" target="_blank" rel="noopener">Inbox options</a>
+      <div id="status" role="status" aria-live="polite">Loading model details…</div>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

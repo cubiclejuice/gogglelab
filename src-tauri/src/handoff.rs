@@ -1,0 +1,2329 @@
+use std::ffi::OsString;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
+use tauri::State;
+
+use crate::extension_api::{self, AppError, AppState, OriginalSource, SlicerApp, SourceFormat};
+use crate::library_commands::LibraryState;
+use crate::settings::SettingsState;
+
+static HANDOFF_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static HANDOFF_STORAGE_LOCK: Mutex<()> = Mutex::new(());
+
+const MAX_BATCH_MODELS: usize = 100;
+const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_HANDOFF_STORAGE_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(any(windows, test))]
+const MAX_HANDOFF_TREE_ENTRIES: usize = 16_384;
+const HANDOFF_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const HANDOFF_ROOT_MARKER: &str = ".gogglelab-handoff-root";
+const HANDOFF_DIRECTORY_MARKER: &str = ".gogglelab-handoff-directory";
+const HANDOFF_ROOT_ID: &str = "gogglelab-handoff-root-v1";
+
+/// Opens the original bytes for the current viewer generation in a supported,
+/// freshly detected slicer. `with_original_source` keeps the generation and
+/// current-model locks held through launch admission, so a newer model cannot
+/// replace the source between validation and the external side effect.
+#[tauri::command]
+pub fn open_in_slicer(
+    viewer: State<'_, AppState>,
+    library: State<'_, LibraryState>,
+    settings: State<'_, SettingsState>,
+    generation: u64,
+    slicer_id: String,
+) -> Result<(), AppError> {
+    let _io = library.begin_io()?;
+    let settings = settings.inner().clone();
+    extension_api::with_original_source_digest(&viewer, generation, |source, digest| {
+        checked_owned_source_launch(
+            source,
+            digest,
+            library.root(),
+            &slicer_id,
+            || {
+                let current = settings.0.lock().unwrap();
+                crate::slicers::available_slicers(&current)
+            },
+            |slicer, path| {
+                crate::slicers::launch_with_current_profile(&settings, slicer, || {
+                    launch(slicer, path)
+                })
+            },
+        )
+        .map(|_| ())
+    })
+}
+
+fn checked_owned_source_launch(
+    source: &OriginalSource,
+    expected_digest: &str,
+    library_root: &Path,
+    slicer_id: &str,
+    detect: impl FnOnce() -> Vec<SlicerApp>,
+    launch: impl FnOnce(&SlicerApp, &Path) -> Result<(), AppError>,
+) -> Result<PathBuf, AppError> {
+    let directory = copy_loaded_source(source, expected_digest, library_root)?;
+    let path = directory.join(handoff_filename(source));
+    let installed = detect();
+    let result = checked_source_launch(
+        &OriginalSource {
+            path: path.clone(),
+            format: source.format,
+        },
+        slicer_id,
+        &installed,
+        launch,
+    );
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result.map(|_| path)
+}
+
+fn copy_loaded_source(
+    source: &OriginalSource,
+    expected_digest: &str,
+    library_root: &Path,
+) -> Result<PathBuf, AppError> {
+    if expected_digest.len() != 64 || !expected_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppError::Library {
+            message: "Loaded source digest is invalid".into(),
+        });
+    }
+    let metadata =
+        fs::symlink_metadata(&source.path).map_err(|error| crate::error::map_io_error(&error))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > stl_core::limits::MAX_FILE_BYTES
+    {
+        return Err(AppError::Library {
+            message: "Loaded source is not a safe regular model file".into(),
+        });
+    }
+    let mut input =
+        fs::File::open(&source.path).map_err(|error| crate::error::map_io_error(&error))?;
+    let mut bytes = Vec::new();
+    (&mut input)
+        .take(stl_core::limits::MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| crate::error::map_io_error(&error))?;
+    if bytes.len() as u64 != metadata.len()
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_digest
+    {
+        return Err(AppError::Library {
+            message: "Loaded source changed after it was opened".into(),
+        });
+    }
+    stage_handoff_bytes(
+        &bytes,
+        &handoff_filename(source),
+        expected_digest,
+        library_root,
+    )
+    .map(|(directory, _)| directory)
+}
+
+fn stage_handoff_bytes(
+    bytes: &[u8],
+    file_name: &str,
+    expected_digest: &str,
+    library_root: &Path,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    if bytes.len() as u64 > stl_core::limits::MAX_FILE_BYTES
+        || expected_digest.len() != 64
+        || !expected_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || format!("{:x}", Sha256::digest(bytes)) != expected_digest
+    {
+        return Err(AppError::Library {
+            message: "Handoff source failed size or digest verification".into(),
+        });
+    }
+    let root = stable_handoff_root(library_root)?;
+    let _storage = HANDOFF_STORAGE_LOCK.lock().map_err(|_| AppError::Library {
+        message: "Handoff storage is unavailable".into(),
+    })?;
+    create_owned_handoff_root(&root)?;
+    prepare_handoff_storage(&root, bytes.len() as u64)?;
+    for _ in 0..1024 {
+        let directory = root.join(format!(
+            "single-{}-{}-{}",
+            std::process::id(),
+            HANDOFF_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            &expected_digest[..12]
+        ));
+        match create_private_directory(&directory) {
+            Ok(()) => {
+                if let Err(error) = mark_owned_handoff_directory(&directory) {
+                    let _ = fs::remove_dir_all(&directory);
+                    return Err(error);
+                }
+                let path = directory.join(file_name);
+                let result = (|| {
+                    let mut output = open_private_file(&path)
+                        .map_err(|error| crate::error::map_io_error(&error))?;
+                    set_private_file_permissions(&path)?;
+                    output
+                        .write_all(bytes)
+                        .map_err(|error| crate::error::map_io_error(&error))?;
+                    output
+                        .sync_all()
+                        .map_err(|error| crate::error::map_io_error(&error))?;
+                    Ok::<_, AppError>(())
+                })();
+                if let Err(error) = result {
+                    let _ = fs::remove_dir_all(&directory);
+                    return Err(error);
+                }
+                return Ok((directory, path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(crate::error::map_io_error(&error)),
+        }
+    }
+    Err(AppError::Library {
+        message: "Could not allocate stable handoff storage".into(),
+    })
+}
+
+pub(crate) struct VerifiedHandoffRequest<'a> {
+    pub bytes: &'a [u8],
+    pub file_name: &'a str,
+    pub expected_digest: &'a str,
+    pub format: SourceFormat,
+    pub library_root: &'a Path,
+    pub slicer_id: &'a str,
+}
+
+pub(crate) struct StreamHandoffRequest<'a> {
+    pub content_id: &'a str,
+    pub file_name: &'a str,
+    pub expected_digest: &'a str,
+    pub expected_bytes: u64,
+    pub format: SourceFormat,
+    pub library_root: &'a Path,
+    pub slicer_id: &'a str,
+}
+
+pub(crate) fn checked_bytes_launch(
+    request: VerifiedHandoffRequest<'_>,
+    detect: impl FnOnce() -> Vec<SlicerApp>,
+    launch: impl FnOnce(&SlicerApp, &Path) -> Result<(), AppError>,
+) -> Result<PathBuf, AppError> {
+    let VerifiedHandoffRequest {
+        bytes,
+        file_name,
+        expected_digest,
+        format,
+        library_root,
+        slicer_id,
+    } = request;
+    let installed = detect();
+    if supported_slicer(slicer_id, &installed).is_none() {
+        return Err(AppError::UnknownSlicer);
+    }
+    let name = handoff_filename(&OriginalSource {
+        path: PathBuf::from(file_name),
+        format,
+    });
+    let (directory, path) = stage_handoff_bytes(bytes, &name, expected_digest, library_root)?;
+    let result = checked_source_launch(
+        &OriginalSource {
+            path: path.clone(),
+            format,
+        },
+        slicer_id,
+        &installed,
+        launch,
+    );
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result.map(|_| path)
+}
+
+#[cfg(test)]
+pub(crate) fn checked_bytes_batch_launch(
+    requests: &[VerifiedHandoffRequest<'_>],
+    detect: impl FnOnce() -> Vec<SlicerApp>,
+    launch: impl FnOnce(&SlicerApp, &[PathBuf]) -> Result<(), AppError>,
+) -> Result<Vec<PathBuf>, AppError> {
+    for request in requests {
+        if request.bytes.len() as u64 > stl_core::limits::MAX_FILE_BYTES
+            || request.expected_digest.len() != 64
+            || !request
+                .expected_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || format!("{:x}", Sha256::digest(request.bytes)) != request.expected_digest
+        {
+            return Err(AppError::Library {
+                message: "Slicer handoff source failed size or digest verification".into(),
+            });
+        }
+    }
+    let content_ids = (0..requests.len())
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>();
+    let streams = requests
+        .iter()
+        .zip(&content_ids)
+        .map(|(request, content_id)| StreamHandoffRequest {
+            content_id,
+            file_name: request.file_name,
+            expected_digest: request.expected_digest,
+            expected_bytes: request.bytes.len() as u64,
+            format: request.format,
+            library_root: request.library_root,
+            slicer_id: request.slicer_id,
+        })
+        .collect::<Vec<_>>();
+    checked_stream_batch_launch(
+        &streams,
+        |content_id, sink| {
+            let index = content_id.parse::<usize>().map_err(|_| AppError::Library {
+                message: "Slicer handoff content ID is invalid".into(),
+            })?;
+            let request = requests.get(index).ok_or_else(|| AppError::Library {
+                message: "Slicer handoff content ID is invalid".into(),
+            })?;
+            sink.write_all(request.bytes)
+                .map_err(|error| crate::error::map_io_error(&error))
+        },
+        detect,
+        launch,
+    )
+}
+
+pub(crate) fn checked_stream_batch_launch(
+    requests: &[StreamHandoffRequest<'_>],
+    mut stream: impl FnMut(&str, &mut dyn Write) -> Result<(), AppError>,
+    detect: impl FnOnce() -> Vec<SlicerApp>,
+    launch: impl FnOnce(&SlicerApp, &[PathBuf]) -> Result<(), AppError>,
+) -> Result<Vec<PathBuf>, AppError> {
+    if requests.is_empty() || requests.len() > MAX_BATCH_MODELS {
+        return Err(AppError::Library {
+            message: "Slicer handoff target count is invalid".into(),
+        });
+    }
+    let slicer_id = requests[0].slicer_id;
+    let mut total_bytes = 0_u64;
+    for request in requests {
+        if request.slicer_id != slicer_id || request.library_root != requests[0].library_root {
+            return Err(AppError::Library {
+                message: "Slicer handoff targets must use the same slicer and library".into(),
+            });
+        }
+        total_bytes = total_bytes
+            .checked_add(request.expected_bytes)
+            .ok_or_else(|| AppError::Library {
+                message: "Slicer handoff byte total is out of range".into(),
+            })?;
+        if total_bytes > MAX_BATCH_BYTES {
+            return Err(AppError::Library {
+                message: "Slicer handoff batch exceeds its byte limit".into(),
+            });
+        }
+        if request.expected_bytes == 0
+            || request.expected_bytes > stl_core::limits::MAX_FILE_BYTES
+            || request.expected_digest.len() != 64
+            || !request
+                .expected_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AppError::Library {
+                message: "Slicer handoff source failed size or digest verification".into(),
+            });
+        }
+    }
+    let installed = detect();
+    if supported_slicer(slicer_id, &installed).is_none() {
+        return Err(AppError::UnknownSlicer);
+    }
+    let root = stable_handoff_root(requests[0].library_root)?;
+    let _storage = HANDOFF_STORAGE_LOCK.lock().map_err(|_| AppError::Library {
+        message: "Handoff storage is unavailable".into(),
+    })?;
+    create_owned_handoff_root(&root)?;
+    prepare_handoff_storage(&root, total_bytes)?;
+    let mut directory = None;
+    for _ in 0..1024 {
+        let candidate = root.join(format!(
+            "batch-{}-{}",
+            std::process::id(),
+            HANDOFF_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match create_private_directory(&candidate) {
+            Ok(()) => {
+                if let Err(error) = mark_owned_handoff_directory(&candidate) {
+                    let _ = fs::remove_dir_all(&candidate);
+                    return Err(error);
+                }
+                directory = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(crate::error::map_io_error(&error)),
+        }
+    }
+    let directory = directory.ok_or_else(|| AppError::Library {
+        message: "Could not allocate stable handoff storage".into(),
+    })?;
+    let mut paths = Vec::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        let source = OriginalSource {
+            path: PathBuf::from(request.file_name),
+            format: request.format,
+        };
+        let path = directory.join(format!("{:03}-{}", index + 1, handoff_filename(&source)));
+        let result = (|| {
+            let file =
+                open_private_file(&path).map_err(|error| crate::error::map_io_error(&error))?;
+            set_private_file_permissions(&path)?;
+            let mut writer = DigestFileWriter::new(file, request.expected_bytes);
+            stream(request.content_id, &mut writer)?;
+            writer.finish(request.expected_digest)?;
+            Ok::<_, AppError>(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&directory);
+            return Err(error);
+        }
+        paths.push(path);
+    }
+    drop(_storage);
+    let result = checked_paths_launch(&paths, slicer_id, &installed, launch);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result.map(|()| paths)
+}
+
+struct DigestFileWriter {
+    file: fs::File,
+    digest: Sha256,
+    written: u64,
+    expected: u64,
+}
+
+impl DigestFileWriter {
+    fn new(file: fs::File, expected: u64) -> Self {
+        Self {
+            file,
+            digest: Sha256::new(),
+            written: 0,
+            expected,
+        }
+    }
+
+    fn finish(self, expected_digest: &str) -> Result<(), AppError> {
+        self.file
+            .sync_all()
+            .map_err(|error| crate::error::map_io_error(&error))?;
+        let actual_digest = format!("{:x}", self.digest.finalize());
+        if self.written != self.expected || actual_digest != expected_digest {
+            return Err(AppError::Library {
+                message: "Slicer handoff source failed size or digest verification".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Write for DigestFileWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let requested = u64::try_from(bytes.len())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        let next = self
+            .written
+            .checked_add(requested)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        if next > self.expected {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        let written = self.file.write(bytes)?;
+        self.digest.update(&bytes[..written]);
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn handoff_filename(source: &OriginalSource) -> String {
+    let raw = source
+        .path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    let mut basename = raw
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    basename = basename.trim_matches([' ', '.']).to_owned();
+    if basename.is_empty() {
+        basename = "model".into();
+    }
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if reserved
+        .iter()
+        .any(|candidate| basename.eq_ignore_ascii_case(candidate))
+    {
+        basename.insert_str(0, "model-");
+    }
+    let extension = match source.format {
+        SourceFormat::Stl => "stl",
+        SourceFormat::ThreeMf => "3mf",
+    };
+    format!("{basename}.{extension}")
+}
+
+#[cfg(any(windows, test))]
+fn canonical_windows_local_app_data(
+    local_app_data: &Path,
+    user_profile: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, AppError> {
+    let local_app_data =
+        canonicalize(local_app_data).map_err(|error| crate::error::map_io_error(&error))?;
+    let user_profile =
+        canonicalize(user_profile).map_err(|error| crate::error::map_io_error(&error))?;
+    if !local_app_data.starts_with(&user_profile) {
+        return Err(AppError::Library {
+            message: "Windows local application data resolves outside the current user profile"
+                .into(),
+        });
+    }
+    Ok(local_app_data)
+}
+
+#[cfg(any(windows, test))]
+fn windows_private_handoff_sddl(user_sid: &str, is_directory: bool) -> Result<String, AppError> {
+    let sid_body = user_sid
+        .strip_prefix("S-1-")
+        .ok_or_else(|| AppError::Library {
+            message: "Current user SID is invalid for private handoff storage".into(),
+        })?;
+    if sid_body.is_empty()
+        || sid_body.split('-').any(|component| {
+            component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err(AppError::Library {
+            message: "Current user SID is invalid for private handoff storage".into(),
+        });
+    }
+    let inheritance = if is_directory { "OICI" } else { "" };
+    Ok(format!(
+        "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;{user_sid})"
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn security_descriptor_owner_matches_user(security_sddl: &str, user_sid: &str) -> bool {
+    security_sddl == user_sid
+}
+
+pub(crate) fn stable_handoff_root(library_root: &Path) -> Result<PathBuf, AppError> {
+    #[cfg(windows)]
+    {
+        let profile = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| AppError::Library {
+                message:
+                    "Windows local application data is unavailable for private handoff storage"
+                        .into(),
+            })?;
+        let user_profile = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .ok_or_else(|| AppError::Library {
+                message: "Windows user profile is unavailable for private handoff storage".into(),
+            })?;
+        // Resolve junctions and other reparse points before checking
+        // containment so a lexical path cannot redirect staged bytes outside
+        // the current user's profile.
+        let profile = canonical_windows_local_app_data(&profile, &user_profile, |path| {
+            fs::canonicalize(path)
+        })?;
+        let library_name = library_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("library");
+        // `create_owned_handoff_root` replaces inherited ACLs with the
+        // current-user-and-SYSTEM-only DACL before staging any model bytes.
+        return Ok(profile.join(format!("GoggleLab-{library_name}-handoff-v1")));
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = library_root.parent().ok_or_else(|| AppError::Library {
+            message: "Library has no stable parent for handoff assets".into(),
+        })?;
+        let library_name = library_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("library");
+        Ok(parent.join(format!("{library_name}-gogglelab-handoff-v1")))
+    }
+}
+
+fn create_owned_handoff_root(root: &Path) -> Result<(), AppError> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || !is_private(&metadata) =>
+        {
+            return Err(AppError::Library {
+                message: "Handoff namespace is not a real directory".into(),
+            });
+        }
+        Ok(_) => {
+            verify_owner_marker(root.join(HANDOFF_ROOT_MARKER), HANDOFF_ROOT_ID)?;
+            set_private_directory_permissions(root)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_and_secure_handoff_root(root, set_private_directory_permissions)?;
+            let marker = root.join(HANDOFF_ROOT_MARKER);
+            if let Err(error) = write_owner_marker(marker.clone(), HANDOFF_ROOT_ID) {
+                let _ = fs::remove_file(marker);
+                let _ = fs::remove_dir(root);
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(crate::error::map_io_error(&error)),
+    }
+    Ok(())
+}
+
+fn mark_owned_handoff_directory(directory: &Path) -> Result<(), AppError> {
+    set_private_directory_permissions(directory)?;
+    let name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Library {
+            message: "Handoff directory name is invalid".into(),
+        })?;
+    write_owner_marker(
+        directory.join(HANDOFF_DIRECTORY_MARKER),
+        &format!("gogglelab-handoff-directory-v1\n{name}"),
+    )
+}
+
+fn is_owned_handoff_directory(directory: &Path) -> bool {
+    let Some(name) = directory.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("single-") && !name.starts_with("batch-") {
+        return false;
+    }
+    verify_owner_marker(
+        directory.join(HANDOFF_DIRECTORY_MARKER),
+        &format!("gogglelab-handoff-directory-v1\n{name}"),
+    )
+    .is_ok()
+}
+
+fn write_owner_marker(path: PathBuf, value: &str) -> Result<(), AppError> {
+    let mut marker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| crate::error::map_io_error(&error))?;
+    marker
+        .write_all(value.as_bytes())
+        .map_err(|error| crate::error::map_io_error(&error))?;
+    marker
+        .sync_all()
+        .map_err(|error| crate::error::map_io_error(&error))?;
+    drop(marker);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| crate::error::map_io_error(&error))?;
+    }
+    #[cfg(windows)]
+    set_private_file_permissions(&path)?;
+    Ok(())
+}
+
+fn verify_owner_marker(path: PathBuf, expected: &str) -> Result<(), AppError> {
+    let metadata = fs::symlink_metadata(&path).map_err(|_| AppError::Library {
+        message: "Handoff namespace is not owned by GoggleLab".into(),
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > 128
+        || !is_private(&metadata)
+    {
+        return Err(AppError::Library {
+            message: "Handoff namespace ownership marker is invalid".into(),
+        });
+    }
+    let value = fs::read_to_string(path).map_err(|_| AppError::Library {
+        message: "Handoff namespace ownership marker is unreadable".into(),
+    })?;
+    if value != expected {
+        return Err(AppError::Library {
+            message: "Handoff namespace is not owned by GoggleLab".into(),
+        });
+    }
+    Ok(())
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| crate::error::map_io_error(&error))?;
+    }
+    #[cfg(windows)]
+    set_private_windows_dacl_tree(path)?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
+fn create_and_secure_handoff_root(
+    root: &Path,
+    secure_permissions: impl FnOnce(&Path) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    create_private_directory(root).map_err(|error| crate::error::map_io_error(&error))?;
+    if let Err(error) = secure_permissions(root) {
+        // This path was just created by this call. `remove_dir` is deliberately
+        // non-recursive, so a concurrent or unexpected child prevents cleanup.
+        let _ = fs::remove_dir(root);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| crate::error::map_io_error(&error))?;
+    }
+    #[cfg(windows)]
+    set_private_windows_dacl(path, false)?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_private_windows_dacl_tree(root: &Path) -> Result<(), AppError> {
+    let user_sid = windows_current_user_sid()?;
+    let mut paths = Vec::new();
+    collect_handoff_tree_paths(root, &mut paths)?;
+
+    // Do not partially repair a tree if any object is owned by another
+    // principal; that owner could still rewrite its DACL after repair.
+    for (path, _) in &paths {
+        let (owner_sid, _) = windows_path_security(path)?;
+        if !security_descriptor_owner_matches_user(&owner_sid, &user_sid) {
+            return Err(windows_owner_mismatch());
+        }
+    }
+    for (path, is_directory) in paths {
+        set_private_windows_dacl_for_user(&path, &user_sid, is_directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn collect_handoff_tree_paths(
+    root: &Path,
+    paths: &mut Vec<(PathBuf, bool)>,
+) -> Result<(), AppError> {
+    let mut pending = Vec::new();
+    let mut discovered_entries = 0;
+    enqueue_handoff_tree_path(&mut pending, root.to_path_buf(), &mut discovered_entries)?;
+    while let Some(path) = pending.pop() {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| crate::error::map_io_error(&error))?;
+        if windows_is_reparse_point(&metadata) {
+            return Err(AppError::Library {
+                message: "Handoff storage contains an unsupported reparse point".into(),
+            });
+        }
+        let is_directory = metadata.is_dir();
+        paths.push((path.clone(), is_directory));
+        if is_directory {
+            for entry in fs::read_dir(&path).map_err(|error| crate::error::map_io_error(&error))? {
+                enqueue_handoff_tree_path(
+                    &mut pending,
+                    entry
+                        .map_err(|error| crate::error::map_io_error(&error))?
+                        .path(),
+                    &mut discovered_entries,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn enqueue_handoff_tree_path(
+    pending: &mut Vec<PathBuf>,
+    path: PathBuf,
+    discovered_entries: &mut usize,
+) -> Result<(), AppError> {
+    if *discovered_entries >= MAX_HANDOFF_TREE_ENTRIES {
+        return Err(AppError::Library {
+            message: "Handoff storage contains too many entries to secure".into(),
+        });
+    }
+    pending.push(path);
+    *discovered_entries += 1;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn windows_current_user_sid() -> Result<String, AppError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: `OpenProcessToken` returned this owned handle.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the process pseudo-handle is valid and the output pointer is writable.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    let token = Token(token);
+    let mut needed = 0_u32;
+    // SAFETY: this first call asks Windows for the required buffer length.
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    let word_count = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut token_data = vec![0_u64; word_count];
+    // SAFETY: `token_data` is suitably aligned and has the size reported by Windows.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            token_data.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    // SAFETY: the successful TokenUser query initialized a TOKEN_USER at the buffer start.
+    let token_user = unsafe { &*(token_data.as_ptr().cast::<TOKEN_USER>()) };
+    let mut sid_string = std::ptr::null_mut();
+    // SAFETY: the SID belongs to the live token buffer and `sid_string` is writable.
+    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string) } == 0 {
+        return Err(AppError::Library {
+            message: "Could not identify the current user for handoff permissions".into(),
+        });
+    }
+    // SAFETY: Windows returned a NUL-terminated UTF-16 SID string.
+    let sid_result = unsafe {
+        let mut length = 0_usize;
+        while *sid_string.add(length) != 0 {
+            length += 1;
+        }
+        let wide = std::slice::from_raw_parts(sid_string, length);
+        OsString::from_wide(wide)
+            .into_string()
+            .map_err(|_| AppError::Library {
+                message: "Current user SID is not valid text".into(),
+            })
+    };
+    // SAFETY: `ConvertSidToStringSidW` allocated this buffer with LocalAlloc.
+    unsafe {
+        LocalFree(sid_string.cast());
+    }
+    let sid = sid_result?;
+    windows_private_handoff_sddl(&sid, false)?;
+    Ok(sid)
+}
+
+#[cfg(windows)]
+fn secure_windows_path_dacl(
+    path: &Path,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<(), AppError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| crate::error::map_io_error(&error))?;
+    if windows_is_reparse_point(&metadata) || metadata.is_dir() != is_directory {
+        return Err(AppError::Library {
+            message: "Handoff storage changed while securing its permissions".into(),
+        });
+    }
+    if windows_path_has_private_dacl(path, user_sid, is_directory)? {
+        return Ok(());
+    }
+    let sddl = windows_private_handoff_sddl(user_sid, is_directory)?;
+    set_windows_named_dacl(path, &sddl)
+}
+
+#[cfg(windows)]
+fn set_private_windows_dacl(path: &Path, is_directory: bool) -> Result<(), AppError> {
+    let user_sid = windows_current_user_sid()?;
+    set_private_windows_dacl_for_user(path, &user_sid, is_directory)
+}
+
+#[cfg(windows)]
+fn set_private_windows_dacl_for_user(
+    path: &Path,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<(), AppError> {
+    secure_windows_path_dacl(path, user_sid, is_directory)?;
+    let (owner_sid, dacl_sddl) = windows_path_security(path)?;
+    if !security_descriptor_owner_matches_user(&owner_sid, user_sid)
+        || !security_descriptor_has_private_dacl(&dacl_sddl, user_sid, is_directory)?
+    {
+        return Err(AppError::Library {
+            message: "Could not verify private handoff ownership and permissions".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_path_has_private_dacl(
+    path: &Path,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<bool, AppError> {
+    let (owner_sid, dacl_sddl) = windows_path_security(path)?;
+    if !security_descriptor_owner_matches_user(&owner_sid, user_sid) {
+        return Err(windows_owner_mismatch());
+    }
+    security_descriptor_has_private_dacl(&dacl_sddl, user_sid, is_directory)
+}
+
+#[cfg(windows)]
+fn security_descriptor_has_private_dacl(
+    security_sddl: &str,
+    user_sid: &str,
+    is_directory: bool,
+) -> Result<bool, AppError> {
+    let dacl_start = security_sddl.find("D:").ok_or_else(|| AppError::Library {
+        message: "Handoff storage DACL could not be read".into(),
+    })?;
+    let actual = &security_sddl[dacl_start..];
+    let expected = windows_private_handoff_sddl(user_sid, is_directory)?;
+    let Some((actual_flags, mut actual_aces)) = parse_dacl_sddl(&actual) else {
+        return Ok(false);
+    };
+    let Some((expected_flags, mut expected_aces)) = parse_dacl_sddl(&expected) else {
+        return Ok(false);
+    };
+    if !actual_flags.contains('P') || !expected_flags.contains('P') {
+        return Ok(false);
+    }
+    actual_aces.sort_unstable();
+    expected_aces.sort_unstable();
+    Ok(actual_aces == expected_aces)
+}
+
+#[cfg(windows)]
+fn windows_owner_mismatch() -> AppError {
+    AppError::Library {
+        message: "Handoff storage is not owned by the current user".into(),
+    }
+}
+
+#[cfg(windows)]
+fn parse_dacl_sddl(value: &str) -> Option<(&str, Vec<&str>)> {
+    let body = value.strip_prefix("D:")?;
+    let first_ace = body.find('(')?;
+    let flags = &body[..first_ace];
+    let mut rest = &body[first_ace..];
+    let mut aces = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix('(')?;
+        let end = rest.find(')')?;
+        let ace = &rest[..end];
+        if ace.contains('(') {
+            return None;
+        }
+        aces.push(ace);
+        rest = &rest[end + 1..];
+    }
+    Some((flags, aces))
+}
+
+#[cfg(windows)]
+fn windows_path_security(path: &Path) -> Result<(String, String), AppError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+        GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut owner_sid: PSID = std::ptr::null_mut();
+    // SAFETY: Windows reads the NUL-terminated path and writes the descriptor pointer.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() || owner_sid.is_null() {
+        // SAFETY: GetNamedSecurityInfoW allocates this only on a successful partial result.
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(AppError::Library {
+            message: "Could not verify handoff storage permissions".into(),
+        });
+    }
+    let mut owner_string = std::ptr::null_mut();
+    // SAFETY: `owner_sid` belongs to the returned descriptor and the output is writable.
+    let owner_converted = unsafe { ConvertSidToStringSidW(owner_sid, &mut owner_string) };
+    let mut dacl_sddl = std::ptr::null_mut();
+    // SAFETY: the descriptor was returned by GetNamedSecurityInfoW and `dacl_sddl` is writable.
+    let dacl_converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            DACL_SECURITY_INFORMATION,
+            &mut dacl_sddl,
+            std::ptr::null_mut(),
+        )
+    };
+    let owner_result = if owner_converted == 0 || owner_string.is_null() {
+        Err(AppError::Library {
+            message: "Could not verify handoff storage owner".into(),
+        })
+    } else {
+        // SAFETY: Windows returned a NUL-terminated UTF-16 SID string.
+        unsafe {
+            let mut length = 0_usize;
+            while *owner_string.add(length) != 0 {
+                length += 1;
+            }
+            let wide = std::slice::from_raw_parts(owner_string, length);
+            OsString::from_wide(wide)
+                .into_string()
+                .map_err(|_| AppError::Library {
+                    message: "Handoff owner SID is not valid text".into(),
+                })
+        }
+    };
+    let dacl_result = if dacl_converted == 0 || dacl_sddl.is_null() {
+        Err(AppError::Library {
+            message: "Could not verify handoff storage permissions".into(),
+        })
+    } else {
+        // SAFETY: Windows returned a NUL-terminated UTF-16 DACL string.
+        unsafe {
+            let mut length = 0_usize;
+            while *dacl_sddl.add(length) != 0 {
+                length += 1;
+            }
+            let wide = std::slice::from_raw_parts(dacl_sddl, length);
+            OsString::from_wide(wide)
+                .into_string()
+                .map_err(|_| AppError::Library {
+                    message: "Handoff DACL is not valid text".into(),
+                })
+        }
+    };
+    // SAFETY: all returned buffers were allocated by Windows with LocalAlloc.
+    unsafe {
+        if !owner_string.is_null() {
+            LocalFree(owner_string.cast());
+        }
+        if !dacl_sddl.is_null() {
+            LocalFree(dacl_sddl.cast());
+        }
+        LocalFree(descriptor.cast());
+    }
+    match (owner_result, dacl_result) {
+        (Ok(owner_sid), Ok(dacl_sddl)) => Ok((owner_sid, dacl_sddl)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn set_windows_named_dacl(path: &Path, sddl: &str) -> Result<(), AppError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let sddl_wide = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the SDDL is NUL-terminated and the output pointer is writable.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(AppError::Library {
+            message: "Could not construct private handoff permissions".into(),
+        });
+    }
+    let result = (|| {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut dacl_present = 0;
+        // SAFETY: the descriptor came from Windows' SDDL converter; output pointers are valid.
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                std::ptr::null_mut(),
+            )
+        } == 0
+            || dacl_present == 0
+            || dacl.is_null()
+        {
+            return Err(AppError::Library {
+                message: "Could not construct private handoff permissions".into(),
+            });
+        }
+        // SAFETY: path and DACL remain valid for the duration of this call.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(AppError::Library {
+                message: "Could not apply private handoff permissions".into(),
+            });
+        }
+        Ok(())
+    })();
+    // SAFETY: descriptor was allocated by the Windows SDDL converter.
+    unsafe {
+        LocalFree(descriptor.cast());
+    }
+    result
+}
+
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn open_private_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn is_private(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        // Windows DACL verification and repair are performed before staging.
+        true
+    }
+}
+
+fn prepare_handoff_storage(root: &Path, incoming_bytes: u64) -> Result<(), AppError> {
+    let now = SystemTime::now();
+    let mut retained_bytes = 0_u64;
+    let entries = fs::read_dir(root).map_err(|error| crate::error::map_io_error(&error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| crate::error::map_io_error(&error))?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("single-")
+            && !name.to_string_lossy().starts_with("batch-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| crate::error::map_io_error(&error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() || !is_private(&metadata) {
+            continue;
+        }
+        if !is_owned_handoff_directory(&path) {
+            continue;
+        }
+        let expired = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > HANDOFF_RETENTION);
+        if expired {
+            fs::remove_dir_all(&path).map_err(|error| crate::error::map_io_error(&error))?;
+            continue;
+        }
+        retained_bytes = retained_bytes
+            .checked_add(handoff_tree_bytes(&path)?)
+            .ok_or_else(|| AppError::Library {
+                message: "Handoff storage size is out of range".into(),
+            })?;
+    }
+    if retained_bytes
+        .checked_add(incoming_bytes)
+        .is_none_or(|total| total > MAX_HANDOFF_STORAGE_BYTES)
+    {
+        return Err(AppError::Library {
+            message: "Handoff storage is full; retained files expire after 24 hours".into(),
+        });
+    }
+    Ok(())
+}
+
+fn handoff_tree_bytes(directory: &Path) -> Result<u64, AppError> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(directory).map_err(|error| crate::error::map_io_error(&error))? {
+        let entry = entry.map_err(|error| crate::error::map_io_error(&error))?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| crate::error::map_io_error(&error))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let bytes = if metadata.is_file() {
+            metadata.len()
+        } else if metadata.is_dir() {
+            handoff_tree_bytes(&path)?
+        } else {
+            0
+        };
+        total = total.checked_add(bytes).ok_or_else(|| AppError::Library {
+            message: "Handoff storage size is out of range".into(),
+        })?;
+    }
+    Ok(total)
+}
+
+fn checked_source_launch(
+    source: &OriginalSource,
+    slicer_id: &str,
+    installed: &[SlicerApp],
+    launch: impl FnOnce(&SlicerApp, &Path) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    // SourceFormat is produced by the parser for the current model. Keeping
+    // this exhaustive match makes a future format an explicit launch-policy
+    // decision instead of silently handing arbitrary input to another app.
+    match source.format {
+        SourceFormat::Stl | SourceFormat::ThreeMf => {}
+    }
+    let slicer = supported_slicer(slicer_id, installed).ok_or(AppError::UnknownSlicer)?;
+    launch(slicer, &source.path)
+}
+
+fn supported_slicer<'a>(slicer_id: &str, installed: &'a [SlicerApp]) -> Option<&'a SlicerApp> {
+    installed.iter().find(|slicer| {
+        if slicer.id != slicer_id {
+            return false;
+        }
+        if slicer.custom {
+            slicer.profile_identity.as_ref().is_some_and(|identity| {
+                identity.canonical_path == slicer.app_path
+                    && identity.bundle_id.as_deref().unwrap_or_default() == slicer.bundle_id
+                    && crate::slicer_profiles::profile_identity_is_current(identity)
+            })
+        } else {
+            slicer.bundle_id == slicer.id
+                && crate::slicers::slicer_definition(&slicer.bundle_id).is_some()
+                && slicer.profile_identity.as_ref().is_none_or(|identity| {
+                    identity.canonical_path == slicer.app_path
+                        && identity.bundle_id.as_deref() == Some(slicer.id.as_str())
+                        && crate::slicer_profiles::profile_identity_is_current(identity)
+                })
+        }
+    })
+}
+
+pub(crate) fn is_supported_slicer(slicer_id: &str, installed: &[SlicerApp]) -> bool {
+    supported_slicer(slicer_id, installed).is_some()
+}
+
+pub(crate) fn checked_paths_launch(
+    source_paths: &[PathBuf],
+    slicer_id: &str,
+    installed: &[SlicerApp],
+    launch: impl FnOnce(&SlicerApp, &[PathBuf]) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    if source_paths.is_empty() {
+        return Err(AppError::Library {
+            message: "Bundle has no admitted model sources".into(),
+        });
+    }
+    let slicer = supported_slicer(slicer_id, installed).ok_or(AppError::UnknownSlicer)?;
+    launch(slicer, source_paths)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launch_arguments(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from("-n"),
+        OsString::from("-a"),
+        OsString::from(&slicer.app_path),
+    ];
+    arguments.extend(source_paths.iter().map(|path| path.as_os_str().to_owned()));
+    arguments
+}
+
+#[cfg(target_os = "macos")]
+fn launch(slicer: &SlicerApp, source_path: &Path) -> Result<(), AppError> {
+    launch_paths(slicer, &[source_path.to_path_buf()])
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_paths(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Result<(), AppError> {
+    verify_slicer_identity(slicer)?;
+    if slicer
+        .profile_identity
+        .as_ref()
+        .is_some_and(|identity| identity.bundle_id.is_some())
+    {
+        let status = Command::new("open")
+            .args(launch_arguments(slicer, source_paths))
+            .status()
+            .map_err(|_| AppError::LaunchFailed { status: None })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(AppError::LaunchFailed {
+                status: status.code(),
+            })
+        }
+    } else {
+        launch_executable(slicer, source_paths)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch(slicer: &SlicerApp, source_path: &Path) -> Result<(), AppError> {
+    launch_paths(slicer, &[source_path.to_path_buf()])
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn launch_paths(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Result<(), AppError> {
+    launch_executable(slicer, source_paths)
+}
+
+fn launch_executable(slicer: &SlicerApp, source_paths: &[PathBuf]) -> Result<(), AppError> {
+    verify_slicer_identity(slicer)?;
+    // The executable path is resolved from a fresh built-in detection or a
+    // saved profile created from the local application picker. No shell is used.
+    Command::new(&slicer.app_path)
+        .args(executable_arguments(source_paths))
+        .spawn()
+        .map(|mut child| {
+            // Reap without blocking the viewer for the lifetime of the slicer.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
+        .map_err(|_| AppError::LaunchFailed { status: None })
+}
+
+fn verify_slicer_identity(slicer: &SlicerApp) -> Result<(), AppError> {
+    let Some(identity) = slicer.profile_identity.as_ref() else {
+        return Err(AppError::UnknownSlicer);
+    };
+    if identity.canonical_path != slicer.app_path
+        || !crate::slicer_profiles::profile_identity_is_current(identity)
+    {
+        return Err(AppError::UnknownSlicer);
+    }
+
+    let actual_bundle_id = identity.bundle_id.as_deref().unwrap_or_default();
+    if slicer.custom {
+        if actual_bundle_id != slicer.bundle_id {
+            return Err(AppError::UnknownSlicer);
+        }
+    } else if slicer.bundle_id != slicer.id
+        || actual_bundle_id != slicer.id
+        || crate::slicers::slicer_definition(&slicer.bundle_id).is_none()
+    {
+        return Err(AppError::UnknownSlicer);
+    }
+    Ok(())
+}
+
+fn executable_arguments(source_paths: &[PathBuf]) -> Vec<OsString> {
+    source_paths
+        .iter()
+        .map(|path| path.as_os_str().to_owned())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        canonical_windows_local_app_data, checked_bytes_batch_launch, checked_bytes_launch,
+        checked_owned_source_launch, checked_paths_launch, checked_source_launch,
+        checked_stream_batch_launch, create_and_secure_handoff_root, create_owned_handoff_root,
+        enqueue_handoff_tree_path, launch_arguments, mark_owned_handoff_directory,
+        security_descriptor_owner_matches_user, stable_handoff_root, supported_slicer,
+        windows_private_handoff_sddl, StreamHandoffRequest, VerifiedHandoffRequest,
+        HANDOFF_SEQUENCE, MAX_BATCH_BYTES, MAX_HANDOFF_STORAGE_BYTES, MAX_HANDOFF_TREE_ENTRIES,
+    };
+    #[cfg(windows)]
+    use super::{
+        set_private_directory_permissions, set_windows_named_dacl, windows_current_user_sid,
+        windows_path_has_private_dacl, windows_path_security,
+    };
+    use crate::extension_api::{AppError, OriginalSource, SlicerApp, SourceFormat};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, SystemTime};
+
+    fn installed_bambu() -> SlicerApp {
+        SlicerApp {
+            id: "com.bambulab.bambu-studio".into(),
+            bundle_id: "com.bambulab.bambu-studio".into(),
+            display_name: "Bambu Studio".into(),
+            app_path: "/Applications/Bambu Studio.app".into(),
+            custom: false,
+            profile_identity: None,
+        }
+    }
+
+    #[test]
+    fn windows_handoff_profile_checks_the_resolved_local_app_data_path() {
+        let local_app_data = Path::new("C:/Users/Ada/AppData/Local");
+        let user_profile = Path::new("C:/Users/Ada");
+        let resolved_profile = PathBuf::from("/private/users/ada");
+        let resolved_local = resolved_profile.join("AppData/Local");
+        let resolve = |path: &Path| {
+            if path == local_app_data {
+                Ok(resolved_local.clone())
+            } else {
+                Ok(resolved_profile.clone())
+            }
+        };
+        assert_eq!(
+            canonical_windows_local_app_data(local_app_data, user_profile, resolve).unwrap(),
+            resolved_local
+        );
+
+        let redirected = PathBuf::from("/shared/local-app-data");
+        let resolve_redirected = |path: &Path| {
+            if path == local_app_data {
+                Ok(redirected.clone())
+            } else {
+                Ok(resolved_profile.clone())
+            }
+        };
+        assert!(
+            canonical_windows_local_app_data(local_app_data, user_profile, resolve_redirected)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_handoff_dacl_grants_only_the_current_user_and_system() {
+        let user_sid = "S-1-5-21-123456789-234567890-345678901-1001";
+        assert_eq!(
+            windows_private_handoff_sddl(user_sid, true).unwrap(),
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-123456789-234567890-345678901-1001)"
+        );
+        assert_eq!(
+            windows_private_handoff_sddl(user_sid, false).unwrap(),
+            "D:P(A;;FA;;;SY)(A;;FA;;;S-1-5-21-123456789-234567890-345678901-1001)"
+        );
+        assert!(windows_private_handoff_sddl("S-1-5-21-1);(A;;FA;;;WD", true).is_err());
+    }
+
+    #[test]
+    fn windows_handoff_owner_policy_requires_the_current_user_sid() {
+        let user_sid = "S-1-5-21-123456789-234567890-345678901-1001";
+        assert!(security_descriptor_owner_matches_user(user_sid, user_sid));
+        assert!(!security_descriptor_owner_matches_user(
+            "S-1-5-21-987654321-123456789-345678901-1002",
+            user_sid,
+        ));
+        assert!(!security_descriptor_owner_matches_user("", user_sid));
+    }
+
+    #[test]
+    fn failed_security_setup_removes_only_the_new_empty_handoff_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("new-handoff-root");
+
+        let result = create_and_secure_handoff_root(&root, |_| {
+            Err(AppError::Library {
+                message: "injected permission failure".into(),
+            })
+        });
+
+        assert!(result.is_err());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn failed_security_setup_never_removes_a_preexisting_handoff_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("existing-handoff-root");
+        fs::create_dir(&root).unwrap();
+        let keep = root.join("keep.txt");
+        fs::write(&keep, b"existing user data").unwrap();
+
+        let result = create_and_secure_handoff_root(&root, |_| {
+            panic!("permission setup must not run for a preexisting root")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(keep).unwrap(), b"existing user data");
+    }
+
+    #[test]
+    fn failed_security_setup_does_not_recursively_remove_unexpected_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("new-handoff-root");
+        let keep = root.join("unexpected-child.txt");
+
+        let result = create_and_secure_handoff_root(&root, |created_root| {
+            fs::write(created_root.join("unexpected-child.txt"), b"keep this data")
+                .map_err(|error| crate::error::map_io_error(&error))?;
+            Err(AppError::Library {
+                message: "injected permission failure".into(),
+            })
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(keep).unwrap(), b"keep this data");
+    }
+
+    #[test]
+    fn handoff_tree_discovery_rejects_an_entry_before_queue_exceeds_limit() {
+        let mut pending = Vec::new();
+        let mut discovered = 0;
+
+        for index in 0..MAX_HANDOFF_TREE_ENTRIES {
+            enqueue_handoff_tree_path(
+                &mut pending,
+                PathBuf::from(format!("entry-{index}")),
+                &mut discovered,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(pending.len(), MAX_HANDOFF_TREE_ENTRIES);
+        assert!(enqueue_handoff_tree_path(
+            &mut pending,
+            PathBuf::from("over-limit"),
+            &mut discovered,
+        )
+        .is_err());
+        assert_eq!(pending.len(), MAX_HANDOFF_TREE_ENTRIES);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handoff_dacl_repairs_broad_permissions_on_existing_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("handoff");
+        let nested = root.join("batch-existing");
+        let file = nested.join("model.stl");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(&file, b"verified model bytes").unwrap();
+
+        let user_sid = windows_current_user_sid().unwrap();
+        for (path, _) in [(&root, true), (&nested, true), (&file, false)] {
+            let (owner_sid, _) = windows_path_security(path).unwrap();
+            if !security_descriptor_owner_matches_user(&owner_sid, &user_sid) {
+                eprintln!("Skipping DACL repair exercise: the Windows token's default owner is not the current user SID");
+                assert!(set_private_directory_permissions(&root).is_err());
+                return;
+            }
+        }
+
+        set_windows_named_dacl(&root, "D:(A;OICI;FA;;;WD)").unwrap();
+        set_windows_named_dacl(&nested, "D:(A;OICI;FA;;;WD)").unwrap();
+        set_windows_named_dacl(&file, "D:(A;;FA;;;WD)").unwrap();
+        assert!(!windows_path_has_private_dacl(&root, &user_sid, true).unwrap());
+        assert!(!windows_path_has_private_dacl(&nested, &user_sid, true).unwrap());
+        assert!(!windows_path_has_private_dacl(&file, &user_sid, false).unwrap());
+
+        set_private_directory_permissions(&root).unwrap();
+
+        assert!(windows_path_has_private_dacl(&root, &user_sid, true).unwrap());
+        assert!(windows_path_has_private_dacl(&nested, &user_sid, true).unwrap());
+        assert!(windows_path_has_private_dacl(&file, &user_sid, false).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handoff_rejects_real_reparse_escape_when_supported() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let app_data_parent = profile.join("AppData");
+        let local_app_data = app_data_parent.join("Local");
+        let shared = temp.path().join("shared");
+        fs::create_dir_all(&app_data_parent).unwrap();
+        fs::create_dir(&shared).unwrap();
+        if let Err(error) = symlink_dir(&shared, &local_app_data) {
+            eprintln!("Skipping real reparse-point check; Windows runner disallowed directory symlinks: {error}");
+            return;
+        }
+
+        assert!(
+            canonical_windows_local_app_data(&local_app_data, &profile, |path| {
+                fs::canonicalize(path)
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_handoff_stages_verified_bytes_under_a_safe_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let bytes = b"verified catalog model bytes";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let mut launched_path = None;
+
+        let path = checked_bytes_launch(
+            VerifiedHandoffRequest {
+                bytes,
+                file_name: "Part;$(touch marker).3mf",
+                expected_digest: &digest,
+                format: SourceFormat::ThreeMf,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            || vec![installed_bambu()],
+            |slicer, path| {
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                launched_path = Some(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(launched_path.as_deref(), Some(path.as_path()));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("3mf")
+        );
+        assert!(!path.to_string_lossy().contains('$'));
+        assert!(!path.to_string_lossy().contains(';'));
+        assert!(!path.to_string_lossy().contains('('));
+        assert!(!path.to_string_lossy().contains(')'));
+    }
+
+    #[test]
+    fn catalog_batch_handoff_preflights_and_launches_all_verified_copies_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let first_bytes = b"first verified model";
+        let second_bytes = b"second verified model";
+        let first_digest = format!("{:x}", Sha256::digest(first_bytes));
+        let second_digest = format!("{:x}", Sha256::digest(second_bytes));
+        let requests = [
+            VerifiedHandoffRequest {
+                bytes: first_bytes,
+                file_name: "First.stl",
+                expected_digest: &first_digest,
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            VerifiedHandoffRequest {
+                bytes: second_bytes,
+                file_name: "Second.3mf",
+                expected_digest: &second_digest,
+                format: SourceFormat::ThreeMf,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+        ];
+        let mut launch_paths = Vec::new();
+        let staged = checked_bytes_batch_launch(
+            &requests,
+            || vec![installed_bambu()],
+            |slicer, paths| {
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                assert_eq!(paths.len(), 2);
+                assert_eq!(fs::read(&paths[0]).unwrap(), first_bytes);
+                assert_eq!(fs::read(&paths[1]).unwrap(), second_bytes);
+                launch_paths = paths.to_vec();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(staged, launch_paths);
+        assert_eq!(staged.len(), 2);
+        assert_ne!(staged[0], staged[1]);
+        assert_eq!(staged[0].extension().unwrap(), "stl");
+        assert_eq!(staged[1].extension().unwrap(), "3mf");
+    }
+
+    #[test]
+    fn catalog_stream_batch_handoff_writes_verified_models_to_stable_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let first_bytes = b"first streamed model";
+        let second_bytes = b"second streamed model";
+        let first_digest = format!("{:x}", Sha256::digest(first_bytes));
+        let second_digest = format!("{:x}", Sha256::digest(second_bytes));
+        let requests = [
+            StreamHandoffRequest {
+                content_id: "lease-1",
+                file_name: "First.stl",
+                expected_digest: &first_digest,
+                expected_bytes: first_bytes.len() as u64,
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            StreamHandoffRequest {
+                content_id: "lease-2",
+                file_name: "Second.3mf",
+                expected_digest: &second_digest,
+                expected_bytes: second_bytes.len() as u64,
+                format: SourceFormat::ThreeMf,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+        ];
+        let handoff_root = stable_handoff_root(&library_root).unwrap();
+        create_owned_handoff_root(&handoff_root).unwrap();
+        let expired = handoff_root.join("batch-expired");
+        fs::create_dir(&expired).unwrap();
+        mark_owned_handoff_directory(&expired).unwrap();
+        fs::write(expired.join("old.stl"), b"expired").unwrap();
+        fs::File::open(&expired)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(25 * 60 * 60)),
+            )
+            .unwrap();
+        let unowned = handoff_root.join("batch-user-created");
+        fs::create_dir(&unowned).unwrap();
+        fs::write(unowned.join("keep.txt"), b"user data").unwrap();
+        let staged = checked_stream_batch_launch(
+            &requests,
+            |lease_id, sink| {
+                let bytes: &[u8] = match lease_id {
+                    "lease-1" => first_bytes,
+                    "lease-2" => second_bytes,
+                    other => panic!("unexpected lease {other}"),
+                };
+                sink.write_all(bytes).map_err(|error| AppError::Library {
+                    message: error.to_string(),
+                })
+            },
+            || vec![installed_bambu()],
+            |slicer, paths| {
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                assert_eq!(fs::read(&paths[0]).unwrap(), first_bytes);
+                assert_eq!(fs::read(&paths[1]).unwrap(), second_bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(staged.len(), 2);
+        assert_ne!(staged[0], staged[1]);
+        assert!(!expired.exists());
+        assert_eq!(fs::read(unowned.join("keep.txt")).unwrap(), b"user data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&handoff_root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(staged[0].parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&staged[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_handoff_storage_quota_rejects_a_batch_before_streaming() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let handoff_root = stable_handoff_root(&library_root).unwrap();
+        create_owned_handoff_root(&handoff_root).unwrap();
+        let existing = handoff_root.join("batch-retained");
+        fs::create_dir(&existing).unwrap();
+        mark_owned_handoff_directory(&existing).unwrap();
+        let retained = fs::File::create(existing.join("retained.stl")).unwrap();
+        retained.set_len(MAX_HANDOFF_STORAGE_BYTES).unwrap();
+
+        let request = StreamHandoffRequest {
+            content_id: "lease",
+            file_name: "Model.stl",
+            expected_digest: &format!("{:x}", Sha256::digest(b"x")),
+            expected_bytes: 1,
+            format: SourceFormat::Stl,
+            library_root: &library_root,
+            slicer_id: "com.bambulab.bambu-studio",
+        };
+        let mut streamed = false;
+        assert!(checked_stream_batch_launch(
+            &[request],
+            |_, _| {
+                streamed = true;
+                Ok(())
+            },
+            || vec![installed_bambu()],
+            |_, _| panic!("full handoff storage must not launch"),
+        )
+        .is_err());
+        assert!(!streamed);
+    }
+
+    #[test]
+    fn catalog_batch_handoff_enforces_aggregate_byte_limit_before_allocating_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"x"));
+        let per_model_bytes = MAX_BATCH_BYTES / 3 + 1;
+        let requests = [
+            StreamHandoffRequest {
+                content_id: "lease-1",
+                file_name: "One.stl",
+                expected_digest: &digest,
+                expected_bytes: per_model_bytes,
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            StreamHandoffRequest {
+                content_id: "lease-2",
+                file_name: "Two.stl",
+                expected_digest: &digest,
+                expected_bytes: per_model_bytes,
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            StreamHandoffRequest {
+                content_id: "lease-3",
+                file_name: "Three.stl",
+                expected_digest: &digest,
+                expected_bytes: per_model_bytes,
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+        ];
+        let mut streamed = false;
+        let mut detected = false;
+        assert!(checked_stream_batch_launch(
+            &requests,
+            |_, _| {
+                streamed = true;
+                Ok(())
+            },
+            || {
+                detected = true;
+                vec![installed_bambu()]
+            },
+            |_, _| panic!("oversized handoff must not launch"),
+        )
+        .is_err());
+        assert!(!streamed);
+        assert!(!detected);
+        assert!(!stable_handoff_root(&library_root).unwrap().exists());
+    }
+
+    #[test]
+    fn handoff_refuses_to_claim_a_preexisting_unowned_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let handoff_root = stable_handoff_root(&library_root).unwrap();
+        fs::create_dir(&handoff_root).unwrap();
+        let user_file = handoff_root.join("keep.txt");
+        fs::write(&user_file, b"user data").unwrap();
+        let bytes = b"verified model";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+
+        assert!(checked_bytes_launch(
+            VerifiedHandoffRequest {
+                bytes,
+                file_name: "Model.stl",
+                expected_digest: &digest,
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            || vec![installed_bambu()],
+            |_, _| panic!("unowned handoff namespace must not launch"),
+        )
+        .is_err());
+        assert_eq!(fs::read(user_file).unwrap(), b"user data");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handoff_storage_uses_the_users_local_app_data_acl() {
+        let library_root = PathBuf::from(r"C:\shared\models\library");
+        let (Some(local_app_data), Some(user_profile)) = (
+            std::env::var_os("LOCALAPPDATA"),
+            std::env::var_os("USERPROFILE"),
+        ) else {
+            assert!(stable_handoff_root(&library_root).is_err());
+            return;
+        };
+
+        let root = stable_handoff_root(&library_root).unwrap();
+        assert!(root.starts_with(fs::canonicalize(PathBuf::from(local_app_data)).unwrap()));
+        assert!(root.starts_with(fs::canonicalize(PathBuf::from(user_profile)).unwrap()));
+    }
+
+    #[test]
+    fn catalog_batch_handoff_rejects_a_bad_member_before_launch_or_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let bytes = b"verified model";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let requests = [
+            VerifiedHandoffRequest {
+                bytes,
+                file_name: "First.stl",
+                expected_digest: &digest,
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            VerifiedHandoffRequest {
+                bytes,
+                file_name: "Second.stl",
+                expected_digest: &"0".repeat(64),
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+        ];
+        assert!(checked_bytes_batch_launch(
+            &requests,
+            || vec![installed_bambu()],
+            |_, _| panic!("a batch with a bad digest must not launch"),
+        )
+        .is_err());
+        assert!(!stable_handoff_root(&library_root).unwrap().exists());
+    }
+
+    #[test]
+    fn catalog_handoff_rejects_unknown_slicers_and_bad_hashes_before_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_root = temp.path().join("library");
+        fs::create_dir(&library_root).unwrap();
+        let bytes = b"verified catalog model bytes";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+
+        assert!(matches!(
+            checked_bytes_launch(
+                VerifiedHandoffRequest {
+                    bytes,
+                    file_name: "model.stl",
+                    expected_digest: &digest,
+                    format: SourceFormat::Stl,
+                    library_root: &library_root,
+                    slicer_id: "unknown.slicer",
+                },
+                || vec![installed_bambu()],
+                |_, _| panic!("unknown slicer must not launch"),
+            ),
+            Err(AppError::UnknownSlicer)
+        ));
+        assert!(!stable_handoff_root(&library_root).unwrap().exists());
+
+        assert!(checked_bytes_launch(
+            VerifiedHandoffRequest {
+                bytes,
+                file_name: "model.stl",
+                expected_digest: &"0".repeat(64),
+                format: SourceFormat::Stl,
+                library_root: &library_root,
+                slicer_id: "com.bambulab.bambu-studio",
+            },
+            || vec![installed_bambu()],
+            |_, _| panic!("digest mismatch must not launch"),
+        )
+        .is_err());
+        assert!(!stable_handoff_root(&library_root).unwrap().exists());
+    }
+
+    #[test]
+    fn free_handoff_launches_the_current_original_source() {
+        let source = OriginalSource {
+            path: "/tmp/模型 with spaces.stl".into(),
+            format: SourceFormat::Stl,
+        };
+        let installed = [installed_bambu()];
+        let mut launch_count = 0;
+
+        checked_source_launch(
+            &source,
+            "com.bambulab.bambu-studio",
+            &installed,
+            |slicer, path| {
+                launch_count += 1;
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                assert_eq!(path, Path::new("/tmp/模型 with spaces.stl"));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(launch_count, 1);
+    }
+
+    #[test]
+    fn handoff_accepts_only_a_freshly_detected_bundle_identifier() {
+        let installed = [installed_bambu()];
+
+        assert!(supported_slicer("com.bambulab.bambu-studio", &installed).is_some());
+        assert!(supported_slicer("/Applications/Other.app", &installed).is_none());
+        assert!(supported_slicer("Bambu Studio", &installed).is_none());
+
+        let mismatched = [SlicerApp {
+            id: "com.bambulab.bambu-studio".into(),
+            bundle_id: "attacker.controlled.bundle".into(),
+            display_name: "Bambu Studio".into(),
+            app_path: "/Applications/Bambu Studio.app".into(),
+            custom: false,
+            profile_identity: None,
+        }];
+        assert!(supported_slicer("com.bambulab.bambu-studio", &mismatched).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_profile_replacement_is_rejected_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CustomSlicer");
+        std::fs::write(&path, b"selected executable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let identity = crate::slicer_profiles::capture_profile_identity(&path).unwrap();
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"different executable").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let custom = SlicerApp {
+            id: "a4c1003e-64ed-4d8b-b687-734f4148e648".into(),
+            bundle_id: String::new(),
+            display_name: "Custom Slicer".into(),
+            app_path: identity.canonical_path.clone(),
+            custom: true,
+            profile_identity: Some(identity),
+        };
+        let source = OriginalSource {
+            path: PathBuf::from("/tmp/model.stl"),
+            format: SourceFormat::Stl,
+        };
+        let custom_id = custom.id.clone();
+        let mut launched = false;
+
+        let result = checked_source_launch(&source, &custom_id, &[custom], |_, _| {
+            launched = true;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(AppError::UnknownSlicer)));
+        assert!(!launched);
+    }
+
+    #[test]
+    fn unknown_slicer_never_reaches_the_launch_side_effect() {
+        let source = OriginalSource {
+            path: "/tmp/model.3mf".into(),
+            format: SourceFormat::ThreeMf,
+        };
+        let installed = [installed_bambu()];
+        let mut launched = false;
+
+        let result = checked_source_launch(&source, "not.installed", &installed, |_, _| {
+            launched = true;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(AppError::UnknownSlicer)));
+        assert!(!launched);
+    }
+
+    #[test]
+    fn executable_launch_reports_missing_detected_executable() {
+        let missing =
+            std::env::temp_dir().join(format!("gogglelab-missing-slicer-{}", std::process::id()));
+        let slicer = SlicerApp {
+            app_path: missing.to_string_lossy().into_owned(),
+            ..installed_bambu()
+        };
+        assert!(matches!(
+            super::launch_executable(&slicer, &[PathBuf::from("source.stl")]),
+            Err(AppError::UnknownSlicer)
+        ));
+    }
+
+    #[test]
+    fn executable_launch_preserves_source_as_one_literal_argument() {
+        let path = Path::new("/tmp/模型 with spaces; $(echo unsafe).3mf");
+        let args = super::executable_arguments(&[path.to_path_buf()]);
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0], path.as_os_str());
+    }
+
+    #[test]
+    fn macos_launch_preserves_exact_application_path_and_source_arguments() {
+        let path = Path::new("/tmp/模型 with spaces; $(echo unsafe).3mf");
+        let slicer = installed_bambu();
+        let args = launch_arguments(&slicer, &[path.to_path_buf()]);
+
+        assert_eq!(args[0], "-n");
+        assert_eq!(args[1], "-a");
+        assert_eq!(args[2], Path::new(&slicer.app_path).as_os_str());
+        assert_eq!(args[3], path.as_os_str());
+    }
+
+    #[test]
+    fn bundle_launch_preserves_every_literal_path_in_order() {
+        let paths = vec![
+            PathBuf::from("/tmp/第一 part; $(unsafe).stl"),
+            PathBuf::from("/tmp/second & final.3mf"),
+        ];
+        let installed = [installed_bambu()];
+        let mut launched = false;
+        checked_paths_launch(
+            &paths,
+            "com.bambulab.bambu-studio",
+            &installed,
+            |slicer, admitted| {
+                launched = true;
+                assert_eq!(slicer.id, "com.bambulab.bambu-studio");
+                assert_eq!(admitted, paths);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(launched);
+        assert_eq!(super::executable_arguments(&paths), paths);
+        let mac = launch_arguments(&installed[0], &paths);
+        assert_eq!(mac[0], "-n");
+        assert_eq!(mac[1], "-a");
+        assert_eq!(mac[2], Path::new(&installed[0].app_path).as_os_str());
+        assert_eq!(mac[3], paths[0].as_os_str());
+        assert_eq!(mac[4], paths[1].as_os_str());
+    }
+
+    #[test]
+    fn single_handoff_copy_survives_library_root_rename() {
+        let parent = std::env::temp_dir().join(format!(
+            "gogglelab-single-handoff-{}-{}",
+            std::process::id(),
+            HANDOFF_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let library = parent.join("library");
+        fs::create_dir_all(&library).unwrap();
+        let source_path = library.join("original 模型.stl");
+        let mut bytes = vec![0_u8; 84];
+        bytes[80..84].copy_from_slice(&0_u32.to_le_bytes());
+        fs::write(&source_path, &bytes).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let source = OriginalSource {
+            path: source_path,
+            format: SourceFormat::Stl,
+        };
+        let slicer = installed_bambu();
+        let copied = checked_owned_source_launch(
+            &source,
+            &digest,
+            &library,
+            &slicer.id,
+            || vec![slicer.clone()],
+            |_, path| {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert_eq!(path.file_name().unwrap(), "original 模型.stl");
+                Ok(())
+            },
+        )
+        .unwrap();
+        let previous = parent.join("library.previous");
+        fs::rename(&library, &previous).unwrap();
+        assert_eq!(fs::read(&copied).unwrap(), bytes);
+        assert!(copied.starts_with(stable_handoff_root(&library).unwrap()));
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn single_handoff_filename_uses_parser_format_and_avoids_windows_reserved_names() {
+        let source = OriginalSource {
+            path: PathBuf::from("/tmp/CON.exe"),
+            format: SourceFormat::ThreeMf,
+        };
+        assert_eq!(super::handoff_filename(&source), "model-CON.3mf");
+        let source = OriginalSource {
+            path: PathBuf::from("/tmp/part; $(unsafe).stl"),
+            format: SourceFormat::Stl,
+        };
+        assert_eq!(super::handoff_filename(&source), "part_ __unsafe_.stl");
+    }
+
+    #[test]
+    fn single_handoff_rejects_same_size_source_change_before_launch() {
+        let parent = std::env::temp_dir().join(format!(
+            "gogglelab-single-handoff-change-{}-{}",
+            std::process::id(),
+            HANDOFF_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let library = parent.join("library");
+        fs::create_dir_all(&library).unwrap();
+        let source_path = library.join("model.stl");
+        let mut original = vec![0_u8; 84];
+        original[80..84].copy_from_slice(&0_u32.to_le_bytes());
+        fs::write(&source_path, &original).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&original));
+        let mut changed = original;
+        changed[0] = 1;
+        fs::write(&source_path, changed).unwrap();
+        let source = OriginalSource {
+            path: source_path,
+            format: SourceFormat::Stl,
+        };
+        let mut launched = false;
+        assert!(checked_owned_source_launch(
+            &source,
+            &digest,
+            &library,
+            "com.bambulab.bambu-studio",
+            || vec![installed_bambu()],
+            |_, _| {
+                launched = true;
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!launched);
+        let _ = fs::remove_dir_all(&parent);
+    }
+}

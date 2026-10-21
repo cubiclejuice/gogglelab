@@ -26,16 +26,42 @@ tauri-plugin-dialog = "2.7.3"
 plist = "1.10.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+uuid = { version = "1.26.0", features = ["v4"] }
 sha2 = "0.10"
+png = "=0.18.1"
+base64 = "0.22"
 stl-core = { path = "../crates/stl-core" }
 library-recovery = { path = "../crates/library-recovery" }
+library-core = { path = "../crates/library-core" }
+library-backup = { path = "../crates/library-backup" }
+library-integrations = { path = "../crates/library-integrations" }
+library-protocol = { path = "../crates/library-protocol" }
+library-runtime = { path = "../crates/library-runtime" }
+library-server = { path = "../crates/library-server" }
+tokio = { version = "1.53.1", features = ["net", "sync"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+quick-xml = "0.41"
 notify = "8.2.0"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+time = { version = "0.3.55", features = ["formatting"] }
+zeroize = "1.8"
 
 [target.'cfg(not(windows))'.dependencies]
 trash = { version = "5.2.9", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
+] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+
+[dev-dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+tempfile = "3"

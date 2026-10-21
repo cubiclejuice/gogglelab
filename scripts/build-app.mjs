@@ -1,20 +1,18 @@
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { isHelpRequest, parseBuildArguments } from "./build-app-args.mjs";
 const root = process.cwd();
-const args = process.argv.slice(2);
-const pro = args.includes("--pro");
-const release = args.includes("--release");
+const { pro, release, forwarded, tauriArgs } = parseBuildArguments(process.argv.slice(2));
 const core = pro ? resolve(root, "core") : root;
-const forwarded = args.filter((arg) => arg !== "--pro" && arg !== "--release");
+const helpRequest = isHelpRequest(forwarded);
 const cli = resolve(root, "node_modules/@tauri-apps/cli/tauri.js");
-const build = spawnSync(
-  process.execPath,
-  [cli, "build", ...(release ? ["--config", "tauri.release.conf.json"] : []), ...forwarded],
-  { cwd: resolve(root, "src-tauri"), stdio: "inherit" },
-);
+const build = spawnSync(process.execPath, [cli, ...tauriArgs], {
+  cwd: resolve(root, "src-tauri"),
+  stdio: "inherit",
+});
 if (build.status !== 0) process.exit(build.status ?? 1);
-if (process.platform === "darwin") {
+if (process.platform === "darwin" && !helpRequest) {
   const targetIndex = forwarded.indexOf("--target");
   const target = targetIndex >= 0 ? forwarded[targetIndex + 1] : "";
   const product = release ? (pro ? "GoggleLab" : "GoggleLab Community") : "GoggleLab";

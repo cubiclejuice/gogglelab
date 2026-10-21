@@ -115,6 +115,45 @@ def npm_components() -> list[Component]:
     return found
 
 
+def approved_vendor_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    for base in (ROOT.resolve(), PROJECT.resolve()):
+        candidate = base / "vendor"
+        # Resolving a symlinked vendor root first would authorize its external
+        # target. Only the script core and selected edition own vendor roots.
+        if candidate.is_symlink():
+            continue
+        canonical = candidate.resolve()
+        if canonical.parent == base and canonical not in roots:
+            if any(canonical.is_relative_to(root) or root.is_relative_to(canonical) for root in roots):
+                # Overlapping roots cannot distinguish an edition's private
+                # workspace from another root's vendored dependencies.
+                raise RuntimeError("Nested approved vendor roots are unsupported")
+            roots.append(canonical)
+    return tuple(roots)
+
+
+def vendored_license_files(directory: Path, vendor_root: Path, explicit) -> tuple[Path, ...]:
+    if explicit:
+        candidates = (directory / explicit,)
+    else:
+        # Include dangling matched links so they cannot disappear into a
+        # standard-text fallback before their authority is checked.
+        candidates = tuple(sorted(
+            (path for path in directory.iterdir()
+             if any(path.name.lower().startswith(name) for name in LICENSE_NAMES)
+             and (path.is_file() or path.is_symlink())),
+            key=lambda path: path.name.lower(),
+        ))
+    files = []
+    for path in candidates:
+        canonical = path.resolve()
+        if not canonical.is_relative_to(vendor_root):
+            raise RuntimeError("Vendored license text escapes approved vendor root")
+        files.append(canonical)
+    return tuple(files)
+
+
 def cargo_components() -> list[Component]:
     proc = subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1"],
@@ -125,14 +164,25 @@ def cargo_components() -> list[Component]:
         check=True,
     )
     metadata = json.loads(proc.stdout)
+    vendor_roots = approved_vendor_roots()
     found: list[Component] = []
     for package in metadata["packages"]:
-        if not package.get("source"):
-            continue
         manifest = Path(package["manifest_path"])
+        canonical_manifest = manifest.resolve()
+        source = package.get("source")
+        vendor_root = max(
+            (root for root in vendor_roots if canonical_manifest.is_relative_to(root)),
+            key=lambda root: len(root.parts),
+            default=None,
+        ) if not source else None
+        if not source and vendor_root is None:
+            continue
         license_expression = package.get("license") or ""
         explicit = package.get("license_file")
-        files = (manifest.parent / explicit,) if explicit else package_license_files(manifest.parent)
+        if vendor_root is not None:
+            files = vendored_license_files(canonical_manifest.parent, vendor_root, explicit)
+        else:
+            files = (manifest.parent / explicit,) if explicit else package_license_files(manifest.parent)
         if not license_expression:
             raise RuntimeError(f"Rust crate has no license expression: {package['name']} {package['version']}")
         if not files:
@@ -156,7 +206,7 @@ def cargo_components() -> list[Component]:
                 package["name"],
                 package["version"],
                 license_expression,
-                package.get("repository") or str(package["source"]),
+                package.get("repository") or package.get("source") or "vendored path dependency",
                 files,
             )
         )

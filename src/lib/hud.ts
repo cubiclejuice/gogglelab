@@ -221,28 +221,21 @@ export class Hud {
     this.render();
   }
 
-  /** Label for the private handoff action, or null to hide it in Community. */
-  setHandoff(slicerName: string | null, locked = false) {
+  /** Label for the handoff action, or null when no compatible target is available. */
+  setHandoff(slicerName: string | null) {
     if (slicerName === null) {
       this.handoffButton.hidden = true;
-      this.handoffButton.classList.remove("locked");
       this.handoffButton.removeAttribute("aria-label");
       return;
     }
     this.handoffButton.hidden = false;
-    this.handoffButton.classList.toggle("locked", locked);
     // .long/.short: the container query in styles.css swaps to the short
     // label when the strip is too narrow for the slicer name.
     this.handoffButton.innerHTML =
-      `<span class="long">Open in ${escapeHtml(slicerName)}${locked ? " · Pro" : ""}</span>` +
-      `<span class="short">${locked ? "Pro" : "Open"}</span><span class="kbd">⌘⏎</span>`;
-    this.handoffButton.setAttribute(
-      "aria-label",
-      locked ? `Unlock Pro to open in ${slicerName}` : `Open in ${slicerName}`,
-    );
-    this.handoffButton.title = locked
-      ? `Open in ${slicerName} with Pro (⌘⏎)`
-      : `Open in ${slicerName} (⌘⏎)`;
+      `<span class="long">Open in ${escapeHtml(slicerName)}</span>` +
+      '<span class="short">Open</span><span class="kbd">⌘⏎</span>';
+    this.handoffButton.setAttribute("aria-label", `Open in ${slicerName}`);
+    this.handoffButton.title = `Open in ${slicerName} (⌘⏎)`;
   }
 
   show(summary: ModelSummary) {

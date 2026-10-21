@@ -1,0 +1,83 @@
+{
+  "version": "1.0",
+  "models": [
+    {
+      "printEvents": [
+        {
+          "printed_at": "2026-10-14T13:00:00.000Z",
+          "outcome": "printed",
+          "quantity": 1,
+          "notes": "Linked history",
+          "created_at": "2026-10-14T13:00:00.000Z",
+          "printer_nickname": "Round-trip printer",
+          "printer_manufacturer": "Fixture maker",
+          "printer_model": "Fixture model",
+          "printer_type": "FDM",
+          "gogglelab_printer_id": "printer-external-1",
+          "filaments": [],
+          "parts": [
+            {
+              "id": "part-external-1",
+              "name": "M3 heat-set insert",
+              "category": "hardware",
+              "unit": "pcs",
+              "quantity": 2,
+              "quantityPerCopy": 2
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "parts": [
+    {
+      "gogglelab_part_id": "part-external-1",
+      "name": "M3 heat-set insert",
+      "category": "hardware",
+      "quantity": 10,
+      "unit": "pcs",
+      "notes": "brass",
+      "low_stock": 2
+    }
+  ],
+  "printers": [
+    {
+      "gogglelab_printer_id": "printer-external-1",
+      "nickname": "Round-trip printer",
+      "manufacturer": "Fixture maker",
+      "model": "Fixture model",
+      "printer_type": "FDM",
+      "created_at": "2026-10-13T11:00:00Z",
+      "updated_at": "2026-10-14T10:00:00Z"
+    }
+  ],
+  "printer_maintenance_logs": [
+    {
+      "gogglelab_maintenance_log_id": "maintenance-external-1",
+      "gogglelab_printer_id": "printer-external-1",
+      "printer_nickname": "Round-trip printer before rename",
+      "title": "Clean nozzle",
+      "notes": "Imported maintenance",
+      "performed_at": "2026-10-14T12:00:00.000Z",
+      "created_at": "2026-10-14T12:00:00Z"
+    }
+  ],
+  "printer_maintenance_reminders": [
+    {
+      "gogglelab_printer_reminder_id": "reminder-external-1",
+      "gogglelab_printer_id": "printer-external-1",
+      "printer_nickname": "Round-trip printer before rename",
+      "title": "Inspect belts",
+      "notes": "Imported reminder",
+      "due_at": "2026-11-14T12:00:00.000Z",
+      "interval_days": 30,
+      "status": "active",
+      "last_completed_at": null,
+      "created_at": "2026-10-14T12:00:00Z",
+      "updated_at": "2026-10-14T12:00:00Z"
+    }
+  ],
+  "slicers": [
+    { "name": "Round-trip slicer", "path": "C:\\Apps\\FixtureSlicer.exe" }
+  ]
+}

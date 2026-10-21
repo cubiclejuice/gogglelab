@@ -23,6 +23,13 @@ output/
 *.pfx
 .perplexity-research/
 
+# Public test certificates only; corresponding private keys are not stored.
+!crates/library-runtime/src/printer_network/testdata/bambu-test-root.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-test-leaf.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-chain-root.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-cross-intermediate.pem
+!crates/library-runtime/src/printer_network/testdata/bambu-cross-leaf.pem
+
 !docs/ARCHITECTURE.md
 !docs/F3D-PREVIEW.md
 
@@ -38,3 +45,29 @@ target-*/
 release-smoke.log
 
 !docs/RELEASE-NOTES.md
+
+!docs/FREE-PRINTVENTORY-PARITY-PLAN.md
+
+!docs/PHASE-2-INDEXING-CATALOG.md
+
+!docs/PHASE-3-ORGANIZATION.md
+
+!docs/PHASE-4-MANAGEMENT.md
+
+!docs/PHASE-5-FILAMENT-AI.md
+
+!docs/PHASE-6-SERVER-MCP-CAPTURE.md
+
+!docs/AI-CATEGORY-SHARING-APPROVAL.md
+
+dist-browser/
+
+!docs/SERVER-INSTALL.md
+!docs/WINDOWS-FRIEND-ACCEPTANCE.md
+!docs/PRINTER-NETWORK-BROWSER-PLAN.md
+!docs/GENERATED-CONTROL-METADATA-PLAN.md
+
+!docs/GENERATED-MEDIA-RETENTION-PLAN.md
+!docs/THUMBNAIL-CLEANUP-CONTRACT.md
+!docs/THUMBNAIL-PUBLICATION-CONTRACT.md
+!docs/THUMBNAIL-PARSER-BOUNDS.md

@@ -1,0 +1,34 @@
+{
+  "allowedRoots": [
+    {
+      "id": "models",
+      "label": "Models",
+      "path": "/models",
+      "access": "readOnly",
+      "catalogRootId": null
+    }
+  ],
+  "allowedHosts": [
+    "localhost:3745",
+    "127.0.0.1:3745"
+  ],
+  "allowedOrigins": [
+    "http://localhost:3745",
+    "http://127.0.0.1:3745"
+  ],
+  "capabilities": [
+    "catalogRead",
+    "catalogWrite",
+    "mediaRead",
+    "mediaWrite",
+    "scan",
+    "integration",
+    "maintenance"
+  ],
+  "library": "/data/library",
+  "web": "/app/web",
+  "tokenFile": "/run/secrets/gogglelab-token",
+  "integrationSettings": "/data/config/integrations.json",
+  "allowExternalIntegrations": false,
+  "networkExposure": "containerLoopbackPublish"
+}

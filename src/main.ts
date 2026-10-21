@@ -4,7 +4,7 @@
 import { getCurrentWindow, type DragDropEvent } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   openModel,
   readStepFile,
@@ -13,9 +13,101 @@ import {
   modelGeometry,
   isAppError,
   describeError,
-  detectSlicers,
+  listSlicerProfiles,
+  detectSlicerProfileCandidates,
+  saveSlicerProfiles,
   getDefaultSlicer,
   setDefaultSlicer,
+  openInSlicer,
+  libraryListFolders,
+  libraryListModels,
+  libraryImportFile,
+  libraryOpenModel,
+  libraryListRoots,
+  libraryAddRoot,
+  libraryUpdateRoot,
+  libraryRemoveRoot,
+  libraryStartScan,
+  libraryScanStatus,
+  libraryCancelScan,
+  libraryGetThumbnail,
+  libraryGetCatalogThumbnail,
+  libraryStartThumbnailJob,
+  libraryGetCatalogSettings,
+  librarySetCatalogSettings,
+  libraryListTags,
+  libraryCreateTag,
+  libraryUpdateTag,
+  libraryDeleteTag,
+  libraryUpdateModelMetadata,
+  libraryUpdateModelsMetadata,
+  libraryListPrintAttempts,
+  libraryCreatePrintAttemptWithPrinter,
+  libraryUpdatePrintAttemptWithPrinter,
+  libraryDeletePrintAttempt,
+  libraryCreateBundle,
+  libraryCreateFolder,
+  libraryRenameFolder,
+  libraryDeleteFolder,
+  libraryDuplicateGroups,
+  libraryRemoveModels,
+  libraryListRemovedModels,
+  libraryRestoreRemoval,
+  libraryTrashLooseSource,
+  libraryUndoTrash,
+  libraryRevealModelSource,
+  libraryPrepareBundlePreview,
+  libraryBundlePreviewGeometry,
+  libraryCloseBundlePreview,
+  librarySendBundleToSlicer,
+  librarySetCustomThumbnail,
+  libraryClearCustomThumbnail,
+  libraryCreateBackup,
+  libraryRestoreBackup,
+  libraryPurgeCatalog,
+  libraryReviewThumbnailCleanup,
+  libraryExecuteThumbnailCleanup,
+  libraryDiscardManagementAction,
+  libraryListFilaments,
+  libraryCreateFilament,
+  libraryUpdateFilament,
+  libraryDeleteFilament,
+  libraryListPartStock,
+  libraryCreatePartStock,
+  libraryUpdatePartStock,
+  libraryDeletePartStock,
+  librarySetModelFilaments,
+  libraryBulkSetModelFilaments,
+  libraryBulkAssignModelFilaments,
+  integrationGetSettings,
+  integrationSaveSpoolmanConfig,
+  spoolmanPull,
+  integrationSaveAiProvider,
+  integrationDeleteAiProvider,
+  aiSuggestTags,
+  aiApplyTagReview,
+  aiDiscardTagReview,
+  libraryServerStart,
+  libraryServerStop,
+  libraryServerStatus,
+  libraryServerRevealAccessKey,
+  libraryListPrinters,
+  libraryCreatePrinter,
+  libraryUpdatePrinter,
+  libraryDeletePrinter,
+  libraryCreatePrintersBatch,
+  libraryDiscoverPrinters,
+  libraryCancelPrinterDiscovery,
+  libraryTestPrinterConnection,
+  libraryListPrinterMaintenanceLogs,
+  libraryCreatePrinterMaintenanceLog,
+  libraryUpdatePrinterMaintenanceLog,
+  libraryDeletePrinterMaintenanceLog,
+  libraryListPrinterReminders,
+  libraryCreatePrinterReminder,
+  libraryUpdatePrinterReminder,
+  libraryDeletePrinterReminder,
+  libraryCompletePrinterReminder,
   getSettings,
   setActivePrinter,
   setDisplayUnits,
@@ -26,10 +118,11 @@ import {
   listDir,
   detectPrinters,
   moveTreeFileToTrash,
-  getDefaultSlicer as getDefaultSlicerId,
   type Printer,
   type AppearanceMode,
   type SlicerApp,
+  type SlicerProfileDraft,
+  type SlicerProfileView,
   type IntegrityReport,
   type ModelSummary,
 } from "./lib/ipc";
@@ -47,6 +140,34 @@ import type { AppExtensions } from "./lib/app-extensions";
 import { mountRecoveryControl } from "./lib/recovery";
 import { isLibraryRequestCurrent, type LibraryRequestToken } from "./lib/library-load-guard";
 import { handoffAvailability } from "./lib/handoff-availability";
+import { withCoreEntitlements } from "./lib/core-entitlements";
+import { LibraryPanel, createNativeThumbnailReader } from "./lib/library";
+import { LibraryOperationGuard } from "./lib/library-operation";
+import { ThumbnailCleanupDialog } from "./lib/thumbnail-cleanup-dialog";
+import { LibraryManagementDialog } from "./lib/library-management-dialog";
+import { LibraryBundleDialog } from "./lib/library-bundle-dialog";
+import { LibraryDuplicatesDialog } from "./lib/library-duplicates-dialog";
+import { removalTargets } from "./lib/library-management";
+import { LibraryFilamentDialog } from "./lib/library-filament-dialog";
+import { LibraryAiDialog } from "./lib/library-ai-dialog";
+import { filamentAssignmentBatch } from "./lib/library-filaments";
+import { pathContainsOpenDialog } from "./lib/dialog-escape";
+import { LibraryServerSettingsSection } from "./lib/library-server-settings";
+import {
+  GENERIC_PRINTER_ID,
+  PrinterFleetManager,
+  mapDiscoverySuggestion,
+  mapLibraryPrinter,
+  mapMaintenanceLog,
+  mapMaintenanceLogDraftToInput,
+  mapMaintenanceReminder,
+  mapMaintenanceReminderDraftToInput,
+  mapPrinterDraftToInput,
+  mapReminderCompletion,
+  type ManagedPrinter,
+  type PrinterFleetModel,
+  type PrinterFleetCallbacks,
+} from "./lib/printer-fleet";
 import "./styles.css";
 
 export function startApp(extensions: AppExtensions): void {
@@ -70,18 +191,103 @@ export function startApp(extensions: AppExtensions): void {
       viewport.dispose();
       plateControls.dispose();
       colorFeature.dispose();
+      libraryPanel.dispose();
+      thumbnailCleanup.dismiss();
       extensions.dispose?.();
     },
     { once: true },
   );
-  const libraryPanel = extensions.createLibraryPanel?.(app) ?? null;
-  const libraryService = extensions.library;
-  let activeEntitlements = extensions.currentEntitlements?.() ?? {
-    library: false,
-    colorways: false,
-    slicerHandoff: false,
-    revision: 0,
+  const libraryPanel = new LibraryPanel(app);
+  const libraryManagement = new LibraryManagementDialog(app);
+  const thumbnailCleanup = new ThumbnailCleanupDialog(
+    app,
+    {
+      review: libraryReviewThumbnailCleanup,
+      execute: libraryExecuteThumbnailCleanup,
+      discard: libraryDiscardManagementAction,
+    },
+    {
+      onChanged: async () => {
+        libraryPanel.clearThumbnailCache();
+        await refreshLibrary();
+      },
+      onNotice: (text) => libraryPanel.setStatus(text),
+      focusFallback: () => libraryPanel.focusSearch(),
+    },
+  );
+  libraryManagement.onDismiss = () => thumbnailCleanup.dismiss();
+  const libraryBundle = new LibraryBundleDialog(app);
+  const libraryDuplicates = new LibraryDuplicatesDialog(app);
+  const libraryFilaments = new LibraryFilamentDialog(app);
+  const libraryAi = new LibraryAiDialog(app);
+  const libraryService = {
+    listFolders: libraryListFolders,
+    listModels: libraryListModels,
+    importFile: libraryImportFile,
+    openModel: libraryOpenModel,
+    listRoots: libraryListRoots,
+    addRoot: libraryAddRoot,
+    updateRoot: libraryUpdateRoot,
+    removeRoot: libraryRemoveRoot,
+    startScan: libraryStartScan,
+    scanStatus: libraryScanStatus,
+    cancelScan: libraryCancelScan,
+    getThumbnail: libraryGetThumbnail,
+    getCatalogThumbnail: libraryGetCatalogThumbnail,
+    startThumbnailJob: libraryStartThumbnailJob,
+    getCatalogSettings: libraryGetCatalogSettings,
+    setCatalogSettings: librarySetCatalogSettings,
+    listTags: libraryListTags,
+    createTag: libraryCreateTag,
+    updateTag: libraryUpdateTag,
+    deleteTag: libraryDeleteTag,
+    updateModelMetadata: libraryUpdateModelMetadata,
+    updateModelsMetadata: libraryUpdateModelsMetadata,
+    createPrintAttempt: libraryCreatePrintAttemptWithPrinter,
+    listPrintAttempts: libraryListPrintAttempts,
+    updatePrintAttempt: libraryUpdatePrintAttemptWithPrinter,
+    deletePrintAttempt: libraryDeletePrintAttempt,
+    createBundle: libraryCreateBundle,
+    createFolder: libraryCreateFolder,
+    renameFolder: libraryRenameFolder,
+    deleteFolder: libraryDeleteFolder,
+    duplicateGroups: libraryDuplicateGroups,
+    removeModels: libraryRemoveModels,
+    listRemovedModels: libraryListRemovedModels,
+    restoreRemoval: libraryRestoreRemoval,
+    trashLooseSource: libraryTrashLooseSource,
+    undoTrash: libraryUndoTrash,
+    revealModelSource: libraryRevealModelSource,
+    prepareBundlePreview: libraryPrepareBundlePreview,
+    bundlePreviewGeometry: libraryBundlePreviewGeometry,
+    closeBundlePreview: libraryCloseBundlePreview,
+    sendBundleToSlicer: librarySendBundleToSlicer,
+    setCustomThumbnail: librarySetCustomThumbnail,
+    clearCustomThumbnail: libraryClearCustomThumbnail,
+    createBackup: libraryCreateBackup,
+    restoreBackup: libraryRestoreBackup,
+    purgeCatalog: libraryPurgeCatalog,
+    listFilaments: libraryListFilaments,
+    createFilament: libraryCreateFilament,
+    updateFilament: libraryUpdateFilament,
+    deleteFilament: libraryDeleteFilament,
+    listPartStock: libraryListPartStock,
+    createPartStock: libraryCreatePartStock,
+    updatePartStock: libraryUpdatePartStock,
+    deletePartStock: libraryDeletePartStock,
+    setModelFilaments: librarySetModelFilaments,
+    bulkSetModelFilaments: libraryBulkSetModelFilaments,
+    bulkAssignModelFilaments: libraryBulkAssignModelFilaments,
+    integrationSettings: integrationGetSettings,
+    saveSpoolmanConfig: integrationSaveSpoolmanConfig,
+    spoolmanPull,
+    saveAiProvider: integrationSaveAiProvider,
+    deleteAiProvider: integrationDeleteAiProvider,
+    suggestTags: aiSuggestTags,
+    applyTagReview: aiApplyTagReview,
+    discardTagReview: aiDiscardTagReview,
   };
+  let activeEntitlements = withCoreEntitlements(extensions.currentEntitlements?.());
   const main = document.createElement("div");
   main.className = "main";
   app.appendChild(main);
@@ -222,7 +428,6 @@ export function startApp(extensions: AppExtensions): void {
   const plateControls = new PlateControls();
   const colorFeature = extensions.createColorFeature();
   colorFeature.setEntitlements?.(activeEntitlements);
-  libraryPanel?.setLocked?.(!activeEntitlements.library);
   let colorwayModeRevision = 0;
   viewportWrap.append(plateControls.root, plateControls.warning, colorFeature.root);
   colorFeature.onChange = () => viewport.setColorway(colorFeature.mode, colorFeature.resolveColor);
@@ -275,6 +480,15 @@ export function startApp(extensions: AppExtensions): void {
   // HUD picker / handoff button would apply it.
   const settingsPanel = new SettingsPanel(main);
   settingsPanel.addExtensionSection(extensions.createSettingsSection?.() ?? null);
+  const libraryServerSettings = new LibraryServerSettingsSection({
+    status: libraryServerStatus,
+    start: (allowExternalIntegrations, printerNetwork) =>
+      libraryServerStart(undefined, allowExternalIntegrations, printerNetwork),
+    stop: libraryServerStop,
+    revealAccessKey: libraryServerRevealAccessKey,
+  });
+  settingsPanel.addExtensionSection(libraryServerSettings.element);
+  settingsPanel.onHide = () => libraryServerSettings.clearSensitive();
   let defaultFolder: string | null = null;
   let displayUnits: "mm" | "in" = "mm";
   let appearanceMode: AppearanceMode = "system";
@@ -300,20 +514,26 @@ export function startApp(extensions: AppExtensions): void {
     '<path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>';
   gearButton.addEventListener("click", () => openSettings(gearButton));
   tree.addFooterControl(gearButton);
-  mountRecoveryControl(app, (control) => tree.addFooterControl(control));
+  mountRecoveryControl(
+    app,
+    (control) => tree.addFooterControl(control),
+    async () => {
+      await refreshSlicers();
+      await refreshPrinterFleet();
+      await refreshLibrary();
+    },
+  );
   extensions.mountLicenseControl?.(app, (control) => tree.addFooterControl(control));
 
-  if (libraryPanel) {
-    const libraryButton = document.createElement("button");
-    libraryButton.className = "btn";
-    libraryButton.textContent = "Library";
-    libraryButton.setAttribute("aria-label", "Open managed library");
-    libraryButton.addEventListener("click", () => {
-      libraryPanel.show(libraryButton);
-      void refreshLibrary();
-    });
-    tree.addFooterControl(libraryButton);
-  }
+  const libraryButton = document.createElement("button");
+  libraryButton.className = "btn";
+  libraryButton.textContent = "Library";
+  libraryButton.setAttribute("aria-label", "Open managed library");
+  libraryButton.addEventListener("click", () => {
+    libraryPanel.show(libraryButton);
+    void refreshLibrary();
+  });
+  tree.addFooterControl(libraryButton);
 
   function refreshSettingsPanel() {
     if (!settingsPanel.isOpen) return;
@@ -322,6 +542,7 @@ export function startApp(extensions: AppExtensions): void {
       printers,
       activePrinterId,
       slicers,
+      slicerProfiles,
       defaultSlicerId: activeSlicerId,
       units: displayUnits,
       appearanceMode,
@@ -332,12 +553,14 @@ export function startApp(extensions: AppExtensions): void {
   }
 
   function openSettings(invoker?: HTMLElement) {
+    void libraryServerSettings.refresh();
     settingsPanel.show(
       {
         defaultFolder,
         printers,
         activePrinterId,
         slicers,
+        slicerProfiles,
         defaultSlicerId: activeSlicerId,
         units: displayUnits,
         appearanceMode,
@@ -355,11 +578,22 @@ export function startApp(extensions: AppExtensions): void {
     refreshSettingsPanel();
   };
   settingsPanel.onPrinter = (id) => applyPrinter(id);
-  settingsPanel.onSlicer = (id) => {
+  settingsPanel.onSlicer = async (id) => {
+    await setDefaultSlicer(id);
     activeSlicerId = id;
-    void setDefaultSlicer(id);
     void refreshColorwayPalette();
     updateHandoffButton();
+    refreshSettingsPanel();
+  };
+  settingsPanel.onChooseSlicerPath = async () => {
+    const selected = await openDialog({ multiple: false });
+    if (Array.isArray(selected)) return selected[0] ?? null;
+    return typeof selected === "string" ? selected : null;
+  };
+  settingsPanel.onDetectSlicerProfiles = () => detectSlicerProfileCandidates();
+  settingsPanel.onSaveSlicerProfiles = async (profiles: SlicerProfileDraft[]) => {
+    await saveSlicerProfiles(profiles);
+    await refreshSlicers();
   };
   settingsPanel.onUnits = (u) => {
     displayUnits = u;
@@ -420,15 +654,46 @@ export function startApp(extensions: AppExtensions): void {
       });
   };
 
-  function applyPrinter(id: string) {
+  let printers: Printer[] = [];
+  let managedPrinters: ManagedPrinter[] = [];
+  let printerFleetManager: PrinterFleetManager | null = null;
+  let printerFleetModel: PrinterFleetModel = {
+    managedPrinters: [],
+    slicerDetections: [],
+    activePrinterId: GENERIC_PRINTER_ID,
+    maintenanceLogs: [],
+    maintenanceReminders: [],
+  };
+
+  function setActivePrinterView(id: string) {
     activePrinterId = id;
-    void setActivePrinter(id);
     const active = printers.find((p) => p.id === id);
     if (active) viewport.setBed(active.bed_mm);
     hud.setPrinters(printers, id);
+    printerFleetModel = { ...printerFleetModel, activePrinterId: id };
+    printerFleetManager?.updateModel(printerFleetModel);
+    const activeManagedPrinterId = managedPrinters.some((printer) => printer.id === id) ? id : null;
+    libraryPanel.setPrinterOptions(
+      managedPrinters.map((printer) => ({ id: printer.id, name: printer.name })),
+      activeManagedPrinterId,
+    );
+    refreshSettingsPanel();
+  }
+
+  function applyPrinter(id: string) {
+    if (!printers.some((printer) => printer.id === id)) return;
+    setActivePrinterView(id);
+    void setActivePrinter(id).catch(() => {
+      if (printerFleetManager) {
+        printerFleetManager.state.error =
+          "Could not save the active printer. Choose it again to retry.";
+        printerFleetManager.updateModel(printerFleetModel);
+      }
+    });
   }
 
   let slicers: SlicerApp[] = [];
+  let slicerProfiles: SlicerProfileView[] = [];
   let activeSlicerId: string | null = null;
   let loadedGeneration: number | null = null; // the generation currently on the viewport, if any
   let loadedSourcePath: string | null = null;
@@ -458,16 +723,12 @@ export function startApp(extensions: AppExtensions): void {
   function updateHandoffButton() {
     const active = slicers.find((s) => s.id === activeSlicerId);
     const availability = handoffAvailability({
-      hasAction: typeof extensions.requestHandoff === "function",
+      hasAction: true,
       hasSlicer: active !== undefined,
       hasModel: loadedGeneration !== null,
       format: loadedFormat,
-      entitled: activeEntitlements.slicerHandoff,
     });
-    hud.setHandoff(
-      availability === "hidden" ? null : active!.display_name,
-      availability === "locked",
-    );
+    hud.setHandoff(availability === "hidden" ? null : active!.display_name);
   }
 
   /** Window title: "bracket_v3.stl — GoggleLab" while a file is open. */
@@ -479,48 +740,218 @@ export function startApp(extensions: AppExtensions): void {
       .catch(() => {});
   }
 
-  async function initSlicers() {
-    slicers = await detectSlicers();
-    const saved = await getDefaultSlicer();
-    activeSlicerId =
-      (saved && slicers.some((s) => s.id === saved) ? saved : slicers[0]?.id) ?? null;
-    if (activeSlicerId && activeSlicerId !== saved) {
-      void setDefaultSlicer(activeSlicerId);
-    }
+  async function refreshSlicers(): Promise<SlicerApp[]> {
+    const [profiles, saved] = await Promise.all([listSlicerProfiles(), getDefaultSlicer()]);
+    slicerProfiles = profiles;
+    slicers = profiles
+      .filter((profile) => profile.available)
+      .map((profile) => ({
+        id: profile.id,
+        bundle_id: profile.bundle_id,
+        display_name: profile.display_name,
+        app_path: profile.app_path,
+      }));
+    activeSlicerId = saved && slicers.some((slicer) => slicer.id === saved) ? saved : null;
     updateHandoffButton();
+    refreshSettingsPanel();
     void refreshColorwayPalette();
+    return slicers;
+  }
+
+  async function initSlicers() {
+    await refreshSlicers().catch(() => {
+      slicerProfiles = [];
+      slicers = [];
+      activeSlicerId = null;
+      updateHandoffButton();
+      refreshSettingsPanel();
+      void refreshColorwayPalette();
+    });
   }
   initSlicers();
 
-  // Printer list = detected from installed slicers (refreshed every launch,
-  // read-only) + manual entries from settings.json. Active printer: whatever
-  // was chosen last if it still exists, else the detected printer from the
-  // default slicer, else the first one, else a generic 256mm bed so bed-fit
-  // always has *something* to evaluate against.
-  let printers: Printer[] = [];
-  async function buildPrinterList(): Promise<{ list: Printer[]; activeId: string }> {
-    const [settings, detected, defaultSlicer] = await Promise.all([
-      getSettings(),
-      detectPrinters().catch(() => []),
-      getDefaultSlicerId(),
-    ]);
-    const list: Printer[] = [
-      ...detected.map((d) => ({
-        id: d.id,
-        name: `${d.name} · ${d.source_display}`,
-        bed_mm: d.bed_mm,
-      })),
-      ...settings.printers,
-    ];
-    if (list.length === 0) {
-      list.push({ id: "generic-256", name: "Generic 256 mm bed", bed_mm: [256, 256, 256] });
+  async function refreshPrinterFleet(deletedPrinterId?: string): Promise<void> {
+    const [settingsResult, catalogResult, detectedResult, logsResult, remindersResult] =
+      await Promise.allSettled([
+        getSettings(),
+        libraryListPrinters(),
+        detectPrinters(),
+        libraryListPrinterMaintenanceLogs(),
+        libraryListPrinterReminders(null, true),
+      ]);
+    if (catalogResult.status === "rejected") throw catalogResult.reason;
+    const settings = settingsResult.status === "fulfilled" ? settingsResult.value : null;
+    const catalog = catalogResult.value;
+    const detected = detectedResult.status === "fulfilled" ? detectedResult.value : [];
+    const maintenanceLogs =
+      logsResult.status === "fulfilled"
+        ? logsResult.value.map(mapMaintenanceLog)
+        : printerFleetModel.maintenanceLogs;
+    const maintenanceReminders =
+      remindersResult.status === "fulfilled"
+        ? remindersResult.value.map(mapMaintenanceReminder)
+        : printerFleetModel.maintenanceReminders;
+    managedPrinters = catalog.map(mapLibraryPrinter);
+    const slicerDetections = detected.map((item) => ({
+      id: item.id,
+      name: `${item.name} · ${item.source_display}`,
+      model: item.name,
+      bedMm: [...item.bed_mm] as [number, number, number],
+      source: item.source_display,
+    }));
+    const seen = new Set<string>();
+    const list: Printer[] = [];
+    const pushPrinter = (printer: Printer) => {
+      if (seen.has(printer.id)) return;
+      seen.add(printer.id);
+      list.push(printer);
+    };
+    for (const printer of managedPrinters) {
+      pushPrinter({ id: printer.id, name: printer.name, bed_mm: [...printer.bedMm] });
     }
-    const fromDefaultSlicer = detected.find((d) => d.source_slicer === defaultSlicer)?.id;
-    const activeId = list.some((p) => p.id === settings.active_printer)
-      ? settings.active_printer
-      : (fromDefaultSlicer ?? list[0].id);
-    return { list, activeId };
+    for (const detection of detected) {
+      pushPrinter({
+        id: detection.id,
+        name: `${detection.name} · ${detection.source_display}`,
+        bed_mm: [...detection.bed_mm],
+      });
+    }
+    pushPrinter({ id: GENERIC_PRINTER_ID, name: "Generic 256 mm bed", bed_mm: [256, 256, 256] });
+
+    let activeId = settings?.active_printer || activePrinterId || GENERIC_PRINTER_ID;
+    if (
+      deletedPrinterId &&
+      activeId === deletedPrinterId &&
+      !managedPrinters.some((printer) => printer.id === deletedPrinterId)
+    ) {
+      activeId = GENERIC_PRINTER_ID;
+      await setActivePrinter(GENERIC_PRINTER_ID).catch(() => {});
+    }
+    if (!seen.has(activeId)) {
+      pushPrinter({
+        id: activeId,
+        name: `Unavailable printer (${activeId})`,
+        bed_mm: [256, 256, 256],
+      });
+    }
+    printers = list;
+    activePrinterId = activeId;
+    printerFleetModel = {
+      managedPrinters,
+      slicerDetections,
+      activePrinterId,
+      maintenanceLogs,
+      maintenanceReminders,
+    };
+    printerFleetManager?.updateModel(printerFleetModel);
+    const activeManagedPrinterId = managedPrinters.some((printer) => printer.id === activePrinterId)
+      ? activePrinterId
+      : null;
+    libraryPanel.setPrinterOptions(
+      managedPrinters.map((printer) => ({ id: printer.id, name: printer.name })),
+      activeManagedPrinterId,
+    );
+    hud.setPrinters(printers, activePrinterId);
+    const active = printers.find((printer) => printer.id === activePrinterId);
+    if (active) viewport.setBed(active.bed_mm);
+    refreshSettingsPanel();
+    if (settings && !settings.active_printer) void setActivePrinter(GENERIC_PRINTER_ID);
   }
+
+  const printerFleetCallbacks: PrinterFleetCallbacks = {
+    removePrinter: async (id) => {
+      const target = managedPrinters.find((printer) => printer.id === id);
+      if (!target) throw new Error("Printer is no longer available.");
+      try {
+        await libraryDeletePrinter(id, target.metadataVersion);
+      } catch (error) {
+        // Deletion may have succeeded before the settings fallback failed.
+        // Re-read both stores before letting the UI report the error.
+        await refreshPrinterFleet(id);
+        throw error;
+      }
+      await refreshPrinterFleet();
+    },
+    savePrinter: async (draft) => {
+      const input = mapPrinterDraftToInput(draft);
+      const saved = draft.id
+        ? await libraryUpdatePrinter(
+            draft.id,
+            draft.metadataVersion ?? 0,
+            input,
+            draft.endpointApproved,
+          )
+        : await libraryCreatePrinter(input, draft.endpointApproved);
+      await refreshPrinterFleet();
+      return mapLibraryPrinter(saved);
+    },
+    setDefaultPrinter: async (id) => {
+      await setActivePrinter(id);
+      setActivePrinterView(id);
+    },
+    discoverPrinters: async (range) =>
+      (await libraryDiscoverPrinters(range)).map(mapDiscoverySuggestion),
+    cancelDiscovery: libraryCancelPrinterDiscovery,
+    addDiscoveredPrinters: async (items) => {
+      const saved = await libraryCreatePrintersBatch(
+        items.map(({ draft, endpointApproved }) => ({
+          input: mapPrinterDraftToInput(draft),
+          endpointApproved,
+        })),
+      );
+      await refreshPrinterFleet();
+      return saved.map(mapLibraryPrinter);
+    },
+    testConnection: async (id, mainboardId, discoverMainboardId) => {
+      const response = await libraryTestPrinterConnection(id, mainboardId, discoverMainboardId);
+      await refreshPrinterFleet();
+      return {
+        result: response.result,
+        printer: mapLibraryPrinter(response.printer),
+        statusEventObserved: response.statusEventObserved,
+      };
+    },
+    saveMaintenanceLog: async (draft) => {
+      const input = mapMaintenanceLogDraftToInput(draft);
+      if (draft.id) {
+        if (draft.metadataVersion === null) {
+          throw new Error("Reload this maintenance log before editing it.");
+        }
+        const saved = await libraryUpdatePrinterMaintenanceLog(
+          draft.id,
+          draft.metadataVersion,
+          input,
+        );
+        return mapMaintenanceLog(saved);
+      }
+      const saved = await libraryCreatePrinterMaintenanceLog(draft.printerId, input);
+      return mapMaintenanceLog(saved);
+    },
+    deleteMaintenanceLog: (id, expectedVersion) =>
+      libraryDeletePrinterMaintenanceLog(id, expectedVersion),
+    saveMaintenanceReminder: async (draft) => {
+      const input = mapMaintenanceReminderDraftToInput(draft);
+      const saved = draft.id
+        ? await libraryUpdatePrinterReminder(draft.id, draft.metadataVersion ?? 0, input)
+        : await libraryCreatePrinterReminder(draft.printerId, input);
+      return mapMaintenanceReminder(saved);
+    },
+    completeMaintenanceReminder: async (id, expectedVersion) =>
+      mapReminderCompletion(
+        await libraryCompletePrinterReminder(id, expectedVersion, {
+          completedAt: new Date().toISOString(),
+          notes: "",
+        }),
+      ),
+    deleteMaintenanceReminder: (id) => {
+      const reminder = printerFleetModel.maintenanceReminders.find((item) => item.id === id);
+      if (!reminder) throw new Error("Reminder is no longer available.");
+      return libraryDeletePrinterReminder(id, reminder.metadataVersion);
+    },
+  };
+
+  printerFleetManager = new PrinterFleetManager(main, printerFleetModel, printerFleetCallbacks);
+  settingsPanel.addExtensionSection(printerFleetManager.element);
 
   async function initSettings() {
     const settings = await getSettings();
@@ -542,13 +973,7 @@ export function startApp(extensions: AppExtensions): void {
       applyAccent(accentColor);
     }
     hud.setUnits(displayUnits);
-    const { list, activeId } = await buildPrinterList();
-    printers = list;
-    activePrinterId = activeId;
-    hud.setPrinters(printers, activeId);
-    const active = printers.find((p) => p.id === activeId);
-    if (active) viewport.setBed(active.bed_mm);
-    if (activeId !== settings.active_printer) void setActivePrinter(activeId);
+    await refreshPrinterFleet();
   }
   initSettings();
 
@@ -567,21 +992,16 @@ export function startApp(extensions: AppExtensions): void {
   async function handoff() {
     const active = slicers.find((s) => s.id === activeSlicerId);
     const availability = handoffAvailability({
-      hasAction: typeof extensions.requestHandoff === "function",
+      hasAction: true,
       hasSlicer: active !== undefined,
       hasModel: loadedGeneration !== null,
       format: loadedFormat,
-      entitled: activeEntitlements.slicerHandoff,
     });
     if (availability === "hidden") return;
-    if (availability === "locked") {
-      extensions.onHandoffLocked?.();
-      return;
-    }
     const generation = loadedGeneration!;
     const slicerId = activeSlicerId!;
     try {
-      await extensions.requestHandoff!(generation, slicerId);
+      await openInSlicer(generation, slicerId);
     } catch (e) {
       if (isAppError(e) && e.kind !== "Superseded") {
         setOverlay({ kind: "error", text: describeError(e) });
@@ -595,22 +1015,26 @@ export function startApp(extensions: AppExtensions): void {
   // is what lets list_dir refuse anything outside them.
   tree.onOpenFile = (path) => loadModel(path);
   tree.onTrashFile = async (path) => {
-    await moveTreeFileToTrash(path);
-    if (path !== loadedSourcePath && path !== loadingSourcePath) return;
-    const gen = ++generation;
-    stepController?.abort();
-    stepController = null;
-    loadingSourcePath = null;
-    loadedSourcePath = null;
-    loadedGeneration = null;
-    loadedFormat = null;
-    plateSession.reset(gen);
-    colorFeature.reset(gen);
-    clearProgressTimer();
-    hud.hide();
-    setWindowTitle(null);
-    updateHandoffButton();
-    setOverlay({ kind: "hint", text: "Model moved to Trash." });
+    const receipt = await moveTreeFileToTrash(path);
+    if (path === loadedSourcePath || path === loadingSourcePath) {
+      const gen = ++generation;
+      stepController?.abort();
+      stepController = null;
+      loadingSourcePath = null;
+      loadedSourcePath = null;
+      loadedGeneration = null;
+      loadedFormat = null;
+      plateSession.reset(gen);
+      colorFeature.reset(gen);
+      clearProgressTimer();
+      hud.hide();
+      setWindowTitle(null);
+      updateHandoffButton();
+    }
+    setOverlay({
+      kind: "hint",
+      text: `Item moved to a recoverable hold at ${receipt.recoveryPath}. Journal: ${receipt.journalPath}.`,
+    });
   };
   tree.onRootChanged = () => hideFolderModal();
   tree.onPickFolder = () => {
@@ -631,6 +1055,8 @@ export function startApp(extensions: AppExtensions): void {
   let pendingLibraryLoad: LibraryRequestToken | null = null;
   let libraryRefreshSequence = 0;
   let activeLibraryRefresh: LibraryRequestToken | null = null;
+  const libraryOperations = new LibraryOperationGuard();
+  let libraryImportInFlight = false;
   let progressTimer: number | undefined;
   let stepController: AbortController | null = null;
 
@@ -639,31 +1065,36 @@ export function startApp(extensions: AppExtensions): void {
     stepController = null;
   }
 
+  function invalidateViewerAfterLibraryReplacement(message: string): void {
+    thumbnailCleanup.dismiss();
+    const nextGeneration = ++generation;
+    pendingLibraryLoad = null;
+    cancelCadPreview();
+    loadingSourcePath = null;
+    loadedSourcePath = null;
+    loadedGeneration = null;
+    loadedFormat = null;
+    clearProgressTimer();
+    plateSession.reset(nextGeneration);
+    colorFeature.reset(nextGeneration);
+    viewport.loadMesh(null);
+    hud.hide();
+    setWindowTitle(null);
+    updateHandoffButton();
+    libraryPanel.invalidateAfterLibraryReplacement();
+    libraryManagement.dismiss();
+    libraryDuplicates.dismiss();
+    void libraryBundle.dismiss();
+    libraryFilaments.dismiss();
+    void libraryAi.dismiss();
+    setOverlay({ kind: "hint", text: message });
+  }
+
   function clearProgressTimer() {
     if (progressTimer !== undefined) {
       window.clearTimeout(progressTimer);
       progressTimer = undefined;
     }
-  }
-
-  function invalidatePendingLibraryLoad() {
-    const pending = pendingLibraryLoad;
-    if (!pending || pending.generation !== generation) return;
-    pendingLibraryLoad = null;
-    const gen = ++generation;
-    stepController?.abort();
-    stepController = null;
-    loadingSourcePath = null;
-    loadedSourcePath = null;
-    loadedGeneration = null;
-    loadedFormat = null;
-    plateSession.reset(gen);
-    colorFeature.reset(gen);
-    clearProgressTimer();
-    hud.hide();
-    setWindowTitle(null);
-    updateHandoffButton();
-    setOverlay({ kind: "hint", text: "Library access changed while the model was loading." });
   }
 
   function scheduleProgress(text: string, gen: number) {
@@ -821,16 +1252,8 @@ export function startApp(extensions: AppExtensions): void {
   }
 
   async function loadLibraryModel(modelId: string) {
-    if (
-      !libraryPanel ||
-      !libraryService ||
-      !activeEntitlements.library ||
-      !libraryService.isEnabled()
-    )
-      return;
     const gen = ++generation;
-    const entitlementRevision = activeEntitlements.revision;
-    const request: LibraryRequestToken = { generation: gen, entitlementRevision };
+    const request: LibraryRequestToken = { generation: gen };
     pendingLibraryLoad = request;
     stepController?.abort();
     stepController = null;
@@ -848,8 +1271,6 @@ export function startApp(extensions: AppExtensions): void {
       if (
         !isLibraryRequestCurrent(request, pendingLibraryLoad, {
           generation,
-          entitlementRevision: activeEntitlements.revision,
-          entitled: activeEntitlements.library && libraryService.isEnabled(),
         })
       ) {
         return;
@@ -873,145 +1294,416 @@ export function startApp(extensions: AppExtensions): void {
     }
   }
 
-  async function refreshLibrary() {
-    if (!libraryPanel || !libraryService) return;
+  async function refreshLibrary(owner = libraryOperations.begin()) {
     const request: LibraryRequestToken = {
       generation: ++libraryRefreshSequence,
-      entitlementRevision: activeEntitlements.revision,
     };
     activeLibraryRefresh = request;
-    if (!activeEntitlements.library || !libraryService.isEnabled()) {
-      libraryPanel.setLocked?.(true);
-      libraryPanel.setStatus(
-        "Import a valid Pro license to use the managed Library. Your existing data stays on this device.",
-      );
-      return;
-    }
-    libraryPanel.setLocked?.(false);
     try {
-      const [folders, models] = await Promise.all([
-        libraryService.listFolders(),
-        libraryService.listModels(),
-      ]);
+      const [folders, models, roots, catalogSettings, tags, filaments, partStock] =
+        await Promise.all([
+          libraryService.listFolders(),
+          libraryService.listModels(),
+          libraryService.listRoots(),
+          libraryService.getCatalogSettings(),
+          libraryService.listTags(),
+          libraryService.listFilaments(true),
+          libraryService.listPartStock(),
+        ]);
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
           generation: libraryRefreshSequence,
-          entitlementRevision: activeEntitlements.revision,
-          entitled: activeEntitlements.library && libraryService.isEnabled(),
         })
       ) {
         return;
       }
-      libraryPanel.render(folders, models);
-      libraryPanel.setStatus("Managed copies are stored locally and survive source-file changes.");
+      libraryPanel.render(folders, models, roots, catalogSettings, tags, filaments, partStock);
+      if (libraryOperations.isCurrent(owner)) {
+        libraryPanel.setStatus(
+          "Managed copies are stored locally and survive source-file changes.",
+        );
+      }
     } catch (e) {
       if (
         !isLibraryRequestCurrent(request, activeLibraryRefresh, {
           generation: libraryRefreshSequence,
-          entitlementRevision: activeEntitlements.revision,
-          entitled: activeEntitlements.library && libraryService.isEnabled(),
         })
       ) {
         return;
       }
-      libraryPanel.setStatus(isAppError(e) ? describeError(e) : String(e));
+      if (libraryOperations.isCurrent(owner)) {
+        libraryPanel.setStatus(isAppError(e) ? describeError(e) : String(e));
+      }
     } finally {
       if (activeLibraryRefresh === request) activeLibraryRefresh = null;
     }
   }
 
   async function importIntoLibrary() {
-    if (!libraryPanel || !libraryService || !libraryService.isEnabled()) return;
-    const entitlementRevision = activeEntitlements.revision;
-    if (!activeEntitlements.library) return;
-    const selected = await openDialog({
-      multiple: true,
-      filters: [{ name: "3D models", extensions: ["stl", "3mf"] }],
-    });
-    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-    if (
-      paths.length === 0 ||
-      entitlementRevision !== activeEntitlements.revision ||
-      !activeEntitlements.library ||
-      !libraryService.isEnabled()
-    ) {
-      return;
-    }
-    libraryPanel.setStatus(`Importing ${paths.length} model${paths.length === 1 ? "" : "s"}…`);
-    let imported = 0;
-    const failures: string[] = [];
-    for (const path of paths) {
-      if (
-        entitlementRevision !== activeEntitlements.revision ||
-        !activeEntitlements.library ||
-        !libraryService.isEnabled()
-      ) {
-        return;
+    if (libraryImportInFlight) return;
+    libraryImportInFlight = true;
+    libraryPanel.setImportBusy(true);
+    const owner = libraryOperations.begin();
+    try {
+      const selected = await openDialog({
+        multiple: true,
+        filters: [{ name: "3D models", extensions: ["stl", "3mf"] }],
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      if (paths.length === 0) return;
+      if (libraryOperations.isCurrent(owner)) {
+        libraryPanel.setStatus(`Importing ${paths.length} model${paths.length === 1 ? "" : "s"}…`);
       }
-      try {
-        await libraryService.importFile(path);
-        imported += 1;
-      } catch (e) {
-        const filename = path.split("/").pop() ?? path;
-        const detail = isAppError(e) ? describeError(e) : String(e);
-        failures.push(`${filename}: ${detail}`);
+      let imported = 0;
+      const failures: string[] = [];
+      for (const path of paths) {
+        try {
+          await libraryService.importFile(path);
+          imported += 1;
+        } catch (e) {
+          const filename = path.split("/").pop() ?? path;
+          const detail = isAppError(e) ? describeError(e) : String(e);
+          failures.push(`${filename}: ${detail}`);
+        }
+      }
+      await refreshLibrary(owner);
+      if (libraryOperations.isCurrent(owner)) {
+        const summary = `${imported} imported · ${failures.length} failed`;
+        libraryPanel.setStatus(
+          failures.length ? `${summary}\n${failures.join("\n")}` : `${summary}.`,
+        );
+      }
+    } finally {
+      libraryImportInFlight = false;
+      libraryPanel.setImportBusy(false);
+    }
+  }
+
+  libraryPanel.onImport = () => void importIntoLibrary();
+  libraryPanel.onOpenModel = (modelId) => {
+    libraryPanel.hide();
+    void loadLibraryModel(modelId);
+  };
+  libraryPanel.onAddRoot = async () => {
+    const path = await openDialog({ directory: true, multiple: false });
+    if (typeof path !== "string") return;
+    const root = await libraryService.addRoot(path);
+    await refreshLibrary();
+    libraryPanel.setStatus(`Indexed source added. Files remain read-only in ${root.path}.`);
+    await libraryPanel.startScan(root.id);
+  };
+  libraryPanel.onUpdateRoot = async (root) => {
+    await libraryService.updateRoot(root);
+    await refreshLibrary();
+    libraryPanel.setStatus("Source settings saved.");
+  };
+  libraryPanel.onRemoveRoot = async (rootId) => {
+    await libraryService.removeRoot(rootId);
+    await refreshLibrary();
+    libraryPanel.setStatus(
+      "Source and its indexed entries removed from the catalog. No source files were deleted.",
+    );
+  };
+  libraryPanel.onStartScan = async (rootId) => {
+    await libraryService.startScan(rootId);
+    libraryPanel.setStatus(rootId ? "Folder scan started." : "Scan started for enabled folders.");
+  };
+  libraryPanel.onCancelScan = async () => {
+    await libraryService.cancelScan();
+    libraryPanel.setStatus("Stopping the active scan…");
+  };
+  libraryPanel.onPollScanStatus = libraryService.scanStatus;
+  libraryPanel.onScanCompleted = () => void refreshLibrary();
+  libraryPanel.onGetThumbnail = createNativeThumbnailReader({
+    readCatalog: libraryService.getCatalogThumbnail,
+    generate: libraryService.getThumbnail,
+  });
+  libraryPanel.onPurgeThumbnails = async () => thumbnailCleanup.show("resetDefaults");
+  libraryPanel.onStartThumbnailJob = libraryService.startThumbnailJob;
+  libraryPanel.onSaveCatalogSettings = async (settings) => {
+    const saved = await libraryService.setCatalogSettings(settings);
+    libraryPanel.clearThumbnailCache();
+    await refreshLibrary();
+    return saved;
+  };
+  libraryPanel.onSaveMetadata = async (targets, patch) => {
+    if (targets.length === 1) {
+      const target = targets[0];
+      await libraryService.updateModelMetadata(target.model_id, target.expected_version, patch);
+    } else {
+      await libraryService.updateModelsMetadata(targets, patch);
+    }
+    await refreshLibrary();
+  };
+  libraryPanel.onCreateTag = async (name, category) => {
+    await libraryService.createTag(name, category);
+    await refreshLibrary();
+  };
+  libraryPanel.onUpdateTag = async (id, name, category) => {
+    await libraryService.updateTag(id, name, category);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeleteTag = async (id) => {
+    await libraryService.deleteTag(id);
+    await refreshLibrary();
+  };
+  libraryPanel.onListPrintAttempts = libraryService.listPrintAttempts;
+  libraryPanel.onCreatePrintAttempt = async (modelId, input, printerId) => {
+    await libraryService.createPrintAttempt(modelId, input, printerId ?? null);
+    await refreshLibrary();
+  };
+  libraryPanel.onUpdatePrintAttempt = async (attemptId, input, printerId) => {
+    await libraryService.updatePrintAttempt(attemptId, input, printerId);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeletePrintAttempt = async (attemptId) => {
+    await libraryService.deletePrintAttempt(attemptId);
+    await refreshLibrary();
+  };
+  libraryPanel.onListPartStock = libraryService.listPartStock;
+  libraryPanel.onCreatePartStock = async (input) => {
+    await libraryService.createPartStock(input);
+    await refreshLibrary();
+  };
+  libraryPanel.onUpdatePartStock = async (id, expectedVersion, input) => {
+    await libraryService.updatePartStock(id, expectedVersion, input);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeletePartStock = async (id, expectedVersion) => {
+    await libraryService.deletePartStock(id, expectedVersion);
+    await refreshLibrary();
+  };
+  libraryPanel.onCreateBundle = async (modelIds) => {
+    await libraryService.createBundle(modelIds);
+    await refreshLibrary();
+  };
+  libraryPanel.onCreateCollection = async (name) => {
+    await libraryService.createFolder(name);
+    await refreshLibrary();
+  };
+  libraryPanel.onRenameCollection = async (id, name) => {
+    await libraryService.renameFolder(id, name);
+    await refreshLibrary();
+  };
+  libraryPanel.onDeleteCollection = async (id) => {
+    await libraryService.deleteFolder(id);
+    await refreshLibrary();
+  };
+  libraryPanel.onReviewDuplicates = async (modelIds) => {
+    const groups = await libraryService.duplicateGroups(modelIds);
+    libraryDuplicates.show(groups, modelIds.length);
+  };
+  libraryDuplicates.onGetThumbnail = libraryService.getCatalogThumbnail;
+  libraryDuplicates.onRemove = async (models) => {
+    await libraryService.removeModels(removalTargets(models));
+    await refreshLibrary();
+    libraryDuplicates.dismiss();
+    libraryPanel.setStatus(
+      `${models.length} duplicate record${models.length === 1 ? "" : "s"} removed recoverably.`,
+    );
+  };
+  libraryPanel.onRemoveModels = async (targets) => {
+    const result = await libraryService.removeModels(targets);
+    await refreshLibrary();
+    libraryPanel.setStatus(
+      `${result.removedIds.length} model${result.removedIds.length === 1 ? "" : "s"} removed recoverably. Snapshot ${result.snapshotId}.`,
+    );
+  };
+  libraryPanel.onRevealSource = async (modelId) => {
+    const source = await libraryService.revealModelSource(modelId);
+    libraryPanel.setStatus(
+      source.archiveMember
+        ? `Archive source: ${source.path} · member ${source.archiveMember}`
+        : `Source: ${source.path}`,
+    );
+  };
+  libraryPanel.onTrashLooseSource = async (model) => {
+    const result = await libraryService.trashLooseSource(model.id, model.metadata_version);
+    await refreshLibrary();
+    if (window.confirm("Source moved to Trash. Undo this action now?")) {
+      await libraryService.undoTrash(result.snapshotId);
+      await refreshLibrary();
+      libraryPanel.setStatus("Trash action undone.");
+    } else {
+      libraryPanel.setStatus(`Source moved to Trash recoverably. Snapshot ${result.snapshotId}.`);
+    }
+  };
+  libraryPanel.onChooseCustomPreview = async (model) => {
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: "Preview image", extensions: ["png", "jpg", "jpeg"] }],
+    });
+    if (typeof path !== "string") return;
+    await libraryService.setCustomThumbnail(model.id, model.metadata_version, path);
+    libraryPanel.clearThumbnailCache();
+    await refreshLibrary();
+  };
+  libraryPanel.onClearCustomPreview = async (model) => {
+    await libraryService.clearCustomThumbnail(model.id, model.metadata_version);
+    libraryPanel.clearThumbnailCache();
+    await refreshLibrary();
+  };
+  let bundlePreviewGeneration = 0;
+  libraryPanel.onPreviewBundle = async (bundleId) => {
+    const preview = await libraryService.prepareBundlePreview(bundleId, ++bundlePreviewGeneration);
+    await libraryBundle.show(preview, await refreshSlicers());
+  };
+  libraryBundle.onClosePreview = libraryService.closeBundlePreview;
+  libraryBundle.onHandoff = libraryService.sendBundleToSlicer;
+  libraryBundle.onLoadGeometry = libraryService.bundlePreviewGeometry;
+  libraryPanel.onOpenManagement = () => {
+    void libraryService
+      .listRemovedModels()
+      .then((removed) => libraryManagement.show(removed))
+      .catch((error) => {
+        libraryPanel.setStatus(
+          `Could not open Library management: ${isAppError(error) ? describeError(error) : String(error)}`,
+        );
+      });
+  };
+  libraryManagement.onRestoreRemoved = async (snapshotId) => {
+    await libraryService.restoreRemoval(snapshotId);
+    await refreshLibrary();
+    libraryManagement.show(await libraryService.listRemovedModels());
+  };
+  libraryManagement.onBackup = async () => {
+    const destination = await saveDialog({ defaultPath: "GoggleLab-Library.gogglelab-backup" });
+    if (!destination) return;
+    const result = await libraryService.createBackup(destination);
+    libraryPanel.setStatus(`Backup created: ${result.files} files · ${result.path}`);
+  };
+  libraryManagement.onRestoreBackup = async () => {
+    const source = await openDialog({
+      multiple: false,
+      filters: [{ name: "GoggleLab backup", extensions: ["gogglelab-backup", "zip"] }],
+    });
+    if (typeof source !== "string") return;
+    if (
+      !window.confirm(
+        "Restore this verified backup and preserve the current Library as rollback data?",
+      )
+    )
+      return;
+    const result = await libraryService.restoreBackup(source);
+    invalidateViewerAfterLibraryReplacement("Library backup restored. Choose a model to continue.");
+    await refreshLibrary();
+    libraryPanel.setStatus(`Backup restored. Previous Library: ${result.previousLibraryBackup}`);
+  };
+  libraryManagement.onChoosePurgeBackupDestination = async () =>
+    await saveDialog({ defaultPath: "GoggleLab-before-purge.gogglelab-backup" });
+  libraryManagement.onPurge = async (confirmation, destinationPath) => {
+    const result = await libraryService.purgeCatalog(confirmation, destinationPath);
+    invalidateViewerAfterLibraryReplacement(
+      "Catalog purged after a restorable backup. The viewer was cleared.",
+    );
+    await refreshLibrary();
+    libraryPanel.setStatus(
+      `Catalog purged after preserving ${result.files} files at ${result.path}.`,
+    );
+  };
+  libraryManagement.onCleanup = async () => thumbnailCleanup.show("orphans");
+  let filamentDialogModelIds: string[] = [];
+  const refreshFilamentDialog = async () => {
+    const [filaments, models] = await Promise.all([
+      libraryService.listFilaments(true),
+      libraryService.listModels(),
+    ]);
+    libraryFilaments.show(
+      filaments,
+      models.filter((model) => filamentDialogModelIds.includes(model.id)),
+    );
+  };
+  libraryPanel.onOpenFilaments = (models) => {
+    filamentDialogModelIds = models.map((model) => model.id);
+    void libraryService
+      .listFilaments(true)
+      .then((filaments) => libraryFilaments.show(filaments, models))
+      .catch((error) => libraryPanel.setStatus(String(error)));
+  };
+  libraryFilaments.onCreate = async (input) => {
+    await libraryService.createFilament(input);
+    await refreshLibrary();
+    await refreshFilamentDialog();
+  };
+  libraryFilaments.onUpdate = async (id, version, input) => {
+    await libraryService.updateFilament(id, version, input);
+    await refreshLibrary();
+    await refreshFilamentDialog();
+  };
+  libraryFilaments.onArchive = async (id, version) => {
+    await libraryService.deleteFilament(id, version);
+    await refreshLibrary();
+    await refreshFilamentDialog();
+  };
+  libraryFilaments.onAssign = async (updates) => {
+    if (updates.length === 1) {
+      await libraryService.setModelFilaments(
+        updates[0].target.model_id,
+        updates[0].target.expected_version,
+        updates[0].filamentIds,
+      );
+    } else if (updates.length > 1) {
+      const first = JSON.stringify(updates[0].filamentIds);
+      if (updates.every((update) => JSON.stringify(update.filamentIds) === first)) {
+        await libraryService.bulkSetModelFilaments(
+          updates.map((update) => update.target),
+          updates[0].filamentIds,
+        );
+      } else {
+        await libraryService.bulkAssignModelFilaments(filamentAssignmentBatch(updates));
       }
     }
     await refreshLibrary();
-    if (
-      entitlementRevision !== activeEntitlements.revision ||
-      !activeEntitlements.library ||
-      !libraryService.isEnabled()
-    ) {
-      return;
-    }
-    const summary = `${imported} imported · ${failures.length} failed`;
-    libraryPanel.setStatus(failures.length ? `${summary}\n${failures.join("\n")}` : `${summary}.`);
-  }
-
-  if (libraryPanel) {
-    libraryPanel.onImport = () => void importIntoLibrary();
-    libraryPanel.onOpenModel = (modelId) => {
-      libraryPanel.hide();
-      void loadLibraryModel(modelId);
-    };
-  }
+    await refreshFilamentDialog();
+  };
+  libraryPanel.onOpenIntegrations = (models) => {
+    void libraryService
+      .integrationSettings()
+      .then((settings) => libraryAi.show(settings, models))
+      .catch((error) => libraryPanel.setStatus(String(error)));
+  };
+  libraryAi.onSaveSpoolman = async (config) => {
+    await libraryService.saveSpoolmanConfig(config);
+    libraryPanel.setStatus("Spoolman configuration saved. No network request was made.");
+  };
+  libraryAi.onPullSpoolman = async () => {
+    const result = await libraryService.spoolmanPull();
+    await refreshLibrary();
+    return `${result.filamentsUpserted} filament types and ${result.spoolsUpserted} physical spools reconciled. ${result.removedLocally} absent remote mirrors marked unavailable; stable IDs, assignments, and history retained.`;
+  };
+  libraryAi.onSaveProvider = async (config, credential) => {
+    await libraryService.saveAiProvider(config, credential);
+    libraryPanel.setStatus("AI provider settings saved. No provider request was made.");
+  };
+  libraryAi.onDeleteProvider = libraryService.deleteAiProvider;
+  libraryAi.onSuggest = libraryService.suggestTags;
+  libraryAi.onApply = async (token, decisions, strategy) => {
+    await libraryService.applyTagReview(token, decisions, strategy);
+    await refreshLibrary();
+    libraryPanel.setStatus("Reviewed AI tag decisions applied.");
+  };
+  libraryAi.onDiscard = libraryService.discardTagReview;
 
   const unsubscribeEntitlements =
     extensions.subscribeEntitlements?.((entitlements) => {
-      const pending = pendingLibraryLoad;
-      activeEntitlements = entitlements;
+      activeEntitlements = withCoreEntitlements(entitlements);
       updateHandoffButton();
       colorwayPaletteRevision += 1;
-      colorFeature.setEntitlements?.(entitlements);
-      if (!entitlements.library) activeLibraryRefresh = null;
-      if (
-        pending &&
-        (!entitlements.library || pending.entitlementRevision !== entitlements.revision)
-      ) {
-        invalidatePendingLibraryLoad();
-      }
-      libraryPanel?.setLocked?.(!entitlements.library);
+      colorFeature.setEntitlements?.(activeEntitlements);
       if (entitlements.colorways) void refreshColorwayPalette();
-      if (entitlements.library) void refreshLibrary();
-      else if (libraryPanel) {
-        libraryPanel.setStatus(
-          "Import a valid Pro license to use the managed Library. Your existing data stays on this device.",
-        );
-      }
     }) ?? (() => {});
   window.addEventListener("beforeunload", unsubscribeEntitlements, { once: true });
   type TopmostOverlay = "none" | "settings" | "library" | "coldStart";
 
   function topmostOverlay(): TopmostOverlay {
     if (settingsPanel.isOpen) return "settings";
-    if (libraryPanel?.isOpen) return "library";
+    if (libraryPanel.isOpen) return "library";
     if (folderModal.open) return "coldStart";
     return "none";
   }
   function closeTopmostOverlay(overlayName: Exclude<TopmostOverlay, "none">) {
     if (overlayName === "settings") settingsPanel.hide();
-    else if (overlayName === "library") libraryPanel?.hide();
+    else if (overlayName === "library") libraryPanel.hide();
     else hideFolderModal();
   }
 
@@ -1021,6 +1713,7 @@ export function startApp(extensions: AppExtensions): void {
     const modal = topmostOverlay();
     if (modal !== "none") {
       if (e.key === "Escape") {
+        if (pathContainsOpenDialog(e.composedPath())) return;
         e.preventDefault();
         closeTopmostOverlay(modal);
       }

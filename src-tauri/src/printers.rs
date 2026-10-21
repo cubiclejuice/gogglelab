@@ -28,6 +28,9 @@ pub struct DetectedPrinter {
 
 #[tauri::command]
 pub fn detect_printers() -> Vec<DetectedPrinter> {
+    if crate::visual_qa::active() {
+        return Vec::new();
+    }
     let installed: HashSet<String> = slicers::detect_slicers()
         .into_iter()
         .map(|s| s.bundle_id)

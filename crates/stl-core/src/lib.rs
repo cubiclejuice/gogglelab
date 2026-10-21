@@ -5,22 +5,35 @@
 //! integrity() and the IPC geometry buffer never know which file they came from.
 
 pub mod error;
+mod input_owned;
 pub mod integrity;
 pub mod limits;
+mod map_owned;
 pub mod measure;
+#[doc(hidden)]
+pub mod metadata_owned;
 pub mod model;
+#[doc(hidden)]
+pub mod package_bounds;
 pub mod parse;
 pub mod threemf;
 mod vec3;
+#[doc(hidden)]
+pub mod xml_bounds;
+pub mod zip_bounds;
 
-pub use error::StlError;
+pub use error::{ResourceStop, StlError};
+#[doc(hidden)]
+pub use input_owned::{InputBufferKind, InputBufferLayoutProfile};
 pub use integrity::{integrity, Integrity, IntegrityResult};
 pub use measure::{measure, Bbox, GeometryStats};
 pub use model::{
-    parse_model_with_plates, MaterialSource, ParsedFilament, ParsedMaterial, ParsedModel,
-    ParsedPart, Plate,
+    parse_model_with_plates, parse_model_with_plates_in_context, MaterialSource, ParsedFilament,
+    ParsedMaterial, ParsedModel, ParsedPart, Plate,
 };
 pub use parse::{parse, ParsedStl, StlFormat};
+#[doc(hidden)]
+pub use threemf::input_buffer_layout_profile;
 pub use threemf::parse_3mf;
 
 /// Parse a model file of either supported format. A 3MF is a zip package, so
@@ -30,4 +43,13 @@ pub use threemf::parse_3mf;
 /// open if its bytes are readable, and fail with the right error if not.
 pub fn parse_model(bytes: &[u8]) -> Result<ParsedStl, StlError> {
     Ok(parse_model_with_plates(bytes)?.model)
+}
+
+/// Parse within one admitted package operation, sharing sequential actual-read accounting.
+#[doc(hidden)]
+pub fn parse_model_in_context(
+    bytes: &[u8],
+    context: &mut package_bounds::PackageProcessingContext,
+) -> Result<ParsedStl, StlError> {
+    Ok(parse_model_with_plates_in_context(bytes, context)?.model)
 }

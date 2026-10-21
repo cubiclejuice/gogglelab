@@ -37,11 +37,34 @@ pub fn load_model_from_path(
     generation: u64,
     source_identity: &str,
 ) -> Result<ModelSummary, AppError> {
+    let mut context = stl_core::package_bounds::PackageProcessingContext::new(
+        stl_core::zip_bounds::ZipResourceObserver::new(),
+    );
+    load_model_from_path_in_context(app, state, path, generation, source_identity, &mut context)
+}
+
+#[doc(hidden)]
+pub fn load_model_from_path_in_context(
+    app: AppHandle,
+    state: &AppState,
+    path: &Path,
+    generation: u64,
+    source_identity: &str,
+    context: &mut stl_core::package_bounds::PackageProcessingContext,
+) -> Result<ModelSummary, AppError> {
+    context.observer().check().map_err(AppError::from)?;
     state.register_generation(generation);
     let canonical =
         std::fs::canonicalize(path).map_err(|error| crate::error::map_io_error(&error))?;
     let canonical = canonical.to_str().ok_or(AppError::NotReadable)?;
-    crate::commands::load_and_dispatch_integrity(app, state, canonical, generation, source_identity)
+    crate::commands::load_and_dispatch_integrity_in_context(
+        app,
+        state,
+        canonical,
+        generation,
+        source_identity,
+        context,
+    )
 }
 
 /// Admit an operation on the source already loaded for the current viewer
@@ -54,6 +77,14 @@ pub fn with_original_source<T>(
     state: &AppState,
     generation: u64,
     operation: impl FnOnce(&OriginalSource) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    with_original_source_digest(state, generation, |source, _digest| operation(source))
+}
+
+pub(crate) fn with_original_source_digest<T>(
+    state: &AppState,
+    generation: u64,
+    operation: impl FnOnce(&OriginalSource, &str) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
     let _request_guard = state.request_commit.lock().unwrap();
     let guard = state.current.lock().unwrap();
@@ -69,7 +100,7 @@ pub fn with_original_source<T>(
         path: PathBuf::from(&model.path),
         format,
     };
-    operation(&source)
+    operation(&source, &model.source_digest)
 }
 
 /// Read-only installed-slicer discovery for Pro extensions and printer lookup.
@@ -93,8 +124,11 @@ pub fn slicer_config(slicer_id: &str) -> Option<SlicerConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::{with_original_source, AppError, AppState, SourceFormat};
+    use super::{
+        with_original_source, with_original_source_digest, AppError, AppState, SourceFormat,
+    };
     use crate::state::LoadedModel;
+    use sha2::Digest;
     use std::sync::Arc;
 
     #[test]
@@ -108,12 +142,20 @@ mod tests {
         *state.current.lock().unwrap() = Some(LoadedModel {
             generation: 7,
             path: path.into(),
+            source_digest: format!("{:x}", sha2::Sha256::digest(&bytes)),
             parsed,
         });
 
         let source = with_original_source(&state, 7, |source| Ok(source.clone())).unwrap();
         assert_eq!(source.path.to_str(), Some(path));
         assert_eq!(source.format, SourceFormat::Stl);
+        with_original_source_digest(&state, 7, |_, digest| {
+            assert_eq!(digest, format!("{:x}", sha2::Sha256::digest(&bytes)));
+            assert!(state.request_commit.try_lock().is_err());
+            assert!(state.current.try_lock().is_err());
+            Ok(())
+        })
+        .unwrap();
 
         state.register_generation(8);
         let mut called = false;
@@ -137,6 +179,7 @@ mod tests {
         *state.current.lock().unwrap() = Some(LoadedModel {
             generation: 7,
             path: "/tmp/model.stl".into(),
+            source_digest: format!("{:x}", sha2::Sha256::digest(&bytes)),
             parsed,
         });
 
@@ -167,6 +210,7 @@ mod tests {
         *state.current.lock().unwrap() = Some(LoadedModel {
             generation: 7,
             path: "/tmp/model.stl".into(),
+            source_digest: format!("{:x}", sha2::Sha256::digest(&bytes)),
             parsed,
         });
         let state = Arc::new(state);

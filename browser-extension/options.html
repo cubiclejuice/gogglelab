@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <title>GoggleLab Capture Options</title>
+    <link rel="stylesheet" href="extension.css">
+  </head>
+  <body class="options-page">
+    <main>
+      <h1>Capture inbox</h1>
+      <p>Choose a folder only if you want capture files written there. Otherwise captures use Downloads/GoggleLabInbox.</p>
+      <button id="choose">Choose writable folder…</button>
+      <button id="clear">Use Downloads fallback</button>
+      <div id="status" role="status"></div>
+      <section aria-labelledby="api-enrichment-title">
+        <h2 id="api-enrichment-title">Optional API enrichment</h2>
+        <p id="api-enrichment-help">Off by default. Enabling asks Chrome for optional Printables and Bambu API access. Public model IDs are sent only after you click Enrich in the popup. No sign-in cookies are sent.</p>
+        <label class="setting-toggle" for="api-enrichment-enabled">
+          <input id="api-enrichment-enabled" type="checkbox" aria-describedby="api-enrichment-help">
+          <span>Enable optional catalog API enrichment</span>
+        </label>
+        <div id="api-enrichment-status" role="status" aria-live="polite"></div>
+      </section>
+      <h2>Pending captures</h2>
+      <ul id="queue"></ul>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,10272 @@
+#![recursion_limit = "256"]
+use library_protocol::{
+    Printer, PrinterConnectionResponse, PrinterDiscoveryJob, PrinterDiscoveryPlan,
+    PrinterFleetEngine, PrinterInput, PrinterMaintenanceInput, PrinterMaintenanceLog,
+    PrinterNetworkEngine, PrinterNetworkPolicySummary, PrinterReminder, PrinterReminderCompletion,
+    PrinterReminderCompletionInput, PrinterReminderInput,
+};
+
+mod bootstrap;
+mod confirmation;
+mod mcp;
+mod security;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::{Multipart, Path as AxumPath, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response, Sse};
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
+
+pub use bootstrap::{load_or_create_bearer_secret, BearerSecret};
+pub use confirmation::{ConfirmationPlan, ConfirmationStore};
+use library_protocol::{
+    ActionPlan, AiProviderConfig, BundleEngine, BundlePreviewSummary, CaptureEngine,
+    CaptureEnvelope, CaptureImportResult, CaptureSummary, CatalogFacets, CatalogJobEngine,
+    CatalogModel, CatalogSettings, CatalogStats, ContentKind, ContentLease, DuplicateEngine,
+    DuplicateGroup, EmbeddedMetadataEngine, EmbeddedMetadataProposal, EmbeddedMetadataSelection,
+    Filament, FilamentEngine, FilamentInput, Folder, FolderEngine, GeometryEngine, GeometryLease,
+    HashStatus, IndexRootSettings, IndexRootSettingsPatch, IntegrationAiReviewDecision,
+    IntegrationAiReviewStrategy, IntegrationAiSuggestionBatch, IntegrationCredentialUpdate,
+    IntegrationEngine, IntegrationSettings, IntegrationSpoolmanConfig,
+    IntegrationSpoolmanPullResult, LibraryEngine as ProtocolLibraryEngine, ManagementAction,
+    ManagementEngine, ManagementResult, MetadataEngine, MetadataPatch, MetadataValueKind,
+    ModelAvailability, ModelFilamentAssignment, ModelGroupFilter, ModelQuery as ProtocolModelQuery,
+    ModelSort, ModelSourceStatus, MoveLooseSourceTarget, MutationVersion, PageRequest, PartStock,
+    PartStockEngine, PartStockInput, PrintAttempt, PrintAttemptBatchItem, PrintAttemptInput,
+    PrintAttemptInputWithPrinter, PrintHistoryEngine, PrintStatus, RootAccess, RootHandle,
+    RuntimeError, RuntimeErrorCode, ScanStatus, SettingsEngine, SortDirection, SourceHoldReceipt,
+    SourceState, Tag, TagEngine, ThumbnailDescriptor, UploadIntent, UploadToken,
+    VersionedMetadataUpdate, VersionedTarget, MAX_MODEL_SEARCH_OFFSET,
+};
+pub use library_protocol::{Capability, RequestContext};
+pub use security::{AllowedAuthority, AllowedOrigin, SecurityConfig};
+use sha2::{Digest, Sha256};
+
+pub const API_VERSION: &str = "1";
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_MCP_BODY_BYTES: usize = 12 * 1024 * 1024;
+pub const MAX_THUMBNAIL_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PAGE_SIZE: u16 = 100;
+const MAX_STATIC_FILES: usize = 2_048;
+const MAX_STATIC_ASSET_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_STATIC_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FILTERED_CATALOG_MODELS: usize = 10_000;
+const MAX_DUPLICATE_SCOPE: usize = 1_000;
+const DEFAULT_CHECK_FILES_EXIST_LIMIT: usize = 500;
+const MAX_CHECK_FILES_EXIST_LIMIT: usize = 2_000;
+
+#[derive(Clone)]
+struct StaticAsset {
+    bytes: Bytes,
+    content_type: &'static str,
+}
+
+#[derive(Clone)]
+struct StaticAssets {
+    files: Arc<BTreeMap<String, StaticAsset>>,
+}
+
+pub struct ServerHandle {
+    local_addr: std::net::SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    stream_shutdown: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+}
+
+impl ServerHandle {
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
+    pub async fn stop(mut self) -> Result<(), String> {
+        let _ = self.stream_shutdown.send(true);
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let mut task = self.task;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await {
+            Ok(result) => result
+                .map_err(|_| "Server task stopped unexpectedly".to_string())?
+                .map_err(|_| "Server listener failed".to_string()),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Ok(())
+            }
+        }
+    }
+}
+
+pub async fn start_listener(
+    listener: tokio::net::TcpListener,
+    app: Router,
+) -> Result<ServerHandle, String> {
+    let local_addr = listener
+        .local_addr()
+        .map_err(|_| "Server listener address is unavailable")?;
+    let (shutdown, receiver) = oneshot::channel();
+    let (stream_shutdown, stream_receiver) = tokio::sync::watch::channel(false);
+    let app = app.layer(axum::Extension(ServerShutdown(stream_receiver)));
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = receiver.await;
+        })
+        .await
+    });
+    Ok(ServerHandle {
+        local_addr,
+        shutdown: Some(shutdown),
+        stream_shutdown,
+        task,
+    })
+}
+
+#[derive(Clone)]
+struct ServerShutdown(tokio::sync::watch::Receiver<bool>);
+
+pub struct ServerState<E: LibraryEngine> {
+    engine: Arc<E>,
+    security: Arc<SecurityConfig>,
+    admission: Arc<Semaphore>,
+    content_admission: Arc<Semaphore>,
+    large_upload_admission: Arc<Semaphore>,
+    event_admission: Arc<Semaphore>,
+    content_send_timeout: std::time::Duration,
+    mcp_sessions: Arc<mcp::SessionStore>,
+    static_assets: Option<StaticAssets>,
+}
+
+struct EventStreamState<E: LibraryEngine> {
+    engine: Arc<E>,
+    context: RequestContext,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    library_epoch: String,
+    catalog_revision: String,
+    initial_reset: bool,
+    first: bool,
+    last_heartbeat: std::time::Instant,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl<E: LibraryEngine> Clone for ServerState<E> {
+    fn clone(&self) -> Self {
+        Self {
+            engine: Arc::clone(&self.engine),
+            security: Arc::clone(&self.security),
+            admission: Arc::clone(&self.admission),
+            content_admission: Arc::clone(&self.content_admission),
+            large_upload_admission: Arc::clone(&self.large_upload_admission),
+            event_admission: Arc::clone(&self.event_admission),
+            content_send_timeout: self.content_send_timeout,
+            mcp_sessions: Arc::clone(&self.mcp_sessions),
+            static_assets: self.static_assets.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostCapabilities {
+    pub api_version: String,
+    pub host_mode: HostMode,
+    pub library_epoch: String,
+    pub catalog_revision: String,
+    pub features: FeatureSet,
+    pub limits: LimitSet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSlicerSummary {
+    pub id: String,
+    pub display_name: String,
+}
+
+pub trait HostSlicerAdapter: Send + Sync {
+    fn list_slicers(&self, context: &RequestContext)
+        -> Result<Vec<HostSlicerSummary>, EngineError>;
+
+    fn open_in_slicer(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        slicer_id: &str,
+    ) -> Result<(), EngineError>;
+
+    fn open_in_slicer_batch(
+        &self,
+        context: &RequestContext,
+        targets: &[VersionedTarget],
+        slicer_id: &str,
+    ) -> Result<(), EngineError> {
+        if targets.len() != 1 {
+            return Err(EngineError {
+                code: "unsupported",
+                message: "This host adapter does not support multi-model slicer handoff".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let target = &targets[0];
+        self.open_in_slicer(
+            context,
+            &target.model_id,
+            target.expected_version,
+            slicer_id,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HostMode {
+    Desktop,
+    Headless,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureSet {
+    pub reveal_source: bool,
+    pub trash_source: bool,
+    pub purge_catalog: bool,
+    pub cleanup_orphans: bool,
+    pub launch_slicer: bool,
+    pub download_source: bool,
+    pub download_bundle: bool,
+    pub ai: bool,
+    pub spoolman: bool,
+    pub mcp: bool,
+    pub capture_inbox: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitSet {
+    pub page_size_max: u16,
+    pub thumbnail_upload_bytes: u64,
+    pub model_upload_bytes: u64,
+    pub active_previews_max: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatus {
+    pub library_epoch: String,
+    pub catalog_revision: String,
+    pub maintenance: bool,
+    pub jobs: Vec<JobStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStatus {
+    pub id: String,
+    pub kind: String,
+    pub state: String,
+    pub completed: u64,
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSummary {
+    pub id: String,
+    pub display_name: String,
+    pub folder_id: String,
+    pub source_root_id: Option<String>,
+    pub bundle_id: Option<String>,
+    pub archive_member: bool,
+    pub parent_model_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_printed_at: Option<String>,
+    pub print_count: String,
+    pub metadata_version: String,
+    pub format: Option<String>,
+    pub bytes: String,
+    pub content_hash: Option<String>,
+    pub tags: Vec<String>,
+    pub filament_ids: Vec<String>,
+    pub source_kind: String,
+    pub availability: String,
+    pub catalog_kind: String,
+    pub thumbnail_id: Option<String>,
+    pub designer: Option<String>,
+    pub source_url: Option<String>,
+    pub notes: Option<String>,
+    pub model_license: Option<String>,
+    pub print_status: String,
+    pub rating: u8,
+    pub favorite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub snapshot_revision: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelQuery {
+    cursor: Option<String>,
+    limit: Option<u16>,
+    query: Option<String>,
+    folder_id: Option<String>,
+    sort: Option<ModelSort>,
+    direction: Option<SortDirection>,
+    tag_id: Option<String>,
+    category: Option<String>,
+    designer: Option<String>,
+    model_license: Option<String>,
+    print_status: Option<PrintStatus>,
+    ever_printed: Option<bool>,
+    bundle_id: Option<String>,
+    root_id: Option<String>,
+    filament_id: Option<String>,
+    source_missing: Option<bool>,
+    duplicates_only: Option<bool>,
+    source_kind: Option<String>,
+    group: Option<ModelGroupFilter>,
+    thumbnail_mode: Option<String>,
+    source_directory: Option<String>,
+    minimum_rating: Option<u8>,
+    favorite: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireMutation {
+    model_id: String,
+    metadata_version: String,
+}
+impl From<MutationVersion> for WireMutation {
+    fn from(v: MutationVersion) -> Self {
+        Self {
+            model_id: v.model_id,
+            metadata_version: v.metadata_version.to_string(),
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireFolder {
+    id: String,
+    name: String,
+    parent_id: Option<String>,
+    model_count: String,
+}
+impl From<Folder> for WireFolder {
+    fn from(v: Folder) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            parent_id: v.parent_id,
+            model_count: v.model_count.to_string(),
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireFilament {
+    id: String,
+    version: String,
+    brand: String,
+    material: String,
+    color: String,
+    name: String,
+    notes: String,
+    origin: String,
+    resource_kind: String,
+    source_id: Option<String>,
+    external_id: Option<String>,
+    parent_filament_id: Option<String>,
+    archived: bool,
+    source_missing: bool,
+}
+impl From<Filament> for WireFilament {
+    fn from(v: Filament) -> Self {
+        Self {
+            id: v.id,
+            version: v.version.to_string(),
+            brand: v.brand,
+            material: v.material,
+            color: v.color,
+            name: v.name,
+            notes: v.notes,
+            origin: v.origin,
+            resource_kind: v.resource_kind,
+            source_id: v.source_id,
+            external_id: v.external_id,
+            parent_filament_id: v.parent_filament_id,
+            archived: v.archived,
+            source_missing: v.source_missing,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WirePartStock {
+    id: String,
+    metadata_version: String,
+    name: String,
+    category: Option<String>,
+    quantity: String,
+    unit: String,
+    notes: String,
+    low_stock: u32,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<PartStock> for WirePartStock {
+    fn from(value: PartStock) -> Self {
+        Self {
+            id: value.id,
+            metadata_version: value.metadata_version.to_string(),
+            name: value.name,
+            category: value.category,
+            quantity: value.quantity.to_string(),
+            unit: value.unit,
+            notes: value.notes,
+            low_stock: value.low_stock,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireThumbnail {
+    thumbnail_id: String,
+    model_id: String,
+    ordinal: u16,
+    active: bool,
+    custom: bool,
+    mime: String,
+    bytes: String,
+    sha256: String,
+}
+impl From<ThumbnailDescriptor> for WireThumbnail {
+    fn from(v: ThumbnailDescriptor) -> Self {
+        Self {
+            thumbnail_id: v.thumbnail_id,
+            model_id: v.model_id,
+            ordinal: v.ordinal,
+            active: v.active,
+            custom: v.custom,
+            mime: v.mime,
+            bytes: v.bytes.to_string(),
+            sha256: v.sha256,
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireLease {
+    id: String,
+    kind: ContentKind,
+    file_name: String,
+    mime: String,
+    bytes: String,
+    sha256: String,
+    library_epoch: String,
+    expires_at: String,
+}
+impl From<ContentLease> for WireLease {
+    fn from(v: ContentLease) -> Self {
+        Self {
+            id: v.id,
+            kind: v.kind,
+            file_name: v.file_name,
+            mime: v.mime,
+            bytes: v.bytes.to_string(),
+            sha256: v.sha256,
+            library_epoch: v.library_epoch.to_string(),
+            expires_at: v.expires_at,
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireGeometryLease {
+    content: WireLease,
+    packet_format: String,
+    packet_version: u32,
+    model_format: String,
+    triangle_count: u32,
+    plates: Vec<library_protocol::GeometryPlate>,
+    parts: Vec<library_protocol::GeometryPart>,
+    materials: Vec<library_protocol::GeometryMaterial>,
+    embedded_filaments: Vec<library_protocol::EmbeddedFilament>,
+    part_warning: Option<String>,
+    plate_warning: Option<String>,
+}
+impl From<GeometryLease> for WireGeometryLease {
+    fn from(v: GeometryLease) -> Self {
+        Self {
+            content: v.content.into(),
+            packet_format: v.packet_format,
+            packet_version: v.packet_version,
+            model_format: v.model_format,
+            triangle_count: v.triangle_count,
+            plates: v.plates,
+            parts: v.parts,
+            materials: v.materials,
+            embedded_filaments: v.embedded_filaments,
+            part_warning: v.part_warning,
+            plate_warning: v.plate_warning,
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireDuplicateGroup {
+    content_hash: String,
+    models: Vec<ModelSummary>,
+}
+impl From<DuplicateGroup> for WireDuplicateGroup {
+    fn from(v: DuplicateGroup) -> Self {
+        Self {
+            content_hash: v.content_hash,
+            models: v.models.into_iter().map(http_model).collect(),
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireUpload {
+    id: String,
+    item_id: String,
+    capture_id: String,
+    expires_at: String,
+    library_epoch: String,
+}
+impl From<UploadToken> for WireUpload {
+    fn from(v: UploadToken) -> Self {
+        Self {
+            id: v.id,
+            item_id: v.item_id,
+            capture_id: v.capture_id,
+            expires_at: v.expires_at,
+            library_epoch: v.library_epoch.to_string(),
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireTarget {
+    model_id: String,
+    expected_version: String,
+}
+impl WireTarget {
+    fn parse(self) -> Result<VersionedTarget, ApiError> {
+        Ok(VersionedTarget {
+            model_id: self.model_id,
+            expected_version: parse_decimal(&self.expected_version)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireMoveLooseSourceTarget {
+    model_id: String,
+    expected_version: String,
+    file_name: String,
+}
+
+impl WireMoveLooseSourceTarget {
+    fn parse(self) -> Result<MoveLooseSourceTarget, EngineError> {
+        if !safe_leaf_filename(&self.file_name) {
+            return Err(invalid_tool());
+        }
+        Ok(MoveLooseSourceTarget {
+            model_id: self.model_id,
+            expected_version: parse_decimal(&self.expected_version).map_err(|_| invalid_tool())?,
+            file_name: self.file_name,
+        })
+    }
+}
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum WireManagementAction {
+    RecoverableRemove {
+        targets: Vec<WireTarget>,
+    },
+    RestoreRemoval {
+        snapshot_id: String,
+    },
+    CreateBackup {
+        destination_handle_id: String,
+        file_name: String,
+    },
+    RestoreBackup {
+        source_handle_id: String,
+        file_name: String,
+        root_mappings: Vec<library_protocol::RestoreRootMapping>,
+    },
+    ExportSelection {
+        targets: Vec<WireTarget>,
+        destination_handle_id: String,
+        file_name: String,
+    },
+    QuarantineLooseSource {
+        target: WireTarget,
+        confirm: bool,
+    },
+    UndoQuarantine {
+        snapshot_id: String,
+        confirm: bool,
+    },
+    MoveLooseSource {
+        target: WireTarget,
+        destination_handle_id: String,
+        file_name: String,
+        confirm: bool,
+    },
+    PurgeCatalog {
+        backup_destination_handle_id: String,
+        backup_file_name: String,
+        confirm: bool,
+    },
+    CleanupOrphans {
+        confirm: bool,
+        #[serde(default)]
+        continuation: Option<String>,
+    },
+    ResetDefaultThumbnails {
+        confirm: bool,
+    },
+}
+impl WireManagementAction {
+    fn parse(self) -> Result<ManagementAction, ApiError> {
+        Ok(match self {
+            Self::RecoverableRemove { targets } => ManagementAction::RecoverableRemove {
+                targets: targets
+                    .into_iter()
+                    .map(WireTarget::parse)
+                    .collect::<Result<_, _>>()?,
+            },
+            Self::RestoreRemoval { snapshot_id } => {
+                ManagementAction::RestoreRemoval { snapshot_id }
+            }
+            Self::CreateBackup {
+                destination_handle_id,
+                file_name,
+            } => ManagementAction::CreateBackup {
+                destination_handle_id,
+                file_name,
+            },
+            Self::RestoreBackup {
+                source_handle_id,
+                file_name,
+                root_mappings,
+            } => ManagementAction::RestoreBackup {
+                source_handle_id,
+                file_name,
+                root_mappings,
+            },
+            Self::ExportSelection {
+                targets,
+                destination_handle_id,
+                file_name,
+            } => ManagementAction::ExportSelection {
+                targets: targets
+                    .into_iter()
+                    .map(WireTarget::parse)
+                    .collect::<Result<_, _>>()?,
+                destination_handle_id,
+                file_name,
+            },
+            Self::QuarantineLooseSource { target, confirm } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Physical source actions require confirm:true",
+                    ));
+                }
+                ManagementAction::QuarantineLooseSource {
+                    target: target.parse()?,
+                }
+            }
+            Self::UndoQuarantine {
+                snapshot_id,
+                confirm,
+            } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Physical source actions require confirm:true",
+                    ));
+                }
+                ManagementAction::UndoQuarantine { snapshot_id }
+            }
+            Self::MoveLooseSource {
+                target,
+                destination_handle_id,
+                file_name,
+                confirm,
+            } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Physical source actions require confirm:true",
+                    ));
+                }
+                ManagementAction::MoveLooseSource {
+                    target: target.parse()?,
+                    destination_handle_id,
+                    file_name,
+                }
+            }
+            Self::PurgeCatalog {
+                backup_destination_handle_id,
+                backup_file_name,
+                confirm,
+            } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Catalog purge requires confirm:true",
+                    ));
+                }
+                ManagementAction::PurgeCatalog {
+                    backup_destination_handle_id,
+                    backup_file_name,
+                }
+            }
+            Self::CleanupOrphans {
+                confirm,
+                continuation,
+            } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Orphan cleanup requires confirm:true",
+                    ));
+                }
+                if continuation
+                    .as_ref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 256)
+                {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Continuation is outside its limits",
+                    ));
+                }
+                ManagementAction::CleanupOrphans { continuation }
+            }
+            Self::ResetDefaultThumbnails { confirm } => {
+                if !confirm {
+                    return Err(api_bad(
+                        "invalidInput",
+                        "Default preview reset requires confirm:true",
+                    ));
+                }
+                ManagementAction::ResetDefaultThumbnails
+            }
+        })
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireActionTargetSnapshot {
+    model_id: String,
+    metadata_version: String,
+    content_hash: Option<String>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireActionPlan {
+    token: String,
+    action_kind: String,
+    expires_at: String,
+    library_epoch: String,
+    catalog_revision: String,
+    targets: Vec<WireActionTargetSnapshot>,
+    impact: Vec<String>,
+    input_bytes: Option<String>,
+    input_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail_review: Option<library_protocol::ThumbnailBatch>,
+}
+impl From<ActionPlan> for WireActionPlan {
+    fn from(value: ActionPlan) -> Self {
+        Self {
+            token: value.token,
+            action_kind: value.action_kind,
+            expires_at: value.expires_at,
+            library_epoch: value.library_epoch.to_string(),
+            catalog_revision: value.catalog_revision.to_string(),
+            targets: value
+                .targets
+                .into_iter()
+                .map(|target| WireActionTargetSnapshot {
+                    model_id: target.model_id,
+                    metadata_version: target.metadata_version.to_string(),
+                    content_hash: target.content_hash,
+                })
+                .collect(),
+            impact: value.impact,
+            input_bytes: value.input_bytes.map(|bytes| bytes.to_string()),
+            input_sha256: value.input_sha256,
+            thumbnail_review: value.thumbnail_review,
+        }
+    }
+}
+fn wire_source_hold(hold: SourceHoldReceipt) -> Value {
+    serde_json::json!({
+        "modelId":hold.model_id,
+        "rootHandleId":hold.root_handle_id,
+        "relativePath":hold.relative_path,
+        "holdName":hold.hold_name,
+        "journalName":hold.journal_name,
+        "bytes":hold.bytes.to_string(),
+        "sha256":hold.sha256
+    })
+}
+
+fn wire_management_result(value: ManagementResult) -> Value {
+    match value {
+        ManagementResult::Removed {
+            snapshot_id,
+            removed_ids,
+        } => {
+            serde_json::json!({"kind":"removed","snapshotId":snapshot_id,"removedIds":removed_ids})
+        }
+        ManagementResult::RestoredRemoval { models } => serde_json::json!({
+            "kind":"restoredRemoval",
+            "models":models.into_iter().map(WireMutation::from).collect::<Vec<_>>()
+        }),
+        ManagementResult::BackupCreated {
+            destination_handle_id,
+            file_name,
+            files,
+            bytes,
+            sha256,
+        } => serde_json::json!({
+            "kind":"backupCreated","destinationHandleId":destination_handle_id,
+            "fileName":file_name,"files":files,"bytes":bytes.to_string(),"sha256":sha256
+        }),
+        ManagementResult::BackupRestored {
+            models,
+            library_epoch,
+        } => serde_json::json!({
+            "kind":"backupRestored","models":models,"libraryEpoch":library_epoch.to_string()
+        }),
+        ManagementResult::SelectionExported {
+            destination_handle_id,
+            file_name,
+            models,
+            bytes,
+        } => serde_json::json!({
+            "kind":"selectionExported","destinationHandleId":destination_handle_id,
+            "fileName":file_name,"models":models,"bytes":bytes.to_string()
+        }),
+        ManagementResult::LibraryExported {
+            destination_handle_id,
+            file_name,
+            models,
+            bytes,
+        } => serde_json::json!({
+            "kind":"libraryExported","destinationHandleId":destination_handle_id,
+            "fileName":file_name,"models":models,"bytes":bytes.to_string()
+        }),
+        ManagementResult::Quarantined {
+            snapshot_id,
+            model_id,
+            source_holds,
+        } => serde_json::json!({
+            "kind":"quarantined",
+            "snapshotId":snapshot_id,
+            "modelId":model_id,
+            "sourceHolds":source_holds.into_iter().map(wire_source_hold).collect::<Vec<_>>()
+        }),
+        ManagementResult::QuarantinedBatch {
+            snapshot_id,
+            models,
+            source_holds,
+        } => serde_json::json!({
+            "kind":"quarantinedMany",
+            "snapshotId":snapshot_id,
+            "models":models,
+            "sourceHolds":source_holds.into_iter().map(wire_source_hold).collect::<Vec<_>>()
+        }),
+        ManagementResult::QuarantineUndone { model } => serde_json::json!({
+            "kind":"quarantineUndone","model":WireMutation::from(model)
+        }),
+        ManagementResult::QuarantineUndoneBatch { models } => serde_json::json!({
+            "kind":"quarantineUndoneMany",
+            "models":models.into_iter().map(WireMutation::from).collect::<Vec<_>>()
+        }),
+        ManagementResult::Moved {
+            model,
+            source_holds,
+        } => serde_json::json!({
+            "kind":"moved",
+            "model":WireMutation::from(model),
+            "sourceHolds":source_holds.into_iter().map(wire_source_hold).collect::<Vec<_>>()
+        }),
+        ManagementResult::MovedBatch {
+            models,
+            source_holds,
+        } => serde_json::json!({
+            "kind":"movedMany",
+            "models":models.into_iter().map(WireMutation::from).collect::<Vec<_>>(),
+            "sourceHolds":source_holds.into_iter().map(wire_source_hold).collect::<Vec<_>>()
+        }),
+        ManagementResult::Purged {
+            backup_destination_handle_id,
+            backup_file_name,
+            library_epoch,
+        } => serde_json::json!({
+            "kind":"purged","backupDestinationHandleId":backup_destination_handle_id,
+            "backupFileName":backup_file_name,"libraryEpoch":library_epoch.to_string()
+        }),
+        ManagementResult::CleanupCompleted {
+            files,
+            bytes,
+            thumbnail_progress,
+        } => {
+            let mut result = serde_json::json!({
+                "kind":"cleanupCompleted","files":files.to_string(),"bytes":bytes.to_string()
+            });
+            if let Some(progress) = thumbnail_progress {
+                result["thumbnailProgress"] = serde_json::to_value(progress)
+                    .expect("thumbnail cleanup progress is serializable");
+            }
+            result
+        }
+    }
+}
+fn parse_decimal(value: &str) -> Result<u64, ApiError> {
+    if value == "0" {
+        return Ok(0);
+    }
+    if value.is_empty() || value.starts_with('0') || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(api_bad("invalidInput", "decimal string is invalid"));
+    }
+    value
+        .parse()
+        .map_err(|_| api_bad("invalidInput", "decimal string is out of range"))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireUploadIntent {
+    item_id: String,
+    capture_id: String,
+    file_name: String,
+    bytes: String,
+    sha256: String,
+}
+impl WireUploadIntent {
+    fn parse(self) -> Result<UploadIntent, ApiError> {
+        Ok(UploadIntent {
+            item_id: self.item_id,
+            capture_id: self.capture_id,
+            file_name: self.file_name,
+            bytes: parse_decimal(&self.bytes)?,
+            sha256: self.sha256,
+        })
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireUploadInput {
+    id: String,
+    item_id: String,
+    capture_id: String,
+    expires_at: String,
+    library_epoch: String,
+}
+impl WireUploadInput {
+    fn parse(self) -> Result<UploadToken, ApiError> {
+        Ok(UploadToken {
+            id: self.id,
+            item_id: self.item_id,
+            capture_id: self.capture_id,
+            expires_at: self.expires_at,
+            library_epoch: parse_decimal(&self.library_epoch)?,
+        })
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireBundleSummary {
+    token: String,
+    bundle_id: String,
+    member_count: usize,
+    previewed_count: usize,
+    omitted_count: usize,
+    triangle_count: u32,
+    layout: String,
+    members: Vec<library_protocol::BundlePreviewMember>,
+    notice: Option<String>,
+    geometry_bytes: String,
+    geometry_sha256: String,
+    library_epoch: String,
+}
+impl From<BundlePreviewSummary> for WireBundleSummary {
+    fn from(v: BundlePreviewSummary) -> Self {
+        Self {
+            token: v.token,
+            bundle_id: v.bundle_id,
+            member_count: v.member_count,
+            previewed_count: v.previewed_count,
+            omitted_count: v.omitted_count,
+            triangle_count: v.triangle_count,
+            layout: v.layout,
+            members: v.members,
+            notice: v.notice,
+            geometry_bytes: v.geometry_bytes.to_string(),
+            geometry_sha256: v.geometry_sha256,
+            library_epoch: v.library_epoch.to_string(),
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireAiSuggestionTarget {
+    model_id: String,
+    expected_version: String,
+    display_name: String,
+    existing_tags: Vec<library_protocol::IntegrationAiExistingTag>,
+    suggestions: Vec<library_protocol::IntegrationAiSuggestion>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireAiSuggestionBatch {
+    review_token: String,
+    provider_id: String,
+    model: String,
+    category_sharing: library_protocol::IntegrationCategorySharing,
+    targets: Vec<WireAiSuggestionTarget>,
+    failures: Vec<library_protocol::IntegrationAiSuggestionFailure>,
+}
+impl From<IntegrationAiSuggestionBatch> for WireAiSuggestionBatch {
+    fn from(value: IntegrationAiSuggestionBatch) -> Self {
+        Self {
+            review_token: value.review_token,
+            provider_id: value.provider_id,
+            model: value.model,
+            category_sharing: value.category_sharing,
+            targets: value
+                .targets
+                .into_iter()
+                .map(|target| WireAiSuggestionTarget {
+                    model_id: target.model_id,
+                    expected_version: target.expected_version.to_string(),
+                    display_name: target.display_name,
+                    existing_tags: target.existing_tags,
+                    suggestions: target.suggestions,
+                })
+                .collect(),
+            failures: value.failures,
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCatalogStats {
+    total_models: String,
+    available_models: String,
+    missing_models: String,
+    bookmarks: String,
+    total_bytes: String,
+    bundle_count: String,
+    duplicate_group_count: String,
+}
+impl From<CatalogStats> for WireCatalogStats {
+    fn from(v: CatalogStats) -> Self {
+        Self {
+            total_models: v.total_models.to_string(),
+            available_models: v.available_models.to_string(),
+            missing_models: v.missing_models.to_string(),
+            bookmarks: v.bookmarks.to_string(),
+            total_bytes: v.total_bytes.to_string(),
+            bundle_count: v.bundle_count.to_string(),
+            duplicate_group_count: v.duplicate_group_count.to_string(),
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireIndexRootSettings {
+    handle_id: String,
+    catalog_root_id: String,
+    label: String,
+    access: library_protocol::RootAccess,
+    enabled: bool,
+    last_scanned_at: Option<String>,
+    scan_interval_minutes: u32,
+    max_file_bytes: String,
+    scan_zip: bool,
+}
+impl From<IndexRootSettings> for WireIndexRootSettings {
+    fn from(v: IndexRootSettings) -> Self {
+        Self {
+            handle_id: v.handle_id,
+            catalog_root_id: v.catalog_root_id,
+            label: v.label,
+            access: v.access,
+            enabled: v.enabled,
+            last_scanned_at: v.last_scanned_at,
+            scan_interval_minutes: v.scan_interval_minutes,
+            max_file_bytes: v.max_file_bytes.to_string(),
+            scan_zip: v.scan_zip,
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireIndexRootSettingsPatch {
+    enabled: bool,
+    scan_interval_minutes: u32,
+    max_file_bytes: String,
+    scan_zip: bool,
+}
+impl WireIndexRootSettingsPatch {
+    fn parse(self) -> Result<IndexRootSettingsPatch, ApiError> {
+        Ok(IndexRootSettingsPatch {
+            enabled: self.enabled,
+            scan_interval_minutes: self.scan_interval_minutes,
+            max_file_bytes: parse_decimal(&self.max_file_bytes)?,
+            scan_zip: self.scan_zip,
+        })
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireAssignment {
+    target: WireTarget,
+    filament_ids: Vec<String>,
+}
+impl WireAssignment {
+    fn parse(self) -> Result<ModelFilamentAssignment, ApiError> {
+        Ok(ModelFilamentAssignment {
+            target: self.target.parse()?,
+            filament_ids: self.filament_ids,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineError {
+    pub code: &'static str,
+    pub message: String,
+    pub retryable: bool,
+    pub current_version: Option<u64>,
+    pub source_holds: Vec<SourceHoldReceipt>,
+}
+
+pub trait LibraryEngine: Send + Sync + 'static {
+    fn capabilities(&self, context: &RequestContext) -> Result<HostCapabilities, EngineError>;
+    fn status(&self, context: &RequestContext) -> Result<RuntimeStatus, EngineError>;
+    fn list_models(
+        &self,
+        context: &RequestContext,
+        cursor: Option<&str>,
+        limit: u16,
+        query: ProtocolModelQuery,
+    ) -> Result<Page<ModelSummary>, EngineError>;
+    fn get_model(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+    ) -> Result<ModelSummary, EngineError>;
+    fn catalog_stats(&self, context: &RequestContext) -> Result<CatalogStats, EngineError>;
+    fn catalog_facets(&self, context: &RequestContext) -> Result<CatalogFacets, EngineError>;
+    fn list_index_root_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Vec<IndexRootSettings>, EngineError>;
+    fn update_index_root_settings(
+        &self,
+        context: &RequestContext,
+        handle_id: &str,
+        patch: IndexRootSettingsPatch,
+    ) -> Result<IndexRootSettings, EngineError>;
+    fn get_catalog_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<CatalogSettings, EngineError>;
+    fn update_catalog_settings(
+        &self,
+        context: &RequestContext,
+        settings: CatalogSettings,
+    ) -> Result<CatalogSettings, EngineError>;
+    fn catalog_hash_status(&self, context: &RequestContext) -> Result<HashStatus, EngineError>;
+    fn check_model_sources(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+    ) -> Result<Vec<ModelSourceStatus>, EngineError>;
+    fn start_thumbnail_job(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+        force: bool,
+    ) -> Result<ScanStatus, EngineError>;
+    fn integration_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<IntegrationSettings, EngineError>;
+    fn save_spoolman_config(
+        &self,
+        context: &RequestContext,
+        config: Option<IntegrationSpoolmanConfig>,
+    ) -> Result<IntegrationSettings, EngineError>;
+    fn pull_spoolman(
+        &self,
+        context: &RequestContext,
+    ) -> Result<IntegrationSpoolmanPullResult, EngineError>;
+    fn save_ai_provider(
+        &self,
+        context: &RequestContext,
+        config: AiProviderConfig,
+        credential: IntegrationCredentialUpdate,
+    ) -> Result<AiProviderConfig, EngineError>;
+    fn delete_ai_provider(
+        &self,
+        context: &RequestContext,
+        provider_id: &str,
+    ) -> Result<(), EngineError>;
+    fn suggest_ai_tags(
+        &self,
+        context: &RequestContext,
+        provider_id: &str,
+        targets: Vec<VersionedTarget>,
+    ) -> Result<IntegrationAiSuggestionBatch, EngineError>;
+    fn apply_ai_review(
+        &self,
+        context: &RequestContext,
+        review_token: &str,
+        decisions: Vec<IntegrationAiReviewDecision>,
+        strategy: IntegrationAiReviewStrategy,
+    ) -> Result<Vec<MutationVersion>, EngineError>;
+    fn discard_ai_review(
+        &self,
+        context: &RequestContext,
+        review_token: &str,
+    ) -> Result<(), EngineError>;
+    fn call_tool(
+        &self,
+        context: &RequestContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, EngineError>;
+
+    fn supports_tool(&self, context: &RequestContext, name: &str) -> bool;
+
+    fn get_printer_network_policy(
+        &self,
+        _: &RequestContext,
+    ) -> Result<PrinterNetworkPolicySummary, EngineError> {
+        Err(network_unsupported())
+    }
+    fn plan_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: bool,
+    ) -> Result<PrinterDiscoveryPlan, EngineError> {
+        Err(network_unsupported())
+    }
+    fn start_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: bool,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Err(network_unsupported())
+    }
+    fn get_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Err(network_unsupported())
+    }
+    fn cancel_printer_discovery(
+        &self,
+        _: &RequestContext,
+        _: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        Err(network_unsupported())
+    }
+    fn set_printer_endpoint_approval(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: u64,
+        _: bool,
+    ) -> Result<Printer, EngineError> {
+        Err(network_unsupported())
+    }
+    fn test_printer_connection(
+        &self,
+        _: &RequestContext,
+        _: &str,
+        _: u64,
+        _: bool,
+        _: bool,
+    ) -> Result<PrinterConnectionResponse, EngineError> {
+        Err(network_unsupported())
+    }
+
+    fn list_thumbnails(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+    ) -> Result<Vec<ThumbnailDescriptor>, EngineError>;
+    fn set_active_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        thumbnail_id: &str,
+    ) -> Result<u64, EngineError>;
+    fn set_thumbnail(
+        &self,
+        _context: &RequestContext,
+        _model_id: &str,
+        _expected_version: u64,
+        _file_name: String,
+        _bytes: Vec<u8>,
+    ) -> Result<u64, EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Replacing a custom thumbnail is not supported by this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn add_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> Result<u64, EngineError>;
+    fn delete_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        thumbnail_id: &str,
+    ) -> Result<u64, EngineError>;
+    fn issue_thumbnail_media(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        thumbnail_id: &str,
+    ) -> Result<ContentLease, EngineError>;
+    fn issue_model_download(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<ContentLease, EngineError>;
+    fn stream_content(
+        &self,
+        context: &RequestContext,
+        lease_id: &str,
+        sink: &mut dyn std::io::Write,
+    ) -> Result<(), EngineError>;
+    fn describe_content(
+        &self,
+        context: &RequestContext,
+        lease_id: &str,
+    ) -> Result<ContentLease, EngineError>;
+    fn update_metadata(
+        &self,
+        c: &RequestContext,
+        t: VersionedTarget,
+        p: MetadataPatch,
+    ) -> Result<MutationVersion, EngineError>;
+    fn rename_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64, EngineError> {
+        let _ = (context, kind, old_name, new_name);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Global metadata rename is unavailable".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        name: &str,
+    ) -> Result<u64, EngineError> {
+        let _ = (context, kind, name);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Global metadata delete is unavailable".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn bulk_update_metadata(
+        &self,
+        c: &RequestContext,
+        t: Vec<VersionedTarget>,
+        p: MetadataPatch,
+    ) -> Result<Vec<MutationVersion>, EngineError>;
+    fn update_metadata_batch(
+        &self,
+        context: &RequestContext,
+        updates: Vec<VersionedMetadataUpdate>,
+    ) -> Result<Vec<MutationVersion>, EngineError> {
+        let _ = (context, updates);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Per-model metadata patches are unavailable".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn list_tags(&self, c: &RequestContext) -> Result<Vec<Tag>, EngineError>;
+    fn create_tag(
+        &self,
+        c: &RequestContext,
+        n: String,
+        k: Option<String>,
+    ) -> Result<Tag, EngineError>;
+    fn update_tag(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        n: String,
+        k: Option<String>,
+    ) -> Result<Tag, EngineError>;
+    fn delete_tag(&self, c: &RequestContext, id: &str) -> Result<(), EngineError>;
+    fn list_folders(&self, c: &RequestContext) -> Result<Vec<Folder>, EngineError>;
+    fn create_folder(
+        &self,
+        c: &RequestContext,
+        n: String,
+        p: Option<String>,
+    ) -> Result<Folder, EngineError>;
+    fn rename_folder(&self, c: &RequestContext, id: &str, n: String)
+        -> Result<Folder, EngineError>;
+    fn move_folder(&self, c: &RequestContext, id: &str, p: &str) -> Result<Folder, EngineError>;
+    fn delete_folder(&self, c: &RequestContext, id: &str) -> Result<(), EngineError>;
+    fn list_filaments(&self, c: &RequestContext, u: bool) -> Result<Vec<Filament>, EngineError>;
+    fn create_filament(
+        &self,
+        c: &RequestContext,
+        i: FilamentInput,
+    ) -> Result<Filament, EngineError>;
+    fn update_filament(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+        i: FilamentInput,
+    ) -> Result<Filament, EngineError>;
+    fn delete_filament(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+    ) -> Result<Option<Filament>, EngineError>;
+    fn list_printers(&self, context: &RequestContext) -> Result<Vec<Printer>, EngineError> {
+        let _ = context;
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn get_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+    ) -> Result<Option<Printer>, EngineError> {
+        let _ = (context, id);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn create_printer(
+        &self,
+        context: &RequestContext,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        let _ = (context, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn update_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        let _ = (context, id, expected_version);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn list_printer_maintenance_logs(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+    ) -> Result<Vec<PrinterMaintenanceLog>, EngineError> {
+        let _ = (context, printer_id);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn create_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        let _ = (context, printer_id, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn update_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        let _ = (context, id, expected_version);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn list_printer_reminders(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<PrinterReminder>, EngineError> {
+        let _ = (context, printer_id, include_completed);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn create_printer_reminder(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, printer_id, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn update_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        let _ = (context, id, expected_version);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn complete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderCompletionInput,
+    ) -> Result<PrinterReminderCompletion, EngineError> {
+        let _ = (context, id, expected_version, input);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn set_printer_reminder_paused(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        paused: bool,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, id, expected_version, paused);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn reschedule_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        due_at: &str,
+    ) -> Result<PrinterReminder, EngineError> {
+        let _ = (context, id, expected_version, due_at);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Printer metadata is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn list_part_stock(&self, _c: &RequestContext) -> Result<Vec<PartStock>, EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Parts stock is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn create_part_stock(
+        &self,
+        _c: &RequestContext,
+        _input: PartStockInput,
+    ) -> Result<PartStock, EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Parts stock is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn update_part_stock(
+        &self,
+        _c: &RequestContext,
+        _id: &str,
+        _expected_version: u64,
+        _input: PartStockInput,
+    ) -> Result<PartStock, EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Parts stock is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn delete_part_stock(
+        &self,
+        _c: &RequestContext,
+        _id: &str,
+        _expected_version: u64,
+    ) -> Result<(), EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Parts stock is unavailable in this engine".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn bulk_assign_filaments(
+        &self,
+        c: &RequestContext,
+        a: Vec<ModelFilamentAssignment>,
+    ) -> Result<Vec<MutationVersion>, EngineError>;
+    fn create_history_batch(
+        &self,
+        c: &RequestContext,
+        idempotency_key: &str,
+        items: Vec<PrintAttemptBatchItem>,
+    ) -> Result<Vec<PrintAttempt>, EngineError>;
+    fn list_history(&self, c: &RequestContext, m: &str) -> Result<Vec<PrintAttempt>, EngineError>;
+    fn create_history(
+        &self,
+        c: &RequestContext,
+        m: &str,
+        i: PrintAttemptInput,
+    ) -> Result<PrintAttempt, EngineError>;
+    fn create_history_with_printer(
+        &self,
+        c: &RequestContext,
+        m: &str,
+        i: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, EngineError> {
+        if matches!(i.printer_id, Some(Some(_))) {
+            return Err(EngineError {
+                code: "unsupported",
+                message: "Printer attribution is unavailable in this engine".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        self.create_history(c, m, i.input)
+    }
+    fn update_history(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        i: PrintAttemptInput,
+    ) -> Result<PrintAttempt, EngineError>;
+    fn update_history_with_printer(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        i: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, EngineError> {
+        if i.printer_id.is_some() {
+            return Err(EngineError {
+                code: "unsupported",
+                message: "Printer attribution is unavailable in this engine".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        self.update_history(c, id, i.input)
+    }
+    fn delete_history(&self, c: &RequestContext, id: &str) -> Result<(), EngineError>;
+    fn stage_upload(
+        &self,
+        c: &RequestContext,
+        i: UploadIntent,
+        b: Vec<u8>,
+    ) -> Result<UploadToken, EngineError>;
+    fn import_capture(
+        &self,
+        c: &RequestContext,
+        e: CaptureEnvelope,
+        u: Vec<UploadToken>,
+    ) -> Result<CaptureImportResult, EngineError>;
+    fn get_capture(&self, c: &RequestContext, id: &str)
+        -> Result<CaptureImportResult, EngineError>;
+    fn roots(&self, c: &RequestContext) -> Result<Vec<RootHandle>, EngineError>;
+    fn start_scan(&self, c: &RequestContext, id: Option<String>)
+        -> Result<ScanStatus, EngineError>;
+    fn start_scan_subdirectory(
+        &self,
+        c: &RequestContext,
+        root_id: String,
+        directory: String,
+    ) -> Result<ScanStatus, EngineError> {
+        if directory.is_empty() {
+            self.start_scan(c, Some(root_id))
+        } else {
+            Err(EngineError {
+                code: "unsupported",
+                message: "Root-relative subdirectory scans are unsupported by this host".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            })
+        }
+    }
+    fn cancel_scan(&self, c: &RequestContext) -> Result<ScanStatus, EngineError>;
+    fn scan_status(&self, c: &RequestContext) -> Result<ScanStatus, EngineError>;
+    fn prepare_bundle(
+        &self,
+        c: &RequestContext,
+        id: &str,
+    ) -> Result<BundlePreviewSummary, EngineError>;
+    fn describe_bundle_geometry(
+        &self,
+        c: &RequestContext,
+        t: &str,
+    ) -> Result<ContentLease, EngineError>;
+    fn stream_bundle_geometry(
+        &self,
+        c: &RequestContext,
+        t: &str,
+        s: &mut dyn std::io::Write,
+    ) -> Result<(), EngineError>;
+    fn close_bundle(&self, c: &RequestContext, t: &str) -> Result<(), EngineError>;
+    fn issue_bundle_download(
+        &self,
+        c: &RequestContext,
+        token: &str,
+    ) -> Result<ContentLease, EngineError>;
+    fn issue_model_geometry(
+        &self,
+        c: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+        plate_id: Option<u32>,
+    ) -> Result<GeometryLease, EngineError>;
+    fn duplicate_groups(
+        &self,
+        c: &RequestContext,
+        model_ids: Vec<String>,
+    ) -> Result<Vec<DuplicateGroup>, EngineError>;
+    fn read_embedded_metadata(
+        &self,
+        c: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<EmbeddedMetadataProposal, EngineError>;
+    fn apply_embedded_metadata(
+        &self,
+        c: &RequestContext,
+        target: VersionedTarget,
+        expected_source_hash: &str,
+        selection: EmbeddedMetadataSelection,
+    ) -> Result<MutationVersion, EngineError>;
+    fn plan_management_action(
+        &self,
+        c: &RequestContext,
+        action: ManagementAction,
+    ) -> Result<ActionPlan, EngineError>;
+    fn plan_library_export(
+        &self,
+        c: &RequestContext,
+        dest_path: Option<&str>,
+    ) -> Result<ActionPlan, EngineError> {
+        let _ = (c, dest_path);
+        Err(EngineError {
+            code: "unsupported",
+            message: "Library JSON export is unavailable".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn execute_management_action(
+        &self,
+        c: &RequestContext,
+        token: &str,
+    ) -> Result<ManagementResult, EngineError>;
+    fn discard_management_action(
+        &self,
+        _context: &RequestContext,
+        _token: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError {
+            code: "unsupported",
+            message: "Action discard is unavailable".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+    fn list_captures(
+        &self,
+        c: &RequestContext,
+        p: PageRequest,
+    ) -> Result<library_protocol::Page<CaptureSummary>, EngineError>;
+}
+
+pub struct ProtocolEngineAdapter<
+    E: ProtocolLibraryEngine
+        + MetadataEngine
+        + TagEngine
+        + FolderEngine
+        + FilamentEngine
+        + PartStockEngine
+        + PrinterFleetEngine
+        + PrinterNetworkEngine
+        + PrintHistoryEngine
+        + CaptureEngine
+        + BundleEngine
+        + GeometryEngine
+        + DuplicateEngine
+        + EmbeddedMetadataEngine
+        + ManagementEngine
+        + CatalogJobEngine
+        + IntegrationEngine
+        + SettingsEngine,
+> {
+    inner: Arc<E>,
+    host_mode: HostMode,
+    host_slicer: Option<Arc<dyn HostSlicerAdapter>>,
+}
+
+impl<
+        E: ProtocolLibraryEngine
+            + MetadataEngine
+            + TagEngine
+            + FolderEngine
+            + FilamentEngine
+            + PartStockEngine
+            + PrinterFleetEngine
+            + PrinterNetworkEngine
+            + PrintHistoryEngine
+            + CaptureEngine
+            + BundleEngine
+            + GeometryEngine
+            + DuplicateEngine
+            + EmbeddedMetadataEngine
+            + ManagementEngine
+            + CatalogJobEngine
+            + IntegrationEngine
+            + SettingsEngine,
+    > ProtocolEngineAdapter<E>
+{
+    pub fn new(inner: Arc<E>, host_mode: HostMode) -> Self {
+        Self {
+            inner,
+            host_mode,
+            host_slicer: None,
+        }
+    }
+
+    pub fn with_host_slicer(mut self, host_slicer: Arc<dyn HostSlicerAdapter>) -> Self {
+        self.host_slicer = Some(host_slicer);
+        self
+    }
+
+    fn collect_filtered_models(
+        &self,
+        context: &RequestContext,
+        filters: &serde_json::Map<String, Value>,
+    ) -> Result<Vec<ModelSummary>, EngineError>
+    where
+        Self: LibraryEngine,
+    {
+        self.collect_filtered_models_bounded(context, filters, MAX_FILTERED_CATALOG_MODELS)
+    }
+
+    fn collect_filtered_models_bounded(
+        &self,
+        context: &RequestContext,
+        filters: &serde_json::Map<String, Value>,
+        maximum: usize,
+    ) -> Result<Vec<ModelSummary>, EngineError>
+    where
+        Self: LibraryEngine,
+    {
+        let mut arguments = filters.clone();
+        arguments.remove("modelIds");
+        arguments.remove("includeZip");
+        arguments.remove("limit");
+        arguments.remove("cursor");
+        arguments.remove("offset");
+        arguments.insert("limit".into(), Value::from(100));
+        let mut cursor = None::<String>;
+        let mut cursors = BTreeSet::new();
+        let mut models = Vec::new();
+        loop {
+            if let Some(cursor) = &cursor {
+                arguments.insert("cursor".into(), Value::String(cursor.clone()));
+            } else {
+                arguments.remove("cursor");
+            }
+            let page = LibraryEngine::call_tool(
+                self,
+                context,
+                "search_models",
+                Value::Object(arguments.clone()),
+            )?;
+            let mut page_models: Vec<ModelSummary> =
+                serde_json::from_value(page.get("items").cloned().ok_or_else(internal_tool)?)
+                    .map_err(|_| internal_tool())?;
+            models.append(&mut page_models);
+            if models.len() > maximum {
+                return Err(EngineError {
+                    code: "invalidInput",
+                    message: format!(
+                        "Filtered catalog scope exceeds {maximum} models; narrow the filters"
+                    ),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+            let next = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match next {
+                Some(next) if cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => {
+                    return Err(internal_tool());
+                }
+                None => break,
+            }
+        }
+        Ok(models)
+    }
+
+    fn collect_catalog_model_ids_bounded(
+        &self,
+        context: &RequestContext,
+        maximum: usize,
+    ) -> Result<Vec<String>, EngineError>
+    where
+        Self: LibraryEngine,
+    {
+        let mut model_ids = Vec::with_capacity(maximum);
+        let mut cursor = None::<String>;
+        let mut seen_cursors = BTreeSet::new();
+        while model_ids.len() < maximum {
+            let page_limit = (maximum - model_ids.len()).min(MAX_PAGE_SIZE as usize) as u16;
+            let page = LibraryEngine::list_models(
+                self,
+                context,
+                cursor.as_deref(),
+                page_limit,
+                ProtocolModelQuery::default(),
+            )?;
+            let page_len = page.items.len();
+            model_ids.extend(page.items.into_iter().map(|model| model.id));
+            if model_ids.len() >= maximum || page_len == 0 {
+                break;
+            }
+            match page.next_cursor {
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err(internal_tool()),
+                None => break,
+            }
+        }
+        Ok(model_ids)
+    }
+}
+
+impl<
+        E: ProtocolLibraryEngine
+            + MetadataEngine
+            + TagEngine
+            + FolderEngine
+            + FilamentEngine
+            + PartStockEngine
+            + PrinterFleetEngine
+            + PrinterNetworkEngine
+            + PrintHistoryEngine
+            + CaptureEngine
+            + BundleEngine
+            + GeometryEngine
+            + DuplicateEngine
+            + EmbeddedMetadataEngine
+            + ManagementEngine
+            + CatalogJobEngine
+            + IntegrationEngine
+            + SettingsEngine
+            + 'static,
+    > LibraryEngine for ProtocolEngineAdapter<E>
+{
+    fn capabilities(&self, context: &RequestContext) -> Result<HostCapabilities, EngineError> {
+        let info = self
+            .inner
+            .runtime_info(context)
+            .map_err(map_runtime_error)?;
+        let integrations_enabled = self.inner.integration_network_enabled(context);
+        let catalog_write = info.capabilities.contains(&Capability::CatalogWrite);
+        let maintenance = info.capabilities.contains(&Capability::Maintenance);
+        let durable_file_mutations = cfg!(any(target_os = "macos", target_os = "linux"));
+        Ok(HostCapabilities {
+            api_version: API_VERSION.into(),
+            host_mode: self.host_mode,
+            library_epoch: info.library_epoch.to_string(),
+            catalog_revision: info.catalog_revision.to_string(),
+            features: FeatureSet {
+                reveal_source: false,
+                trash_source: durable_file_mutations
+                    && catalog_write
+                    && info.capabilities.contains(&Capability::PhysicalSourceWrite)
+                    && info.roots.iter().any(|root| {
+                        root.access == RootAccess::Writable && root.catalog_root_id.is_some()
+                    }),
+                purge_catalog: durable_file_mutations
+                    && catalog_write
+                    && maintenance
+                    && info.capabilities.contains(&Capability::BackupWrite)
+                    && info
+                        .roots
+                        .iter()
+                        .any(|root| root.access == RootAccess::BackupOnly),
+                cleanup_orphans: durable_file_mutations
+                    && maintenance
+                    && info.capabilities.contains(&Capability::MediaWrite),
+                launch_slicer: self.host_mode == HostMode::Desktop
+                    && self.host_slicer.is_some()
+                    && info.capabilities.contains(&Capability::HostSlicer)
+                    && info.capabilities.contains(&Capability::MediaRead),
+                download_source: info.capabilities.contains(&Capability::MediaRead),
+                download_bundle: info.capabilities.contains(&Capability::MediaRead),
+                ai: integrations_enabled,
+                spoolman: integrations_enabled
+                    && info.capabilities.contains(&Capability::CatalogWrite),
+                mcp: true,
+                capture_inbox: info.capabilities.contains(&Capability::CatalogWrite),
+            },
+            limits: LimitSet {
+                page_size_max: MAX_PAGE_SIZE,
+                thumbnail_upload_bytes: MAX_THUMBNAIL_UPLOAD_BYTES as u64,
+                model_upload_bytes: 100 * 1024 * 1024,
+                active_previews_max: 4,
+            },
+        })
+    }
+
+    fn status(&self, context: &RequestContext) -> Result<RuntimeStatus, EngineError> {
+        let status = self
+            .inner
+            .runtime_status(context)
+            .map_err(map_runtime_error)?;
+        Ok(RuntimeStatus {
+            library_epoch: status.library_epoch.to_string(),
+            catalog_revision: status.catalog_revision.to_string(),
+            maintenance: status.maintenance,
+            jobs: Vec::new(),
+        })
+    }
+
+    fn list_models(
+        &self,
+        context: &RequestContext,
+        cursor: Option<&str>,
+        limit: u16,
+        query: ProtocolModelQuery,
+    ) -> Result<Page<ModelSummary>, EngineError> {
+        let query = if let Some(requested_root_id) = query.root_id.clone() {
+            let mut matches = self
+                .roots(context)?
+                .into_iter()
+                .filter(|root| {
+                    root.id == requested_root_id
+                        || root.catalog_root_id.as_deref() == Some(requested_root_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err(EngineError {
+                    code: "forbidden",
+                    message: "Root handle is not admitted for catalog search".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+            let catalog_root_id = matches
+                .pop()
+                .and_then(|root| root.catalog_root_id)
+                .ok_or_else(|| EngineError {
+                    code: "forbidden",
+                    message: "Root handle is not admitted for catalog search".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                })?;
+            ProtocolModelQuery {
+                root_id: Some(catalog_root_id),
+                ..query
+            }
+        } else {
+            query
+        };
+        let page = self
+            .inner
+            .list_models(
+                context,
+                query,
+                PageRequest {
+                    cursor: cursor.map(str::to_owned),
+                    limit,
+                },
+            )
+            .map_err(map_runtime_error)?;
+        Ok(Page {
+            items: page.items.into_iter().map(http_model).collect(),
+            next_cursor: page.next_cursor,
+            snapshot_revision: page.snapshot_revision.to_string(),
+        })
+    }
+
+    fn get_model(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+    ) -> Result<ModelSummary, EngineError> {
+        self.inner
+            .get_model(context, model_id)
+            .map(http_model)
+            .map_err(map_runtime_error)
+    }
+
+    fn catalog_stats(&self, context: &RequestContext) -> Result<CatalogStats, EngineError> {
+        self.inner.catalog_stats(context).map_err(map_runtime_error)
+    }
+
+    fn catalog_facets(&self, context: &RequestContext) -> Result<CatalogFacets, EngineError> {
+        self.inner
+            .catalog_facets(context)
+            .map_err(map_runtime_error)
+    }
+
+    fn list_index_root_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Vec<IndexRootSettings>, EngineError> {
+        self.inner
+            .list_index_root_settings(context)
+            .map_err(map_runtime_error)
+    }
+
+    fn update_index_root_settings(
+        &self,
+        context: &RequestContext,
+        handle_id: &str,
+        patch: IndexRootSettingsPatch,
+    ) -> Result<IndexRootSettings, EngineError> {
+        self.inner
+            .update_index_root_settings(context, handle_id, patch)
+            .map_err(map_runtime_error)
+    }
+
+    fn get_catalog_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<CatalogSettings, EngineError> {
+        self.inner
+            .get_catalog_settings(context)
+            .map_err(map_runtime_error)
+    }
+
+    fn update_catalog_settings(
+        &self,
+        context: &RequestContext,
+        settings: CatalogSettings,
+    ) -> Result<CatalogSettings, EngineError> {
+        self.inner
+            .update_catalog_settings(context, settings)
+            .map_err(map_runtime_error)
+    }
+
+    fn catalog_hash_status(&self, context: &RequestContext) -> Result<HashStatus, EngineError> {
+        self.inner
+            .catalog_hash_status(context)
+            .map_err(map_runtime_error)
+    }
+
+    fn check_model_sources(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+    ) -> Result<Vec<ModelSourceStatus>, EngineError> {
+        self.inner
+            .check_model_sources(context, model_ids)
+            .map_err(map_runtime_error)
+    }
+
+    fn start_thumbnail_job(
+        &self,
+        context: &RequestContext,
+        model_ids: Vec<String>,
+        force: bool,
+    ) -> Result<ScanStatus, EngineError> {
+        self.inner
+            .start_thumbnail_job(context, model_ids, force)
+            .map_err(map_runtime_error)
+    }
+
+    fn integration_settings(
+        &self,
+        context: &RequestContext,
+    ) -> Result<IntegrationSettings, EngineError> {
+        self.inner
+            .integration_settings(context)
+            .map_err(map_runtime_error)
+    }
+    fn save_spoolman_config(
+        &self,
+        context: &RequestContext,
+        config: Option<IntegrationSpoolmanConfig>,
+    ) -> Result<IntegrationSettings, EngineError> {
+        self.inner
+            .save_spoolman_config(context, config)
+            .map_err(map_runtime_error)
+    }
+    fn pull_spoolman(
+        &self,
+        context: &RequestContext,
+    ) -> Result<IntegrationSpoolmanPullResult, EngineError> {
+        self.inner.pull_spoolman(context).map_err(map_runtime_error)
+    }
+    fn save_ai_provider(
+        &self,
+        context: &RequestContext,
+        config: AiProviderConfig,
+        credential: IntegrationCredentialUpdate,
+    ) -> Result<AiProviderConfig, EngineError> {
+        self.inner
+            .save_ai_provider(context, config, credential)
+            .map_err(map_runtime_error)
+    }
+    fn delete_ai_provider(
+        &self,
+        context: &RequestContext,
+        provider_id: &str,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_ai_provider(context, provider_id)
+            .map_err(map_runtime_error)
+    }
+    fn suggest_ai_tags(
+        &self,
+        context: &RequestContext,
+        provider_id: &str,
+        targets: Vec<VersionedTarget>,
+    ) -> Result<IntegrationAiSuggestionBatch, EngineError> {
+        self.inner
+            .suggest_ai_tags(context, provider_id, targets)
+            .map_err(map_runtime_error)
+    }
+    fn apply_ai_review(
+        &self,
+        context: &RequestContext,
+        review_token: &str,
+        decisions: Vec<IntegrationAiReviewDecision>,
+        strategy: IntegrationAiReviewStrategy,
+    ) -> Result<Vec<MutationVersion>, EngineError> {
+        self.inner
+            .apply_ai_review(context, review_token, decisions, strategy)
+            .map_err(map_runtime_error)
+    }
+    fn discard_ai_review(
+        &self,
+        context: &RequestContext,
+        review_token: &str,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .discard_ai_review(context, review_token)
+            .map_err(map_runtime_error)
+    }
+
+    fn call_tool(
+        &self,
+        context: &RequestContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, EngineError> {
+        macro_rules! encoded {
+            ($value:expr) => {
+                serde_json::to_value($value).map_err(|_| internal_tool())
+            };
+        }
+        validate_tool_shape(name, &arguments)?;
+        if network_tool_schema(name).is_some() {
+            return call_network_tool(self, context, name, arguments);
+        }
+
+        if fleet_tool_schema(name).is_some() {
+            let string = |key: &str| {
+                arguments
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty() && v.len() <= 128)
+                    .ok_or_else(invalid_tool)
+            };
+            let filter = || -> Result<Option<&str>, EngineError> {
+                arguments
+                    .get("printerId")
+                    .map(|_| string("printerId"))
+                    .transpose()
+            };
+            let input = || arguments.get("input").cloned().ok_or_else(invalid_tool);
+            match name {
+                "list_printers" => return encoded!(self.list_printers(context)?),
+                "get_printer" => return encoded!(self.get_printer(context, string("printerId")?)?),
+                "create_printer" => {
+                    return encoded!(self.create_printer(
+                        context,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "update_printer" => {
+                    return encoded!(self.update_printer(
+                        context,
+                        string("printerId")?,
+                        tool_version(&arguments)?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "delete_printer" => {
+                    self.delete_printer(context, string("printerId")?, tool_version(&arguments)?)?;
+                    return Ok(serde_json::json!({"deleted":true}));
+                }
+                "list_printer_maintenance_logs" => {
+                    return encoded!(self.list_printer_maintenance_logs(context, filter()?)?)
+                }
+                "create_printer_maintenance_log" => {
+                    return encoded!(self.create_printer_maintenance_log(
+                        context,
+                        string("printerId")?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "update_printer_maintenance_log" => {
+                    return encoded!(self.update_printer_maintenance_log(
+                        context,
+                        string("logId")?,
+                        tool_version(&arguments)?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "delete_printer_maintenance_log" => {
+                    self.delete_printer_maintenance_log(
+                        context,
+                        string("logId")?,
+                        tool_version(&arguments)?,
+                    )?;
+                    return Ok(serde_json::json!({"deleted":true}));
+                }
+                "list_printer_reminders" => {
+                    let include = arguments
+                        .get("includeCompleted")
+                        .map(Value::as_bool)
+                        .unwrap_or(Some(false))
+                        .ok_or_else(invalid_tool)?;
+                    return encoded!(self.list_printer_reminders(context, filter()?, include)?);
+                }
+                "create_printer_reminder" => {
+                    return encoded!(self.create_printer_reminder(
+                        context,
+                        string("printerId")?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "update_printer_reminder" => {
+                    return encoded!(self.update_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        serde_json::from_value(input()?).map_err(|_| invalid_tool())?
+                    )?)
+                }
+                "delete_printer_reminder" => {
+                    self.delete_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                    )?;
+                    return Ok(serde_json::json!({"deleted":true}));
+                }
+                "complete_printer_reminder" => {
+                    let completed_at = arguments
+                        .get("completedAt")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned();
+                    let notes = arguments
+                        .get("notes")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned();
+                    return encoded!(self.complete_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        PrinterReminderCompletionInput {
+                            completed_at,
+                            notes
+                        }
+                    )?);
+                }
+                "set_printer_reminder_paused" => {
+                    return encoded!(self.set_printer_reminder_paused(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        arguments
+                            .get("paused")
+                            .and_then(Value::as_bool)
+                            .ok_or_else(invalid_tool)?
+                    )?)
+                }
+                "reschedule_printer_reminder" => {
+                    return encoded!(self.reschedule_printer_reminder(
+                        context,
+                        string("reminderId")?,
+                        tool_version(&arguments)?,
+                        arguments
+                            .get("dueAt")
+                            .and_then(Value::as_str)
+                            .ok_or_else(invalid_tool)?
+                    )?)
+                }
+                _ => return Err(invalid_tool()),
+            }
+        }
+        match name {
+            "list_slicers" => {
+                if !self.supports_tool(context, name) {
+                    return Err(host_slicer_unavailable());
+                }
+                let slicers = self
+                    .host_slicer
+                    .as_ref()
+                    .ok_or_else(host_slicer_unavailable)?
+                    .list_slicers(context)?;
+                return encoded!(slicers);
+            }
+            "open_in_slicer" => {
+                if !self.supports_tool(context, name) {
+                    return Err(host_slicer_unavailable());
+                }
+                let slicer_id = arguments
+                    .get("slicerId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let targets = slicer_targets(&arguments)?;
+                if self.host_mode == HostMode::Desktop {
+                    self.host_slicer
+                        .as_ref()
+                        .ok_or_else(host_slicer_unavailable)?
+                        .open_in_slicer_batch(context, &targets, slicer_id)?;
+                    return Ok(serde_json::json!({
+                        "kind":"opened",
+                        "opened":true,
+                        "modelIds":targets.into_iter().map(|target| target.model_id).collect::<Vec<_>>()
+                    }));
+                }
+
+                const MAX_CLIENT_HANDOFF_BYTES: u64 = 1024 * 1024 * 1024;
+                let mut preflight = Vec::with_capacity(targets.len());
+                let mut total_bytes = 0_u64;
+                for target in &targets {
+                    let model = self.get_model(context, &target.model_id)?;
+                    let actual_version =
+                        parse_decimal(&model.metadata_version).map_err(|_| internal_tool())?;
+                    if actual_version != target.expected_version {
+                        return Err(EngineError {
+                            code: "conflict",
+                            message: "Model metadata changed; refresh the model before opening it"
+                                .into(),
+                            retryable: true,
+                            current_version: Some(actual_version),
+                            source_holds: Vec::new(),
+                        });
+                    }
+                    let model_bytes = parse_decimal(&model.bytes).map_err(|_| internal_tool())?;
+                    total_bytes = total_bytes
+                        .checked_add(model_bytes)
+                        .ok_or_else(invalid_tool)?;
+                    if total_bytes > MAX_CLIENT_HANDOFF_BYTES {
+                        return Err(EngineError {
+                            code: "invalidInput",
+                            message: "Slicer client-command batch exceeds its byte limit".into(),
+                            retryable: false,
+                            current_version: None,
+                            source_holds: Vec::new(),
+                        });
+                    }
+                    preflight.push(model);
+                }
+                total_bytes = 0;
+                let mut client_targets = Vec::with_capacity(targets.len());
+                for (target, model) in targets.into_iter().zip(preflight) {
+                    let lease = self.issue_model_download(
+                        context,
+                        &target.model_id,
+                        model.content_hash.as_deref(),
+                    )?;
+                    total_bytes = total_bytes
+                        .checked_add(lease.bytes)
+                        .ok_or_else(invalid_tool)?;
+                    if total_bytes > MAX_CLIENT_HANDOFF_BYTES {
+                        return Err(EngineError {
+                            code: "invalidInput",
+                            message: "Slicer client-command batch exceeds its byte limit".into(),
+                            retryable: false,
+                            current_version: None,
+                            source_holds: Vec::new(),
+                        });
+                    }
+                    let lease_id = lease.id.clone();
+                    let wire_lease = WireLease::from(lease);
+                    client_targets.push(serde_json::json!({
+                        "modelId":target.model_id,
+                        "expectedVersion":target.expected_version.to_string(),
+                        "downloadLease":wire_lease,
+                        "contentRoute":format!("/api/v1/content/{lease_id}")
+                    }));
+                }
+                return Ok(serde_json::json!({
+                    "kind":"clientCommand",
+                    "command":"openInSlicer",
+                    "slicerId":slicer_id,
+                    "targets":client_targets,
+                    "totalBytes":total_bytes.to_string()
+                }));
+            }
+            "integration_get_settings" => return encoded!(self.integration_settings(context)?),
+            "integration_save_spoolman_config" => {
+                let config = match arguments.get("config") {
+                    Some(Value::Null) => None,
+                    Some(value) => {
+                        Some(serde_json::from_value(value.clone()).map_err(|_| invalid_tool())?)
+                    }
+                    None => return Err(invalid_tool()),
+                };
+                return encoded!(self.save_spoolman_config(context, config)?);
+            }
+            "sync_spoolman_filaments" => return encoded!(self.pull_spoolman(context)?),
+            "integration_save_ai_provider" => {
+                let config: AiProviderConfig = serde_json::from_value(
+                    arguments.get("config").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let credential: IntegrationCredentialUpdate = serde_json::from_value(
+                    arguments
+                        .get("credentialUpdate")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(self.save_ai_provider(context, config, credential)?);
+            }
+            "integration_delete_ai_provider" => {
+                let provider_id = arguments
+                    .get("providerId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.delete_ai_provider(context, provider_id)?;
+                return Ok(serde_json::json!({"ok":true}));
+            }
+            "generate_tags" => {
+                let provider_id = arguments
+                    .get("providerId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let targets: Vec<WireTarget> = serde_json::from_value(
+                    arguments.get("targets").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let targets = targets
+                    .into_iter()
+                    .map(WireTarget::parse)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| invalid_tool())?;
+                return encoded!(WireAiSuggestionBatch::from(self.suggest_ai_tags(
+                    context,
+                    provider_id,
+                    targets,
+                )?));
+            }
+            "apply_tag_review" => {
+                let review_token = arguments
+                    .get("reviewToken")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let decisions: Vec<IntegrationAiReviewDecision> = serde_json::from_value(
+                    arguments
+                        .get("decisions")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let strategy: IntegrationAiReviewStrategy = serde_json::from_value(
+                    arguments
+                        .get("strategy")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(self
+                    .apply_ai_review(context, review_token, decisions, strategy)?
+                    .into_iter()
+                    .map(WireMutation::from)
+                    .collect::<Vec<_>>());
+            }
+            "discard_tag_review" => {
+                let review_token = arguments
+                    .get("reviewToken")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.discard_ai_review(context, review_token)?;
+                return Ok(serde_json::json!({"ok":true}));
+            }
+            "get_hash_status" => {
+                let filters = arguments.as_object().ok_or_else(invalid_tool)?;
+                if !has_catalog_filters(filters) {
+                    return encoded!(self.catalog_hash_status(context)?);
+                }
+                let models = self.collect_filtered_models(context, filters)?;
+                let model_count = models.len() as u64;
+                let hashed_count = models
+                    .iter()
+                    .filter(|model| model.content_hash.is_some())
+                    .count() as u64;
+                let bookmark_count = models
+                    .iter()
+                    .filter(|model| model.catalog_kind == "bookmark")
+                    .count() as u64;
+                let unhashed_count = models
+                    .iter()
+                    .filter(|model| {
+                        model.catalog_kind != "bookmark" && model.content_hash.is_none()
+                    })
+                    .count() as u64;
+                let missing_count = models
+                    .iter()
+                    .filter(|model| model.availability == "missing")
+                    .count() as u64;
+                return encoded!(HashStatus {
+                    model_count: model_count.to_string(),
+                    hashed_count: hashed_count.to_string(),
+                    unhashed_count: unhashed_count.to_string(),
+                    bookmark_count: bookmark_count.to_string(),
+                    missing_count: missing_count.to_string(),
+                });
+            }
+            "check_files_exist" => {
+                let object = arguments.as_object().ok_or_else(invalid_tool)?;
+                let explicit_ids = object.get("modelIds");
+                let limit = object
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize);
+                let missing_only = object
+                    .get("missingOnly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(explicit_ids.is_none());
+                let model_ids = if let Some(value) = explicit_ids {
+                    let model_ids: Vec<String> =
+                        serde_json::from_value(value.clone()).map_err(|_| invalid_tool())?;
+                    if limit.is_some_and(|maximum| model_ids.len() > maximum) {
+                        return Err(invalid_tool());
+                    }
+                    model_ids
+                } else {
+                    self.collect_catalog_model_ids_bounded(
+                        context,
+                        limit.unwrap_or(DEFAULT_CHECK_FILES_EXIST_LIMIT),
+                    )?
+                };
+                let mut statuses = if model_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    self.check_model_sources(context, model_ids)?
+                };
+                if missing_only {
+                    statuses.retain(|status| status.state == SourceState::Missing);
+                }
+                return encoded!(statuses);
+            }
+            "calculate_missing_hashes" | "refresh_hashes" => {
+                let filters = arguments.as_object().ok_or_else(invalid_tool)?;
+                if let Some(root_id) = filters.get("rootId").and_then(Value::as_str) {
+                    return encoded!(self.start_scan(context, Some(root_id.to_owned()))?);
+                }
+                if !has_catalog_filters(filters) {
+                    return encoded!(self.start_scan(context, None)?);
+                }
+                let models = self.collect_filtered_models(context, filters)?;
+                let missing_hashes = models
+                    .iter()
+                    .filter(|model| {
+                        model.catalog_kind != "bookmark" && model.content_hash.is_none()
+                    })
+                    .count();
+                if name == "calculate_missing_hashes" && missing_hashes == 0 {
+                    return Ok(serde_json::json!({
+                        "started":false,
+                        "total":"0",
+                        "message":"Filtered models already have stored SHA-256 hashes"
+                    }));
+                }
+                if models.is_empty() {
+                    return Ok(serde_json::json!({"started":false,"total":"0"}));
+                }
+                let roots = models
+                    .iter()
+                    .filter_map(|model| model.source_root_id.clone())
+                    .collect::<BTreeSet<_>>();
+                if roots.is_empty() && filters.get("rootId").is_none() {
+                    if missing_hashes == 0 {
+                        return Ok(serde_json::json!({
+                            "started":false,
+                            "total":"0",
+                            "message":"Filtered models have no indexed root requiring a scan"
+                        }));
+                    }
+                    return Err(EngineError {
+                        code: "invalidInput",
+                        message:
+                            "Missing hashes cannot be calculated for models without an indexed root"
+                                .into(),
+                        retryable: false,
+                        current_version: None,
+                        source_holds: Vec::new(),
+                    });
+                }
+                let root_id = match (filters.get("rootId").and_then(Value::as_str), roots.len()) {
+                    (Some(root_id), _) => root_id.to_owned(),
+                    (None, 1) => roots.into_iter().next().ok_or_else(invalid_tool)?,
+                    _ => {
+                        return Err(EngineError {
+                            code: "invalidInput",
+                            message: "Filtered hash refresh must resolve to one admitted root; provide rootId to narrow it".into(),
+                            retryable: false,
+                            current_version: None,
+                            source_holds: Vec::new(),
+                        });
+                    }
+                };
+                return encoded!(self.start_scan(context, Some(root_id))?);
+            }
+            "start_thumbnail_job" => {
+                let model_ids: Vec<String> = serde_json::from_value(
+                    arguments
+                        .get("modelIds")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let force = arguments
+                    .get("force")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                return encoded!(self.start_thumbnail_job(context, model_ids, force)?);
+            }
+            "get_models_missing_thumbnails" | "get_models_with_default_thumbnails" => {
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(50);
+                let thumbnail_mode = if name == "get_models_missing_thumbnails" {
+                    "missing"
+                } else {
+                    "default"
+                };
+                let exclude_model_ids = if name == "get_models_missing_thumbnails" {
+                    arguments
+                        .get("excludeIds")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|_| invalid_tool())?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                return encoded!(self.list_models(
+                    context,
+                    arguments.get("cursor").and_then(Value::as_str),
+                    limit,
+                    ProtocolModelQuery {
+                        thumbnail_mode: Some(thumbnail_mode.into()),
+                        exclude_model_ids,
+                        ..ProtocolModelQuery::default()
+                    }
+                )?);
+            }
+            "get_models_by_directory" => {
+                let directory = arguments
+                    .get("directory")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let root_id = arguments
+                    .get("rootId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(50)
+                    .min(MAX_PAGE_SIZE);
+                return encoded!(self.list_models(
+                    context,
+                    arguments.get("cursor").and_then(Value::as_str),
+                    limit,
+                    ProtocolModelQuery {
+                        root_id: Some(root_id.to_owned()),
+                        source_directory: Some(directory.to_owned()),
+                        ..ProtocolModelQuery::default()
+                    }
+                )?);
+            }
+            "rename_metadata" | "delete_metadata" => {
+                let is_rename = name == "rename_metadata";
+                let kind: MetadataValueKind = serde_json::from_value(
+                    arguments.get("type").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let value_name = arguments
+                    .get(if is_rename { "oldName" } else { "name" })
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let count = if is_rename {
+                    let new_name = arguments
+                        .get("newName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?;
+                    self.rename_metadata_global(context, kind, value_name, new_name)?
+                } else {
+                    self.delete_metadata_global(context, kind, value_name)?
+                };
+                return Ok(serde_json::json!({"affectedModels":count.to_string()}));
+            }
+            "add_model_tags" | "remove_model_tags" => {
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                let names: Vec<String> = serde_json::from_value(
+                    arguments.get("tags").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let target = VersionedTarget {
+                    model_id,
+                    expected_version: tool_version(&arguments)?,
+                };
+                let result = if name == "add_model_tags" {
+                    self.inner.add_model_tags_by_name(context, target, names)
+                } else {
+                    self.inner.remove_model_tags_by_name(context, target, names)
+                }
+                .map_err(map_runtime_error)?;
+                return encoded!(WireMutation::from(result));
+            }
+            "remove_model" => {
+                if arguments.get("confirm").and_then(Value::as_bool) != Some(true) {
+                    return Err(invalid_tool());
+                }
+                let targets = versioned_tool_targets(&arguments)?;
+                return encoded!(WireActionPlan::from(self.plan_management_action(
+                    context,
+                    ManagementAction::RecoverableRemove { targets },
+                )?));
+            }
+            "trash_file" => {
+                let targets = versioned_tool_targets(&arguments)?;
+                let action = if arguments.get("targets").is_some() {
+                    ManagementAction::QuarantineLooseSources { targets }
+                } else {
+                    let target = targets.into_iter().next().ok_or_else(invalid_tool)?;
+                    ManagementAction::QuarantineLooseSource { target }
+                };
+                return encoded!(WireActionPlan::from(
+                    self.plan_management_action(context, action,)?
+                ));
+            }
+            "undo_trash" => {
+                let snapshot_id = arguments
+                    .get("snapshotId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                return encoded!(WireActionPlan::from(self.plan_management_action(
+                    context,
+                    ManagementAction::UndoQuarantine { snapshot_id },
+                )?));
+            }
+            "move_files" => {
+                let destination_handle_id = arguments
+                    .get("destinationHandleId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                let action = if let Some(value) = arguments.get("targets") {
+                    let targets: Vec<WireMoveLooseSourceTarget> =
+                        serde_json::from_value(value.clone()).map_err(|_| invalid_tool())?;
+                    let targets = targets
+                        .into_iter()
+                        .map(WireMoveLooseSourceTarget::parse)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    ManagementAction::MoveLooseSources {
+                        targets,
+                        destination_handle_id,
+                    }
+                } else {
+                    let target = VersionedTarget {
+                        model_id: arguments
+                            .get("modelId")
+                            .and_then(Value::as_str)
+                            .ok_or_else(invalid_tool)?
+                            .to_owned(),
+                        expected_version: tool_version(&arguments)?,
+                    };
+                    let file_name = arguments
+                        .get("fileName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned();
+                    ManagementAction::MoveLooseSource {
+                        target,
+                        destination_handle_id,
+                        file_name,
+                    }
+                };
+                return encoded!(WireActionPlan::from(
+                    self.plan_management_action(context, action,)?
+                ));
+            }
+            "backup_database" => {
+                let action = ManagementAction::CreateBackup {
+                    destination_handle_id: arguments
+                        .get("destinationHandleId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned(),
+                    file_name: arguments
+                        .get("fileName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?
+                        .to_owned(),
+                };
+                return encoded!(WireActionPlan::from(
+                    self.plan_management_action(context, action)?
+                ));
+            }
+            "export_library" => {
+                return encoded!(WireActionPlan::from(
+                    self.inner
+                        .plan_library_export(
+                            context,
+                            arguments.get("destPath").and_then(Value::as_str),
+                        )
+                        .map_err(map_runtime_error)?,
+                ));
+            }
+            "pull_3mf_metadata" => {
+                if arguments.get("targets").is_some() {
+                    let targets = embedded_metadata_targets(&arguments)?;
+                    let items = targets
+                        .into_iter()
+                        .map(|(model_id, expected_hash)| {
+                            self.read_embedded_metadata(
+                                context,
+                                &model_id,
+                                expected_hash.as_deref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return encoded!(serde_json::json!({"items":items}));
+                }
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(self.read_embedded_metadata(
+                    context,
+                    model_id,
+                    arguments.get("expectedHash").and_then(Value::as_str),
+                )?);
+            }
+            "plan_management_action" => {
+                let action: WireManagementAction = serde_json::from_value(
+                    arguments.get("action").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(WireActionPlan::from(self.plan_management_action(
+                    context,
+                    action.parse().map_err(|_| invalid_tool())?
+                )?));
+            }
+            "execute_management_action" => {
+                let token = arguments
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return Ok(wire_management_result(
+                    self.execute_management_action(context, token)?,
+                ));
+            }
+            "discard_management_action" => {
+                let token = arguments
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.discard_management_action(context, token)?;
+                return Ok(serde_json::json!({"discarded":true}));
+            }
+            "get_index_root_settings" => {
+                return encoded!(self
+                    .list_index_root_settings(context)?
+                    .into_iter()
+                    .map(WireIndexRootSettings::from)
+                    .collect::<Vec<_>>())
+            }
+            "update_index_root_settings" => {
+                let handle_id = arguments
+                    .get("handleId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let settings: WireIndexRootSettingsPatch = serde_json::from_value(
+                    arguments
+                        .get("settings")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let settings = settings.parse().map_err(|_| invalid_tool())?;
+                return encoded!(WireIndexRootSettings::from(
+                    self.update_index_root_settings(context, handle_id, settings)?
+                ));
+            }
+            "get_catalog_settings" => return encoded!(self.get_catalog_settings(context)?),
+            "update_catalog_settings" => {
+                let settings: CatalogSettings = serde_json::from_value(
+                    arguments
+                        .get("settings")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(self.update_catalog_settings(context, settings)?);
+            }
+            "get_model" => {
+                let id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(self.get_model(context, id)?);
+            }
+            "get_all_metadata" => return aggregate_metadata(self, context),
+            "get_library_stats" => {
+                return encoded!(WireCatalogStats::from(self.catalog_stats(context)?))
+            }
+            "list_parent_models" => return encoded!(self.catalog_facets(context)?.parents),
+            "list_designers" => return encoded!(self.catalog_facets(context)?.designers),
+            "list_licenses" => return encoded!(self.catalog_facets(context)?.licenses),
+            "list_roots" => return encoded!(self.roots(context)?),
+            "scan_directory" => {
+                let root_id = arguments
+                    .get("rootId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(directory) = arguments.get("directory").and_then(Value::as_str) {
+                    let root_id = root_id.ok_or_else(invalid_tool)?;
+                    return encoded!(self.start_scan_subdirectory(
+                        context,
+                        root_id,
+                        directory.to_owned(),
+                    )?);
+                }
+                return encoded!(self.start_scan(context, root_id,)?);
+            }
+            "cancel_scan" => return encoded!(self.cancel_scan(context)?),
+            "get_scan_status" => return encoded!(self.scan_status(context)?),
+            "prepare_bundle_preview" => {
+                let id = arguments
+                    .get("bundleId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(WireBundleSummary::from(self.prepare_bundle(context, id)?));
+            }
+            "get_bundle_preview_geometry" => {
+                let token = arguments
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let lease = WireLease::from(self.describe_bundle_geometry(context, token)?);
+                return encoded!(serde_json::json!({
+                    "lease": lease,
+                    "contentPath": format!("/api/v1/bundle-previews/{token}/geometry")
+                }));
+            }
+            "download_bundle" => {
+                let token = arguments
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(WireLease::from(self.issue_bundle_download(context, token)?));
+            }
+            "get_model_geometry" => {
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let plate_id = arguments
+                    .get("plateId")
+                    .and_then(Value::as_u64)
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| invalid_tool())?;
+                return encoded!(WireGeometryLease::from(self.issue_model_geometry(
+                    context,
+                    model_id,
+                    arguments.get("expectedHash").and_then(Value::as_str),
+                    plate_id,
+                )?));
+            }
+            "find_duplicates" => {
+                let include_zip = arguments
+                    .get("includeZip")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let group_limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(50)
+                    .min(200);
+                let model_ids = if let Some(ids) = arguments.get("modelIds") {
+                    let ids: Vec<String> =
+                        serde_json::from_value(ids.clone()).map_err(|_| invalid_tool())?;
+                    if include_zip {
+                        ids
+                    } else {
+                        ids.into_iter()
+                            .filter_map(|id| match self.get_model(context, &id) {
+                                Ok(model) if !model.archive_member => Some(Ok(id)),
+                                Ok(_) => None,
+                                Err(error) => Some(Err(error)),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    }
+                } else {
+                    let filter_object = arguments.as_object().ok_or_else(invalid_tool)?;
+                    self.collect_filtered_models_bounded(
+                        context,
+                        filter_object,
+                        MAX_DUPLICATE_SCOPE,
+                    )?
+                    .into_iter()
+                    .filter(|model| include_zip || !model.archive_member)
+                    .map(|model| model.id)
+                    .collect()
+                };
+                if model_ids.len() > MAX_DUPLICATE_SCOPE {
+                    return Err(EngineError {
+                        code: "invalidInput",
+                        message: "Duplicate scope exceeds 1000 models; narrow the filters".into(),
+                        retryable: false,
+                        current_version: None,
+                        source_holds: Vec::new(),
+                    });
+                }
+                let mut groups = self.duplicate_groups(context, model_ids)?;
+                groups.truncate(group_limit);
+                return encoded!(groups
+                    .into_iter()
+                    .map(WireDuplicateGroup::from)
+                    .collect::<Vec<_>>());
+            }
+            "get_embedded_3mf_metadata" => {
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(self.read_embedded_metadata(
+                    context,
+                    model_id,
+                    arguments.get("expectedHash").and_then(Value::as_str),
+                )?);
+            }
+            "apply_embedded_3mf_metadata" => {
+                let model_id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let expected_source_hash = arguments
+                    .get("expectedSourceHash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let selection: EmbeddedMetadataSelection = serde_json::from_value(
+                    arguments
+                        .get("selection")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(WireMutation::from(self.apply_embedded_metadata(
+                    context,
+                    VersionedTarget {
+                        model_id: model_id.to_owned(),
+                        expected_version: tool_version(&arguments)?,
+                    },
+                    expected_source_hash,
+                    selection,
+                )?));
+            }
+            "close_bundle_preview" => {
+                let token = arguments
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.close_bundle(context, token)?;
+                return Ok(serde_json::json!({"ok":true}));
+            }
+            "list_capture_items" => {
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(50);
+                if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+                    return Err(invalid_tool());
+                }
+                let page = self.list_captures(
+                    context,
+                    PageRequest {
+                        cursor: arguments
+                            .get("cursor")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        limit,
+                    },
+                )?;
+                return Ok(serde_json::json!({
+                    "items": page.items,
+                    "nextCursor": page.next_cursor,
+                    "snapshotRevision": page.snapshot_revision.to_string()
+                }));
+            }
+            "retry_capture" => {
+                let item_id = arguments
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let envelope: CaptureEnvelope = serde_json::from_value(
+                    arguments
+                        .get("envelope")
+                        .cloned()
+                        .ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                if envelope.item_id != item_id {
+                    return Err(invalid_tool());
+                }
+                let uploads: Vec<WireUploadInput> = serde_json::from_value(
+                    arguments.get("uploads").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let uploads = uploads
+                    .into_iter()
+                    .map(WireUploadInput::parse)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| invalid_tool())?;
+                return encoded!(self.import_capture(context, envelope, uploads)?);
+            }
+            "get_folder_tree" => {
+                return encoded!(self
+                    .list_folders(context)?
+                    .into_iter()
+                    .map(WireFolder::from)
+                    .collect::<Vec<_>>())
+            }
+            "list_tags" => return encoded!(self.list_tags(context)?),
+            "list_filaments" => {
+                return encoded!(self
+                    .list_filaments(
+                        context,
+                        arguments
+                            .get("includeUnavailable")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true)
+                    )?
+                    .into_iter()
+                    .map(WireFilament::from)
+                    .collect::<Vec<_>>())
+            }
+            "update_model" => {
+                let target: WireTarget = serde_json::from_value(
+                    arguments.get("target").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                let patch: MetadataPatch = serde_json::from_value(
+                    arguments.get("patch").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(WireMutation::from(self.update_metadata(
+                    context,
+                    target.parse().map_err(|_| invalid_tool())?,
+                    patch
+                )?));
+            }
+            "update_models_batch" => {
+                if arguments.get("updates").is_some() {
+                    let updates = versioned_metadata_updates(&arguments)?;
+                    return encoded!(self
+                        .update_metadata_batch(context, updates)?
+                        .into_iter()
+                        .map(WireMutation::from)
+                        .collect::<Vec<_>>());
+                }
+                let request: BulkMetadataRequest =
+                    serde_json::from_value(arguments).map_err(|_| invalid_tool())?;
+                let targets = request
+                    .targets
+                    .into_iter()
+                    .map(|v| v.parse().map_err(|_| invalid_tool()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return encoded!(self
+                    .bulk_update_metadata(context, targets, request.patch)?
+                    .into_iter()
+                    .map(WireMutation::from)
+                    .collect::<Vec<_>>());
+            }
+            "add_tag" => {
+                let value: NameCategory =
+                    serde_json::from_value(arguments).map_err(|_| invalid_tool())?;
+                return encoded!(self.create_tag(context, value.name, value.category)?);
+            }
+            "rename_tag" => {
+                let id = arguments
+                    .get("tagId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let name = arguments
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                let category = arguments
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                return encoded!(self.update_tag(context, id, name, category)?);
+            }
+            "delete_tag" => {
+                let id = arguments
+                    .get("tagId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.delete_tag(context, id)?;
+                return Ok(serde_json::json!({"ok":true}));
+            }
+            "save_filament" => {
+                let input: FilamentInput = serde_json::from_value(
+                    arguments.get("input").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                if let Some(id) = arguments.get("filamentId").and_then(Value::as_str) {
+                    let version = tool_version(&arguments)?;
+                    return encoded!(WireFilament::from(
+                        self.update_filament(context, id, version, input)?
+                    ));
+                }
+                return encoded!(WireFilament::from(self.create_filament(context, input)?));
+            }
+            "delete_filament" => {
+                let id = arguments
+                    .get("filamentId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(self
+                    .delete_filament(context, id, tool_version(&arguments)?)?
+                    .map(WireFilament::from));
+            }
+            "list_part_stock" => {
+                return encoded!(self
+                    .list_part_stock(context)?
+                    .into_iter()
+                    .map(WirePartStock::from)
+                    .collect::<Vec<_>>());
+            }
+            "create_part_stock" => {
+                let input: PartStockInput = serde_json::from_value(
+                    arguments.get("input").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(WirePartStock::from(self.create_part_stock(context, input)?));
+            }
+            "update_part_stock" => {
+                let id = arguments
+                    .get("partId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let input: PartStockInput = serde_json::from_value(
+                    arguments.get("input").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(WirePartStock::from(self.update_part_stock(
+                    context,
+                    id,
+                    tool_version(&arguments)?,
+                    input,
+                )?));
+            }
+            "delete_part_stock" => {
+                let id = arguments
+                    .get("partId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.delete_part_stock(context, id, tool_version(&arguments)?)?;
+                return Ok(serde_json::json!({"ok":true}));
+            }
+            "set_model_filaments" => {
+                let values: Assignments =
+                    serde_json::from_value(arguments).map_err(|_| invalid_tool())?;
+                let assignments = values
+                    .assignments
+                    .into_iter()
+                    .map(|v| v.parse().map_err(|_| invalid_tool()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return encoded!(self
+                    .bulk_assign_filaments(context, assignments)?
+                    .into_iter()
+                    .map(WireMutation::from)
+                    .collect::<Vec<_>>());
+            }
+            "get_print_events" => {
+                let id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                return encoded!(self.list_history(context, id)?);
+            }
+            "log_print_event" => {
+                let id = arguments
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let input = parse_print_attempt_input_with_printer(
+                    arguments.get("input").cloned().ok_or_else(invalid_tool)?,
+                )?;
+                return encoded!(self.create_history_with_printer(context, id, input)?);
+            }
+            "log_print_events_batch" => {
+                let idempotency_key = arguments
+                    .get("idempotencyKey")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                let items: Vec<PrintAttemptBatchItem> = serde_json::from_value(
+                    arguments.get("items").cloned().ok_or_else(invalid_tool)?,
+                )
+                .map_err(|_| invalid_tool())?;
+                return encoded!(self.create_history_batch(context, idempotency_key, items)?);
+            }
+            "delete_print_event" => {
+                let id = arguments
+                    .get("attemptId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                self.delete_history(context, id)?;
+                return Ok(serde_json::json!({"ok":true}));
+            }
+            _ => {}
+        }
+        if name != "search_models" {
+            let model_id = arguments
+                .get("modelId")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid_tool)?
+                .to_owned();
+            return match name {
+                "get_thumbnails" => {
+                    let thumbnails = self.list_thumbnails(context, &model_id)?;
+                    let mut items = Vec::with_capacity(thumbnails.len());
+                    for thumbnail in thumbnails {
+                        let thumbnail_id = thumbnail.thumbnail_id.clone();
+                        let mut item = serde_json::to_value(WireThumbnail::from(thumbnail))
+                            .map_err(|_| internal_tool())?;
+                        if context.capabilities.contains(&Capability::MediaRead) {
+                            match self.issue_thumbnail_media(context, &model_id, &thumbnail_id) {
+                                Ok(lease) => {
+                                    item.as_object_mut().ok_or_else(internal_tool)?.insert(
+                                        "mediaLease".into(),
+                                        serde_json::to_value(WireLease::from(lease))
+                                            .map_err(|_| internal_tool())?,
+                                    );
+                                }
+                                Err(error) if error.code == "forbidden" => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        items.push(item);
+                    }
+                    Ok(Value::Array(items))
+                }
+                "set_default_thumbnail" => {
+                    let version = tool_version(&arguments)?;
+                    let id = arguments
+                        .get("thumbnailId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?;
+                    Ok(
+                        serde_json::json!({"metadataVersion":self.set_active_thumbnail(context,&model_id,version,id)?.to_string()}),
+                    )
+                }
+                "delete_thumbnail" => {
+                    let version = tool_version(&arguments)?;
+                    let id = arguments
+                        .get("thumbnailId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(invalid_tool)?;
+                    Ok(
+                        serde_json::json!({"metadataVersion":self.delete_thumbnail(context,&model_id,version,id)?.to_string()}),
+                    )
+                }
+                "set_thumbnail" => {
+                    let version = tool_version(&arguments)?;
+                    let bytes = decode_tool_image(&arguments)?;
+                    Ok(
+                        serde_json::json!({"metadataVersion":self.set_thumbnail(context,&model_id,version,"thumbnail-replacement".into(),bytes)?.to_string()}),
+                    )
+                }
+                "add_thumbnail" => {
+                    let version = tool_version(&arguments)?;
+                    let bytes = decode_tool_image(&arguments)?;
+                    Ok(
+                        serde_json::json!({"metadataVersion":self.add_thumbnail(context,&model_id,version,"thumbnail-upload".into(),bytes)?.to_string()}),
+                    )
+                }
+                "download_model" => {
+                    serde_json::to_value(WireLease::from(self.issue_model_download(
+                        context,
+                        &model_id,
+                        arguments.get("expectedHash").and_then(Value::as_str),
+                    )?))
+                    .map_err(|_| internal_tool())
+                }
+                _ => Err(EngineError {
+                    code: "unsupported",
+                    message: "Tool is not connected to the runtime yet".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                }),
+            };
+        }
+        let object = arguments.as_object().ok_or_else(|| EngineError {
+            code: "invalidInput",
+            message: "Tool arguments must be an object".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })?;
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "query"
+                    | "search"
+                    | "cursor"
+                    | "limit"
+                    | "offset"
+                    | "tags"
+                    | "fileType"
+                    | "directory"
+                    | "thumbnailMode"
+                    | "rootId"
+                    | "sourceDirectory"
+                    | "minimumRating"
+                    | "favorite"
+                    | "designer"
+                    | "printed"
+            )
+        }) || (object.contains_key("query") && object.contains_key("search"))
+            || (object.contains_key("cursor") && object.contains_key("offset"))
+            || (object.contains_key("directory") && object.contains_key("sourceDirectory"))
+            || ((object.contains_key("directory") || object.contains_key("sourceDirectory"))
+                && !object.contains_key("rootId"))
+            || object
+                .get("search")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 256))
+            || object
+                .get("query")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 256))
+            || object
+                .get("cursor")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 512))
+            || object.get("limit").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|value| value == 0 || value > u64::from(MAX_PAGE_SIZE))
+            })
+            || object.get("thumbnailMode").is_some_and(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|value| !matches!(value, "missing" | "default" | "custom"))
+            })
+            || object
+                .get("rootId")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 128))
+            || object
+                .get("minimumRating")
+                .is_some_and(|value| value.as_u64().is_none_or(|rating| rating > 5))
+            || object
+                .get("favorite")
+                .is_some_and(|value| !value.is_boolean())
+            || object
+                .get("designer")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 200))
+            || object.get("printed").is_some_and(|value| {
+                value.as_str().is_none_or(|status| {
+                    !matches!(
+                        status,
+                        "unprinted"
+                            | "printed"
+                            | "want"
+                            | "queued"
+                            | "printing"
+                            | "failed"
+                            | "ever-printed"
+                            | "never-printed"
+                            | "all"
+                    )
+                })
+            })
+            || object
+                .get("tags")
+                .is_some_and(|value| !valid_search_tag_names(value))
+            || object.get("fileType").is_some_and(|value| {
+                value
+                    .as_str()
+                    .and_then(normalize_search_file_type)
+                    .is_none()
+            })
+            || object.get("offset").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|offset| offset > u64::from(MAX_MODEL_SEARCH_OFFSET))
+            })
+            || object.get("sourceDirectory").is_some_and(|value| {
+                value.as_str().is_none_or(|value| {
+                    value.len() > 1024 || value.contains('\\') || value.contains('\0')
+                })
+            })
+            || object.get("directory").is_some_and(|value| {
+                value.as_str().is_none_or(|value| {
+                    value.len() > 1024 || value.contains('\\') || value.contains('\0')
+                })
+            })
+        {
+            return Err(EngineError {
+                code: "invalidInput",
+                message: "Search arguments are invalid".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(50)
+            .min(MAX_PAGE_SIZE);
+        let (print_status, ever_printed) = match arguments.get("printed").and_then(Value::as_str) {
+            None | Some("all") => (None, None),
+            Some("unprinted") => (Some(PrintStatus::Unprinted), None),
+            Some("printed") => (Some(PrintStatus::Printed), None),
+            Some("want") => (Some(PrintStatus::Want), None),
+            Some("queued") => (Some(PrintStatus::Queued), None),
+            Some("printing") => (Some(PrintStatus::Printing), None),
+            Some("failed") => (Some(PrintStatus::Failed), None),
+            Some("ever-printed") => (None, Some(true)),
+            Some("never-printed") => (None, Some(false)),
+            Some(_) => return Err(invalid_tool()),
+        };
+        let page = self.list_models(
+            context,
+            arguments.get("cursor").and_then(Value::as_str),
+            limit,
+            ProtocolModelQuery {
+                search: arguments
+                    .get("query")
+                    .or_else(|| arguments.get("search"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                designer: arguments
+                    .get("designer")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                print_status,
+                ever_printed,
+                tags: arguments.get("tags").and_then(Value::as_array).map(|tags| {
+                    tags.iter()
+                        .filter_map(Value::as_str)
+                        .map(|tag| tag.trim().to_owned())
+                        .collect()
+                }),
+                file_type: arguments
+                    .get("fileType")
+                    .and_then(Value::as_str)
+                    .and_then(normalize_search_file_type),
+                offset: arguments
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|offset| u32::try_from(offset).ok()),
+                thumbnail_mode: arguments
+                    .get("thumbnailMode")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                root_id: arguments
+                    .get("rootId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                source_directory: arguments
+                    .get("sourceDirectory")
+                    .or_else(|| arguments.get("directory"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                minimum_rating: arguments
+                    .get("minimumRating")
+                    .and_then(Value::as_u64)
+                    .and_then(|rating| u8::try_from(rating).ok()),
+                favorite: arguments.get("favorite").and_then(Value::as_bool),
+                ..ProtocolModelQuery::default()
+            },
+        )?;
+        serde_json::to_value(page).map_err(|_| EngineError {
+            code: "internal",
+            message: "Catalog page could not be encoded".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        })
+    }
+
+    fn supports_tool(&self, context: &RequestContext, name: &str) -> bool {
+        if network_tool_schema(name).is_some() {
+            if !context.capabilities.contains(&Capability::CatalogRead) {
+                return false;
+            }
+            let Ok(policy) = self.inner.get_printer_network_policy(context) else {
+                return false;
+            };
+            if name == "get_printer_network_policy" {
+                return true;
+            }
+            if !context.capabilities.contains(&Capability::PrinterNetwork) || !policy.enabled {
+                return false;
+            }
+            return if matches!(
+                name,
+                "set_printer_endpoint_approval" | "test_printer_connection"
+            ) {
+                policy.status_checks_available
+                    && context.capabilities.contains(&Capability::CatalogWrite)
+            } else {
+                policy.discovery_available
+            };
+        }
+        let connected = matches!(
+            name,
+            "search_models"
+                | "integration_get_settings"
+                | "integration_save_spoolman_config"
+                | "integration_save_ai_provider"
+                | "integration_delete_ai_provider"
+                | "discard_tag_review"
+                | "get_hash_status"
+                | "check_files_exist"
+                | "refresh_hashes"
+                | "calculate_missing_hashes"
+                | "start_thumbnail_job"
+                | "get_models_missing_thumbnails"
+                | "get_models_with_default_thumbnails"
+                | "get_models_by_directory"
+                | "backup_database"
+                | "export_library"
+                | "rename_metadata"
+                | "delete_metadata"
+                | "add_model_tags"
+                | "remove_model_tags"
+                | "sync_spoolman_filaments"
+                | "generate_tags"
+                | "apply_tag_review"
+                | "plan_management_action"
+                | "execute_management_action"
+                | "get_index_root_settings"
+                | "update_index_root_settings"
+                | "get_catalog_settings"
+                | "update_catalog_settings"
+                | "get_model"
+                | "get_all_metadata"
+                | "get_library_stats"
+                | "remove_model"
+                | "list_parent_models"
+                | "list_designers"
+                | "list_licenses"
+                | "get_thumbnails"
+                | "set_default_thumbnail"
+                | "delete_thumbnail"
+                | "add_thumbnail"
+                | "set_thumbnail"
+                | "download_model"
+                | "get_folder_tree"
+                | "list_tags"
+                | "add_tag"
+                | "rename_tag"
+                | "delete_tag"
+                | "list_filaments"
+                | "save_filament"
+                | "delete_filament"
+                | "set_model_filaments"
+                | "list_printers"
+                | "get_printer"
+                | "create_printer"
+                | "update_printer"
+                | "delete_printer"
+                | "list_printer_maintenance_logs"
+                | "create_printer_maintenance_log"
+                | "update_printer_maintenance_log"
+                | "delete_printer_maintenance_log"
+                | "list_printer_reminders"
+                | "create_printer_reminder"
+                | "update_printer_reminder"
+                | "delete_printer_reminder"
+                | "complete_printer_reminder"
+                | "set_printer_reminder_paused"
+                | "reschedule_printer_reminder"
+                | "list_part_stock"
+                | "create_part_stock"
+                | "update_part_stock"
+                | "delete_part_stock"
+                | "get_print_events"
+                | "log_print_event"
+                | "log_print_events_batch"
+                | "delete_print_event"
+                | "update_model"
+                | "update_models_batch"
+                | "list_roots"
+                | "scan_directory"
+                | "cancel_scan"
+                | "get_scan_status"
+                | "prepare_bundle_preview"
+                | "get_bundle_preview_geometry"
+                | "download_bundle"
+                | "get_model_geometry"
+                | "close_bundle_preview"
+                | "find_duplicates"
+                | "get_embedded_3mf_metadata"
+                | "pull_3mf_metadata"
+                | "apply_embedded_3mf_metadata"
+                | "list_capture_items"
+                | "retry_capture"
+                | "list_slicers"
+                | "open_in_slicer"
+                | "trash_file"
+                | "undo_trash"
+                | "move_files"
+        );
+        if name == "list_slicers" {
+            return connected
+                && self.host_mode == HostMode::Desktop
+                && self.host_slicer.is_some()
+                && context.capabilities.contains(&Capability::CatalogRead)
+                && context.capabilities.contains(&Capability::HostSlicer);
+        }
+        if name == "open_in_slicer" {
+            let can_read = context.capabilities.contains(&Capability::CatalogRead)
+                && context.capabilities.contains(&Capability::MediaRead);
+            return connected
+                && can_read
+                && match self.host_mode {
+                    HostMode::Desktop => {
+                        self.host_slicer.is_some()
+                            && context.capabilities.contains(&Capability::HostSlicer)
+                    }
+                    HostMode::Headless => true,
+                };
+        }
+        if matches!(name, "trash_file" | "undo_trash" | "move_files") {
+            if !cfg!(any(target_os = "macos", target_os = "linux"))
+                || !connected
+                || !context.capabilities.contains(&Capability::CatalogWrite)
+                || !context
+                    .capabilities
+                    .contains(&Capability::PhysicalSourceWrite)
+            {
+                return false;
+            }
+            let Ok(info) = self.inner.runtime_info(context) else {
+                return false;
+            };
+            return info.capabilities.contains(&Capability::CatalogWrite)
+                && info.capabilities.contains(&Capability::PhysicalSourceWrite)
+                && info
+                    .roots
+                    .iter()
+                    .any(|root| root.access == library_protocol::RootAccess::Writable);
+        }
+        let write = matches!(
+            name,
+            "add_thumbnail"
+                | "set_thumbnail"
+                | "set_default_thumbnail"
+                | "delete_thumbnail"
+                | "update_model"
+                | "update_models_batch"
+                | "add_tag"
+                | "rename_tag"
+                | "delete_tag"
+                | "add_model_tags"
+                | "remove_model_tags"
+                | "remove_model"
+                | "save_filament"
+                | "delete_filament"
+                | "set_model_filaments"
+                | "create_printer"
+                | "update_printer"
+                | "delete_printer"
+                | "create_printer_maintenance_log"
+                | "update_printer_maintenance_log"
+                | "delete_printer_maintenance_log"
+                | "create_printer_reminder"
+                | "update_printer_reminder"
+                | "delete_printer_reminder"
+                | "complete_printer_reminder"
+                | "set_printer_reminder_paused"
+                | "reschedule_printer_reminder"
+                | "create_part_stock"
+                | "update_part_stock"
+                | "delete_part_stock"
+                | "log_print_event"
+                | "log_print_events_batch"
+                | "delete_print_event"
+                | "update_catalog_settings"
+                | "rename_metadata"
+                | "delete_metadata"
+                | "apply_embedded_3mf_metadata"
+                | "retry_capture"
+        );
+        if name == "backup_database" {
+            return connected
+                && context.capabilities.contains(&Capability::Maintenance)
+                && (context.capabilities.contains(&Capability::BackupWrite)
+                    || context
+                        .capabilities
+                        .contains(&Capability::PhysicalSourceWrite));
+        }
+        if name == "export_library" {
+            return connected
+                && context.capabilities.contains(&Capability::Maintenance)
+                && context.capabilities.contains(&Capability::BackupWrite);
+        }
+        if matches!(name, "plan_management_action" | "execute_management_action") {
+            return connected
+                && (context.capabilities.contains(&Capability::CatalogWrite)
+                    || context.capabilities.contains(&Capability::Maintenance));
+        }
+        if name == "discard_management_action" {
+            // Authenticated ownership is checked by the token store. Revoking
+            // mutation scopes must not prevent the owner releasing a review.
+            return true;
+        }
+        if name == "check_files_exist" {
+            return connected
+                && context.capabilities.contains(&Capability::CatalogRead)
+                && context.capabilities.contains(&Capability::MediaRead);
+        }
+        if name == "start_thumbnail_job" {
+            return connected
+                && context.capabilities.contains(&Capability::CatalogWrite)
+                && context.capabilities.contains(&Capability::MediaWrite);
+        }
+        if name == "integration_save_spoolman_config" {
+            return connected
+                && context.capabilities.contains(&Capability::Integration)
+                && context.capabilities.contains(&Capability::CatalogWrite);
+        }
+        if name == "sync_spoolman_filaments" {
+            return connected
+                && self.inner.integration_network_enabled(context)
+                && context.capabilities.contains(&Capability::Integration)
+                && context.capabilities.contains(&Capability::CatalogWrite);
+        }
+        if name == "generate_tags" {
+            return connected
+                && self.inner.integration_network_enabled(context)
+                && context.capabilities.contains(&Capability::Integration)
+                && context.capabilities.contains(&Capability::CatalogRead);
+        }
+        if matches!(
+            name,
+            "integration_get_settings"
+                | "integration_save_ai_provider"
+                | "integration_delete_ai_provider"
+                | "discard_tag_review"
+        ) {
+            return connected && context.capabilities.contains(&Capability::Integration);
+        }
+        if name == "apply_tag_review" {
+            return connected
+                && context.capabilities.contains(&Capability::Integration)
+                && context.capabilities.contains(&Capability::CatalogWrite);
+        }
+        let required = if matches!(
+            name,
+            "scan_directory"
+                | "cancel_scan"
+                | "update_index_root_settings"
+                | "refresh_hashes"
+                | "calculate_missing_hashes"
+        ) {
+            &Capability::Scan
+        } else if matches!(
+            name,
+            "prepare_bundle_preview"
+                | "get_bundle_preview_geometry"
+                | "download_bundle"
+                | "get_model_geometry"
+                | "close_bundle_preview"
+        ) {
+            &Capability::MediaRead
+        } else if write {
+            &Capability::CatalogWrite
+        } else {
+            &Capability::CatalogRead
+        };
+        connected && context.capabilities.contains(required)
+    }
+
+    fn list_thumbnails(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+    ) -> Result<Vec<ThumbnailDescriptor>, EngineError> {
+        self.inner
+            .list_thumbnails(context, model_id)
+            .map_err(map_runtime_error)
+    }
+    fn set_active_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        thumbnail_id: &str,
+    ) -> Result<u64, EngineError> {
+        self.inner
+            .set_active_thumbnail(context, model_id, expected_version, thumbnail_id)
+            .map_err(map_runtime_error)
+    }
+    fn set_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> Result<u64, EngineError> {
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let intent = UploadIntent {
+            item_id: model_id.into(),
+            capture_id: uuid::Uuid::new_v4().simple().to_string(),
+            file_name,
+            bytes: bytes.len() as u64,
+            sha256,
+        };
+        let token = self
+            .inner
+            .stage_upload(context, intent, &mut std::io::Cursor::new(bytes))
+            .map_err(map_runtime_error)?;
+        match self
+            .inner
+            .set_thumbnail(context, model_id, expected_version, &token.id)
+        {
+            Ok(version) => Ok(version),
+            Err(error) => {
+                let _ = self.inner.discard_upload(context, &token.id);
+                Err(map_runtime_error(error))
+            }
+        }
+    }
+    fn add_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> Result<u64, EngineError> {
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let intent = UploadIntent {
+            item_id: model_id.into(),
+            capture_id: uuid::Uuid::new_v4().simple().to_string(),
+            file_name,
+            bytes: bytes.len() as u64,
+            sha256,
+        };
+        let token = self
+            .inner
+            .stage_upload(context, intent, &mut std::io::Cursor::new(bytes))
+            .map_err(map_runtime_error)?;
+        match self
+            .inner
+            .add_thumbnail(context, model_id, expected_version, &token.id)
+        {
+            Ok(version) => Ok(version),
+            Err(error) => {
+                let _ = self.inner.discard_upload(context, &token.id);
+                Err(map_runtime_error(error))
+            }
+        }
+    }
+    fn delete_thumbnail(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_version: u64,
+        thumbnail_id: &str,
+    ) -> Result<u64, EngineError> {
+        self.inner
+            .delete_thumbnail(context, model_id, expected_version, thumbnail_id)
+            .map_err(map_runtime_error)
+    }
+    fn issue_thumbnail_media(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        thumbnail_id: &str,
+    ) -> Result<ContentLease, EngineError> {
+        self.inner
+            .issue_thumbnail_media(context, model_id, thumbnail_id)
+            .map_err(map_runtime_error)
+    }
+    fn issue_model_download(
+        &self,
+        context: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<ContentLease, EngineError> {
+        self.inner
+            .issue_model_download(context, model_id, expected_hash)
+            .map_err(map_runtime_error)
+    }
+    fn stream_content(
+        &self,
+        context: &RequestContext,
+        lease_id: &str,
+        sink: &mut dyn std::io::Write,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .stream_content(context, lease_id, sink)
+            .map_err(map_runtime_error)
+    }
+    fn describe_content(
+        &self,
+        context: &RequestContext,
+        lease_id: &str,
+    ) -> Result<ContentLease, EngineError> {
+        self.inner
+            .describe_content(context, lease_id)
+            .map_err(map_runtime_error)
+    }
+    fn update_metadata(
+        &self,
+        c: &RequestContext,
+        t: VersionedTarget,
+        p: MetadataPatch,
+    ) -> Result<MutationVersion, EngineError> {
+        self.inner
+            .update_metadata(c, t, p)
+            .map_err(map_runtime_error)
+    }
+    fn rename_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64, EngineError> {
+        self.inner
+            .rename_metadata_value(context, kind, old_name, new_name)
+            .map_err(map_runtime_error)
+    }
+    fn delete_metadata_global(
+        &self,
+        context: &RequestContext,
+        kind: MetadataValueKind,
+        name: &str,
+    ) -> Result<u64, EngineError> {
+        self.inner
+            .delete_metadata_value(context, kind, name)
+            .map_err(map_runtime_error)
+    }
+    fn bulk_update_metadata(
+        &self,
+        c: &RequestContext,
+        t: Vec<VersionedTarget>,
+        p: MetadataPatch,
+    ) -> Result<Vec<MutationVersion>, EngineError> {
+        self.inner
+            .bulk_update_metadata(c, t, p)
+            .map_err(map_runtime_error)
+    }
+    fn update_metadata_batch(
+        &self,
+        context: &RequestContext,
+        updates: Vec<VersionedMetadataUpdate>,
+    ) -> Result<Vec<MutationVersion>, EngineError> {
+        self.inner
+            .update_metadata_batch(context, updates)
+            .map_err(map_runtime_error)
+    }
+    fn list_tags(&self, c: &RequestContext) -> Result<Vec<Tag>, EngineError> {
+        self.inner.list_tags(c).map_err(map_runtime_error)
+    }
+    fn create_tag(
+        &self,
+        c: &RequestContext,
+        n: String,
+        k: Option<String>,
+    ) -> Result<Tag, EngineError> {
+        self.inner.create_tag(c, n, k).map_err(map_runtime_error)
+    }
+    fn update_tag(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        n: String,
+        k: Option<String>,
+    ) -> Result<Tag, EngineError> {
+        self.inner
+            .update_tag(c, id, n, k)
+            .map_err(map_runtime_error)
+    }
+    fn delete_tag(&self, c: &RequestContext, id: &str) -> Result<(), EngineError> {
+        self.inner.delete_tag(c, id).map_err(map_runtime_error)
+    }
+    fn list_folders(&self, c: &RequestContext) -> Result<Vec<Folder>, EngineError> {
+        self.inner.list_folders(c).map_err(map_runtime_error)
+    }
+    fn create_folder(
+        &self,
+        c: &RequestContext,
+        n: String,
+        p: Option<String>,
+    ) -> Result<Folder, EngineError> {
+        self.inner.create_folder(c, n, p).map_err(map_runtime_error)
+    }
+    fn rename_folder(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        n: String,
+    ) -> Result<Folder, EngineError> {
+        self.inner
+            .rename_folder(c, id, n)
+            .map_err(map_runtime_error)
+    }
+    fn move_folder(&self, c: &RequestContext, id: &str, p: &str) -> Result<Folder, EngineError> {
+        self.inner.move_folder(c, id, p).map_err(map_runtime_error)
+    }
+    fn delete_folder(&self, c: &RequestContext, id: &str) -> Result<(), EngineError> {
+        self.inner.delete_folder(c, id).map_err(map_runtime_error)
+    }
+    fn list_filaments(&self, c: &RequestContext, u: bool) -> Result<Vec<Filament>, EngineError> {
+        self.inner.list_filaments(c, u).map_err(map_runtime_error)
+    }
+    fn create_filament(
+        &self,
+        c: &RequestContext,
+        i: FilamentInput,
+    ) -> Result<Filament, EngineError> {
+        self.inner.create_filament(c, i).map_err(map_runtime_error)
+    }
+    fn update_filament(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+        i: FilamentInput,
+    ) -> Result<Filament, EngineError> {
+        self.inner
+            .update_filament(c, id, v, i)
+            .map_err(map_runtime_error)
+    }
+    fn delete_filament(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+    ) -> Result<Option<Filament>, EngineError> {
+        self.inner
+            .delete_filament(c, id, v)
+            .map_err(map_runtime_error)
+    }
+    fn list_printers(&self, context: &RequestContext) -> Result<Vec<Printer>, EngineError> {
+        self.inner.list_printers(context).map_err(map_runtime_error)
+    }
+    fn get_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+    ) -> Result<Option<Printer>, EngineError> {
+        self.inner
+            .get_printer(context, id)
+            .map_err(map_runtime_error)
+    }
+    fn create_printer(
+        &self,
+        context: &RequestContext,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        self.inner
+            .create_printer(context, input)
+            .map_err(map_runtime_error)
+    }
+    fn update_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterInput,
+    ) -> Result<Printer, EngineError> {
+        self.inner
+            .update_printer(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn delete_printer(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_printer(context, id, expected_version)
+            .map_err(map_runtime_error)
+    }
+    fn list_printer_maintenance_logs(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+    ) -> Result<Vec<PrinterMaintenanceLog>, EngineError> {
+        self.inner
+            .list_printer_maintenance_logs(context, printer_id)
+            .map_err(map_runtime_error)
+    }
+    fn create_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        self.inner
+            .create_printer_maintenance_log(context, printer_id, input)
+            .map_err(map_runtime_error)
+    }
+    fn update_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterMaintenanceInput,
+    ) -> Result<PrinterMaintenanceLog, EngineError> {
+        self.inner
+            .update_printer_maintenance_log(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn delete_printer_maintenance_log(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_printer_maintenance_log(context, id, expected_version)
+            .map_err(map_runtime_error)
+    }
+    fn list_printer_reminders(
+        &self,
+        context: &RequestContext,
+        printer_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<PrinterReminder>, EngineError> {
+        self.inner
+            .list_printer_reminders(context, printer_id, include_completed)
+            .map_err(map_runtime_error)
+    }
+    fn create_printer_reminder(
+        &self,
+        context: &RequestContext,
+        printer_id: &str,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .create_printer_reminder(context, printer_id, input)
+            .map_err(map_runtime_error)
+    }
+    fn update_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderInput,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .update_printer_reminder(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn delete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_printer_reminder(context, id, expected_version)
+            .map_err(map_runtime_error)
+    }
+    fn complete_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        input: PrinterReminderCompletionInput,
+    ) -> Result<PrinterReminderCompletion, EngineError> {
+        self.inner
+            .complete_printer_reminder(context, id, expected_version, input)
+            .map_err(map_runtime_error)
+    }
+    fn set_printer_reminder_paused(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        paused: bool,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .set_printer_reminder_paused(context, id, expected_version, paused)
+            .map_err(map_runtime_error)
+    }
+    fn reschedule_printer_reminder(
+        &self,
+        context: &RequestContext,
+        id: &str,
+        expected_version: u64,
+        due_at: &str,
+    ) -> Result<PrinterReminder, EngineError> {
+        self.inner
+            .reschedule_printer_reminder(context, id, expected_version, due_at)
+            .map_err(map_runtime_error)
+    }
+    fn get_printer_network_policy(
+        &self,
+        c: &RequestContext,
+    ) -> Result<PrinterNetworkPolicySummary, EngineError> {
+        self.inner
+            .get_printer_network_policy(c)
+            .map_err(map_runtime_error)
+    }
+    fn plan_printer_discovery(
+        &self,
+        c: &RequestContext,
+        range: &str,
+        bambu: bool,
+    ) -> Result<PrinterDiscoveryPlan, EngineError> {
+        self.inner
+            .plan_printer_discovery(c, range, bambu)
+            .map_err(map_runtime_error)
+    }
+    fn start_printer_discovery(
+        &self,
+        c: &RequestContext,
+        token: &str,
+        confirm: bool,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        self.inner
+            .start_printer_discovery(c, token, confirm)
+            .map_err(map_runtime_error)
+    }
+    fn get_printer_discovery(
+        &self,
+        c: &RequestContext,
+        id: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        self.inner
+            .get_printer_discovery(c, id)
+            .map_err(map_runtime_error)
+    }
+    fn cancel_printer_discovery(
+        &self,
+        c: &RequestContext,
+        id: &str,
+    ) -> Result<PrinterDiscoveryJob, EngineError> {
+        self.inner
+            .cancel_printer_discovery(c, id)
+            .map_err(map_runtime_error)
+    }
+    fn set_printer_endpoint_approval(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+        approved: bool,
+    ) -> Result<Printer, EngineError> {
+        self.inner
+            .set_printer_endpoint_approval(c, id, v, approved)
+            .map_err(map_runtime_error)
+    }
+    fn test_printer_connection(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        v: u64,
+        discover: bool,
+        confirm: bool,
+    ) -> Result<PrinterConnectionResponse, EngineError> {
+        self.inner
+            .test_printer_connection(c, id, v, discover, confirm)
+            .map_err(map_runtime_error)
+    }
+    fn list_part_stock(&self, c: &RequestContext) -> Result<Vec<PartStock>, EngineError> {
+        self.inner.list_part_stock(c).map_err(map_runtime_error)
+    }
+    fn create_part_stock(
+        &self,
+        c: &RequestContext,
+        input: PartStockInput,
+    ) -> Result<PartStock, EngineError> {
+        self.inner
+            .create_part_stock(c, input)
+            .map_err(map_runtime_error)
+    }
+    fn update_part_stock(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        version: u64,
+        input: PartStockInput,
+    ) -> Result<PartStock, EngineError> {
+        self.inner
+            .update_part_stock(c, id, version, input)
+            .map_err(map_runtime_error)
+    }
+    fn delete_part_stock(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        version: u64,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .delete_part_stock(c, id, version)
+            .map_err(map_runtime_error)
+    }
+    fn bulk_assign_filaments(
+        &self,
+        c: &RequestContext,
+        a: Vec<ModelFilamentAssignment>,
+    ) -> Result<Vec<MutationVersion>, EngineError> {
+        self.inner
+            .bulk_assign_model_filaments(c, a)
+            .map_err(map_runtime_error)
+    }
+    fn create_history_batch(
+        &self,
+        c: &RequestContext,
+        idempotency_key: &str,
+        items: Vec<PrintAttemptBatchItem>,
+    ) -> Result<Vec<PrintAttempt>, EngineError> {
+        self.inner
+            .create_print_attempts(c, idempotency_key, items)
+            .map_err(map_runtime_error)
+    }
+    fn list_history(&self, c: &RequestContext, m: &str) -> Result<Vec<PrintAttempt>, EngineError> {
+        self.inner
+            .list_print_attempts(c, m)
+            .map_err(map_runtime_error)
+    }
+    fn create_history(
+        &self,
+        c: &RequestContext,
+        m: &str,
+        i: PrintAttemptInput,
+    ) -> Result<PrintAttempt, EngineError> {
+        self.inner
+            .create_print_attempt(c, m, i)
+            .map_err(map_runtime_error)
+    }
+    fn create_history_with_printer(
+        &self,
+        c: &RequestContext,
+        m: &str,
+        i: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, EngineError> {
+        self.inner
+            .create_print_attempt_with_printer(c, m, i)
+            .map_err(map_runtime_error)
+    }
+    fn update_history(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        i: PrintAttemptInput,
+    ) -> Result<PrintAttempt, EngineError> {
+        self.inner
+            .update_print_attempt(c, id, i)
+            .map_err(map_runtime_error)
+    }
+    fn update_history_with_printer(
+        &self,
+        c: &RequestContext,
+        id: &str,
+        i: PrintAttemptInputWithPrinter,
+    ) -> Result<PrintAttempt, EngineError> {
+        self.inner
+            .update_print_attempt_with_printer(c, id, i)
+            .map_err(map_runtime_error)
+    }
+    fn delete_history(&self, c: &RequestContext, id: &str) -> Result<(), EngineError> {
+        self.inner
+            .delete_print_attempt(c, id)
+            .map_err(map_runtime_error)
+    }
+    fn stage_upload(
+        &self,
+        c: &RequestContext,
+        i: UploadIntent,
+        b: Vec<u8>,
+    ) -> Result<UploadToken, EngineError> {
+        self.inner
+            .stage_upload(c, i, &mut std::io::Cursor::new(b))
+            .map_err(map_runtime_error)
+    }
+    fn import_capture(
+        &self,
+        c: &RequestContext,
+        e: CaptureEnvelope,
+        u: Vec<UploadToken>,
+    ) -> Result<CaptureImportResult, EngineError> {
+        self.inner
+            .import_capture(c, e, u)
+            .map_err(map_runtime_error)
+    }
+    fn get_capture(
+        &self,
+        c: &RequestContext,
+        id: &str,
+    ) -> Result<CaptureImportResult, EngineError> {
+        self.inner
+            .get_capture_result(c, id)
+            .map_err(map_runtime_error)
+    }
+    fn roots(&self, c: &RequestContext) -> Result<Vec<RootHandle>, EngineError> {
+        self.inner
+            .runtime_info(c)
+            .map(|v| v.roots)
+            .map_err(map_runtime_error)
+    }
+    fn start_scan(
+        &self,
+        c: &RequestContext,
+        id: Option<String>,
+    ) -> Result<ScanStatus, EngineError> {
+        let catalog_root_id = if let Some(handle_id) = id {
+            let mut matches = self
+                .inner
+                .runtime_info(c)
+                .map_err(map_runtime_error)?
+                .roots
+                .into_iter()
+                .filter(|root| {
+                    root.id == handle_id
+                        || root.catalog_root_id.as_deref() == Some(handle_id.as_str())
+                })
+                .filter_map(|root| root.catalog_root_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            if matches.len() != 1 {
+                return Err(EngineError {
+                    code: "forbidden",
+                    message: "Root handle is not admitted for scanning".into(),
+                    retryable: false,
+                    current_version: None,
+                    source_holds: Vec::new(),
+                });
+            }
+            matches.pop_first()
+        } else {
+            None
+        };
+        self.inner
+            .start_scan(c, catalog_root_id)
+            .map_err(map_runtime_error)
+    }
+    fn start_scan_subdirectory(
+        &self,
+        c: &RequestContext,
+        root_id: String,
+        directory: String,
+    ) -> Result<ScanStatus, EngineError> {
+        if directory.is_empty() {
+            return self.start_scan(c, Some(root_id));
+        }
+        let mut matches = self
+            .inner
+            .runtime_info(c)
+            .map_err(map_runtime_error)?
+            .roots
+            .into_iter()
+            .filter(|root| {
+                root.id == root_id || root.catalog_root_id.as_deref() == Some(root_id.as_str())
+            })
+            .filter_map(|root| root.catalog_root_id)
+            .collect::<BTreeSet<_>>();
+        if matches.len() != 1 {
+            return Err(EngineError {
+                code: "forbidden",
+                message: "Root handle is not admitted for scanning".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        self.inner
+            .start_scan_subdirectory(c, matches.pop_first().unwrap(), directory)
+            .map_err(map_runtime_error)
+    }
+    fn cancel_scan(&self, c: &RequestContext) -> Result<ScanStatus, EngineError> {
+        self.inner.cancel_scan(c).map_err(map_runtime_error)
+    }
+    fn scan_status(&self, c: &RequestContext) -> Result<ScanStatus, EngineError> {
+        self.inner.scan_status(c).map_err(map_runtime_error)
+    }
+    fn prepare_bundle(
+        &self,
+        c: &RequestContext,
+        id: &str,
+    ) -> Result<BundlePreviewSummary, EngineError> {
+        self.inner
+            .prepare_bundle_preview(c, id)
+            .map_err(map_runtime_error)
+    }
+    fn describe_bundle_geometry(
+        &self,
+        c: &RequestContext,
+        t: &str,
+    ) -> Result<ContentLease, EngineError> {
+        self.inner
+            .describe_bundle_geometry(c, t)
+            .map_err(map_runtime_error)
+    }
+    fn stream_bundle_geometry(
+        &self,
+        c: &RequestContext,
+        t: &str,
+        s: &mut dyn std::io::Write,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .stream_bundle_geometry(c, t, s)
+            .map_err(map_runtime_error)
+    }
+    fn close_bundle(&self, c: &RequestContext, t: &str) -> Result<(), EngineError> {
+        self.inner
+            .close_bundle_preview(c, t)
+            .map_err(map_runtime_error)
+    }
+    fn issue_bundle_download(
+        &self,
+        c: &RequestContext,
+        token: &str,
+    ) -> Result<ContentLease, EngineError> {
+        self.inner
+            .issue_bundle_download(c, token)
+            .map_err(map_runtime_error)
+    }
+    fn issue_model_geometry(
+        &self,
+        c: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+        plate_id: Option<u32>,
+    ) -> Result<GeometryLease, EngineError> {
+        self.inner
+            .issue_model_geometry(c, model_id, expected_hash, plate_id)
+            .map_err(map_runtime_error)
+    }
+    fn duplicate_groups(
+        &self,
+        c: &RequestContext,
+        model_ids: Vec<String>,
+    ) -> Result<Vec<DuplicateGroup>, EngineError> {
+        self.inner
+            .duplicate_groups(c, model_ids)
+            .map_err(map_runtime_error)
+    }
+    fn read_embedded_metadata(
+        &self,
+        c: &RequestContext,
+        model_id: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<EmbeddedMetadataProposal, EngineError> {
+        self.inner
+            .read_embedded_metadata(c, model_id, expected_hash)
+            .map_err(map_runtime_error)
+    }
+    fn apply_embedded_metadata(
+        &self,
+        c: &RequestContext,
+        target: VersionedTarget,
+        expected_source_hash: &str,
+        selection: EmbeddedMetadataSelection,
+    ) -> Result<MutationVersion, EngineError> {
+        self.inner
+            .apply_embedded_metadata(c, target, expected_source_hash, selection)
+            .map_err(map_runtime_error)
+    }
+    fn plan_management_action(
+        &self,
+        c: &RequestContext,
+        action: ManagementAction,
+    ) -> Result<ActionPlan, EngineError> {
+        self.inner.plan_action(c, action).map_err(map_runtime_error)
+    }
+    fn plan_library_export(
+        &self,
+        c: &RequestContext,
+        dest_path: Option<&str>,
+    ) -> Result<ActionPlan, EngineError> {
+        self.inner
+            .plan_library_export(c, dest_path)
+            .map_err(map_runtime_error)
+    }
+    fn execute_management_action(
+        &self,
+        c: &RequestContext,
+        token: &str,
+    ) -> Result<ManagementResult, EngineError> {
+        self.inner
+            .execute_action(c, token)
+            .map_err(map_runtime_error)
+    }
+    fn discard_management_action(
+        &self,
+        context: &RequestContext,
+        token: &str,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .discard_action(context, token)
+            .map_err(map_runtime_error)
+    }
+    fn list_captures(
+        &self,
+        c: &RequestContext,
+        p: PageRequest,
+    ) -> Result<library_protocol::Page<CaptureSummary>, EngineError> {
+        self.inner
+            .list_capture_items(c, p)
+            .map_err(map_runtime_error)
+    }
+}
+
+fn aggregate_metadata<E: LibraryEngine>(
+    engine: &E,
+    context: &RequestContext,
+) -> Result<Value, EngineError> {
+    fn increment(counts: &mut BTreeMap<String, u64>, name: &str) -> Result<(), EngineError> {
+        let count = counts.entry(name.to_owned()).or_default();
+        *count = count.checked_add(1).ok_or_else(internal_tool)?;
+        Ok(())
+    }
+
+    let mut designers = BTreeMap::<String, u64>::new();
+    let mut licenses = BTreeMap::<String, u64>::new();
+    let mut parent_ids = BTreeMap::<String, u64>::new();
+    let mut parent_names = BTreeMap::<String, String>::new();
+    let mut cursor = None::<String>;
+    let mut seen_cursors = BTreeSet::new();
+    let mut snapshot_revision = None::<String>;
+
+    loop {
+        let page = engine.list_models(
+            context,
+            cursor.as_deref(),
+            MAX_PAGE_SIZE,
+            ProtocolModelQuery::default(),
+        )?;
+        if snapshot_revision
+            .as_deref()
+            .is_some_and(|revision| revision != page.snapshot_revision.as_str())
+        {
+            return Err(EngineError {
+                code: "conflict",
+                message: "Catalog changed while reading metadata; retry the request".into(),
+                retryable: true,
+                current_version: None,
+                source_holds: Vec::new(),
+            });
+        }
+        snapshot_revision.get_or_insert_with(|| page.snapshot_revision.clone());
+
+        for model in page.items {
+            if let Some(designer) = model.designer.as_deref().filter(|value| !value.is_empty()) {
+                increment(&mut designers, designer)?;
+            }
+            if let Some(license) = model
+                .model_license
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                increment(&mut licenses, license)?;
+            }
+            if let Some(parent_id) = model
+                .parent_model_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                increment(&mut parent_ids, parent_id)?;
+            }
+            parent_names.insert(model.id, model.display_name);
+        }
+
+        match page.next_cursor {
+            Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+            Some(_) => return Err(internal_tool()),
+            None => break,
+        }
+    }
+
+    let mut parents = BTreeMap::<String, u64>::new();
+    for (parent_id, count) in parent_ids {
+        let name = match parent_names.get(&parent_id) {
+            Some(name) => Some(name.clone()),
+            None => match engine.get_model(context, &parent_id) {
+                Ok(parent) => Some(parent.display_name),
+                Err(error) if error.code == "notFound" => None,
+                Err(error) => return Err(error),
+            },
+        };
+        if let Some(name) = name {
+            let total = parents.entry(name.clone()).or_default();
+            *total = total.checked_add(count).ok_or_else(internal_tool)?;
+        }
+    }
+
+    let mut rows = Vec::with_capacity(designers.len() + licenses.len() + parents.len());
+    rows.extend(designers.into_iter().map(|(name, model_count)| {
+        serde_json::json!({"type":"designer","name":name,"model_count":model_count})
+    }));
+    rows.extend(licenses.into_iter().map(|(name, model_count)| {
+        serde_json::json!({"type":"license","name":name,"model_count":model_count})
+    }));
+    rows.extend(parents.into_iter().map(|(name, model_count)| {
+        serde_json::json!({"type":"parentModel","name":name,"model_count":model_count})
+    }));
+    Ok(Value::Array(rows))
+}
+
+fn invalid_tool() -> EngineError {
+    EngineError {
+        code: "invalidInput",
+        message: "Tool arguments are invalid".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    }
+}
+
+fn parse_print_attempt_input_with_printer(
+    value: Value,
+) -> Result<PrintAttemptInputWithPrinter, EngineError> {
+    serde_json::from_value(value).map_err(|_| invalid_tool())
+}
+
+fn valid_part_stock_input_value(value: &Value) -> bool {
+    let Some(input) = value.as_object() else {
+        return false;
+    };
+    let allowed = ["name", "category", "quantity", "unit", "notes", "lowStock"];
+    let required = ["name", "quantity", "unit", "notes", "lowStock"];
+    if input.keys().any(|key| !allowed.contains(&key.as_str()))
+        || required.iter().any(|key| !input.contains_key(*key))
+    {
+        return false;
+    }
+    let valid_label = |key: &str| {
+        input.get(key).and_then(Value::as_str).is_some_and(|label| {
+            !label.trim().is_empty()
+                && label.chars().count() <= 128
+                && !label.chars().any(char::is_control)
+        })
+    };
+    valid_label("name")
+        && valid_label("unit")
+        && input.get("category").is_none_or(|category| {
+            category.is_null()
+                || category.as_str().is_some_and(|value| {
+                    value.trim().is_empty()
+                        || (value.chars().count() <= 128 && !value.chars().any(char::is_control))
+                })
+        })
+        && input
+            .get("quantity")
+            .is_some_and(|value| value.as_u64().is_some_and(|quantity| quantity <= 1_000_000))
+        && input
+            .get("lowStock")
+            .is_some_and(|value| value.as_u64().is_some_and(|quantity| quantity <= 1_000_000))
+        && input.get("notes").is_some_and(|value| {
+            value.as_str().is_some_and(|notes| {
+                notes.len() <= 20_000
+                    && !notes.chars().any(|character| {
+                        character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                    })
+            })
+        })
+}
+
+fn valid_part_usage_value(value: &Value) -> bool {
+    let Some(parts) = value.as_array() else {
+        return false;
+    };
+    if parts.len() > 256 {
+        return false;
+    }
+    let mut ids = BTreeSet::new();
+    parts.iter().all(|part| {
+        let Some(part) = part.as_object() else {
+            return false;
+        };
+        part.len() == 2
+            && part
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty() && id.len() <= 128 && ids.insert(id.to_owned()))
+            && part
+                .get("quantity")
+                .and_then(Value::as_u64)
+                .is_some_and(|quantity| (1..=9_999).contains(&quantity))
+    })
+}
+
+fn valid_print_attempt_parts(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|input| input.get("parts").is_none_or(valid_part_usage_value))
+}
+
+fn has_catalog_filters(object: &serde_json::Map<String, Value>) -> bool {
+    [
+        "search",
+        "designer",
+        "tags",
+        "directory",
+        "rootId",
+        "fileType",
+        "printed",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
+fn normalize_search_file_type(value: &str) -> Option<String> {
+    let value = value.trim();
+    let extension = value.strip_prefix('.').unwrap_or(value);
+    if extension.is_empty()
+        || extension.len() > 16
+        || !extension
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-'))
+    {
+        return None;
+    }
+    Some(extension.to_ascii_lowercase())
+}
+
+fn valid_search_tag_names(value: &Value) -> bool {
+    let Some(tags) = value.as_array() else {
+        return false;
+    };
+    if tags.len() > 100 {
+        return false;
+    }
+    let mut unique = BTreeSet::new();
+    tags.iter().all(|tag| {
+        tag.as_str().is_some_and(|tag| {
+            let tag = tag.trim();
+            !tag.is_empty() && tag.len() <= 256 && unique.insert(tag.to_lowercase())
+        })
+    })
+}
+
+fn safe_leaf_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && !matches!(value, "." | "..")
+        && !value.ends_with([' ', '.'])
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '"' | '<' | '>' | '|' | '?' | '*'
+                )
+        })
+}
+
+fn valid_excluded_model_ids(value: &Value) -> bool {
+    let Some(ids) = value.as_array() else {
+        return false;
+    };
+    if ids.len() > 2000 {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    ids.iter().all(|id| {
+        id.as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 128)
+            .is_some_and(|id| seen.insert(id.to_owned()))
+    })
+}
+
+fn valid_source_target_object(
+    target: &serde_json::Map<String, Value>,
+    has_file_name: bool,
+) -> bool {
+    target.len() == (if has_file_name { 3 } else { 2 })
+        && target
+            .get("modelId")
+            .and_then(Value::as_str)
+            .is_some_and(|model_id| !model_id.is_empty() && model_id.len() <= 128)
+        && target
+            .get("expectedVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|version| parse_decimal(version).is_ok())
+        && (!has_file_name
+            || target
+                .get("fileName")
+                .and_then(Value::as_str)
+                .is_some_and(safe_leaf_filename))
+}
+
+fn valid_catalog_filter_fields(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("search")
+        .is_none_or(|value| value.as_str().is_some_and(|value| value.len() <= 256))
+        && object
+            .get("designer")
+            .is_none_or(|value| value.as_str().is_some_and(|value| value.len() <= 200))
+        && object.get("tags").is_none_or(valid_search_tag_names)
+        && object.get("fileType").is_none_or(|value| {
+            value
+                .as_str()
+                .and_then(normalize_search_file_type)
+                .is_some()
+        })
+        && object.get("printed").is_none_or(|value| {
+            value.as_str().is_some_and(|status| {
+                matches!(
+                    status,
+                    "unprinted"
+                        | "printed"
+                        | "want"
+                        | "queued"
+                        | "printing"
+                        | "failed"
+                        | "ever-printed"
+                        | "never-printed"
+                        | "all"
+                )
+            })
+        })
+        && object.get("rootId").is_none_or(|value| {
+            value
+                .as_str()
+                .is_some_and(|root| !root.is_empty() && root.len() <= 128)
+        })
+        && object.get("directory").is_none_or(|value| {
+            value.as_str().is_some_and(|directory| {
+                directory.len() <= 1024 && !directory.contains('\\') && !directory.contains('\0')
+            })
+        })
+        && (!(object.contains_key("directory")) || object.contains_key("rootId"))
+}
+
+fn validate_source_file_action_shape(
+    name: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), EngineError> {
+    const TRASH_ALLOWED: &[&str] = &["modelId", "expectedVersion", "targets", "confirm"];
+    const MOVE_ALLOWED: &[&str] = &[
+        "modelId",
+        "expectedVersion",
+        "destinationHandleId",
+        "fileName",
+        "targets",
+        "confirm",
+    ];
+    let is_move = name == "move_files";
+    let allowed = if is_move { MOVE_ALLOWED } else { TRASH_ALLOWED };
+    if object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || object.get("confirm").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(invalid_tool());
+    }
+    if is_move
+        && !object
+            .get("destinationHandleId")
+            .and_then(Value::as_str)
+            .is_some_and(|handle| !handle.is_empty() && handle.len() <= 128)
+    {
+        return Err(invalid_tool());
+    }
+
+    if let Some(targets) = object.get("targets") {
+        if object.contains_key("modelId")
+            || object.contains_key("expectedVersion")
+            || (is_move && object.contains_key("fileName"))
+        {
+            return Err(invalid_tool());
+        }
+        let targets = targets.as_array().ok_or_else(invalid_tool)?;
+        if targets.is_empty() || targets.len() > 100 {
+            return Err(invalid_tool());
+        }
+        let mut model_ids = BTreeSet::new();
+        let mut file_names = BTreeSet::new();
+        for target in targets {
+            let target = target.as_object().ok_or_else(invalid_tool)?;
+            if !valid_source_target_object(target, is_move) {
+                return Err(invalid_tool());
+            }
+            let model_id = target
+                .get("modelId")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid_tool)?;
+            if !model_ids.insert(model_id.to_owned()) {
+                return Err(invalid_tool());
+            }
+            if is_move {
+                let file_name = target
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?;
+                if !file_names.insert(file_name.to_lowercase()) {
+                    return Err(invalid_tool());
+                }
+            }
+        }
+    } else {
+        let _model_id = object
+            .get("modelId")
+            .and_then(Value::as_str)
+            .filter(|model_id| !model_id.is_empty() && model_id.len() <= 128)
+            .ok_or_else(invalid_tool)?;
+        let version = object
+            .get("expectedVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_tool)?;
+        if parse_decimal(version).is_err() {
+            return Err(invalid_tool());
+        }
+        if is_move
+            && !object
+                .get("fileName")
+                .and_then(Value::as_str)
+                .is_some_and(safe_leaf_filename)
+        {
+            return Err(invalid_tool());
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_shape(name: &str, value: &Value) -> Result<(), EngineError> {
+    let object = value.as_object().ok_or_else(invalid_tool)?;
+    if network_tool_schema(name).is_some() {
+        return validate_network_tool(name, value);
+    }
+    if matches!(name, "trash_file" | "move_files") {
+        return validate_source_file_action_shape(name, object);
+    }
+    let (allowed, required): (&[&str], &[&str]) = match name {
+        "search_models" => (
+            &[
+                "query",
+                "search",
+                "cursor",
+                "limit",
+                "offset",
+                "tags",
+                "fileType",
+                "directory",
+                "thumbnailMode",
+                "rootId",
+                "sourceDirectory",
+                "minimumRating",
+                "favorite",
+                "designer",
+                "printed",
+            ],
+            &[],
+        ),
+        "integration_get_settings" | "sync_spoolman_filaments" => (&[], &[]),
+        "integration_save_spoolman_config" => (&["config"], &["config"]),
+        "integration_save_ai_provider" => (
+            &["config", "credentialUpdate"],
+            &["config", "credentialUpdate"],
+        ),
+        "integration_delete_ai_provider" => (&["providerId"], &["providerId"]),
+        "generate_tags" => (&["providerId", "targets"], &["providerId", "targets"]),
+        "apply_tag_review" => (
+            &["reviewToken", "decisions", "strategy"],
+            &["reviewToken", "decisions", "strategy"],
+        ),
+        "discard_tag_review" => (&["reviewToken"], &["reviewToken"]),
+        "get_hash_status" | "calculate_missing_hashes" | "refresh_hashes" => (
+            &[
+                "search",
+                "designer",
+                "tags",
+                "directory",
+                "rootId",
+                "fileType",
+                "printed",
+            ],
+            &[],
+        ),
+        "check_files_exist" => (&["modelIds", "missingOnly", "limit"], &[]),
+        "start_thumbnail_job" => (&["modelIds", "force"], &["modelIds"]),
+        "get_models_missing_thumbnails" => (&["cursor", "limit", "excludeIds"], &[]),
+        "get_models_with_default_thumbnails" => (&["cursor", "limit"], &[]),
+        "get_models_by_directory" => (
+            &["rootId", "directory", "cursor", "limit"],
+            &["rootId", "directory"],
+        ),
+        "rename_metadata" => (
+            &["type", "oldName", "newName"],
+            &["type", "oldName", "newName"],
+        ),
+        "delete_metadata" => (&["type", "name"], &["type", "name"]),
+        "add_model_tags" | "remove_model_tags" => (
+            &["modelId", "expectedVersion", "tags"],
+            &["modelId", "expectedVersion", "tags"],
+        ),
+        "remove_model" => (
+            &["targets", "modelId", "expectedVersion", "confirm"],
+            &["confirm"],
+        ),
+        "undo_trash" => (&["snapshotId", "confirm"], &["snapshotId", "confirm"]),
+        "backup_database" => (
+            &["destinationHandleId", "fileName"],
+            &["destinationHandleId", "fileName"],
+        ),
+        "export_library" => (&["destPath"], &[]),
+        "plan_management_action" => (&["action"], &["action"]),
+        "execute_management_action" | "discard_management_action" => (&["token"], &["token"]),
+        "get_index_root_settings" | "get_catalog_settings" => (&[], &[]),
+        "update_index_root_settings" => (&["handleId", "settings"], &["handleId", "settings"]),
+        "update_catalog_settings" => (&["settings"], &["settings"]),
+        "get_model" => (&["modelId"], &["modelId"]),
+        "get_all_metadata" => (&[], &[]),
+        "get_library_stats" | "list_parent_models" | "list_designers" | "list_licenses"
+        | "list_roots" | "cancel_scan" | "get_scan_status" => (&[], &[]),
+        "scan_directory" => (&["rootId", "directory"], &[]),
+        "prepare_bundle_preview" => (&["bundleId"], &["bundleId"]),
+        "get_bundle_preview_geometry" | "download_bundle" | "close_bundle_preview" => {
+            (&["token"], &["token"])
+        }
+        "get_model_geometry" => (&["modelId", "expectedHash", "plateId"], &["modelId"]),
+        "find_duplicates" => (
+            &[
+                "modelIds",
+                "includeZip",
+                "search",
+                "designer",
+                "tags",
+                "directory",
+                "rootId",
+                "fileType",
+                "printed",
+                "limit",
+            ],
+            &[],
+        ),
+        "get_embedded_3mf_metadata" => (&["modelId", "expectedHash"], &["modelId"]),
+        "pull_3mf_metadata" => (&["modelId", "expectedHash", "targets"], &[]),
+        "apply_embedded_3mf_metadata" => (
+            &[
+                "modelId",
+                "expectedVersion",
+                "expectedSourceHash",
+                "selection",
+            ],
+            &[
+                "modelId",
+                "expectedVersion",
+                "expectedSourceHash",
+                "selection",
+            ],
+        ),
+        "list_capture_items" => (&["cursor", "limit"], &[]),
+        "retry_capture" => (
+            &["itemId", "envelope", "uploads"],
+            &["itemId", "envelope", "uploads"],
+        ),
+        "get_folder_tree" | "list_tags" => (&[], &[]),
+        "list_filaments" => (&["includeUnavailable"], &[]),
+        name if fleet_tool_schema(name).is_some() => {
+            let schema = fleet_tool_schema(name).unwrap();
+            if object
+                .keys()
+                .any(|key| schema["properties"].get(key).is_none())
+                || schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| !object.contains_key(key.as_str().unwrap()))
+            {
+                return Err(invalid_tool());
+            }
+            for (key, value) in object {
+                match key.as_str() {
+                    "input" => {
+                        let valid = if name.ends_with("maintenance_log") {
+                            serde_json::from_value::<PrinterMaintenanceInput>(value.clone()).is_ok()
+                        } else if name.ends_with("reminder") {
+                            serde_json::from_value::<PrinterReminderInput>(value.clone()).is_ok()
+                        } else {
+                            serde_json::from_value::<PrinterInput>(value.clone()).is_ok()
+                        };
+                        if !valid {
+                            return Err(invalid_tool());
+                        }
+                    }
+                    "expectedVersion" => {
+                        let text = value.as_str().ok_or_else(invalid_tool)?;
+                        if text.is_empty()
+                            || text.len() > 20
+                            || (text.len() > 1 && text.starts_with('0'))
+                            || !text.bytes().all(|b| b.is_ascii_digit())
+                            || text.parse::<u64>().is_err()
+                        {
+                            return Err(invalid_tool());
+                        }
+                    }
+                    "includeCompleted" | "paused" => {
+                        if !value.is_boolean() {
+                            return Err(invalid_tool());
+                        }
+                    }
+                    _ => {
+                        let text = value.as_str().ok_or_else(invalid_tool)?;
+                        let maximum = schema["properties"][key]["maxLength"]
+                            .as_u64()
+                            .unwrap_or(128) as usize;
+                        if text.len() > maximum || (key.ends_with("Id") && text.is_empty()) {
+                            return Err(invalid_tool());
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        "list_part_stock" => (&[], &[]),
+        "create_part_stock" => (&["input"], &["input"]),
+        "update_part_stock" => (
+            &["partId", "expectedVersion", "input"],
+            &["partId", "expectedVersion", "input"],
+        ),
+        "delete_part_stock" => (
+            &["partId", "expectedVersion"],
+            &["partId", "expectedVersion"],
+        ),
+        "update_model" => (&["target", "patch"], &["target", "patch"]),
+        "update_models_batch" => (&["targets", "patch", "updates"], &[]),
+        "add_tag" => (&["name", "category"], &["name"]),
+        "rename_tag" => (&["tagId", "name", "category"], &["tagId", "name"]),
+        "delete_tag" => (&["tagId"], &["tagId"]),
+        "save_filament" => (&["filamentId", "expectedVersion", "input"], &["input"]),
+        "delete_filament" => (
+            &["filamentId", "expectedVersion"],
+            &["filamentId", "expectedVersion"],
+        ),
+        "set_model_filaments" => (&["assignments"], &["assignments"]),
+        "get_print_events" => (&["modelId"], &["modelId"]),
+        "log_print_event" => (&["modelId", "input"], &["modelId", "input"]),
+        "log_print_events_batch" => (&["idempotencyKey", "items"], &["idempotencyKey", "items"]),
+        "delete_print_event" => (&["attemptId"], &["attemptId"]),
+        "get_thumbnails" => (&["modelId"], &["modelId"]),
+        "set_default_thumbnail" | "delete_thumbnail" => (
+            &["modelId", "expectedVersion", "thumbnailId"],
+            &["modelId", "expectedVersion", "thumbnailId"],
+        ),
+        "set_thumbnail" | "add_thumbnail" => (
+            &["modelId", "expectedVersion", "image", "mimeType"],
+            &["modelId", "expectedVersion", "image"],
+        ),
+        "download_model" => (&["modelId", "expectedHash"], &["modelId"]),
+        "list_slicers" => (&[], &[]),
+        "open_in_slicer" => (
+            &["modelId", "expectedVersion", "targets", "slicerId"],
+            &["slicerId"],
+        ),
+        _ => return Ok(()),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || required.iter().any(|key| !object.contains_key(*key))
+    {
+        return Err(invalid_tool());
+    }
+    let string_field_valid = |key: &str| object.get(key).is_none_or(Value::is_string);
+    let valid_types = match name {
+        "get_model" => string_field_valid("modelId"),
+        "get_all_metadata" => true,
+        "list_part_stock" => true,
+        "create_part_stock" => object
+            .get("input")
+            .is_some_and(valid_part_stock_input_value),
+        "update_part_stock" => {
+            object
+                .get("partId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+                && tool_version(value).is_ok()
+                && object
+                    .get("input")
+                    .is_some_and(valid_part_stock_input_value)
+        }
+        "delete_part_stock" => {
+            object
+                .get("partId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+                && tool_version(value).is_ok()
+        }
+        "get_hash_status" | "calculate_missing_hashes" | "refresh_hashes" => {
+            valid_catalog_filter_fields(object)
+        }
+        "find_duplicates" => {
+            let ids_valid = object.get("modelIds").is_none_or(|value| {
+                let Some(ids) = value.as_array() else {
+                    return false;
+                };
+                if ids.is_empty() || ids.len() > MAX_DUPLICATE_SCOPE {
+                    return false;
+                }
+                let mut unique = BTreeSet::new();
+                ids.iter().all(|id| {
+                    id.as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128)
+                        .is_some_and(|id| unique.insert(id.to_owned()))
+                })
+            });
+            let direct = object.contains_key("modelIds");
+            let has_filters = has_catalog_filters(object);
+            ids_valid
+                && !(direct && has_filters)
+                && object.get("includeZip").is_none_or(Value::is_boolean)
+                && object.get("limit").is_none_or(|value| {
+                    value
+                        .as_u64()
+                        .is_some_and(|limit| (1..=200).contains(&limit))
+                })
+                && if direct {
+                    true
+                } else {
+                    valid_catalog_filter_fields(object)
+                }
+        }
+        "list_slicers" => true,
+        "open_in_slicer" => {
+            let valid_slicer = object
+                .get("slicerId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.len() <= 128);
+            let valid_targets = if let Some(targets) = object.get("targets") {
+                if object.contains_key("modelId") || object.contains_key("expectedVersion") {
+                    false
+                } else if let Some(targets) = targets.as_array() {
+                    if targets.is_empty() || targets.len() > 100 {
+                        false
+                    } else {
+                        let mut model_ids = BTreeSet::new();
+                        targets.iter().all(|target| {
+                            let Some(target) = target.as_object() else {
+                                return false;
+                            };
+                            target.len() == 2
+                                && target.get("modelId").and_then(Value::as_str).is_some_and(
+                                    |model_id| {
+                                        !model_id.is_empty()
+                                            && model_id.len() <= 128
+                                            && model_ids.insert(model_id.to_owned())
+                                    },
+                                )
+                                && target
+                                    .get("expectedVersion")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|version| parse_decimal(version).is_ok())
+                        })
+                    }
+                } else {
+                    false
+                }
+            } else {
+                object
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                    && object
+                        .get("expectedVersion")
+                        .and_then(Value::as_str)
+                        .is_some_and(|version| parse_decimal(version).is_ok())
+            };
+            valid_slicer && valid_targets
+        }
+        "search_models" => {
+            string_field_valid("query")
+                && string_field_valid("search")
+                && !(object.contains_key("query") && object.contains_key("search"))
+                && !(object.contains_key("cursor") && object.contains_key("offset"))
+                && !(object.contains_key("directory") && object.contains_key("sourceDirectory"))
+                && (!(object.contains_key("directory") || object.contains_key("sourceDirectory"))
+                    || object.contains_key("rootId"))
+                && string_field_valid("designer")
+                && object.get("designer").is_none_or(|value| {
+                    value.as_str().is_some_and(|designer| designer.len() <= 200)
+                })
+                && object.get("printed").is_none_or(|value| {
+                    value.as_str().is_some_and(|status| {
+                        matches!(
+                            status,
+                            "unprinted"
+                                | "printed"
+                                | "want"
+                                | "queued"
+                                | "printing"
+                                | "failed"
+                                | "ever-printed"
+                                | "never-printed"
+                                | "all"
+                        )
+                    })
+                })
+                && string_field_valid("cursor")
+                && object.get("limit").is_none_or(Value::is_u64)
+                && string_field_valid("thumbnailMode")
+                && string_field_valid("rootId")
+                && string_field_valid("sourceDirectory")
+                && object
+                    .get("minimumRating")
+                    .is_none_or(|value| value.as_u64().is_some_and(|rating| rating <= 5))
+                && object.get("favorite").is_none_or(Value::is_boolean)
+                && object.get("tags").is_none_or(valid_search_tag_names)
+                && object.get("fileType").is_none_or(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|file_type| normalize_search_file_type(file_type).is_some())
+                })
+                && object.get("offset").is_none_or(|value| {
+                    value
+                        .as_u64()
+                        .is_some_and(|offset| offset <= u64::from(MAX_MODEL_SEARCH_OFFSET))
+                })
+                && object.get("directory").is_none_or(|value| {
+                    value.as_str().is_some_and(|directory| {
+                        directory.len() <= 1024
+                            && !directory.contains('\\')
+                            && !directory.contains('\0')
+                    })
+                })
+        }
+        "integration_save_spoolman_config" => object
+            .get("config")
+            .is_some_and(|value| value.is_null() || value.is_object()),
+        "integration_save_ai_provider" => {
+            object.get("config").is_some_and(Value::is_object)
+                && object.get("credentialUpdate").is_some_and(Value::is_object)
+        }
+        "integration_delete_ai_provider" => string_field_valid("providerId"),
+        "generate_tags" => {
+            string_field_valid("providerId") && object.get("targets").is_some_and(Value::is_array)
+        }
+        "apply_tag_review" => {
+            string_field_valid("reviewToken")
+                && object.get("decisions").is_some_and(Value::is_array)
+                && object.get("strategy").is_some_and(Value::is_string)
+        }
+        "discard_tag_review" => string_field_valid("reviewToken"),
+        "update_models_batch" => {
+            if object.contains_key("updates") {
+                !object.contains_key("targets")
+                    && !object.contains_key("patch")
+                    && versioned_metadata_updates(value).is_ok()
+            } else {
+                object
+                    .get("targets")
+                    .and_then(Value::as_array)
+                    .is_some_and(|targets| !targets.is_empty() && targets.len() <= 50_000)
+                    && object.get("patch").is_some_and(Value::is_object)
+            }
+        }
+        "check_files_exist" => {
+            let ids_valid = object.get("modelIds").is_none_or(|value| {
+                let Some(ids) = value.as_array() else {
+                    return false;
+                };
+                if ids.is_empty() || ids.len() > 10_000 {
+                    return false;
+                }
+                let mut unique = BTreeSet::new();
+                ids.iter().all(|id| {
+                    id.as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128)
+                        .is_some_and(|id| unique.insert(id.to_owned()))
+                })
+            });
+            ids_valid
+                && object.get("missingOnly").is_none_or(Value::is_boolean)
+                && object.get("limit").is_none_or(|value| {
+                    value.as_u64().is_some_and(|limit| {
+                        (1..=MAX_CHECK_FILES_EXIST_LIMIT as u64).contains(&limit)
+                    })
+                })
+        }
+        "start_thumbnail_job" => {
+            object.get("modelIds").is_some_and(Value::is_array)
+                && object.get("force").is_none_or(Value::is_boolean)
+        }
+        "get_models_missing_thumbnails" => {
+            string_field_valid("cursor")
+                && object.get("limit").is_none_or(Value::is_u64)
+                && object
+                    .get("excludeIds")
+                    .is_none_or(valid_excluded_model_ids)
+        }
+        "get_models_with_default_thumbnails" => {
+            string_field_valid("cursor") && object.get("limit").is_none_or(Value::is_u64)
+        }
+        "get_models_by_directory" => {
+            string_field_valid("rootId")
+                && string_field_valid("directory")
+                && string_field_valid("cursor")
+                && object.get("limit").is_none_or(Value::is_u64)
+        }
+        "rename_metadata" => {
+            string_field_valid("type")
+                && string_field_valid("oldName")
+                && string_field_valid("newName")
+        }
+        "delete_metadata" => string_field_valid("type") && string_field_valid("name"),
+        "add_model_tags" | "remove_model_tags" => {
+            string_field_valid("modelId")
+                && string_field_valid("expectedVersion")
+                && object.get("tags").is_some_and(Value::is_array)
+        }
+        "remove_model" => {
+            let target_shape_valid = if let Some(targets) = object.get("targets") {
+                targets.as_array().is_some_and(|targets| {
+                    !targets.is_empty()
+                        && targets.len() <= 50_000
+                        && !object.contains_key("modelId")
+                        && !object.contains_key("expectedVersion")
+                        && targets.iter().all(|target| {
+                            target.as_object().is_some_and(|target| {
+                                target.len() == 2
+                                    && target.get("modelId").and_then(Value::as_str).is_some_and(
+                                        |value| !value.is_empty() && value.len() <= 128,
+                                    )
+                                    && tool_version(&Value::Object(target.clone())).is_ok()
+                            })
+                        })
+                })
+            } else {
+                object
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                    && tool_version(value).is_ok()
+            };
+            target_shape_valid && object.get("confirm").and_then(Value::as_bool) == Some(true)
+        }
+        "undo_trash" => {
+            object
+                .get("snapshotId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+                && object.get("confirm").and_then(Value::as_bool) == Some(true)
+        }
+        "backup_database" => {
+            string_field_valid("destinationHandleId") && string_field_valid("fileName")
+        }
+        "export_library" => string_field_valid("destPath"),
+        "plan_management_action" => {
+            object
+                .get("action")
+                .and_then(Value::as_object)
+                .is_some_and(|action| {
+                    !matches!(
+                        action.get("kind").and_then(Value::as_str),
+                        Some("quarantineLooseSource" | "undoQuarantine" | "moveLooseSource")
+                    )
+                })
+        }
+        "execute_management_action" => string_field_valid("token"),
+        "discard_management_action" => object
+            .get("token")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty() && token.len() <= 256),
+        "update_index_root_settings" => {
+            string_field_valid("handleId") && object.get("settings").is_some_and(Value::is_object)
+        }
+        "update_catalog_settings" => object.get("settings").is_some_and(Value::is_object),
+        "scan_directory" => {
+            string_field_valid("rootId")
+                && object.get("rootId").is_none_or(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+                })
+                && object.get("directory").is_none_or(|value| {
+                    value.as_str().is_some_and(|directory| {
+                        directory.len() <= 1024
+                            && !directory.contains('\\')
+                            && !directory.contains('\0')
+                    })
+                })
+                && (!object.contains_key("directory") || object.contains_key("rootId"))
+        }
+        "prepare_bundle_preview" => string_field_valid("bundleId"),
+        "get_bundle_preview_geometry" | "download_bundle" | "close_bundle_preview" => {
+            string_field_valid("token")
+        }
+        "get_model_geometry" => {
+            string_field_valid("modelId")
+                && string_field_valid("expectedHash")
+                && object.get("plateId").is_none_or(Value::is_u64)
+        }
+        "get_embedded_3mf_metadata" => {
+            string_field_valid("modelId") && string_field_valid("expectedHash")
+        }
+        "pull_3mf_metadata" => {
+            if object.contains_key("targets") {
+                !object.contains_key("modelId")
+                    && !object.contains_key("expectedHash")
+                    && embedded_metadata_targets(value).is_ok()
+            } else {
+                object
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|model_id| !model_id.is_empty() && model_id.len() <= 128)
+                    && string_field_valid("expectedHash")
+            }
+        }
+        "apply_embedded_3mf_metadata" => {
+            string_field_valid("modelId")
+                && string_field_valid("expectedVersion")
+                && string_field_valid("expectedSourceHash")
+                && object.get("selection").is_some_and(Value::is_object)
+        }
+        "list_capture_items" => {
+            string_field_valid("cursor") && object.get("limit").is_none_or(Value::is_u64)
+        }
+        "retry_capture" => {
+            string_field_valid("itemId")
+                && object.get("envelope").is_some_and(Value::is_object)
+                && object.get("uploads").is_some_and(Value::is_array)
+        }
+        "log_print_event" => {
+            object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+                && object.get("input").is_some_and(valid_print_attempt_parts)
+                && object
+                    .get("input")
+                    .cloned()
+                    .is_some_and(|input| parse_print_attempt_input_with_printer(input).is_ok())
+        }
+        "log_print_events_batch" => {
+            let valid_key = object
+                .get("idempotencyKey")
+                .and_then(Value::as_str)
+                .is_some_and(|key| !key.is_empty() && key.len() <= 128);
+            let valid_items = object
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    !items.is_empty()
+                        && items.len() <= 10_000
+                        && items.iter().all(|item| {
+                            let Some(item) = item.as_object() else {
+                                return false;
+                            };
+                            item.len() == 2
+                                && item
+                                    .get("modelId")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+                                && item.get("input").is_some_and(valid_print_attempt_parts)
+                                && item.get("input").cloned().is_some_and(|input| {
+                                    serde_json::from_value::<PrintAttemptInput>(input).is_ok()
+                                })
+                        })
+                });
+            valid_key && valid_items
+        }
+        _ => true,
+    };
+    if !valid_types {
+        return Err(invalid_tool());
+    }
+    Ok(())
+}
+fn internal_tool() -> EngineError {
+    EngineError {
+        code: "internal",
+        message: "Tool response could not be encoded".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    }
+}
+
+fn host_slicer_unavailable() -> EngineError {
+    EngineError {
+        code: "unsupported",
+        message: "Host slicer integration is unavailable on this server".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    }
+}
+fn tool_version(value: &Value) -> Result<u64, EngineError> {
+    value
+        .get("expectedVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_tool)
+        .and_then(|value| parse_decimal(value).map_err(|_| invalid_tool()))
+}
+fn slicer_targets(value: &Value) -> Result<Vec<VersionedTarget>, EngineError> {
+    let targets = versioned_tool_targets(value)?;
+    if targets.is_empty() || targets.len() > 100 {
+        return Err(invalid_tool());
+    }
+    Ok(targets)
+}
+fn versioned_tool_targets(value: &Value) -> Result<Vec<VersionedTarget>, EngineError> {
+    if let Some(targets) = value.get("targets") {
+        let targets = targets.as_array().ok_or_else(invalid_tool)?;
+        let mut seen = BTreeSet::new();
+        targets
+            .iter()
+            .map(|target| {
+                let model_id = target
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_tool)?
+                    .to_owned();
+                if !seen.insert(model_id.clone()) {
+                    return Err(invalid_tool());
+                }
+                Ok(VersionedTarget {
+                    model_id,
+                    expected_version: tool_version(target)?,
+                })
+            })
+            .collect()
+    } else {
+        Ok(vec![VersionedTarget {
+            model_id: value
+                .get("modelId")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid_tool)?
+                .to_owned(),
+            expected_version: tool_version(value)?,
+        }])
+    }
+}
+
+fn versioned_metadata_updates(value: &Value) -> Result<Vec<VersionedMetadataUpdate>, EngineError> {
+    let updates = value
+        .get("updates")
+        .and_then(Value::as_array)
+        .filter(|updates| !updates.is_empty() && updates.len() <= 50_000)
+        .ok_or_else(invalid_tool)?;
+    let mut seen = BTreeSet::new();
+    updates
+        .iter()
+        .map(|update| {
+            let object = update.as_object().ok_or_else(invalid_tool)?;
+            if object.len() < 3
+                || object.len() > 5
+                || object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "modelId" | "expectedVersion" | "patch" | "tags" | "filamentIds"
+                    )
+                })
+            {
+                return Err(invalid_tool());
+            }
+            let model_id = object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .ok_or_else(invalid_tool)?
+                .to_owned();
+            if !seen.insert(model_id.clone()) {
+                return Err(invalid_tool());
+            }
+            let patch_value = object.get("patch").ok_or_else(invalid_tool)?;
+            let patch_object = patch_value.as_object().ok_or_else(invalid_tool)?;
+            if patch_object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "designer"
+                        | "sourceUrl"
+                        | "notes"
+                        | "modelLicense"
+                        | "printStatus"
+                        | "parentModelId"
+                        | "rating"
+                        | "favorite"
+                )
+            }) {
+                return Err(invalid_tool());
+            }
+            let patch = serde_json::from_value(patch_value.clone()).map_err(|_| invalid_tool())?;
+            let tags = object
+                .get("tags")
+                .map(|value| {
+                    let values = value
+                        .as_array()
+                        .filter(|values| values.len() <= 200)
+                        .ok_or_else(invalid_tool)?;
+                    values
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_owned).ok_or_else(invalid_tool))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            let filament_ids = object
+                .get("filamentIds")
+                .map(|value| {
+                    let values = value
+                        .as_array()
+                        .filter(|values| values.len() <= 5)
+                        .ok_or_else(invalid_tool)?;
+                    values
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_owned).ok_or_else(invalid_tool))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            Ok(VersionedMetadataUpdate {
+                model_id,
+                expected_version: tool_version(update)?,
+                patch,
+                tags,
+                filament_ids,
+            })
+        })
+        .collect()
+}
+
+fn embedded_metadata_targets(value: &Value) -> Result<Vec<(String, Option<String>)>, EngineError> {
+    let targets = value
+        .get("targets")
+        .and_then(Value::as_array)
+        .filter(|targets| !targets.is_empty() && targets.len() <= 100)
+        .ok_or_else(invalid_tool)?;
+    let mut seen = BTreeSet::new();
+    targets
+        .iter()
+        .map(|target| {
+            let object = target.as_object().ok_or_else(invalid_tool)?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "modelId" | "expectedHash"))
+            {
+                return Err(invalid_tool());
+            }
+            let model_id = object
+                .get("modelId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .ok_or_else(invalid_tool)?
+                .to_owned();
+            if !seen.insert(model_id.clone()) {
+                return Err(invalid_tool());
+            }
+            let expected_hash = object
+                .get("expectedHash")
+                .map(|value| {
+                    let hash = value.as_str().ok_or_else(invalid_tool)?;
+                    if hash.len() != 64
+                        || !hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    {
+                        return Err(invalid_tool());
+                    }
+                    Ok(hash.to_owned())
+                })
+                .transpose()?;
+            Ok((model_id, expected_hash))
+        })
+        .collect()
+}
+fn decode_tool_image(value: &Value) -> Result<Vec<u8>, EngineError> {
+    use base64::Engine as _;
+    let image = value
+        .get("image")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_tool)?;
+    let encoded = image
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| image.strip_prefix("data:image/jpeg;base64,"))
+        .unwrap_or(image);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid_tool())?;
+    if bytes.len() > MAX_THUMBNAIL_UPLOAD_BYTES {
+        return Err(invalid_tool());
+    }
+    Ok(bytes)
+}
+
+fn http_model(model: CatalogModel) -> ModelSummary {
+    ModelSummary {
+        id: model.id,
+        display_name: model.display_name,
+        folder_id: model.folder_id,
+        source_root_id: model.root_id,
+        bundle_id: model.bundle_id,
+        archive_member: model.archive_member,
+        parent_model_id: model.parent_model_id,
+        created_at: model.created_at,
+        updated_at: model.updated_at,
+        last_printed_at: model.last_printed_at,
+        print_count: model.print_count.to_string(),
+        metadata_version: model.metadata_version.to_string(),
+        format: model.format,
+        bytes: model.bytes.to_string(),
+        content_hash: model.content_hash,
+        tags: model.tags,
+        filament_ids: model.filament_ids,
+        source_kind: model.source_kind,
+        availability: match model.availability {
+            ModelAvailability::Available => "available",
+            ModelAvailability::Missing => "missing",
+            ModelAvailability::Bookmark => "bookmark",
+        }
+        .into(),
+        catalog_kind: model.catalog_kind,
+        thumbnail_id: model.thumbnail_id,
+        designer: model.designer,
+        source_url: model.source_url,
+        notes: model.notes,
+        model_license: model.model_license,
+        print_status: model.print_status,
+        rating: model.rating,
+        favorite: model.favorite,
+    }
+}
+
+fn map_runtime_error(error: RuntimeError) -> EngineError {
+    EngineError {
+        code: match error.code {
+            RuntimeErrorCode::InvalidInput => "invalidInput",
+            RuntimeErrorCode::NotFound => "notFound",
+            RuntimeErrorCode::Conflict => "conflict",
+            RuntimeErrorCode::Stale => "stale",
+            RuntimeErrorCode::Busy => "busy",
+            RuntimeErrorCode::Maintenance => "maintenance",
+            RuntimeErrorCode::Forbidden => "forbidden",
+            RuntimeErrorCode::Io => "io",
+            RuntimeErrorCode::Corrupt => "corrupt",
+            RuntimeErrorCode::Unsupported => "unsupported",
+            RuntimeErrorCode::Internal => "internal",
+        },
+        message: error.message,
+        retryable: error.retryable,
+        current_version: error.current_version,
+        source_holds: error.source_holds,
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorBody {
+    code: String,
+    message: String,
+    request_id: String,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_holds: Option<Vec<Value>>,
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    body: ErrorBody,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(ErrorEnvelope { error: self.body })).into_response()
+    }
+}
+
+impl ApiError {
+    fn from_engine(error: EngineError, request_id: &str) -> Self {
+        let status = match error.code {
+            "notFound" => StatusCode::NOT_FOUND,
+            "conflict" | "stale" => StatusCode::CONFLICT,
+            "busy" => StatusCode::TOO_MANY_REQUESTS,
+            "maintenance" => StatusCode::SERVICE_UNAVAILABLE,
+            "forbidden" => StatusCode::FORBIDDEN,
+            "unsupported" => StatusCode::NOT_IMPLEMENTED,
+            "invalidInput" => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let source_holds = if error.source_holds.is_empty() {
+            None
+        } else {
+            Some(
+                error
+                    .source_holds
+                    .into_iter()
+                    .map(wire_source_hold)
+                    .collect(),
+            )
+        };
+        Self {
+            status,
+            body: ErrorBody {
+                code: error.code.into(),
+                message: error.message,
+                request_id: request_id.into(),
+                retryable: error.retryable,
+                current_version: error.current_version.map(|value| value.to_string()),
+                source_holds,
+            },
+        }
+    }
+}
+
+async fn blocking_engine<E, T, F>(
+    engine: Arc<E>,
+    request_id: &str,
+    operation: F,
+) -> Result<T, ApiError>
+where
+    E: LibraryEngine,
+    T: Send + 'static,
+    F: FnOnce(Arc<E>) -> Result<T, EngineError> + Send + 'static,
+{
+    let request_id = request_id.to_owned();
+    match tokio::task::spawn_blocking(move || operation(engine)).await {
+        Ok(result) => result.map_err(|error| ApiError::from_engine(error, &request_id)),
+        Err(_) => Err(ApiError::from_engine(
+            EngineError {
+                code: "internal",
+                message: "The operation stopped unexpectedly".into(),
+                retryable: true,
+                current_version: None,
+                source_holds: Vec::new(),
+            },
+            &request_id,
+        )),
+    }
+}
+
+fn static_content_type(extension: &str) -> Option<&'static str> {
+    match extension {
+        "html" => Some("text/html; charset=utf-8"),
+        "css" => Some("text/css; charset=utf-8"),
+        "js" => Some("text/javascript; charset=utf-8"),
+        "json" => Some("application/json"),
+        "wasm" => Some("application/wasm"),
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        "ico" => Some("image/x-icon"),
+        "woff" => Some("font/woff"),
+        "woff2" => Some("font/woff2"),
+        "ttf" => Some("font/ttf"),
+        "otf" => Some("font/otf"),
+        _ => None,
+    }
+}
+
+fn load_static_assets(web_root: &std::path::Path) -> Result<StaticAssets, String> {
+    use std::io::Read as _;
+
+    let root_metadata = std::fs::symlink_metadata(web_root)
+        .map_err(|_| "Browser asset directory could not be inspected")?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("Browser asset directory must be a real directory".into());
+    }
+    let root = web_root
+        .canonicalize()
+        .map_err(|_| "Browser asset directory could not be resolved")?;
+    let mut pending = vec![root.clone()];
+    let mut files = BTreeMap::new();
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|_| "Browser asset directory could not be read")?
+        {
+            let entry = entry.map_err(|_| "Browser asset directory contains an invalid entry")?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| "Browser asset escaped its directory")?;
+            if relative.components().count() > 8
+                || relative.components().any(|component| match component {
+                    std::path::Component::Normal(value) => value
+                        .to_str()
+                        .is_none_or(|name| name.starts_with('.') || name.is_empty()),
+                    _ => true,
+                })
+            {
+                return Err("Browser asset path is invalid".into());
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| "Browser asset could not be inspected")?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() || files.len() >= MAX_STATIC_FILES {
+                return Err("Browser asset inventory is invalid or too large".into());
+            }
+            let extension = path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| "Browser asset has an unsupported file type".to_string())?;
+            let content_type = static_content_type(&extension)
+                .ok_or_else(|| "Browser asset has an unsupported file type".to_string())?;
+            if metadata.len() > MAX_STATIC_ASSET_BYTES {
+                return Err("Browser asset exceeds its size limit".into());
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| "Browser asset could not be resolved")?;
+            if !canonical.starts_with(&root) || canonical != path {
+                return Err("Browser asset escaped its directory".into());
+            }
+            let file =
+                std::fs::File::open(&path).map_err(|_| "Browser asset could not be opened")?;
+            let opened = file
+                .metadata()
+                .map_err(|_| "Browser asset could not be inspected")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+                    return Err("Browser asset changed during validation".into());
+                }
+            }
+            let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+            file.take(MAX_STATIC_ASSET_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "Browser asset could not be read")?;
+            if bytes.len() as u64 != opened.len() || bytes.len() as u64 > MAX_STATIC_ASSET_BYTES {
+                return Err("Browser asset changed during validation".into());
+            }
+            let after = std::fs::symlink_metadata(&path)
+                .map_err(|_| "Browser asset changed during validation")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if after.file_type().is_symlink()
+                    || after.dev() != opened.dev()
+                    || after.ino() != opened.ino()
+                {
+                    return Err("Browser asset changed during validation".into());
+                }
+            }
+            total = total
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| "Browser asset inventory is too large".to_string())?;
+            if total > MAX_STATIC_TOTAL_BYTES {
+                return Err("Browser asset inventory is too large".into());
+            }
+            let key = format!("/{}", relative.to_string_lossy().replace('\\', "/"));
+            files.insert(
+                key,
+                StaticAsset {
+                    bytes: Bytes::from(bytes),
+                    content_type,
+                },
+            );
+        }
+    }
+    if !files.contains_key("/index.html") {
+        return Err("Browser asset directory is missing index.html".into());
+    }
+    Ok(StaticAssets {
+        files: Arc::new(files),
+    })
+}
+
+async fn static_asset<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Response {
+    let Some(assets) = state.static_assets else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let path = uri.path();
+    let key = if path == "/" {
+        "/index.html"
+    } else if assets.files.contains_key(path) {
+        path
+    } else if !path.starts_with("/api/")
+        && path != "/mcp"
+        && !path.rsplit('/').next().unwrap_or_default().contains('.')
+    {
+        "/index.html"
+    } else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(asset) = assets.files.get(key) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = (StatusCode::OK, asset.bytes.clone()).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(asset.content_type),
+    );
+    response
+}
+
+async fn admit_large_upload<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestContext>()
+        .map(|context| context.request_id.clone())
+        .unwrap_or_else(|| "request".into());
+    let permit = match state.large_upload_admission.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(serde_json::json!({"error":{
+                    "code":"busy",
+                    "message":"Large upload limit reached",
+                    "requestId":request_id,
+                    "retryable":true
+                }})),
+            )
+                .into_response()
+        }
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
+pub fn router<E: LibraryEngine>(engine: Arc<E>, security: SecurityConfig) -> Router {
+    build_router(engine, security, None)
+}
+
+pub fn router_with_static<E: LibraryEngine>(
+    engine: Arc<E>,
+    security: SecurityConfig,
+    web_root: &std::path::Path,
+) -> Result<Router, String> {
+    let assets = load_static_assets(web_root)?;
+    Ok(build_router(engine, security, Some(assets)))
+}
+
+fn build_router<E: LibraryEngine>(
+    engine: Arc<E>,
+    security: SecurityConfig,
+    static_assets: Option<StaticAssets>,
+) -> Router {
+    let state = ServerState {
+        engine,
+        admission: Arc::new(Semaphore::new(security.max_in_flight)),
+        content_admission: Arc::new(Semaphore::new(4)),
+        large_upload_admission: Arc::new(Semaphore::new(2)),
+        event_admission: Arc::new(Semaphore::new(8)),
+        content_send_timeout: security.content_send_timeout,
+        mcp_sessions: Arc::new(mcp::SessionStore::new(
+            security.max_mcp_sessions,
+            security.mcp_session_ttl,
+        )),
+        static_assets,
+        security: Arc::new(security),
+    };
+    let mut routes = Router::new()
+        .route(
+            "/api/v1/printers",
+            get(fleet_list_printers::<E>).post(fleet_create_printer::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}",
+            get(fleet_get_printer::<E>)
+                .put(fleet_update_printer::<E>)
+                .delete(fleet_delete_printer::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}/maintenance-logs",
+            get(fleet_printer_logs::<E>).post(fleet_create_log::<E>),
+        )
+        .route(
+            "/api/v1/printer-maintenance-logs",
+            get(fleet_list_logs::<E>),
+        )
+        .route(
+            "/api/v1/printer-maintenance-logs/{id}",
+            axum::routing::put(fleet_update_log::<E>).delete(fleet_delete_log::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders",
+            get(fleet_list_reminders::<E>).post(fleet_create_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}",
+            axum::routing::put(fleet_update_reminder::<E>).delete(fleet_delete_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}/complete",
+            axum::routing::post(fleet_complete_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}/pause",
+            axum::routing::post(fleet_pause_reminder::<E>),
+        )
+        .route(
+            "/api/v1/printer-reminders/{id}/reschedule",
+            axum::routing::post(fleet_reschedule_reminder::<E>),
+        )
+        .route("/api/v1/printer-network/policy", get(network_policy::<E>))
+        .route(
+            "/api/v1/printer-network/discovery-plans",
+            axum::routing::post(network_plan::<E>),
+        )
+        .route(
+            "/api/v1/printer-network/discovery-jobs",
+            axum::routing::post(network_start::<E>),
+        )
+        .route(
+            "/api/v1/printer-network/discovery-jobs/{jobId}",
+            get(network_get::<E>).delete(network_cancel::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}/endpoint-approval",
+            axum::routing::put(network_approve::<E>),
+        )
+        .route(
+            "/api/v1/printers/{id}/status-checks",
+            axum::routing::post(network_test::<E>),
+        )
+        .route("/api/v1/health", get(health))
+        .route("/api/v1/openapi.json", get(openapi::<E>))
+        .route("/api/v1/capabilities", get(capabilities::<E>))
+        .route("/api/v1/status", get(status::<E>))
+        .route("/api/v1/models", get(models::<E>))
+        .route("/api/v1/models/{model_id}", get(model::<E>))
+        .route("/api/v1/catalog/stats", get(catalog_stats::<E>))
+        .route("/api/v1/catalog/facets", get(catalog_facets::<E>))
+        .route("/api/v1/catalog/hash-status", get(catalog_hash_status::<E>))
+        .route(
+            "/api/v1/models/source-status",
+            axum::routing::post(model_source_status::<E>),
+        )
+        .route(
+            "/api/v1/thumbnails/jobs",
+            axum::routing::post(start_thumbnail_job::<E>),
+        )
+        .route(
+            "/api/v1/models/metadata/bulk",
+            axum::routing::post(bulk_metadata::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/metadata",
+            axum::routing::patch(update_metadata::<E>),
+        )
+        .route("/api/v1/tags", get(list_tags::<E>).post(create_tag::<E>))
+        .route(
+            "/api/v1/tags/{tag_id}",
+            axum::routing::patch(update_tag::<E>).delete(delete_tag::<E>),
+        )
+        .route(
+            "/api/v1/folders",
+            get(list_folders::<E>).post(create_folder::<E>),
+        )
+        .route(
+            "/api/v1/folders/{folder_id}",
+            axum::routing::patch(rename_folder::<E>).delete(delete_folder::<E>),
+        )
+        .route(
+            "/api/v1/folders/{folder_id}/move",
+            axum::routing::post(move_folder::<E>),
+        )
+        .route(
+            "/api/v1/filaments",
+            get(list_filaments::<E>).post(create_filament::<E>),
+        )
+        .route(
+            "/api/v1/filaments/{filament_id}",
+            axum::routing::put(update_filament::<E>).delete(delete_filament::<E>),
+        )
+        .route(
+            "/api/v1/parts",
+            get(list_part_stock::<E>).post(create_part_stock::<E>),
+        )
+        .route(
+            "/api/v1/parts/{part_id}",
+            axum::routing::put(update_part_stock::<E>).delete(delete_part_stock::<E>),
+        )
+        .route(
+            "/api/v1/models/filaments/bulk",
+            axum::routing::post(bulk_assign_filaments::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/history",
+            get(list_history::<E>).post(create_history::<E>),
+        )
+        .route(
+            "/api/v1/history/bulk",
+            axum::routing::post(create_history_batch::<E>),
+        )
+        .route(
+            "/api/v1/history/{attempt_id}",
+            axum::routing::put(update_history::<E>).delete(delete_history::<E>),
+        )
+        .route(
+            "/api/v1/captures/uploads",
+            axum::routing::post(capture_upload::<E>)
+                .layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    admit_large_upload::<E>,
+                )),
+        )
+        .route(
+            "/api/v1/captures/import",
+            axum::routing::post(import_capture::<E>),
+        )
+        .route(
+            "/api/v1/captures/{item_id}/retry",
+            axum::routing::post(retry_capture::<E>),
+        )
+        .route("/api/v1/captures/{item_id}", get(get_capture::<E>))
+        .route(
+            "/api/v1/models/{model_id}/thumbnails",
+            get(list_thumbnails::<E>).post(add_thumbnail::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/thumbnails/{thumbnail_id}/active",
+            axum::routing::patch(set_active_thumbnail::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/thumbnails/{thumbnail_id}",
+            axum::routing::delete(delete_thumbnail::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/thumbnails/{thumbnail_id}/media-lease",
+            axum::routing::post(thumbnail_media_lease::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/download-lease",
+            axum::routing::post(model_download_lease::<E>),
+        )
+        .route("/api/v1/content/{lease_id}", get(content::<E>))
+        .route("/api/v1/events", get(events::<E>))
+        .route("/api/v1/roots", get(roots::<E>))
+        .route("/api/v1/settings/roots", get(index_root_settings::<E>))
+        .route(
+            "/api/v1/settings/roots/{handle_id}",
+            axum::routing::patch(update_index_root_settings::<E>),
+        )
+        .route(
+            "/api/v1/settings/catalog",
+            get(catalog_settings::<E>).put(update_catalog_settings::<E>),
+        )
+        .route(
+            "/api/v1/management/actions/plan",
+            axum::routing::post(plan_management_action::<E>),
+        )
+        .route(
+            "/api/v1/management/actions/execute",
+            axum::routing::post(execute_management_action::<E>),
+        )
+        .route(
+            "/api/v1/management/actions/discard",
+            axum::routing::post(discard_management_action::<E>),
+        )
+        .route(
+            "/api/v1/integrations/settings",
+            get(integration_settings::<E>),
+        )
+        .route(
+            "/api/v1/integrations/spoolman",
+            axum::routing::put(save_spoolman_config::<E>),
+        )
+        .route(
+            "/api/v1/integrations/spoolman/pull",
+            axum::routing::post(pull_spoolman::<E>),
+        )
+        .route(
+            "/api/v1/integrations/ai/providers/{provider_id}",
+            axum::routing::put(save_ai_provider::<E>).delete(delete_ai_provider::<E>),
+        )
+        .route(
+            "/api/v1/integrations/ai/suggestions",
+            axum::routing::post(suggest_ai_tags::<E>),
+        )
+        .route(
+            "/api/v1/integrations/ai/reviews/{review_token}/apply",
+            axum::routing::post(apply_ai_review::<E>),
+        )
+        .route(
+            "/api/v1/integrations/ai/reviews/{review_token}",
+            axum::routing::delete(discard_ai_review::<E>),
+        )
+        .route(
+            "/api/v1/scan",
+            get(scan_status::<E>)
+                .post(start_scan::<E>)
+                .delete(cancel_scan::<E>),
+        )
+        .route(
+            "/api/v1/bundles/{bundle_id}/preview",
+            axum::routing::post(prepare_bundle::<E>),
+        )
+        .route(
+            "/api/v1/bundle-previews/{token}/geometry",
+            get(bundle_geometry::<E>),
+        )
+        .route(
+            "/api/v1/bundle-previews/{token}/download-lease",
+            axum::routing::post(bundle_download::<E>),
+        )
+        .route(
+            "/api/v1/bundle-previews/{token}",
+            axum::routing::delete(close_bundle::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/geometry-lease",
+            axum::routing::post(model_geometry::<E>),
+        )
+        .route(
+            "/api/v1/duplicates/query",
+            axum::routing::post(duplicates::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/embedded-metadata/proposal",
+            axum::routing::post(embedded_metadata::<E>),
+        )
+        .route(
+            "/api/v1/models/{model_id}/embedded-metadata/apply",
+            axum::routing::post(apply_embedded_metadata::<E>),
+        )
+        .route("/api/v1/captures", get(list_captures::<E>))
+        .route(
+            "/mcp",
+            axum::routing::post(mcp::post::<E>)
+                .get(mcp::get)
+                .delete(mcp::delete::<E>),
+        );
+    if state.static_assets.is_some() {
+        routes = routes.fallback(static_asset::<E>);
+    }
+    routes
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_MCP_BODY_BYTES))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(30),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security::admit::<E>,
+        ))
+        .with_state(state)
+}
+
+async fn health() -> Json<Value> {
+    Json(serde_json::json!({"status":"ok","apiVersion":API_VERSION}))
+}
+
+async fn openapi<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Value>, ApiError> {
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        let mut document = openapi_document();
+        for (path, mut operations) in network_openapi_paths().as_object().unwrap().clone() {
+            operations.as_object_mut().unwrap().retain(|_, operation| {
+                operation["operationId"]
+                    .as_str()
+                    .is_some_and(|name| engine.supports_tool(&c, name))
+            });
+            if operations.as_object().unwrap().is_empty() {
+                document["paths"].as_object_mut().unwrap().remove(&path);
+            } else {
+                document["paths"][&path] = operations;
+            }
+        }
+        Ok(document)
+    })
+    .await
+    .map(Json)
+}
+
+fn thumbnail_cleanup_output_schemas() -> Value {
+    serde_json::json!({
+        "ThumbnailBatch": {
+            "type":"object","additionalProperties":false,
+            "required":["mode","reviewedFiles","eligibleFiles","eligibleBytes","preservedFiles",
+                "protectedSourceCopies","defaultRecordsToClear","partial","hasMore","remainingFiles","continuation"],
+            "properties":{
+                "mode":{"type":"string","enum":["orphans","resetDefaults"]},
+                "reviewedFiles":{"type":"integer","minimum":0},
+                "eligibleFiles":{"type":"integer","minimum":0,"maximum":4},
+                "eligibleBytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                "preservedFiles":{"type":"integer","minimum":0},
+                "protectedSourceCopies":{"type":"integer","minimum":0},
+                "defaultRecordsToClear":{"type":"integer","minimum":0},
+                "partial":{"type":"boolean"},"hasMore":{"type":"boolean"},
+                "remainingFiles":{"type":["integer","null"],"minimum":0},
+                "continuation":{"type":["string","null"],"maxLength":256}
+            }
+        },
+        "ThumbnailProgress": {
+            "type":"object","additionalProperties":false,
+            "required":["review","defaultRecordsCleared","stopped"],
+            "properties":{
+                "review":{"$ref":"#/components/schemas/ThumbnailBatch"},
+                "defaultRecordsCleared":{"type":"integer","minimum":0},
+                "stopped":{"type":"boolean"}
+            }
+        }
+    })
+}
+pub fn openapi_document() -> Value {
+    let mut document = serde_json::json!({
+        "openapi":"3.1.0",
+        "info":{"title":"GoggleLab Library API","version":"1.0.0"},
+        "servers":[{"url":"/"}],
+        "components":{
+            "securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}},
+            "schemas":{
+                "Error":{
+                    "type":"object",
+                    "required":["error"],
+                    "properties":{
+                        "error":{
+                            "type":"object",
+                            "required":["code","message","requestId","retryable"],
+                            "properties":{
+                                "sourceHolds":{
+                                    "type":"array",
+                                    "items":{
+                                        "type":"object",
+                                        "required":["modelId","rootHandleId","relativePath","holdName","journalName","bytes","sha256"],
+                                        "properties":{
+                                            "modelId":{"type":"string"},
+                                            "rootHandleId":{"type":"string"},
+                                            "relativePath":{"type":"string"},
+                                            "holdName":{"type":"string"},
+                                            "journalName":{"type":"string"},
+                                            "bytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                                            "sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "security":[{"bearerAuth":[]}],
+        "paths":{
+            "/api/v1/health":{"get":{"security":[],"responses":{"200":{"description":"Liveness only"}}}},
+            "/api/v1/openapi.json":{"get":{"responses":{"200":{"description":"Versioned API contract"}}}},
+            "/api/v1/capabilities":{"get":{"responses":{"200":{"description":"Host capabilities"},"401":{"description":"Unauthenticated"},"403":{"description":"Rejected Host or Origin"}}}},
+            "/api/v1/status":{"get":{"responses":{"200":{"description":"Library epochs and jobs"}}}},
+            "/api/v1/models":{"get":{"parameters":[
+                {"name":"cursor","in":"query","schema":{"type":"string","maxLength":512}},
+                {"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":100}},
+                {"name":"query","in":"query","schema":{"type":"string","maxLength":256}}
+                ,{"name":"folderId","in":"query","schema":{"type":"string","maxLength":128}}
+                ,{"name":"sort","in":"query","schema":{"type":"string","enum":["name","size","date"]}}
+                ,{"name":"direction","in":"query","schema":{"type":"string","enum":["asc","desc"]}}
+                ,{"name":"tagId","in":"query","schema":{"type":"string","maxLength":128}}
+                ,{"name":"category","in":"query","schema":{"type":"string","maxLength":120}}
+                ,{"name":"designer","in":"query","schema":{"type":"string","maxLength":256}}
+                ,{"name":"modelLicense","in":"query","schema":{"type":"string","maxLength":256}}
+                ,{"name":"printStatus","in":"query","schema":{"type":"string","enum":["unprinted","want","queued","printing","printed","failed"]}}
+                ,{"name":"everPrinted","in":"query","schema":{"type":"boolean"}}
+                ,{"name":"bundleId","in":"query","schema":{"type":"string","maxLength":128}}
+                ,{"name":"rootId","in":"query","schema":{"type":"string","maxLength":128}}
+                ,{"name":"filamentId","in":"query","schema":{"type":"string","maxLength":128}}
+                ,{"name":"sourceMissing","in":"query","schema":{"type":"boolean"}}
+                ,{"name":"duplicatesOnly","in":"query","schema":{"type":"boolean"}}
+                ,{"name":"sourceKind","in":"query","schema":{"type":"string","maxLength":64}}
+                ,{"name":"group","in":"query","schema":{"type":"string","enum":["standalone","bundle","archive"]}}
+                ,{"name":"thumbnailMode","in":"query","schema":{"type":"string","enum":["missing","default","custom"]}}
+                ,{"name":"sourceDirectory","in":"query","schema":{"type":"string","maxLength":1024,"description":"Relative directory prefix within rootId"}}
+                ,{"name":"minimumRating","in":"query","schema":{"type":"integer","minimum":0,"maximum":5}}
+                ,{"name":"favorite","in":"query","schema":{"type":"boolean"}}
+            ],"responses":{"200":{"description":"Revision-bound model page"},"409":{"description":"Cursor revision is stale"}}}},
+            "/api/v1/models/{modelId}":{"get":{"responses":{"200":{"description":"Path-free model detail"},"404":{"description":"Unknown model"}}}},
+            "/api/v1/catalog/stats":{"get":{"responses":{"200":{"description":"Catalog totals with decimal-string counters and bytes"}}}},
+            "/api/v1/catalog/facets":{"get":{"responses":{"200":{"description":"Bounded designer, license, category, parent, folder, and root facets"}}}},
+            "/api/v1/catalog/hash-status":{"get":{"responses":{"200":{"description":"Decimal-string catalog hash coverage counts"}}}},
+            "/api/v1/models/source-status":{"post":{"responses":{"200":{"description":"Path-free verified source states for up to 10000 models"}}}},
+            "/api/v1/thumbnails/jobs":{"post":{"responses":{"200":{"description":"Started bounded shared thumbnail generation job"},"409":{"description":"Another scan or thumbnail job is active"}}}},
+            "/api/v1/models/{modelId}/thumbnails":{"get":{"responses":{"200":{"description":"Stable thumbnail gallery descriptors"}}},"post":{"requestBody":{"required":true,"content":{"multipart/form-data":{"schema":{"type":"object","required":["expectedVersion","file"],"properties":{"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"file":{"type":"string","contentEncoding":"binary"}}}}}},"responses":{"200":{"description":"Thumbnail appended and activated"},"409":{"description":"Stale model version"},"413":{"description":"Upload exceeds 8 MiB"}}}},
+            "/api/v1/models/{modelId}/thumbnails/{thumbnailId}/active":{"patch":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["expectedVersion"],"properties":{"expectedVersion":{"type":"string","pattern":"^[0-9]+$"}}}}}},"responses":{"200":{"description":"Active thumbnail selected"},"409":{"description":"Stale model version"}}}},
+            "/api/v1/models/{modelId}/thumbnails/{thumbnailId}":{"delete":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["expectedVersion"],"properties":{"expectedVersion":{"type":"string","pattern":"^[0-9]+$"}}}}}},"responses":{"200":{"description":"Thumbnail deleted with guarded fallback"},"409":{"description":"Stale model version"}}}},
+            "/api/v1/models/{modelId}/thumbnails/{thumbnailId}/media-lease":{"post":{"responses":{"200":{"description":"Five-minute epoch-bound media lease"}}}},
+            "/api/v1/models/{modelId}/download-lease":{"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"properties":{"expectedHash":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"}}}}}},"responses":{"200":{"description":"Five-minute verified source lease"},"409":{"description":"Source hash changed"}}}},
+            "/api/v1/content/{leaseId}":{"get":{"responses":{"200":{"description":"Verified lease bytes","content":{"application/octet-stream":{}}},"404":{"description":"Unknown lease"},"409":{"description":"Expired or epoch-stale lease"}}}},
+            "/api/v1/models/{modelId}/metadata":{"patch":{"responses":{"200":{"description":"Versioned metadata mutation"},"409":{"description":"Stale model version"}}}},
+            "/api/v1/models/metadata/bulk":{"post":{"responses":{"200":{"description":"Atomic common-patch metadata batch"},"409":{"description":"Any stale target aborts all writes"}}}},
+            "/api/v1/tags":{"get":{"responses":{"200":{"description":"Tag catalog"}}},"post":{"responses":{"200":{"description":"Created tag"}}}},
+            "/api/v1/tags/{tagId}":{"patch":{"responses":{"200":{"description":"Updated tag"}}},"delete":{"responses":{"204":{"description":"Deleted tag"}}}},
+            "/api/v1/folders":{"get":{"responses":{"200":{"description":"Folder tree records"}}},"post":{"responses":{"200":{"description":"Created folder"}}}},
+            "/api/v1/folders/{folderId}":{"patch":{"responses":{"200":{"description":"Renamed folder"}}},"delete":{"responses":{"204":{"description":"Deleted empty folder"}}}},
+            "/api/v1/folders/{folderId}/move":{"post":{"responses":{"200":{"description":"Moved folder"},"422":{"description":"Cycle rejected"}}}},
+            "/api/v1/filaments":{"get":{"responses":{"200":{"description":"Filament catalog"}}},"post":{"responses":{"200":{"description":"Created manual filament"}}}},
+            "/api/v1/filaments/{filamentId}":{"put":{"responses":{"200":{"description":"Updated manual filament"},"409":{"description":"Stale filament version"}}},"delete":{"responses":{"200":{"description":"Deleted or archived filament"}}}},
+            "/api/v1/parts":{"get":{"responses":{"200":{"description":"Parts stock catalog; quantities and metadata versions are decimal strings"}}},"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["name","quantity","unit","notes","lowStock"],"properties":{"name":{"type":"string","minLength":1,"maxLength":128},"category":{"type":["string","null"],"maxLength":128},"quantity":{"type":"integer","minimum":0,"maximum":1000000},"unit":{"type":"string","minLength":1,"maxLength":128},"notes":{"type":"string","maxLength":20000},"lowStock":{"type":"integer","minimum":0,"maximum":1000000}}}}}},"responses":{"200":{"description":"Created stock part"},"403":{"description":"CatalogWrite capability required"}}}},
+            "/api/v1/parts/{partId}":{"put":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["expectedVersion","input"],"properties":{"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"input":{"type":"object"}}}}}},"responses":{"200":{"description":"Updated stock part"},"409":{"description":"Stale metadata version"}}},"delete":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["expectedVersion"],"properties":{"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}}}},"responses":{"204":{"description":"Deleted stock part"},"409":{"description":"Stale metadata version"}}}},
+            "/api/v1/models/filaments/bulk":{"post":{"responses":{"200":{"description":"Atomic heterogeneous assignments"},"409":{"description":"Any stale target aborts all writes"}}}},
+            "/api/v1/models/{modelId}/history":{"get":{"responses":{"200":{"description":"Print attempts with historical stock-part snapshots and per-copy usage"}}},"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["printedAt","quantity","notes","filamentIds","outcome"],"properties":{"printedAt":{"type":"string","format":"date-time"},"quantity":{"type":"integer","minimum":1,"maximum":10000},"notes":{"type":"string","maxLength":20000},"filamentIds":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":256}},"parts":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":false,"required":["id","quantity"],"properties":{"id":{"type":"string","minLength":1,"maxLength":128},"quantity":{"type":"integer","minimum":1,"maximum":9999}}}},"outcome":{"type":"string","enum":["printed","failed","cancelled"]},"printerId":{"type":["string","null"],"maxLength":128}}}}}},"responses":{"200":{"description":"Created event; failed and cancelled events consume listed stock parts"}}}},
+            "/api/v1/history/bulk":{"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["idempotencyKey","items"],"properties":{"idempotencyKey":{"type":"string","minLength":1,"maxLength":128},"items":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"object","required":["modelId","input"]}}}}}}},"responses":{"200":{"description":"Atomic idempotent print attempt batch"},"409":{"description":"Idempotency key payload conflict or stale model"}}}},
+            "/api/v1/history/{attemptId}":{"put":{"responses":{"200":{"description":"Updated print attempt"}}},"delete":{"responses":{"204":{"description":"Deleted print attempt"}}}},
+            "/api/v1/captures/uploads":{"post":{"requestBody":{"required":true,"content":{"multipart/form-data":{"schema":{"type":"object","required":["intent","file"],"properties":{"intent":{"type":"string","description":"UploadIntent JSON"},"file":{"type":"string","contentEncoding":"binary"}}}}}},"responses":{"200":{"description":"Epoch-bound staged upload token"},"413":{"description":"Upload exceeds 100 MiB"}}}},
+            "/api/v1/captures/import":{"post":{"responses":{"200":{"description":"Idempotent capture import result"}}}},
+            "/api/v1/captures/{itemId}/retry":{"post":{"responses":{"200":{"description":"Retry using the exact original envelope and replacement upload tokens"},"422":{"description":"Envelope itemId does not match route"}}}},
+            "/api/v1/captures/{itemId}":{"get":{"responses":{"200":{"description":"Persisted capture result"}}}},
+            "/api/v1/captures":{"get":{"parameters":[{"name":"cursor","in":"query","schema":{"type":"string","maxLength":512}},{"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":100}}],"responses":{"200":{"description":"Bounded capture summary page"}}}},
+            "/api/v1/roots":{"get":{"responses":{"200":{"description":"Opaque admitted root handles"}}}},
+            "/api/v1/settings/roots":{"get":{"responses":{"200":{"description":"Path-free index root settings; maxFileBytes is a decimal string"}}}},
+            "/api/v1/settings/roots/{handleId}":{"patch":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["enabled","scanIntervalMinutes","maxFileBytes","scanZip"],"properties":{"enabled":{"type":"boolean"},"scanIntervalMinutes":{"type":"integer","minimum":1,"maximum":1440},"maxFileBytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"scanZip":{"type":"boolean"}}}}}},"responses":{"200":{"description":"Validated index root settings update"},"403":{"description":"Scan capability required"}}}},
+            "/api/v1/settings/catalog":{"get":{"responses":{"200":{"description":"Catalog thumbnail and scan settings"}}},"put":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["thumbnailSize","thumbnailBackground","thumbnailConcurrency","scanBatchSize"],"properties":{"thumbnailSize":{"type":"integer","enum":[128,256,512]},"thumbnailBackground":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},"thumbnailConcurrency":{"type":"integer","minimum":1,"maximum":2},"scanBatchSize":{"type":"integer","minimum":16,"maximum":256}}}}}},"responses":{"200":{"description":"Validated catalog settings update"},"403":{"description":"CatalogWrite capability required"}}}},
+            "/api/v1/management/actions/plan":{"post":{"responses":{"200":{"description":"Five-minute principal, epoch, revision, version, and source-hash-bound action plan"},"403":{"description":"Required catalog-write or maintenance capability is absent"}}}},
+            "/api/v1/management/actions/execute":{"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}}}},"responses":{"200":{"description":"One-use planned action result"},"409":{"description":"Plan is stale or already consumed"}}}},
+            "/api/v1/management/actions/discard":{"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}}}},"responses":{"204":{"description":"Owner review discarded without executing or changing files"},"403":{"description":"Token belongs to another principal"},"409":{"description":"Plan is stale or already consumed"}}}},
+            "/api/v1/integrations/settings":{"get":{"responses":{"200":{"description":"Redacted integration settings; credentials are never returned"}}}},
+            "/api/v1/integrations/spoolman":{"put":{"responses":{"200":{"description":"Validated nonsecret Spoolman configuration"}}}},
+            "/api/v1/integrations/spoolman/pull":{"post":{"responses":{"200":{"description":"Atomic filament and spool snapshot result"},"501":{"description":"Network transport is not enabled by this host"}}}},
+            "/api/v1/integrations/ai/providers/{providerId}":{"put":{"responses":{"200":{"description":"Validated provider with session-only credential action"}}},"delete":{"responses":{"204":{"description":"Provider and session credential removed"}}}},
+            "/api/v1/integrations/ai/suggestions":{"post":{"responses":{"200":{"description":"Human-review-only bounded tag suggestions"},"501":{"description":"Network transport is not enabled by this host"}}}},
+            "/api/v1/integrations/ai/reviews/{reviewToken}/apply":{"post":{"responses":{"200":{"description":"Atomic versioned accepted tag mutations"},"409":{"description":"Review is stale or replayed"}}}},
+            "/api/v1/integrations/ai/reviews/{reviewToken}":{"delete":{"responses":{"204":{"description":"Review discarded"}}}},
+            "/api/v1/scan":{"get":{"responses":{"200":{"description":"Scan status"}}},"post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"properties":{"rootId":{"type":["string","null"],"maxLength":128},"directory":{"type":"string","maxLength":1024}},"oneOf":[{"not":{"required":["directory"]}},{"required":["rootId","directory"]}]}}}},"responses":{"200":{"description":"Started admitted-root or root-relative subdirectory scan"},"403":{"description":"Root handle is not admitted"}}},"delete":{"responses":{"200":{"description":"Cancellation requested"}}}},
+            "/api/v1/bundles/{bundleId}/preview":{"post":{"responses":{"200":{"description":"Prepared bounded bundle preview summary"}}}},
+            "/api/v1/bundle-previews/{token}/geometry":{"get":{"responses":{"200":{"description":"Existing GoggleLab binary geometry packet","content":{"application/vnd.gogglelab.geometry":{}}}}}},
+            "/api/v1/bundle-previews/{token}/download-lease":{"post":{"responses":{"200":{"description":"Verified all-member ZIP content lease"}}}},
+            "/api/v1/bundle-previews/{token}":{"delete":{"responses":{"204":{"description":"Preview closed"}}}},
+            "/api/v1/models/{modelId}/geometry-lease":{"post":{"responses":{"200":{"description":"Verified STL2 v2 model geometry lease"},"409":{"description":"Source hash changed"}}}},
+            "/api/v1/duplicates/query":{"post":{"responses":{"200":{"description":"Path-free duplicate groups for the requested models"}}}},
+            "/api/v1/models/{modelId}/embedded-metadata/proposal":{"post":{"responses":{"200":{"description":"Read-only embedded 3MF metadata proposal"},"409":{"description":"Source hash changed"}}}},
+            "/api/v1/models/{modelId}/embedded-metadata/apply":{"post":{"responses":{"200":{"description":"Versioned embedded metadata selection applied"},"409":{"description":"Model version or source hash changed"}}}},
+            "/api/v1/events":{"get":{"responses":{"200":{"description":"Authenticated server-sent invalidation events","content":{"text/event-stream":{}}}}}},
+            "/mcp":{"post":{"responses":{"200":{"description":"JSON-RPC response"},"202":{"description":"Notification accepted"}}},"get":{"responses":{"405":{"description":"Standalone SSE listener disabled in v1"}}},"delete":{"responses":{"204":{"description":"Session terminated"},"404":{"description":"Unknown session"}}}}
+        }
+    });
+    document["components"]["schemas"]
+        .as_object_mut()
+        .unwrap()
+        .extend(fleet_output_schemas().as_object().unwrap().clone());
+    document["components"]["schemas"]
+        .as_object_mut()
+        .unwrap()
+        .extend(network_output_schemas().as_object().unwrap().clone());
+    document["components"]["schemas"]
+        .as_object_mut()
+        .unwrap()
+        .extend(
+            thumbnail_cleanup_output_schemas()
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+    document["paths"]["/api/v1/management/actions/plan"]["post"]["requestBody"] = serde_json::json!({
+        "required":true,"content":{"application/json":{"schema":{"oneOf":[
+            {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{
+                "kind":{"const":"cleanupOrphans"},"confirm":{"const":true},
+                "continuation":{"type":["string","null"],"minLength":1,"maxLength":256}
+            }},
+            {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{
+                "kind":{"const":"resetDefaultThumbnails"},"confirm":{"const":true}
+            }},
+            {"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":[
+                "recoverableRemove","restoreRemoval","createBackup","restoreBackup","exportSelection",
+                "quarantineLooseSource","undoQuarantine","moveLooseSource","purgeCatalog"
+            ]}}}
+        ]}}}
+    });
+    document["paths"]["/api/v1/management/actions/plan"]["post"]["responses"]["200"]["content"] = serde_json::json!({
+        "application/json":{"schema":{"type":"object","properties":{
+            "thumbnailReview":{"$ref":"#/components/schemas/ThumbnailBatch"}
+        }}}
+    });
+    document["paths"]["/api/v1/management/actions/execute"]["post"]["responses"]["200"]
+        ["content"] = serde_json::json!({
+        "application/json":{"schema":{"type":"object","properties":{
+            "thumbnailProgress":{"$ref":"#/components/schemas/ThumbnailProgress"}
+        },"allOf":[{"if":{"required":["kind"],"properties":{"kind":{"const":"cleanupCompleted"}}},
+            "then":{"required":["files","bytes"],"properties":{
+                "files":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                "bytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}
+            }}}]}}
+    });
+    document["paths"]
+        .as_object_mut()
+        .unwrap()
+        .extend(fleet_openapi_paths().as_object().unwrap().clone());
+    document["paths"]
+        .as_object_mut()
+        .unwrap()
+        .extend(network_openapi_paths().as_object().unwrap().clone());
+    document
+}
+
+async fn capabilities<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<HostCapabilities>, ApiError> {
+    state
+        .engine
+        .capabilities(&context)
+        .map(Json)
+        .map_err(|error| ApiError::from_engine(error, &context.request_id))
+}
+
+async fn status<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<RuntimeStatus>, ApiError> {
+    state
+        .engine
+        .status(&context)
+        .map(Json)
+        .map_err(|error| ApiError::from_engine(error, &context.request_id))
+}
+
+async fn models<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Query(query): Query<ModelQuery>,
+) -> Result<Json<Page<ModelSummary>>, ApiError> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=MAX_PAGE_SIZE).contains(&limit)
+        || query.cursor.as_ref().is_some_and(|value| value.len() > 512)
+        || query.query.as_ref().is_some_and(|value| value.len() > 256)
+        || query
+            .folder_id
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || query.tag_id.as_ref().is_some_and(|value| value.len() > 128)
+        || query
+            .category
+            .as_ref()
+            .is_some_and(|value| value.len() > 120)
+        || query
+            .designer
+            .as_ref()
+            .is_some_and(|value| value.len() > 256)
+        || query
+            .model_license
+            .as_ref()
+            .is_some_and(|value| value.len() > 256)
+        || query
+            .bundle_id
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || query
+            .root_id
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || query
+            .filament_id
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || query
+            .source_kind
+            .as_ref()
+            .is_some_and(|value| value.len() > 64)
+        || query
+            .thumbnail_mode
+            .as_ref()
+            .is_some_and(|value| !matches!(value.as_str(), "missing" | "default" | "custom"))
+        || query
+            .source_directory
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024 || value.contains('\\') || value.contains('\0'))
+        || query.minimum_rating.is_some_and(|rating| rating > 5)
+    {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            body: ErrorBody {
+                code: "invalidInput".into(),
+                message: "Model query is outside its limits".into(),
+                request_id: context.request_id,
+                retryable: false,
+                current_version: None,
+                source_holds: None,
+            },
+        });
+    }
+    let cursor = query.cursor;
+    let protocol_query = ProtocolModelQuery {
+        folder_id: query.folder_id,
+        search: query.query,
+        sort: query.sort.unwrap_or(ModelSort::Date),
+        direction: query.direction.unwrap_or(SortDirection::Asc),
+        tag_id: query.tag_id,
+        category: query.category,
+        designer: query.designer,
+        model_license: query.model_license,
+        print_status: query.print_status,
+        ever_printed: query.ever_printed,
+        bundle_id: query.bundle_id,
+        root_id: query.root_id,
+        filament_id: query.filament_id,
+        source_missing: query.source_missing,
+        duplicates_only: query.duplicates_only.unwrap_or(false),
+        source_kind: query.source_kind,
+        group: query.group,
+        thumbnail_mode: query.thumbnail_mode,
+        source_directory: query.source_directory,
+        minimum_rating: query.minimum_rating,
+        favorite: query.favorite,
+        tags: None,
+        file_type: None,
+        offset: None,
+        exclude_model_ids: Vec::new(),
+    };
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.list_models(&request, cursor.as_deref(), limit, protocol_query)
+    })
+    .await
+    .map(Json)
+}
+
+async fn model<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(model_id): AxumPath<String>,
+) -> Result<Json<ModelSummary>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.get_model(&request, &model_id)
+    })
+    .await
+    .map(Json)
+}
+
+async fn catalog_stats<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<WireCatalogStats>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.catalog_stats(&request)
+    })
+    .await
+    .map(|value| Json(value.into()))
+}
+
+async fn catalog_facets<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<CatalogFacets>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.catalog_facets(&request)
+    })
+    .await
+    .map(Json)
+}
+async fn catalog_hash_status<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<HashStatus>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.catalog_hash_status(&request)
+    })
+    .await
+    .map(Json)
+}
+async fn model_source_status<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<ModelIdsRequest>,
+) -> Result<Json<Vec<ModelSourceStatus>>, ApiError> {
+    validate_model_ids(&body.model_ids, 10_000)?;
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.check_model_sources(&request, body.model_ids)
+    })
+    .await
+    .map(Json)
+}
+async fn start_thumbnail_job<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<ThumbnailJobRequest>,
+) -> Result<Json<ScanStatus>, ApiError> {
+    validate_model_ids(&body.model_ids, 10_000)?;
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.start_thumbnail_job(&request, body.model_ids, body.force)
+    })
+    .await
+    .map(Json)
+}
+
+fn validate_model_ids(model_ids: &[String], maximum: usize) -> Result<(), ApiError> {
+    let mut unique = std::collections::BTreeSet::new();
+    if model_ids.is_empty()
+        || model_ids.len() > maximum
+        || model_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 128 || !unique.insert(id.as_str()))
+    {
+        return Err(api_bad("invalidInput", "modelIds are outside their limits"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VersionBody {
+    expected_version: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DownloadBody {
+    expected_hash: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GeometryRequest {
+    expected_hash: Option<String>,
+    plate_id: Option<u32>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DuplicateRequest {
+    model_ids: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmbeddedApplyRequest {
+    expected_version: String,
+    expected_source_hash: String,
+    selection: EmbeddedMetadataSelection,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecuteActionRequest {
+    token: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelIdsRequest {
+    model_ids: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThumbnailJobRequest {
+    model_ids: Vec<String>,
+    force: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpoolmanConfigRequest {
+    config: Option<IntegrationSpoolmanConfig>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AiProviderRequest {
+    config: AiProviderConfig,
+    credential_update: IntegrationCredentialUpdate,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AiSuggestRequest {
+    provider_id: String,
+    targets: Vec<WireTarget>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AiApplyRequest {
+    decisions: Vec<IntegrationAiReviewDecision>,
+    strategy: IntegrationAiReviewStrategy,
+}
+fn parse_version(value: &str) -> Result<u64, ApiError> {
+    parse_decimal(value)
+}
+fn api_bad(code: &str, message: &str) -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_REQUEST,
+        body: ErrorBody {
+            code: code.into(),
+            message: message.into(),
+            request_id: "request".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: None,
+        },
+    }
+}
+async fn list_thumbnails<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(model): AxumPath<String>,
+) -> Result<Json<Vec<WireThumbnail>>, ApiError> {
+    s.engine
+        .list_thumbnails(&c, &model)
+        .map(|values| Json(values.into_iter().map(Into::into).collect()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn set_active_thumbnail<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath((model, thumb)): AxumPath<(String, String)>,
+    Json(body): Json<VersionBody>,
+) -> Result<Json<Value>, ApiError> {
+    let v = parse_version(&body.expected_version)?;
+    s.engine
+        .set_active_thumbnail(&c, &model, v, &thumb)
+        .map(|v| Json(serde_json::json!({"metadataVersion":v.to_string()})))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn delete_thumbnail<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath((model, thumb)): AxumPath<(String, String)>,
+    Json(body): Json<VersionBody>,
+) -> Result<Json<Value>, ApiError> {
+    let v = parse_version(&body.expected_version)?;
+    s.engine
+        .delete_thumbnail(&c, &model, v, &thumb)
+        .map(|v| Json(serde_json::json!({"metadataVersion":v.to_string()})))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn add_thumbnail<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(model): AxumPath<String>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, ApiError> {
+    let mut version = None;
+    let mut file = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| api_bad("invalidInput", "multipart is invalid"))?
+    {
+        match field.name() {
+            Some("expectedVersion") => {
+                version = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| api_bad("invalidInput", "expectedVersion is invalid"))?,
+                )
+            }
+            Some("file") => {
+                let name = field.file_name().unwrap_or("thumbnail.png").to_owned();
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|_| api_bad("invalidInput", "file is invalid"))?;
+                if bytes.len() > MAX_THUMBNAIL_UPLOAD_BYTES {
+                    return Err(api_bad("tooLarge", "thumbnail exceeds 8 MiB"));
+                }
+                file = Some((name, bytes.to_vec()));
+            }
+            _ => return Err(api_bad("invalidInput", "unexpected multipart field")),
+        }
+    }
+    let v = parse_version(
+        version
+            .as_deref()
+            .ok_or_else(|| api_bad("invalidInput", "expectedVersion is required"))?,
+    )?;
+    let (name, bytes) = file.ok_or_else(|| api_bad("invalidInput", "file is required"))?;
+    s.engine
+        .add_thumbnail(&c, &model, v, name, bytes)
+        .map(|v| Json(serde_json::json!({"metadataVersion":v.to_string()})))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn thumbnail_media_lease<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath((model, thumb)): AxumPath<(String, String)>,
+) -> Result<Json<WireLease>, ApiError> {
+    s.engine
+        .issue_thumbnail_media(&c, &model, &thumb)
+        .map(|v| Json(v.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn model_download_lease<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(model): AxumPath<String>,
+    Json(body): Json<DownloadBody>,
+) -> Result<Json<WireLease>, ApiError> {
+    if body.expected_hash.as_ref().is_some_and(|hash| {
+        hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }) {
+        return Err(api_bad("invalidInput", "expectedHash is invalid"));
+    }
+    let request = c.clone();
+    blocking_engine(s.engine, &c.request_id, move |engine| {
+        engine.issue_model_download(&request, &model, body.expected_hash.as_deref())
+    })
+    .await
+    .map(|value| Json(value.into()))
+}
+async fn content<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(lease): AxumPath<String>,
+) -> Response {
+    let permit = match s.content_admission.clone().try_acquire_owned() {
+        Ok(value) => value,
+        Err(_) => {
+            return ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: ErrorBody {
+                    code: "busy".into(),
+                    message: "Content stream limit reached".into(),
+                    request_id: c.request_id.clone(),
+                    retryable: true,
+                    current_version: None,
+                    source_holds: None,
+                },
+            }
+            .into_response()
+        }
+    };
+    let describe_engine = Arc::clone(&s.engine);
+    let describe_context = c.clone();
+    let describe_lease = lease.clone();
+    let descriptor = match blocking_engine(describe_engine, &c.request_id, move |engine| {
+        engine.describe_content(&describe_context, &describe_lease)
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let byte_limit = match descriptor.kind {
+        ContentKind::Thumbnail => 4 * 1024 * 1024,
+        ContentKind::Model => 100 * 1024 * 1024,
+        ContentKind::Geometry => 128 * 1024 * 1024,
+        ContentKind::BundleArchive => 4 * 1024 * 1024 * 1024,
+    };
+    if descriptor.bytes > byte_limit {
+        return api_bad("tooLarge", "content exceeds limit").into_response();
+    }
+    let engine = Arc::clone(&s.engine);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        struct Sink {
+            sender: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+            blocked_since: Option<std::time::Instant>,
+            timeout: std::time::Duration,
+        }
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                for chunk in bytes.chunks(64 * 1024) {
+                    let mut value = Ok(Bytes::copy_from_slice(chunk));
+                    loop {
+                        match self.sender.try_send(value) {
+                            Ok(()) => {
+                                self.blocked_since = None;
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                return Err(std::io::Error::other("client disconnected"))
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                                let since = *self
+                                    .blocked_since
+                                    .get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed() >= self.timeout {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "content consumer stalled",
+                                    ));
+                                }
+                                value = returned;
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                        }
+                    }
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink {
+            sender: tx.clone(),
+            blocked_since: None,
+            timeout: s.content_send_timeout,
+        };
+        if let Err(error) = engine.stream_content(&c, &lease, &mut sink) {
+            let _ = tx.try_send(Err(std::io::Error::other(error.message)));
+        }
+    });
+    use tokio_stream::StreamExt as _;
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .timeout(std::time::Duration::from_secs(30))
+        .map(move |item| {
+            let _hold = &permit;
+            match item {
+                Ok(value) => value,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "content stream timed out",
+                )),
+            }
+        });
+    let body = axum::body::Body::from_stream(stream);
+    let mut response = (StatusCode::OK, body).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&descriptor.mime) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&descriptor.bytes.to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!("\"{}\"", descriptor.sha256)) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}\"",
+        descriptor.file_name.replace(['\"', '\\'], "_")
+    )) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MetadataRequest {
+    expected_version: String,
+    patch: MetadataPatch,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BulkMetadataRequest {
+    targets: Vec<WireTarget>,
+    patch: MetadataPatch,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NameCategory {
+    name: String,
+    category: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FolderCreate {
+    name: String,
+    parent_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FolderRename {
+    name: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FolderMove {
+    parent_id: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FilamentUpdate {
+    expected_version: String,
+    input: FilamentInput,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartStockUpdate {
+    expected_version: String,
+    input: PartStockInput,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Assignments {
+    assignments: Vec<WireAssignment>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CaptureImportRequest {
+    envelope: CaptureEnvelope,
+    uploads: Vec<WireUploadInput>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrintBatchRequest {
+    idempotency_key: String,
+    items: Vec<PrintAttemptBatchItem>,
+}
+async fn update_metadata<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<MetadataRequest>,
+) -> Result<Json<WireMutation>, ApiError> {
+    let v = parse_version(&b.expected_version)?;
+    s.engine
+        .update_metadata(
+            &c,
+            VersionedTarget {
+                model_id: id,
+                expected_version: v,
+            },
+            b.patch,
+        )
+        .map(|v| Json(v.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn bulk_metadata<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<BulkMetadataRequest>,
+) -> Result<Json<Vec<WireMutation>>, ApiError> {
+    let targets = b
+        .targets
+        .into_iter()
+        .map(WireTarget::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    s.engine
+        .bulk_update_metadata(&c, targets, b.patch)
+        .map(|values| Json(values.into_iter().map(Into::into).collect()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn list_tags<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Vec<Tag>>, ApiError> {
+    s.engine
+        .list_tags(&c)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn create_tag<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<NameCategory>,
+) -> Result<Json<Tag>, ApiError> {
+    s.engine
+        .create_tag(&c, b.name, b.category)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn update_tag<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<NameCategory>,
+) -> Result<Json<Tag>, ApiError> {
+    s.engine
+        .update_tag(&c, &id, b.name, b.category)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn delete_tag<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_tag(&c, &id)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn list_folders<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Vec<WireFolder>>, ApiError> {
+    s.engine
+        .list_folders(&c)
+        .map(|values| Json(values.into_iter().map(Into::into).collect()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn create_folder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<FolderCreate>,
+) -> Result<Json<WireFolder>, ApiError> {
+    s.engine
+        .create_folder(&c, b.name, b.parent_id)
+        .map(|v| Json(v.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn rename_folder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FolderRename>,
+) -> Result<Json<WireFolder>, ApiError> {
+    s.engine
+        .rename_folder(&c, &id, b.name)
+        .map(|v| Json(v.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn move_folder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FolderMove>,
+) -> Result<Json<WireFolder>, ApiError> {
+    s.engine
+        .move_folder(&c, &id, &b.parent_id)
+        .map(|v| Json(v.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn delete_folder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_folder(&c, &id)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FilamentQuery {
+    include_unavailable: Option<bool>,
+}
+async fn list_filaments<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Query(q): Query<FilamentQuery>,
+) -> Result<Json<Vec<WireFilament>>, ApiError> {
+    s.engine
+        .list_filaments(&c, q.include_unavailable.unwrap_or(true))
+        .map(|values| Json(values.into_iter().map(Into::into).collect()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn create_filament<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(i): Json<FilamentInput>,
+) -> Result<Json<WireFilament>, ApiError> {
+    s.engine
+        .create_filament(&c, i)
+        .map(|v| Json(v.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn update_filament<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FilamentUpdate>,
+) -> Result<Json<WireFilament>, ApiError> {
+    let v = parse_version(&b.expected_version)?;
+    s.engine
+        .update_filament(&c, &id, v, b.input)
+        .map(|v| Json(v.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn delete_filament<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<VersionBody>,
+) -> Result<Json<Option<WireFilament>>, ApiError> {
+    let v = parse_version(&b.expected_version)?;
+    s.engine
+        .delete_filament(&c, &id, v)
+        .map(|v| Json(v.map(Into::into)))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn list_part_stock<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Vec<WirePartStock>>, ApiError> {
+    s.engine
+        .list_part_stock(&c)
+        .map(|values| Json(values.into_iter().map(Into::into).collect()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn create_part_stock<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(input): Json<PartStockInput>,
+) -> Result<Json<WirePartStock>, ApiError> {
+    s.engine
+        .create_part_stock(&c, input)
+        .map(|value| Json(value.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn update_part_stock<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PartStockUpdate>,
+) -> Result<Json<WirePartStock>, ApiError> {
+    let version = parse_version(&body.expected_version)?;
+    s.engine
+        .update_part_stock(&c, &id, version, body.input)
+        .map(|value| Json(value.into()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn delete_part_stock<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<VersionBody>,
+) -> Result<StatusCode, ApiError> {
+    let version = parse_version(&body.expected_version)?;
+    s.engine
+        .delete_part_stock(&c, &id, version)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn bulk_assign_filaments<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<Assignments>,
+) -> Result<Json<Vec<WireMutation>>, ApiError> {
+    let assignments = b
+        .assignments
+        .into_iter()
+        .map(WireAssignment::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    s.engine
+        .bulk_assign_filaments(&c, assignments)
+        .map(|values| Json(values.into_iter().map(Into::into).collect()))
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn list_history<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<PrintAttempt>>, ApiError> {
+    s.engine
+        .list_history(&c, &id)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn create_history<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(i): Json<PrintAttemptInputWithPrinter>,
+) -> Result<Json<PrintAttempt>, ApiError> {
+    s.engine
+        .create_history_with_printer(&c, &id, i)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn create_history_batch<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<PrintBatchRequest>,
+) -> Result<Json<Vec<PrintAttempt>>, ApiError> {
+    if body.idempotency_key.is_empty()
+        || body.idempotency_key.len() > 128
+        || body.items.is_empty()
+        || body.items.len() > 10_000
+    {
+        return Err(api_bad("invalidInput", "Print batch is outside its limits"));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.create_history_batch(&request, &body.idempotency_key, body.items)
+    })
+    .await
+    .map(Json)
+}
+async fn update_history<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(i): Json<PrintAttemptInputWithPrinter>,
+) -> Result<Json<PrintAttempt>, ApiError> {
+    s.engine
+        .update_history_with_printer(&c, &id, i)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn delete_history<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_history(&c, &id)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn capture_upload<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    mut m: Multipart,
+) -> Result<Json<WireUpload>, ApiError> {
+    let mut intent = None;
+    let mut file = None;
+    while let Some(f) = m
+        .next_field()
+        .await
+        .map_err(|_| api_bad("invalidInput", "multipart is invalid"))?
+    {
+        match f.name() {
+            Some("intent") => {
+                intent = Some(
+                    serde_json::from_str::<WireUploadIntent>(
+                        &f.text()
+                            .await
+                            .map_err(|_| api_bad("invalidInput", "intent is invalid"))?,
+                    )
+                    .map_err(|_| api_bad("invalidInput", "intent is invalid"))?,
+                )
+            }
+            Some("file") => {
+                file = Some(
+                    f.bytes()
+                        .await
+                        .map_err(|_| api_bad("invalidInput", "file is invalid"))?
+                        .to_vec(),
+                )
+            }
+            _ => return Err(api_bad("invalidInput", "unexpected multipart field")),
+        }
+    }
+    let intent = intent
+        .ok_or_else(|| api_bad("invalidInput", "intent is required"))?
+        .parse()?;
+    let file = file.ok_or_else(|| api_bad("invalidInput", "file is required"))?;
+    let request = c.clone();
+    blocking_engine(s.engine, &c.request_id, move |engine| {
+        engine.stage_upload(&request, intent, file)
+    })
+    .await
+    .map(|value| Json(value.into()))
+}
+async fn import_capture<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<CaptureImportRequest>,
+) -> Result<Json<CaptureImportResult>, ApiError> {
+    let uploads = b
+        .uploads
+        .into_iter()
+        .map(WireUploadInput::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = c.clone();
+    blocking_engine(s.engine, &c.request_id, move |engine| {
+        engine.import_capture(&request, b.envelope, uploads)
+    })
+    .await
+    .map(Json)
+}
+async fn retry_capture<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(item_id): AxumPath<String>,
+    Json(b): Json<CaptureImportRequest>,
+) -> Result<Json<CaptureImportResult>, ApiError> {
+    if b.envelope.item_id != item_id {
+        return Err(api_bad(
+            "invalidInput",
+            "Capture item does not match the retry route",
+        ));
+    }
+    let uploads = b
+        .uploads
+        .into_iter()
+        .map(WireUploadInput::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = c.clone();
+    blocking_engine(s.engine, &c.request_id, move |engine| {
+        engine.import_capture(&request, b.envelope, uploads)
+    })
+    .await
+    .map(Json)
+}
+async fn get_capture<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<CaptureImportResult>, ApiError> {
+    let request = c.clone();
+    blocking_engine(s.engine, &c.request_id, move |engine| {
+        engine.get_capture(&request, &id)
+    })
+    .await
+    .map(Json)
+}
+
+async fn roots<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Vec<RootHandle>>, ApiError> {
+    s.engine
+        .roots(&c)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn index_root_settings<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<Vec<WireIndexRootSettings>>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.list_index_root_settings(&request)
+    })
+    .await
+    .map(|settings| Json(settings.into_iter().map(Into::into).collect()))
+}
+async fn update_index_root_settings<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(handle_id): AxumPath<String>,
+    Json(body): Json<WireIndexRootSettingsPatch>,
+) -> Result<Json<WireIndexRootSettings>, ApiError> {
+    if handle_id.is_empty() || handle_id.len() > 128 {
+        return Err(api_bad("invalidInput", "handleId is outside its limits"));
+    }
+    let patch = body.parse()?;
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.update_index_root_settings(&request, &handle_id, patch)
+    })
+    .await
+    .map(|settings| Json(settings.into()))
+}
+async fn catalog_settings<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<CatalogSettings>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.get_catalog_settings(&request)
+    })
+    .await
+    .map(Json)
+}
+async fn update_catalog_settings<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(settings): Json<CatalogSettings>,
+) -> Result<Json<CatalogSettings>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.update_catalog_settings(&request, settings)
+    })
+    .await
+    .map(Json)
+}
+async fn plan_management_action<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(action): Json<WireManagementAction>,
+) -> Result<Json<WireActionPlan>, ApiError> {
+    let action = action.parse()?;
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.plan_management_action(&request, action)
+    })
+    .await
+    .map(|plan| Json(plan.into()))
+}
+async fn execute_management_action<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<ExecuteActionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if body.token.is_empty() || body.token.len() > 256 {
+        return Err(api_bad(
+            "invalidInput",
+            "Action token is outside its limits",
+        ));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.execute_management_action(&request, &body.token)
+    })
+    .await
+    .map(|result| Json(wire_management_result(result)))
+}
+async fn discard_management_action<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<ExecuteActionRequest>,
+) -> Result<StatusCode, ApiError> {
+    if body.token.is_empty() || body.token.len() > 256 {
+        return Err(api_bad(
+            "invalidInput",
+            "Action token is outside its limits",
+        ));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.discard_management_action(&request, &body.token)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn integration_settings<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<IntegrationSettings>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.integration_settings(&request)
+    })
+    .await
+    .map(Json)
+}
+async fn save_spoolman_config<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<SpoolmanConfigRequest>,
+) -> Result<Json<IntegrationSettings>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.save_spoolman_config(&request, body.config)
+    })
+    .await
+    .map(Json)
+}
+async fn pull_spoolman<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+) -> Result<Json<IntegrationSpoolmanPullResult>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.pull_spoolman(&request)
+    })
+    .await
+    .map(Json)
+}
+async fn save_ai_provider<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(provider_id): AxumPath<String>,
+    Json(body): Json<AiProviderRequest>,
+) -> Result<Json<AiProviderConfig>, ApiError> {
+    if provider_id != body.config.id {
+        return Err(api_bad(
+            "invalidInput",
+            "Provider route and configuration IDs differ",
+        ));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.save_ai_provider(&request, body.config, body.credential_update)
+    })
+    .await
+    .map(Json)
+}
+async fn delete_ai_provider<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(provider_id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.delete_ai_provider(&request, &provider_id)
+    })
+    .await
+    .map(|_| StatusCode::NO_CONTENT)
+}
+async fn suggest_ai_tags<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<AiSuggestRequest>,
+) -> Result<Json<WireAiSuggestionBatch>, ApiError> {
+    let targets = body
+        .targets
+        .into_iter()
+        .map(WireTarget::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.suggest_ai_tags(&request, &body.provider_id, targets)
+    })
+    .await
+    .map(|batch| Json(batch.into()))
+}
+async fn apply_ai_review<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(review_token): AxumPath<String>,
+    Json(body): Json<AiApplyRequest>,
+) -> Result<Json<Vec<WireMutation>>, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.apply_ai_review(&request, &review_token, body.decisions, body.strategy)
+    })
+    .await
+    .map(|versions| Json(versions.into_iter().map(Into::into).collect()))
+}
+async fn discard_ai_review<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(review_token): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.discard_ai_review(&request, &review_token)
+    })
+    .await
+    .map(|_| StatusCode::NO_CONTENT)
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScanRequest {
+    root_id: Option<String>,
+    directory: Option<String>,
+}
+async fn start_scan<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<ScanRequest>,
+) -> Result<Json<ScanStatus>, ApiError> {
+    if b.root_id.as_ref().is_some_and(|value| value.len() > 128)
+        || b.directory
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024 || value.contains('\\') || value.contains('\0'))
+    {
+        return Err(api_bad("invalidInput", "rootId is outside its limits"));
+    }
+    if b.directory.is_some() && b.root_id.is_none() {
+        return Err(api_bad(
+            "invalidInput",
+            "directory requires an admitted rootId",
+        ));
+    }
+    let request = c.clone();
+    blocking_engine(s.engine, &c.request_id, move |engine| {
+        if let (Some(root_id), Some(directory)) = (b.root_id.clone(), b.directory) {
+            engine.start_scan_subdirectory(&request, root_id, directory)
+        } else {
+            engine.start_scan(&request, b.root_id)
+        }
+    })
+    .await
+    .map(Json)
+}
+async fn cancel_scan<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<ScanStatus>, ApiError> {
+    s.engine
+        .cancel_scan(&c)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn scan_status<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<ScanStatus>, ApiError> {
+    s.engine
+        .scan_status(&c)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+async fn prepare_bundle<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<WireBundleSummary>, ApiError> {
+    if id.is_empty() || id.len() > 128 {
+        return Err(api_bad("invalidInput", "bundleId is outside its limits"));
+    }
+    let request = c.clone();
+    blocking_engine(s.engine, &c.request_id, move |engine| {
+        engine.prepare_bundle(&request, &id)
+    })
+    .await
+    .map(|value| Json(value.into()))
+}
+async fn close_bundle<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(token): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    if token.is_empty() || token.len() > 256 {
+        return Err(api_bad(
+            "invalidInput",
+            "preview token is outside its limits",
+        ));
+    }
+    s.engine
+        .close_bundle(&c, &token)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CaptureQuery {
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+async fn list_captures<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Query(q): Query<CaptureQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = q.limit.unwrap_or(50);
+    if !(1..=MAX_PAGE_SIZE).contains(&limit)
+        || q.cursor.as_ref().is_some_and(|value| value.len() > 512)
+    {
+        return Err(api_bad(
+            "invalidInput",
+            "Capture query is outside its limits",
+        ));
+    }
+    let request = c.clone();
+    let page = blocking_engine(s.engine, &c.request_id, move |engine| {
+        engine.list_captures(
+            &request,
+            PageRequest {
+                cursor: q.cursor,
+                limit,
+            },
+        )
+    })
+    .await?;
+    Ok(Json(
+        serde_json::json!({"items":page.items,"nextCursor":page.next_cursor,"snapshotRevision":page.snapshot_revision.to_string()}),
+    ))
+}
+async fn bundle_geometry<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(token): AxumPath<String>,
+) -> Response {
+    if token.is_empty() || token.len() > 256 {
+        return api_bad("invalidInput", "preview token is outside its limits").into_response();
+    }
+    let permit = match s.content_admission.clone().try_acquire_owned() {
+        Ok(v) => v,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let describe_engine = Arc::clone(&s.engine);
+    let describe_context = c.clone();
+    let describe_token = token.clone();
+    let descriptor = match blocking_engine(describe_engine, &c.request_id, move |engine| {
+        engine.describe_bundle_geometry(&describe_context, &describe_token)
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    if descriptor.kind != ContentKind::Geometry
+        || descriptor.mime != "application/vnd.gogglelab.geometry"
+    {
+        return ApiError::from_engine(
+            EngineError {
+                code: "corrupt",
+                message: "Bundle geometry descriptor is invalid".into(),
+                retryable: false,
+                current_version: None,
+                source_holds: Vec::new(),
+            },
+            &c.request_id,
+        )
+        .into_response();
+    }
+    if descriptor.bytes > 128 * 1024 * 1024 {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let engine = Arc::clone(&s.engine);
+    let timeout = s.content_send_timeout;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        struct Sink {
+            tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+            blocked: Option<std::time::Instant>,
+            timeout: std::time::Duration,
+        }
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                for chunk in b.chunks(64 * 1024) {
+                    let mut value = Ok(Bytes::copy_from_slice(chunk));
+                    loop {
+                        match self.tx.try_send(value) {
+                            Ok(()) => {
+                                self.blocked = None;
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                return Err(std::io::Error::other("closed"))
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(v)) => {
+                                let since =
+                                    *self.blocked.get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed() >= self.timeout {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "stalled",
+                                    ));
+                                }
+                                value = v;
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                        }
+                    }
+                }
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink {
+            tx: tx.clone(),
+            blocked: None,
+            timeout,
+        };
+        if let Err(e) = engine.stream_bundle_geometry(&c, &token, &mut sink) {
+            let _ = tx.try_send(Err(std::io::Error::other(e.message)));
+        }
+    });
+    use tokio_stream::StreamExt as _;
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .timeout(std::time::Duration::from_secs(30))
+        .map(move |v| {
+            let _hold = &permit;
+            v.unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "geometry timeout",
+                ))
+            })
+        });
+    let mut response = (StatusCode::OK, axum::body::Body::from_stream(stream)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/vnd.gogglelab.geometry"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&descriptor.bytes.to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!("\"{}\"", descriptor.sha256)) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, value);
+    }
+    response
+}
+
+async fn bundle_download<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(token): AxumPath<String>,
+) -> Result<Json<WireLease>, ApiError> {
+    if token.is_empty() || token.len() > 256 {
+        return Err(api_bad(
+            "invalidInput",
+            "preview token is outside its limits",
+        ));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.issue_bundle_download(&request, &token)
+    })
+    .await
+    .map(|lease| Json(lease.into()))
+}
+
+async fn model_geometry<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(model_id): AxumPath<String>,
+    Json(body): Json<GeometryRequest>,
+) -> Result<Json<WireGeometryLease>, ApiError> {
+    if body.expected_hash.as_ref().is_some_and(|hash| {
+        hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }) {
+        return Err(api_bad("invalidInput", "expectedHash is invalid"));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.issue_model_geometry(
+            &request,
+            &model_id,
+            body.expected_hash.as_deref(),
+            body.plate_id,
+        )
+    })
+    .await
+    .map(|lease| Json(lease.into()))
+}
+
+async fn duplicates<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    Json(body): Json<DuplicateRequest>,
+) -> Result<Json<Vec<WireDuplicateGroup>>, ApiError> {
+    if body.model_ids.is_empty()
+        || body.model_ids.len() > 50_000
+        || body
+            .model_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 128)
+    {
+        return Err(api_bad("invalidInput", "modelIds are outside their limits"));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.duplicate_groups(&request, body.model_ids)
+    })
+    .await
+    .map(|groups| Json(groups.into_iter().map(Into::into).collect()))
+}
+
+async fn embedded_metadata<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(model_id): AxumPath<String>,
+    Json(body): Json<DownloadBody>,
+) -> Result<Json<EmbeddedMetadataProposal>, ApiError> {
+    if body.expected_hash.as_ref().is_some_and(|hash| {
+        hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }) {
+        return Err(api_bad("invalidInput", "expectedHash is invalid"));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.read_embedded_metadata(&request, &model_id, body.expected_hash.as_deref())
+    })
+    .await
+    .map(Json)
+}
+
+async fn apply_embedded_metadata<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    AxumPath(model_id): AxumPath<String>,
+    Json(body): Json<EmbeddedApplyRequest>,
+) -> Result<Json<WireMutation>, ApiError> {
+    let expected_version = parse_version(&body.expected_version)?;
+    if body.expected_source_hash.len() != 64
+        || !body
+            .expected_source_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(api_bad("invalidInput", "expectedSourceHash is invalid"));
+    }
+    let request = context.clone();
+    blocking_engine(state.engine, &context.request_id, move |engine| {
+        engine.apply_embedded_metadata(
+            &request,
+            VersionedTarget {
+                model_id,
+                expected_version,
+            },
+            &body.expected_source_hash,
+            body.selection,
+        )
+    })
+    .await
+    .map(|version| Json(version.into()))
+}
+
+async fn events<E: LibraryEngine>(
+    State(state): State<ServerState<E>>,
+    axum::Extension(context): axum::Extension<RequestContext>,
+    headers: axum::http::HeaderMap,
+    shutdown: Option<axum::Extension<ServerShutdown>>,
+) -> Response {
+    let permit = match state.event_admission.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(serde_json::json!({"error":{
+                    "code":"busy",
+                    "message":"Event stream limit reached",
+                    "requestId":context.request_id,
+                    "retryable":true
+                }})),
+            )
+                .into_response()
+        }
+    };
+    let request = context.clone();
+    let status = match blocking_engine(
+        Arc::clone(&state.engine),
+        &context.request_id,
+        move |engine| engine.status(&request),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) => return error.into_response(),
+    };
+    let current_id = format!("{}:{}", status.library_epoch, status.catalog_revision);
+    let last_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok());
+    let stream_state = EventStreamState {
+        engine: state.engine,
+        context,
+        _permit: permit,
+        library_epoch: status.library_epoch,
+        catalog_revision: status.catalog_revision,
+        initial_reset: last_id != Some(current_id.as_str()),
+        first: true,
+        last_heartbeat: std::time::Instant::now(),
+        shutdown: shutdown.map(|shutdown| shutdown.0 .0),
+    };
+    let stream = futures_util::stream::unfold(stream_state, |mut stream| async move {
+        if stream.first {
+            stream.first = false;
+            if stream.initial_reset {
+                let id = format!("{}:{}", stream.library_epoch, stream.catalog_revision);
+                let payload = serde_json::json!({
+                    "sequence":stream.catalog_revision,
+                    "libraryEpoch":stream.library_epoch,
+                    "catalogRevision":stream.catalog_revision,
+                    "requestId":stream.context.request_id,
+                    "reset":true
+                });
+                let event = axum::response::sse::Event::default()
+                    .event("library.reset")
+                    .id(id)
+                    .json_data(payload)
+                    .expect("event payload is serializable");
+                return Some((Ok::<_, std::convert::Infallible>(event), stream));
+            }
+        }
+        loop {
+            if let Some(shutdown) = stream.shutdown.as_mut() {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return None;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let engine = Arc::clone(&stream.engine);
+            let request = stream.context.clone();
+            let status = tokio::task::spawn_blocking(move || engine.status(&request)).await;
+            let Ok(Ok(status)) = status else {
+                if stream.last_heartbeat.elapsed() >= std::time::Duration::from_secs(15) {
+                    stream.last_heartbeat = std::time::Instant::now();
+                    return Some((
+                        Ok(axum::response::sse::Event::default().comment("keepalive")),
+                        stream,
+                    ));
+                }
+                continue;
+            };
+            let epoch_changed = status.library_epoch != stream.library_epoch;
+            let revision_changed = status.catalog_revision != stream.catalog_revision;
+            if epoch_changed || revision_changed {
+                stream.library_epoch = status.library_epoch;
+                stream.catalog_revision = status.catalog_revision;
+                stream.last_heartbeat = std::time::Instant::now();
+                let id = format!("{}:{}", stream.library_epoch, stream.catalog_revision);
+                let reset = epoch_changed;
+                let payload = serde_json::json!({
+                    "sequence":stream.catalog_revision,
+                    "libraryEpoch":stream.library_epoch,
+                    "catalogRevision":stream.catalog_revision,
+                    "requestId":stream.context.request_id,
+                    "reset":reset
+                });
+                let event = axum::response::sse::Event::default()
+                    .event(if reset {
+                        "library.reset"
+                    } else {
+                        "library.changed"
+                    })
+                    .id(id)
+                    .json_data(payload)
+                    .expect("event payload is serializable");
+                return Some((Ok(event), stream));
+            }
+            if stream.last_heartbeat.elapsed() >= std::time::Duration::from_secs(15) {
+                stream.last_heartbeat = std::time::Instant::now();
+                return Some((
+                    Ok(axum::response::sse::Event::default().comment("keepalive")),
+                    stream,
+                ));
+            }
+        }
+    });
+    Sse::new(stream).into_response()
+}
+
+pub fn tool_names() -> &'static [&'static str] {
+    &[
+        "search_models",
+        "integration_get_settings",
+        "integration_save_spoolman_config",
+        "integration_save_ai_provider",
+        "integration_delete_ai_provider",
+        "discard_tag_review",
+        "plan_management_action",
+        "execute_management_action",
+        "discard_management_action",
+        "get_index_root_settings",
+        "update_index_root_settings",
+        "get_catalog_settings",
+        "update_catalog_settings",
+        "get_model",
+        "get_library_stats",
+        "get_folder_tree",
+        "list_tags",
+        "add_tag",
+        "rename_tag",
+        "delete_tag",
+        "add_model_tags",
+        "remove_model_tags",
+        "list_filaments",
+        "save_filament",
+        "delete_filament",
+        "set_model_filaments",
+        "get_printer_network_policy",
+        "plan_printer_discovery",
+        "start_printer_discovery",
+        "get_printer_discovery",
+        "cancel_printer_discovery",
+        "set_printer_endpoint_approval",
+        "test_printer_connection",
+        "list_printers",
+        "get_printer",
+        "create_printer",
+        "update_printer",
+        "delete_printer",
+        "list_printer_maintenance_logs",
+        "create_printer_maintenance_log",
+        "update_printer_maintenance_log",
+        "delete_printer_maintenance_log",
+        "list_printer_reminders",
+        "create_printer_reminder",
+        "update_printer_reminder",
+        "delete_printer_reminder",
+        "complete_printer_reminder",
+        "set_printer_reminder_paused",
+        "reschedule_printer_reminder",
+        "list_part_stock",
+        "create_part_stock",
+        "update_part_stock",
+        "delete_part_stock",
+        "sync_spoolman_filaments",
+        "get_print_events",
+        "log_print_event",
+        "delete_print_event",
+        "log_print_events_batch",
+        "list_parent_models",
+        "list_designers",
+        "list_licenses",
+        "get_all_metadata",
+        "update_model",
+        "update_models_batch",
+        "rename_metadata",
+        "delete_metadata",
+        "get_models_by_directory",
+        "get_models_missing_thumbnails",
+        "get_models_with_default_thumbnails",
+        "start_thumbnail_job",
+        "get_thumbnails",
+        "set_thumbnail",
+        "add_thumbnail",
+        "set_default_thumbnail",
+        "delete_thumbnail",
+        "find_duplicates",
+        "get_model_geometry",
+        "get_hash_status",
+        "calculate_missing_hashes",
+        "refresh_hashes",
+        "check_files_exist",
+        "get_embedded_3mf_metadata",
+        "pull_3mf_metadata",
+        "apply_embedded_3mf_metadata",
+        "generate_tags",
+        "apply_tag_review",
+        "scan_directory",
+        "list_roots",
+        "cancel_scan",
+        "get_scan_status",
+        "remove_model",
+        "trash_file",
+        "undo_trash",
+        "move_files",
+        "export_library",
+        "backup_library",
+        "backup_database",
+        "restore_library",
+        "list_slicers",
+        "open_in_slicer",
+        "prepare_bundle_preview",
+        "get_bundle_preview_geometry",
+        "close_bundle_preview",
+        "list_capture_items",
+        "retry_capture",
+        "download_model",
+        "download_bundle",
+    ]
+}
+
+pub fn tool_definitions() -> Vec<Value> {
+    tool_names()
+        .iter()
+        .map(|name| {
+            let input_schema = if let Some(schema) = network_tool_schema(name).or_else(|| fleet_tool_schema(name)) { schema } else { match *name {
+                "search_models" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "query":{"type":"string","maxLength":256},
+                        "search":{"type":"string","maxLength":256},
+                        "designer":{"type":"string","maxLength":200},
+                        "printed":{"type":"string","enum":["unprinted","printed","want","queued","printing","failed","ever-printed","never-printed","all"]},
+                        "cursor":{"type":"string","maxLength":512},
+                        "limit":{"type":"integer","minimum":1,"maximum":100},
+                        "offset":{"type":"integer","minimum":0,"maximum":100000},
+                        "tags":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1,"maxLength":256}},
+                        "fileType":{"type":"string","maxLength":16},
+                        "directory":{"type":"string","maxLength":1024,"description":"Root-relative directory filter. Requires rootId."},
+                        "thumbnailMode":{"type":"string","enum":["missing","default","custom"]},
+                        "rootId":{"type":"string","maxLength":128,"description":"An admitted handle ID or catalogRootId returned by list_roots. Required with directory or sourceDirectory."},
+                        "sourceDirectory":{"type":"string","maxLength":1024,"description":"Root-relative directory filter. Requires rootId."},
+                        "minimumRating":{"type":"integer","minimum":0,"maximum":5},
+                        "favorite":{"type":"boolean"}
+                    }
+                }),
+                "integration_get_settings"|"sync_spoolman_filaments" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "integration_save_spoolman_config" => serde_json::json!({"type":"object","additionalProperties":false,"required":["config"],"properties":{"config":{"type":["object","null"]}}}),
+                "integration_save_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["config","credentialUpdate"],"properties":{"config":{"type":"object"},"credentialUpdate":{"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"type":"string","enum":["keep","clear","setSession"]},"secret":{"type":["string","null"],"maxLength":16384}}}}}),
+                "rename_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","oldName","newName"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"oldName":{"type":"string","minLength":1,"maxLength":200},"newName":{"type":"string","minLength":1,"maxLength":200}}}),
+                "delete_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"required":["type","name"],"properties":{"type":{"type":"string","enum":["designer","parentModel","license"]},"name":{"type":"string","minLength":1,"maxLength":200}}}),
+                "add_model_tags"|"remove_model_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","tags"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"tags":{"type":"array","minItems":1,"maxItems":200,"items":{"type":"string","minLength":1,"maxLength":256}}}}),
+                "remove_model" => serde_json::json!({
+                    "type":"object","additionalProperties":false,"required":["confirm"],
+                    "properties":{
+                        "targets":{"type":"array","minItems":1,"maxItems":50000,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                        "confirm":{"const":true}
+                    },
+                    "oneOf":[
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]}]}},
+                        {"required":["modelId","expectedVersion"],"not":{"required":["targets"]}}
+                    ]
+                }),
+                "trash_file" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "confirm":{"const":true}
+                    },
+                    "required":["confirm"],
+                    "oneOf":[
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]}]}},
+                        {"required":["modelId","expectedVersion"],"not":{"required":["targets"]}}
+                    ]
+                }),
+                "undo_trash" => serde_json::json!({"type":"object","additionalProperties":false,"required":["snapshotId","confirm"],"properties":{"snapshotId":{"type":"string","minLength":1,"maxLength":128},"confirm":{"const":true}}}),
+                "move_files" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+                        "destinationHandleId":{"type":"string","minLength":1,"maxLength":128},
+                        "fileName":{"type":"string","minLength":1,"maxLength":200,"pattern":"^[^/\\\\\\\\:*?\"<>|]+$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","fileName"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"fileName":{"type":"string","minLength":1,"maxLength":200,"pattern":"^[^/\\\\\\\\:*?\"<>|]+$"}}}},
+                        "confirm":{"const":true}
+                    },
+                    "required":["destinationHandleId","confirm"],
+                    "oneOf":[
+                        {"required":["modelId","expectedVersion","fileName"],"not":{"required":["targets"]}},
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]},{"required":["fileName"]}]}}
+                    ]
+                }),
+                "backup_database" => serde_json::json!({"type":"object","additionalProperties":false,"required":["destinationHandleId","fileName"],"properties":{"destinationHandleId":{"type":"string","minLength":1,"maxLength":128},"fileName":{"type":"string","minLength":1,"maxLength":200}}}),
+                "export_library" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"destPath":{"type":"string","maxLength":1024}}}),
+                "integration_delete_ai_provider" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128}}}),
+                "generate_tags" => serde_json::json!({"type":"object","additionalProperties":false,"required":["providerId","targets"],"properties":{"providerId":{"type":"string","minLength":1,"maxLength":128},"targets":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"object","required":["modelId","expectedVersion"]}}}}),
+                "apply_tag_review" => serde_json::json!({"type":"object","additionalProperties":false,"required":["reviewToken","decisions","strategy"],"properties":{"reviewToken":{"type":"string","minLength":1,"maxLength":128},"decisions":{"type":"array","minItems":1,"maxItems":50},"strategy":{"type":"string","enum":["append","replace","merge"]}}}),
+                "discard_tag_review" => serde_json::json!({"type":"object","additionalProperties":false,"required":["reviewToken"],"properties":{"reviewToken":{"type":"string","minLength":1,"maxLength":128}}}),
+                "get_hash_status"|"calculate_missing_hashes"|"refresh_hashes" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"search":{"type":"string","maxLength":256},"designer":{"type":"string","maxLength":200},"tags":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1,"maxLength":120}},"directory":{"type":"string","maxLength":1024},"rootId":{"type":"string","minLength":1,"maxLength":128},"fileType":{"type":"string","minLength":1,"maxLength":16},"printed":{"type":"string","enum":["unprinted","printed","want","queued","printing","failed","ever-printed","never-printed","all"]}}}),
+                "check_files_exist" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}},"missingOnly":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":2000}}}),
+                "start_thumbnail_job" => serde_json::json!({"type":"object","additionalProperties":false,"required":["modelIds"],"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128}},"force":{"type":"boolean"}}}),
+                "get_models_missing_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100},"excludeIds":{"type":"array","maxItems":2000,"items":{"type":"string","minLength":1,"maxLength":128}}}}),
+                "get_models_with_default_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
+                "get_models_by_directory" => serde_json::json!({"type":"object","additionalProperties":false,"required":["rootId","directory"],"properties":{"rootId":{"type":"string","minLength":1,"maxLength":128},"directory":{"type":"string","maxLength":1024},"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
+                "plan_management_action" => serde_json::json!({
+                    "type":"object","additionalProperties":false,"required":["action"],
+                    "properties":{"action":{"oneOf":[
+                        {"type":"object","additionalProperties":false,"required":["kind","targets"],"properties":{"kind":{"const":"recoverableRemove"},"targets":{"type":"array","maxItems":50000,"items":{"type":"object","required":["modelId","expectedVersion"]}}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","snapshotId"],"properties":{"kind":{"const":"restoreRemoval"},"snapshotId":{"type":"string","minLength":1,"maxLength":128}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","destinationHandleId","fileName"],"properties":{"kind":{"const":"createBackup"},"destinationHandleId":{"type":"string"},"fileName":{"type":"string"}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","sourceHandleId","fileName","rootMappings"],"properties":{"kind":{"const":"restoreBackup"},"sourceHandleId":{"type":"string"},"fileName":{"type":"string"},"rootMappings":{"type":"array","maxItems":256}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","targets","destinationHandleId","fileName"],"properties":{"kind":{"const":"exportSelection"},"targets":{"type":"array","maxItems":50000},"destinationHandleId":{"type":"string"},"fileName":{"type":"string"}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","backupDestinationHandleId","backupFileName","confirm"],"properties":{"kind":{"const":"purgeCatalog"},"backupDestinationHandleId":{"type":"string","minLength":1,"maxLength":128},"backupFileName":{"type":"string","minLength":1,"maxLength":200},"confirm":{"const":true}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{"kind":{"const":"cleanupOrphans"},"confirm":{"const":true},"continuation":{"type":["string","null"],"minLength":1,"maxLength":256}}},
+                        {"type":"object","additionalProperties":false,"required":["kind","confirm"],"properties":{"kind":{"const":"resetDefaultThumbnails"},"confirm":{"const":true}}}
+                    ]}}
+                }),
+                "execute_management_action" | "discard_management_action" => serde_json::json!({"type":"object","additionalProperties":false,"required":["token"],"properties":{"token":{"type":"string","minLength":1,"maxLength":256}}}),
+                "get_index_root_settings"|"get_catalog_settings" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "update_index_root_settings" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"handleId":{"type":"string","minLength":1,"maxLength":128},"settings":{"type":"object","additionalProperties":false,"required":["enabled","scanIntervalMinutes","maxFileBytes","scanZip"],"properties":{"enabled":{"type":"boolean"},"scanIntervalMinutes":{"type":"integer","minimum":1,"maximum":1440},"maxFileBytes":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"scanZip":{"type":"boolean"}}}},"required":["handleId","settings"]}),
+                "update_catalog_settings" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"settings":{"type":"object","additionalProperties":false,"required":["thumbnailSize","thumbnailBackground","thumbnailConcurrency","scanBatchSize"],"properties":{"thumbnailSize":{"type":"integer","enum":[128,256,512]},"thumbnailBackground":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},"thumbnailConcurrency":{"type":"integer","minimum":1,"maximum":2},"scanBatchSize":{"type":"integer","minimum":16,"maximum":256}}}},"required":["settings"]}),
+                "get_model" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId"]}),
+                "get_all_metadata" => serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+                "get_library_stats"|"list_parent_models"|"list_designers"|"list_licenses"|"list_roots"|"cancel_scan"|"get_scan_status" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "scan_directory" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"rootId":{"type":"string","minLength":1,"maxLength":128},"directory":{"type":"string","maxLength":1024}},"oneOf":[{"not":{"required":["directory"]}},{"required":["rootId","directory"]}]}),
+                "prepare_bundle_preview" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"bundleId":{"type":"string","minLength":1,"maxLength":128}},"required":["bundleId"]}),
+                "get_bundle_preview_geometry"|"download_bundle"|"close_bundle_preview" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"token":{"type":"string","minLength":1,"maxLength":256}},"required":["token"]}),
+                "get_model_geometry" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"plateId":{"type":"integer","minimum":0,"maximum":4294967295_u64}},"required":["modelId"]}),
+                "find_duplicates" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelIds":{"type":"array","minItems":1,"maxItems":1000,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}},"includeZip":{"type":"boolean"},"search":{"type":"string","maxLength":256},"designer":{"type":"string","maxLength":200},"tags":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1,"maxLength":120}},"directory":{"type":"string","maxLength":1024},"rootId":{"type":"string","minLength":1,"maxLength":128},"fileType":{"type":"string","minLength":1,"maxLength":16},"printed":{"type":"string","enum":["unprinted","printed","want","queued","printing","failed","ever-printed","never-printed","all"]},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
+                "get_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
+                "pull_3mf_metadata" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
+                    },
+                    "oneOf":[
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedHash"]}]}},
+                        {"required":["modelId"],"not":{"required":["targets"]}}
+                    ]
+                }),
+                "apply_embedded_3mf_metadata" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"expectedSourceHash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"selection":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":"boolean"},"sourceUrl":{"type":"boolean"},"notes":{"type":"boolean"},"modelLicense":{"type":"boolean"},"parentModel":{"type":"boolean"}}}},"required":["modelId","expectedVersion","expectedSourceHash","selection"]}),
+                "list_capture_items" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"cursor":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":100}}}),
+                "retry_capture" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"itemId":{"type":"string","minLength":1,"maxLength":128},"envelope":{"type":"object"},"uploads":{"type":"array","maxItems":10000,"items":{"type":"object","required":["id","itemId","captureId","expiresAt","libraryEpoch"]}}},"required":["itemId","envelope","uploads"]}),
+                "get_folder_tree"|"list_tags" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "list_filaments" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"includeUnavailable":{"type":"boolean"}}}),
+                "list_part_stock" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "create_part_stock" => serde_json::json!({"type":"object","additionalProperties":false,"required":["input"],"properties":{"input":{"type":"object","additionalProperties":false,"required":["name","quantity","unit","notes","lowStock"],"properties":{"name":{"type":"string","minLength":1,"maxLength":128},"category":{"type":["string","null"],"maxLength":128},"quantity":{"type":"integer","minimum":0,"maximum":1000000},"unit":{"type":"string","minLength":1,"maxLength":128},"notes":{"type":"string","maxLength":20000},"lowStock":{"type":"integer","minimum":0,"maximum":1000000}}}}}),
+                "update_part_stock" => serde_json::json!({"type":"object","additionalProperties":false,"required":["partId","expectedVersion","input"],"properties":{"partId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"input":{"type":"object","additionalProperties":false,"required":["name","quantity","unit","notes","lowStock"],"properties":{"name":{"type":"string","minLength":1,"maxLength":128},"category":{"type":["string","null"],"maxLength":128},"quantity":{"type":"integer","minimum":0,"maximum":1000000},"unit":{"type":"string","minLength":1,"maxLength":128},"notes":{"type":"string","maxLength":20000},"lowStock":{"type":"integer","minimum":0,"maximum":1000000}}}}}),
+                "delete_part_stock" => serde_json::json!({"type":"object","additionalProperties":false,"required":["partId","expectedVersion"],"properties":{"partId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}),
+                "update_model" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"target":{"type":"object","required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string"},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}},"patch":{"type":"object","properties":{"designer":{"type":["string","null"]},"sourceUrl":{"type":["string","null"]},"notes":{"type":["string","null"]},"modelLicense":{"type":["string","null"]},"printStatus":{"type":"string"},"parentModelId":{"type":["string","null"]},"rating":{"type":"integer","minimum":0,"maximum":5},"favorite":{"type":"boolean"}}}},"required":["target","patch"]}),
+                "update_models_batch" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "targets":{"type":"array","maxItems":50000,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "patch":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":["string","null"]},"sourceUrl":{"type":["string","null"]},"notes":{"type":["string","null"]},"modelLicense":{"type":["string","null"]},"printStatus":{"type":"string"},"parentModelId":{"type":["string","null"]},"rating":{"type":"integer","minimum":0,"maximum":5},"favorite":{"type":"boolean"}}},
+                        "updates":{"type":"array","minItems":1,"maxItems":50000,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion","patch"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"patch":{"type":"object","additionalProperties":false,"properties":{"designer":{"type":["string","null"]},"sourceUrl":{"type":["string","null"]},"notes":{"type":["string","null"]},"modelLicense":{"type":["string","null"]},"printStatus":{"type":"string"},"parentModelId":{"type":["string","null"]},"rating":{"type":"integer","minimum":0,"maximum":5},"favorite":{"type":"boolean"}}},"tags":{"type":"array","maxItems":200,"uniqueItems":true,"items":{"type":"string","minLength":1,"pattern":"\\S","maxLength":256}},"filamentIds":{"type":"array","maxItems":5,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}}}}}
+                    },
+                    "oneOf":[
+                        {"required":["targets","patch"],"not":{"required":["updates"]}},
+                        {"required":["updates"],"not":{"anyOf":[{"required":["targets"]},{"required":["patch"]}]}}
+                    ]
+                }),
+                "add_tag" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"name":{"type":"string","maxLength":256},"category":{"type":["string","null"],"maxLength":120}},"required":["name"]}),
+                "rename_tag" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"tagId":{"type":"string"},"name":{"type":"string","maxLength":256},"category":{"type":["string","null"],"maxLength":120}},"required":["tagId","name"]}),
+                "delete_tag" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"tagId":{"type":"string"}},"required":["tagId"]}),
+                "save_filament" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"filamentId":{"type":"string"},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"input":{"type":"object"}},"required":["input"]}),
+                "delete_filament" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"filamentId":{"type":"string"},"expectedVersion":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"required":["filamentId","expectedVersion"]}),
+                "set_model_filaments" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"assignments":{"type":"array","maxItems":50000}},"required":["assignments"]}),
+                "get_print_events" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string"}},"required":["modelId"]}),
+                "log_print_event" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"input":{"type":"object","properties":{"printedAt":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":10000},"notes":{"type":"string","maxLength":20000},"filamentIds":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":256}},"parts":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":false,"required":["id","quantity"],"properties":{"id":{"type":"string","minLength":1,"maxLength":128},"quantity":{"type":"integer","minimum":1,"maximum":9999}}}},"outcome":{"type":"string","enum":["printed","failed","cancelled"]},"printerId":{"type":["string","null"],"maxLength":128}},"required":["printedAt","quantity","notes","filamentIds","outcome"]}},"required":["modelId","input"]}),
+                "log_print_events_batch" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"idempotencyKey":{"type":"string","minLength":1,"maxLength":128},"items":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"object","additionalProperties":false,"required":["modelId","input"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"input":{"type":"object"}}}}},"required":["idempotencyKey","items"]}),
+                "delete_print_event" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"attemptId":{"type":"string"}},"required":["attemptId"]}),
+                "set_thumbnail" | "add_thumbnail" => serde_json::json!({
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","pattern":"^[0-9]+$"},
+                        "image":{"type":"string","maxLength":11500000},
+                        "mimeType":{"type":"string","enum":["image/png","image/jpeg"]}
+                    },
+                    "required":["modelId","expectedVersion","image"]
+                }),
+                "get_thumbnails" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId"]}),
+                "set_default_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
+                "download_model" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedHash":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["modelId"]}),
+                "list_slicers" => serde_json::json!({"type":"object","additionalProperties":false}),
+                "open_in_slicer" => serde_json::json!({
+                    "type":"object","additionalProperties":false,"required":["slicerId"],
+                    "properties":{
+                        "modelId":{"type":"string","minLength":1,"maxLength":128},
+                        "expectedVersion":{"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"},
+                        "targets":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","additionalProperties":false,"required":["modelId","expectedVersion"],"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"}}}},
+                        "slicerId":{"type":"string","minLength":1,"maxLength":128}
+                    },
+                    "oneOf":[
+                        {"required":["modelId","expectedVersion"],"not":{"required":["targets"]}},
+                        {"required":["targets"],"not":{"anyOf":[{"required":["modelId"]},{"required":["expectedVersion"]}]}}
+                    ]
+                }),
+                "delete_thumbnail" => serde_json::json!({"type":"object","additionalProperties":false,"properties":{"modelId":{"type":"string","minLength":1,"maxLength":128},"expectedVersion":{"type":"string","pattern":"^[0-9]+$"},"thumbnailId":{"type":"string","minLength":1,"maxLength":128}},"required":["modelId","expectedVersion","thumbnailId"]}),
+                "restore_library" => serde_json::json!({
+                    "type":"object",
+                    "properties":{"confirmationToken":{"type":"string","minLength":43,"maxLength":256}},
+                    "required":["confirmationToken"]
+                }),
+                _ => serde_json::json!({"type":"object"}),
+            }};
+            serde_json::json!({
+                "name": name,
+                "description": match *name {
+                    "get_printer_network_policy" => "Read host-configured printer LAN availability and bounds without network I/O. Clients cannot enable or expand this policy.".to_owned(),
+                    "plan_printer_discovery" => "Review an admitted private IPv4 range and implemented protocol choices without networking. Returns an expiring principal-bound one-use plan and multicast disclosure. Requires PrinterNetwork and CatalogRead.".to_owned(),
+                    "start_printer_discovery" => "Start the exact reviewed discovery plan with confirm:true. Returns an owner-bound bounded job; poll or cancel it explicitly. No automatic save or endpoint approval.".to_owned(),
+                    "get_printer_discovery" | "cancel_printer_discovery" => "Read or cancel only this principal's bounded discovery job. Current PrinterNetwork/CatalogRead permission and host policy are rechecked; opaque job IDs grant no authority.".to_owned(),
+                    "set_printer_endpoint_approval" => "Approve or revoke an exact saved printer endpoint using its decimal expectedVersion. Requires current PrinterNetwork, CatalogRead, CatalogWrite, and operator-admitted scope; performs no network I/O.".to_owned(),
+                    "test_printer_connection" => "Explicit one-shot read-only check of an approved saved printer, with decimal expectedVersion and confirm:true. Saving its snapshot requires PrinterNetwork/CatalogRead/CatalogWrite. Carbon discoverMainboardId broadcasts to 255.255.255.255:3000 on the routed interface only when independently permitted; other LAN devices may receive it. MainboardID stays transient. No credentials or control commands are accepted.".to_owned(),
+                    "search_models" => "Search the catalog with either search or the legacy query field, plus designer, all supplied tag names, file type, print-state, rating, favorite, thumbnail, and admitted-root filters. Use offset only on the first page; follow the returned cursor for stable continuation.".to_owned(),
+                    "find_duplicates" => "Find duplicate models by stored SHA-256, either for up to 1,000 explicit modelIds or a catalog filter set limited to 1,000 matches. Filtered scans require an admitted root when directory is supplied, exclude ZIP members by default, and return at most 200 groups. Hashes are the catalog's import/scan fingerprints; use source-status checks before making file decisions.".to_owned(),
+                    "get_hash_status" => "Return global hash counts, or counts for a bounded catalog filter set. Directory filters require an admitted root. Stored hashes are computed during import and scans; this count does not claim that current source bytes still match.".to_owned(),
+                    "calculate_missing_hashes" => "Refresh source hashes by scanning the selected admitted root. Optional catalog filters choose the matching scope; filtered work must resolve to one root and the scan refreshes that root's sources. GoggleLab normally stores hashes during import and indexing, so no background job is created when the filtered selection already has hashes.".to_owned(),
+                    "update_models_batch" => "Atomically update metadata for multiple models. Use targets plus one patch for a shared change, or updates with one modelId, expectedVersion, and patch per model for heterogeneous changes. Each heterogeneous update may also provide tags as replacement tag names and filamentIds as replacement local filament IDs; tags and filament assignments commit in the same transaction as metadata.".to_owned(),
+                    "get_all_metadata" => "List designers, parent models, and licenses with model counts.".to_owned(),
+                    "list_part_stock" => "List the Free parts-stock catalog. Stock quantities and metadata versions are decimal strings; this is consumable inventory, separate from geometric model parts.".to_owned(),
+                    "create_part_stock" => "Create one parts-stock record. Requires CatalogWrite. Quantity and lowStock are bounded to 1,000,000; names and units are limited to 128 characters.".to_owned(),
+                    "update_part_stock" => "Update one parts-stock record using its expectedVersion decimal string. A stale version fails without changing stock. Requires CatalogWrite.".to_owned(),
+                    "delete_part_stock" => "Delete one parts-stock record using its expectedVersion decimal string. Historical event snapshots remain, and deletion does not refund prior usage. Requires CatalogWrite.".to_owned(),
+                    "log_print_event" => "Create a print event. Provide optional parts as per-copy {id, quantity} usage; printed, failed, and cancelled events consume stock transactionally. On update, omitting parts preserves existing links while parts:[] explicitly clears them.".to_owned(),
+                    "log_print_events_batch" => "Create print events atomically with an idempotency key. Replaying the same key and payload returns the original events without charging parts stock again.".to_owned(),
+                    "check_files_exist" => "Check source status for explicit modelIds, or omit modelIds to scan a bounded catalog slice. Catalog scans check up to 500 models by default and 2000 maximum; missingOnly defaults to true for catalog scans. Each request is capped at 256 MiB of source bytes: split large selections into smaller explicit modelIds batches. A single source larger than 256 MiB cannot be checked by this tool. Returns catalog IDs and source states, never host paths.".to_owned(),
+                    "remove_model" => "Plan recoverable removal of one or more models. Provide a bounded targets array of model IDs and expected versions, or the legacy single modelId/expectedVersion pair, plus confirm:true. Execute the returned one-use management token to remove the selected catalog records; source files stay on disk.".to_owned(),
+                    "plan_management_action" => "Review a versioned one-use library action. purgeCatalog requires confirm:true and a verified archive before catalog replacement; previous Libraries and external source roots remain. cleanupOrphans requires confirm:true, independently reproduces a bounded batch of unreferenced raster previews, and preserves unknown, custom, embedded and indexed-cache source copies. Continuation reviews another batch; every batch needs separate execution. resetDefaultThumbnails requires confirm:true and clears only default catalog records, keeping files. Discard cancelled plans separately.".to_owned(),
+                    "discard_management_action" => "Discard one plan owned by this authenticated principal, releasing retained review resources without executing the plan or changing files. A cancelled plan cannot be executed afterward.".to_owned(),
+                    "pull_3mf_metadata" => "Read embedded metadata proposals for one model or a bounded targets array of stable model IDs with optional expected hashes. The batch form returns an items array and never applies metadata.".to_owned(),
+                    "get_thumbnails" => "List thumbnail gallery descriptors for a model. When the caller has MediaRead, each descriptor includes a short-lived authenticated mediaLease for fetching its image bytes.".to_owned(),
+                    "get_models_missing_thumbnails" => "List missing-thumbnail models with keyset pagination. Pass excludeIds for models that repeatedly fail rendering; excluded IDs are filtered before the page limit.".to_owned(),
+                    "export_library" => "Export library metadata as Printventory JSON without thumbnails. Omit destPath to write a unique JSON file in the only admitted backupOnly root. Otherwise use a backup handle and filename, or an absolute path directly inside an admitted backupOnly root. Requires Maintenance and BackupWrite.".to_owned(),
+                    "list_slicers" => "List supported slicers installed on this authenticated desktop host. Returns stable IDs and display names without application paths.".to_owned(),
+                    "open_in_slicer" => "Open one model or a bounded targets array in a supported slicer. Desktop hosts preflight and stage all verified models before launch. Headless hosts return a clientCommand with short-lived authenticated download leases and content routes for the caller to fetch locally. Provide slicerId and either modelId/expectedVersion or targets; filesystem paths are not accepted.".to_owned(),
+                    "scan_directory" => "Scan all admitted roots, one admitted rootId, or a safe root-relative directory under an admitted root. When directory is supplied, rootId is required; absolute paths, parent traversal, and symlinked directories are rejected. Subdirectory scans add/update sources without marking files outside that subdirectory missing.".to_owned(),
+                    "trash_file" => "Plan moving one or more verified source files into the application trash. Provide either modelId and expectedVersion, or a targets array of 1 to 100 versioned model IDs; always set confirm:true. Execute the returned one-use token separately with execute_management_action. Client filesystem paths are not accepted.".to_owned(),
+                    "undo_trash" => "Plan restoring a previously quarantined source file. Provide snapshotId and confirm:true; then execute the returned one-use token with execute_management_action.".to_owned(),
+                    "move_files" => "Plan moving one or more verified source files to an admitted writable root. Provide destinationHandleId and confirm:true, plus either modelId, expectedVersion, and fileName, or a targets array of 1 to 100 objects containing those fields. Execute the returned one-use token separately with execute_management_action. Client source paths are not accepted.".to_owned(),
+                    _ => format!("GoggleLab {} operation", name.replace('_', " ")),
+                },
+                "inputSchema": input_schema
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod print_history_contract_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_single_print_event_parser_preserves_printer_id_tristate() {
+        let base = serde_json::json!({
+            "printedAt": "2026-10-14T12:00:00Z",
+            "quantity": 1,
+            "notes": "",
+            "filamentIds": [],
+            "outcome": "printed"
+        });
+        assert_eq!(
+            parse_print_attempt_input_with_printer(base.clone())
+                .unwrap()
+                .printer_id,
+            None
+        );
+
+        let mut clear = base.clone();
+        clear["printerId"] = Value::Null;
+        assert_eq!(
+            parse_print_attempt_input_with_printer(clear)
+                .unwrap()
+                .printer_id,
+            Some(None)
+        );
+
+        let mut linked = base;
+        linked["printerId"] = Value::String("printer-1".into());
+        assert_eq!(
+            parse_print_attempt_input_with_printer(linked)
+                .unwrap()
+                .printer_id,
+            Some(Some("printer-1".into()))
+        );
+    }
+
+    #[test]
+    fn mcp_exposes_printer_id_for_single_history_only_not_legacy_batch_items() {
+        let definitions = tool_definitions();
+        let single = definitions
+            .iter()
+            .find(|tool| tool["name"] == "log_print_event")
+            .unwrap();
+        assert_eq!(
+            single["inputSchema"]["properties"]["input"]["properties"]["printerId"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+
+        let batch = definitions
+            .iter()
+            .find(|tool| tool["name"] == "log_print_events_batch")
+            .unwrap();
+        assert!(
+            batch["inputSchema"]["properties"]["items"]["items"]["properties"]["input"]
+                ["properties"]
+                .get("printerId")
+                .is_none()
+        );
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetUpdate<T> {
+    expected_version: String,
+    input: T,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetQuery {
+    printer_id: Option<String>,
+    #[serde(default)]
+    include_completed: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetReminderCreate {
+    printer_id: String,
+    input: PrinterReminderInput,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetComplete {
+    expected_version: String,
+    completed_at: String,
+    notes: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetPause {
+    expected_version: String,
+    paused: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FleetReschedule {
+    expected_version: String,
+    due_at: String,
+}
+
+async fn fleet_list_printers<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<Vec<Printer>>, ApiError> {
+    s.engine
+        .list_printers(&c)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_get_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Option<Printer>>, ApiError> {
+    s.engine
+        .get_printer(&c, &id)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_create_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(input): Json<PrinterInput>,
+) -> Result<Json<Printer>, ApiError> {
+    s.engine
+        .create_printer(&c, input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_update_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetUpdate<PrinterInput>>,
+) -> Result<Json<Printer>, ApiError> {
+    s.engine
+        .update_printer(&c, &id, parse_version(&b.expected_version)?, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_delete_printer<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<VersionBody>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_printer(&c, &id, parse_version(&b.expected_version)?)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_list_logs<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Query(q): Query<FleetQuery>,
+) -> Result<Json<Vec<PrinterMaintenanceLog>>, ApiError> {
+    s.engine
+        .list_printer_maintenance_logs(&c, q.printer_id.as_deref())
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_printer_logs<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<PrinterMaintenanceLog>>, ApiError> {
+    s.engine
+        .list_printer_maintenance_logs(&c, Some(&id))
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_create_log<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<PrinterMaintenanceInput>,
+) -> Result<Json<PrinterMaintenanceLog>, ApiError> {
+    s.engine
+        .create_printer_maintenance_log(&c, &id, input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_update_log<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetUpdate<PrinterMaintenanceInput>>,
+) -> Result<Json<PrinterMaintenanceLog>, ApiError> {
+    s.engine
+        .update_printer_maintenance_log(&c, &id, parse_version(&b.expected_version)?, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_delete_log<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<VersionBody>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_printer_maintenance_log(&c, &id, parse_version(&b.expected_version)?)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_list_reminders<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Query(q): Query<FleetQuery>,
+) -> Result<Json<Vec<PrinterReminder>>, ApiError> {
+    s.engine
+        .list_printer_reminders(&c, q.printer_id.as_deref(), q.include_completed)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_create_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<FleetReminderCreate>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .create_printer_reminder(&c, &b.printer_id, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_update_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetUpdate<PrinterReminderInput>>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .update_printer_reminder(&c, &id, parse_version(&b.expected_version)?, b.input)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_delete_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<VersionBody>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .delete_printer_reminder(&c, &id, parse_version(&b.expected_version)?)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_complete_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetComplete>,
+) -> Result<Json<PrinterReminderCompletion>, ApiError> {
+    s.engine
+        .complete_printer_reminder(
+            &c,
+            &id,
+            parse_version(&b.expected_version)?,
+            PrinterReminderCompletionInput {
+                completed_at: b.completed_at,
+                notes: b.notes,
+            },
+        )
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_pause_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetPause>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .set_printer_reminder_paused(&c, &id, parse_version(&b.expected_version)?, b.paused)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+async fn fleet_reschedule_reminder<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<FleetReschedule>,
+) -> Result<Json<PrinterReminder>, ApiError> {
+    s.engine
+        .reschedule_printer_reminder(&c, &id, parse_version(&b.expected_version)?, &b.due_at)
+        .map(Json)
+        .map_err(|e| ApiError::from_engine(e, &c.request_id))
+}
+
+fn fleet_input_schema(kind: &str) -> Value {
+    let text = |maximum| serde_json::json!({"type":"string","maxLength":maximum});
+    let optional_text = |maximum| serde_json::json!({"type":["string","null"],"maxLength":maximum});
+    let (properties, required) = match kind {
+        "printer" => (
+            serde_json::json!({"nickname":{"type":"string","minLength":1,"maxLength":128},"make":optional_text(128),"model":optional_text(128),"printerType":optional_text(128),"firmware":optional_text(128),"host":optional_text(255),"webUrl":optional_text(2048),"bedMm":{"oneOf":[{"type":"null"},{"type":"array","minItems":3,"maxItems":3,"items":{"type":"number","minimum":0.1,"maximum":10000}}]},"notes":text(20000)}),
+            vec!["nickname", "notes"],
+        ),
+        "log" => (
+            serde_json::json!({"title":{"type":"string","minLength":1,"maxLength":128},"performedAt":{"type":"string","format":"date-time","maxLength":64},"notes":text(20000)}),
+            vec!["title", "performedAt", "notes"],
+        ),
+        _ => (
+            serde_json::json!({"title":{"type":"string","minLength":1,"maxLength":128},"notes":text(20000),"dueAt":{"type":"string","format":"date-time","maxLength":64},"intervalDays":{"type":["integer","null"],"minimum":1,"maximum":36500}}),
+            vec!["title", "notes", "dueAt"],
+        ),
+    };
+    serde_json::json!({"type":"object","additionalProperties":false,"properties":properties,"required":required})
+}
+fn fleet_tool_schema(name: &str) -> Option<Value> {
+    let id = serde_json::json!({"type":"string","minLength":1,"maxLength":128});
+    let version = serde_json::json!({"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"});
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    match name {
+        "list_printers" => {}
+        "get_printer"
+        | "create_printer_maintenance_log"
+        | "create_printer_reminder"
+        | "update_printer"
+        | "delete_printer" => {
+            properties.insert("printerId".into(), id.clone());
+            required.push("printerId");
+        }
+        "list_printer_maintenance_logs" | "list_printer_reminders" => {
+            properties.insert("printerId".into(), id.clone());
+        }
+        "update_printer_maintenance_log" | "delete_printer_maintenance_log" => {
+            properties.insert("logId".into(), id.clone());
+            required.push("logId");
+        }
+        "update_printer_reminder"
+        | "delete_printer_reminder"
+        | "complete_printer_reminder"
+        | "set_printer_reminder_paused"
+        | "reschedule_printer_reminder" => {
+            properties.insert("reminderId".into(), id.clone());
+            required.push("reminderId");
+        }
+        "create_printer" => {}
+        _ => return None,
+    }
+    if name.starts_with("update_")
+        || name.starts_with("delete_")
+        || matches!(
+            name,
+            "complete_printer_reminder"
+                | "set_printer_reminder_paused"
+                | "reschedule_printer_reminder"
+        )
+    {
+        properties.insert("expectedVersion".into(), version);
+        required.push("expectedVersion");
+    }
+    if name.starts_with("create_") || name.starts_with("update_") {
+        let kind = if name.ends_with("maintenance_log") {
+            "log"
+        } else if name.ends_with("reminder") {
+            "reminder"
+        } else {
+            "printer"
+        };
+        properties.insert("input".into(), fleet_input_schema(kind));
+        required.push("input");
+    }
+    if name == "list_printer_reminders" {
+        properties.insert(
+            "includeCompleted".into(),
+            serde_json::json!({"type":"boolean"}),
+        );
+    }
+    for (tool, field, schema) in [
+        (
+            "complete_printer_reminder",
+            "completedAt",
+            serde_json::json!({"type":"string","format":"date-time","maxLength":64}),
+        ),
+        (
+            "complete_printer_reminder",
+            "notes",
+            serde_json::json!({"type":"string","maxLength":20000}),
+        ),
+        (
+            "set_printer_reminder_paused",
+            "paused",
+            serde_json::json!({"type":"boolean"}),
+        ),
+        (
+            "reschedule_printer_reminder",
+            "dueAt",
+            serde_json::json!({"type":"string","format":"date-time","maxLength":64}),
+        ),
+    ] {
+        if name == tool {
+            properties.insert(field.into(), schema);
+            required.push(field);
+        }
+    }
+    Some(
+        serde_json::json!({"type":"object","additionalProperties":false,"properties":properties,"required":required}),
+    )
+}
+fn fleet_openapi_paths() -> Value {
+    let mut paths = serde_json::Map::new();
+    for (path, actions) in [
+        (
+            "/api/v1/printers",
+            vec![("get", "list_printers"), ("post", "create_printer")],
+        ),
+        (
+            "/api/v1/printers/{id}",
+            vec![
+                ("get", "get_printer"),
+                ("put", "update_printer"),
+                ("delete", "delete_printer"),
+            ],
+        ),
+        (
+            "/api/v1/printers/{id}/maintenance-logs",
+            vec![
+                ("get", "list_printer_maintenance_logs"),
+                ("post", "create_printer_maintenance_log"),
+            ],
+        ),
+        (
+            "/api/v1/printer-maintenance-logs",
+            vec![("get", "list_printer_maintenance_logs")],
+        ),
+        (
+            "/api/v1/printer-maintenance-logs/{id}",
+            vec![
+                ("put", "update_printer_maintenance_log"),
+                ("delete", "delete_printer_maintenance_log"),
+            ],
+        ),
+        (
+            "/api/v1/printer-reminders",
+            vec![
+                ("get", "list_printer_reminders"),
+                ("post", "create_printer_reminder"),
+            ],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}",
+            vec![
+                ("put", "update_printer_reminder"),
+                ("delete", "delete_printer_reminder"),
+            ],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}/complete",
+            vec![("post", "complete_printer_reminder")],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}/pause",
+            vec![("post", "set_printer_reminder_paused")],
+        ),
+        (
+            "/api/v1/printer-reminders/{id}/reschedule",
+            vec![("post", "reschedule_printer_reminder")],
+        ),
+    ] {
+        let mut methods = serde_json::Map::new();
+        for (method, tool) in actions {
+            let mut operation = serde_json::json!({"operationId":tool,"description":"Data-only Community printer fleet metadata. CatalogRead permits reads; CatalogWrite permits mutations. No discovery, credentials, endpoint approval, network requests, or printer controls. Versions and printCount are decimal strings. Stale versions fail atomically.","responses":{"200":{"description":"Credential-free printer metadata; metadataVersion and printCount are decimal strings"},"204":{"description":"Deleted"},"401":{"description":"Authentication required"},"403":{"description":"Required catalog capability absent"},"409":{"description":"Stored version changed; no mutation"},"422":{"description":"Invalid metadata or unsupported input fields"},"503":{"description":"Library maintenance in progress"}}});
+            if path.contains("{id}") {
+                operation["parameters"] = serde_json::json!([{"name":"id","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":128}}]);
+            }
+            if method == "get" && !path.contains("{id}") && tool != "list_printers" {
+                operation["parameters"] = serde_json::json!([{"name":"printerId","in":"query","schema":{"type":"string","maxLength":128}},{"name":"includeCompleted","in":"query","schema":{"type":"boolean","default":false}}]);
+            }
+            if method != "get" {
+                let mut schema = fleet_tool_schema(tool).expect("known fleet tool");
+                for key in ["printerId", "logId", "reminderId"] {
+                    if path.contains("{id}") {
+                        schema["properties"].as_object_mut().unwrap().remove(key);
+                        schema["required"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|value| value != key);
+                    }
+                }
+                if matches!(tool, "create_printer" | "create_printer_maintenance_log") {
+                    schema = schema["properties"]["input"].take();
+                }
+                operation["requestBody"] = serde_json::json!({"required":true,"content":{"application/json":{"schema":schema}}});
+            }
+            let response_kind =
+                if tool.ends_with("maintenance_log") || tool == "list_printer_maintenance_logs" {
+                    "PrinterMaintenanceLog"
+                } else if tool == "complete_printer_reminder" {
+                    "PrinterReminderCompletion"
+                } else if tool.contains("reminder") {
+                    "PrinterReminder"
+                } else {
+                    "Printer"
+                };
+            let item = serde_json::json!({"$ref":format!("#/components/schemas/{response_kind}")});
+            let response_schema = if tool.starts_with("list_") {
+                serde_json::json!({"type":"array","items":item})
+            } else if tool == "get_printer" {
+                serde_json::json!({"oneOf":[item,{"type":"null"}]})
+            } else {
+                item
+            };
+            if method == "delete" {
+                operation["responses"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("200");
+            } else {
+                operation["responses"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("204");
+                operation["responses"]["200"]["content"] =
+                    serde_json::json!({"application/json":{"schema":response_schema}});
+            }
+            methods.insert(method.into(), operation);
+        }
+        paths.insert(path.into(), Value::Object(methods));
+    }
+    Value::Object(paths)
+}
+
+fn fleet_output_schemas() -> Value {
+    let decimal = serde_json::json!({"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"});
+    let text = serde_json::json!({"type":"string"});
+    let nullable = serde_json::json!({"type":["string","null"]});
+    let mut schemas = serde_json::Map::new();
+    for (kind, name) in [
+        ("printer", "Printer"),
+        ("log", "PrinterMaintenanceLog"),
+        ("reminder", "PrinterReminder"),
+    ] {
+        let mut schema = fleet_input_schema(kind);
+        let properties = schema["properties"].as_object_mut().unwrap();
+        properties.insert("id".into(), text.clone());
+        properties.insert("metadataVersion".into(), decimal.clone());
+        properties.insert("createdAt".into(), text.clone());
+        if kind == "printer" {
+            for field in ["lastCheckedAt", "connectionErrorCode", "lastPrintedAt"] {
+                properties.insert(field.into(), nullable.clone());
+            }
+            properties.insert("updatedAt".into(), text.clone());
+            properties.insert("printCount".into(), decimal.clone());
+            properties.insert(
+                "endpointApproved".into(),
+                serde_json::json!({"type":"boolean"}),
+            );
+            properties.insert(
+                "sourceKind".into(),
+                serde_json::json!({"type":"string","enum":["manual","discovered","imported"]}),
+            );
+            properties.insert("connectionStatus".into(),serde_json::json!({"type":"string","enum":["unknown","online","offline","auth_required","error"]}));
+            properties.insert("jobStatus".into(),serde_json::json!({"type":"string","enum":["unknown","idle","printing","paused","complete"]}));
+        } else {
+            properties.insert("printerId".into(), nullable.clone());
+            properties.insert("printerNickname".into(), text.clone());
+            if kind == "reminder" {
+                properties.insert("updatedAt".into(), text.clone());
+                properties.insert("lastCompletedAt".into(), nullable.clone());
+                properties.insert(
+                    "status".into(),
+                    serde_json::json!({"type":"string","enum":["active","paused","completed"]}),
+                );
+            }
+        }
+        let required = properties.keys().cloned().collect::<Vec<_>>();
+        schema["required"] = serde_json::json!(required);
+        schemas.insert(name.into(), schema);
+    }
+    schemas.insert("PrinterReminderCompletion".into(),serde_json::json!({"type":"object","additionalProperties":false,"required":["reminder","maintenanceLog"],"properties":{"reminder":{"$ref":"#/components/schemas/PrinterReminder"},"maintenanceLog":{"$ref":"#/components/schemas/PrinterMaintenanceLog"}}}));
+    Value::Object(schemas)
+}
+
+fn network_unsupported() -> EngineError {
+    EngineError {
+        code: "unsupported",
+        message: "Printer networking is unavailable in this engine".into(),
+        retryable: false,
+        current_version: None,
+        source_holds: Vec::new(),
+    }
+}
+fn network_permissions(
+    c: &RequestContext,
+    write: bool,
+    policy_only: bool,
+) -> Result<(), EngineError> {
+    if !c.capabilities.contains(&Capability::CatalogRead)
+        || (!policy_only && !c.capabilities.contains(&Capability::PrinterNetwork))
+        || (write && !c.capabilities.contains(&Capability::CatalogWrite))
+    {
+        return Err(EngineError {
+            code: "forbidden",
+            message: "Printer networking permission is required".into(),
+            retryable: false,
+            current_version: None,
+            source_holds: Vec::new(),
+        });
+    }
+    Ok(())
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkPlanBody {
+    range: String,
+    include_bambu_discovery: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkStartBody {
+    plan_token: String,
+    confirm: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkApprovalBody {
+    expected_version: String,
+    approved: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetworkCheckBody {
+    expected_version: String,
+    discover_mainboard_id: bool,
+    confirm: bool,
+}
+
+async fn network_policy<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+) -> Result<Json<PrinterNetworkPolicySummary>, ApiError> {
+    network_permissions(&c, false, true).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.get_printer_network_policy(&c)
+    })
+    .await
+    .map(Json)
+}
+async fn network_plan<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<NetworkPlanBody>,
+) -> Result<Json<PrinterDiscoveryPlan>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if b.range.is_empty() || b.range.len() > 4096 {
+        return Err(api_bad("invalidInput", "Discovery range is invalid"));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.plan_printer_discovery(&c, &b.range, b.include_bambu_discovery)
+    })
+    .await
+    .map(Json)
+}
+async fn network_start<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    Json(b): Json<NetworkStartBody>,
+) -> Result<Json<PrinterDiscoveryJob>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if b.plan_token.is_empty() || b.plan_token.len() > 256 || !b.confirm {
+        return Err(api_bad(
+            "invalidInput",
+            "A reviewed plan and confirm:true are required",
+        ));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.start_printer_discovery(&c, &b.plan_token, b.confirm)
+    })
+    .await
+    .map(Json)
+}
+async fn network_get<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PrinterDiscoveryJob>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 {
+        return Err(api_bad("invalidInput", "Job ID is invalid"));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.get_printer_discovery(&c, &id)
+    })
+    .await
+    .map(Json)
+}
+async fn network_cancel<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PrinterDiscoveryJob>, ApiError> {
+    network_permissions(&c, false, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 {
+        return Err(api_bad("invalidInput", "Job ID is invalid"));
+    }
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.cancel_printer_discovery(&c, &id)
+    })
+    .await
+    .map(Json)
+}
+async fn network_approve<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<NetworkApprovalBody>,
+) -> Result<Json<Printer>, ApiError> {
+    network_permissions(&c, true, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 {
+        return Err(api_bad("invalidInput", "Printer ID is invalid"));
+    }
+    let version = parse_version(&b.expected_version)?;
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.set_printer_endpoint_approval(&c, &id, version, b.approved)
+    })
+    .await
+    .map(Json)
+}
+async fn network_test<E: LibraryEngine>(
+    State(s): State<ServerState<E>>,
+    axum::Extension(c): axum::Extension<RequestContext>,
+    AxumPath(id): AxumPath<String>,
+    Json(b): Json<NetworkCheckBody>,
+) -> Result<Json<PrinterConnectionResponse>, ApiError> {
+    network_permissions(&c, true, false).map_err(|e| ApiError::from_engine(e, &c.request_id))?;
+    if id.is_empty() || id.len() > 128 || !b.confirm {
+        return Err(api_bad(
+            "invalidInput",
+            "A printer ID and confirm:true are required",
+        ));
+    }
+    let version = parse_version(&b.expected_version)?;
+    let request_id = c.request_id.clone();
+    blocking_engine(s.engine, &request_id, move |engine| {
+        engine.test_printer_connection(&c, &id, version, b.discover_mainboard_id, b.confirm)
+    })
+    .await
+    .map(Json)
+}
+
+fn network_tool_schema(name: &str) -> Option<Value> {
+    let text = |max| serde_json::json!({"type":"string","minLength":1,"maxLength":max});
+    let version = serde_json::json!({"type":"string","maxLength":20,"pattern":"^(0|[1-9][0-9]*)$"});
+    let confirm = serde_json::json!({"type":"boolean","const":true});
+    let properties = match name {
+        "get_printer_network_policy" => serde_json::json!({}),
+        "plan_printer_discovery" => {
+            serde_json::json!({"range":text(4096),"includeBambuDiscovery":{"type":"boolean"}})
+        }
+        "start_printer_discovery" => serde_json::json!({"planToken":text(256),"confirm":confirm}),
+        "get_printer_discovery" | "cancel_printer_discovery" => {
+            serde_json::json!({"jobId":text(128)})
+        }
+        "set_printer_endpoint_approval" => {
+            serde_json::json!({"printerId":text(128),"expectedVersion":version,"approved":{"type":"boolean"}})
+        }
+        "test_printer_connection" => {
+            serde_json::json!({"printerId":text(128),"expectedVersion":version,"discoverMainboardId":{"type":"boolean"},"confirm":confirm})
+        }
+        _ => return None,
+    };
+    let required = properties
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(
+        serde_json::json!({"type":"object","additionalProperties":false,"properties":properties,"required":required}),
+    )
+}
+fn validate_network_tool(name: &str, value: &Value) -> Result<(), EngineError> {
+    let schema = network_tool_schema(name).ok_or_else(invalid_tool)?;
+    let object = value.as_object().ok_or_else(invalid_tool)?;
+    let fields = schema["properties"].as_object().unwrap();
+    if object.len() != fields.len() || object.keys().any(|key| !fields.contains_key(key)) {
+        return Err(invalid_tool());
+    }
+    for (key, field) in fields {
+        let value = &object[key];
+        if field["type"] == "boolean" {
+            if !value.is_boolean() || (key == "confirm" && value != true) {
+                return Err(invalid_tool());
+            }
+        } else {
+            let text = value.as_str().ok_or_else(invalid_tool)?;
+            if text.is_empty() || text.len() > field["maxLength"].as_u64().unwrap_or(128) as usize {
+                return Err(invalid_tool());
+            }
+            if key == "expectedVersion" && parse_decimal(text).is_err() {
+                return Err(invalid_tool());
+            }
+        }
+    }
+    Ok(())
+}
+fn call_network_tool<E: LibraryEngine + ?Sized>(
+    engine: &E,
+    c: &RequestContext,
+    name: &str,
+    args: Value,
+) -> Result<Value, EngineError> {
+    let write = matches!(
+        name,
+        "set_printer_endpoint_approval" | "test_printer_connection"
+    );
+    network_permissions(c, write, name == "get_printer_network_policy")?;
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_tool)
+    };
+    let boolean = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_bool)
+            .ok_or_else(invalid_tool)
+    };
+    let encode = |value: Value| Ok(value);
+    match name {
+        "get_printer_network_policy" => encode(
+            serde_json::to_value(engine.get_printer_network_policy(c)?)
+                .map_err(|_| invalid_tool())?,
+        ),
+        "plan_printer_discovery" => encode(
+            serde_json::to_value(engine.plan_printer_discovery(
+                c,
+                text("range")?,
+                boolean("includeBambuDiscovery")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        "start_printer_discovery" => encode(
+            serde_json::to_value(engine.start_printer_discovery(
+                c,
+                text("planToken")?,
+                boolean("confirm")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        "get_printer_discovery" => encode(
+            serde_json::to_value(engine.get_printer_discovery(c, text("jobId")?)?)
+                .map_err(|_| invalid_tool())?,
+        ),
+        "cancel_printer_discovery" => encode(
+            serde_json::to_value(engine.cancel_printer_discovery(c, text("jobId")?)?)
+                .map_err(|_| invalid_tool())?,
+        ),
+        "set_printer_endpoint_approval" => encode(
+            serde_json::to_value(engine.set_printer_endpoint_approval(
+                c,
+                text("printerId")?,
+                tool_version(&args)?,
+                boolean("approved")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        "test_printer_connection" => encode(
+            serde_json::to_value(engine.test_printer_connection(
+                c,
+                text("printerId")?,
+                tool_version(&args)?,
+                boolean("discoverMainboardId")?,
+                boolean("confirm")?,
+            )?)
+            .map_err(|_| invalid_tool())?,
+        ),
+        _ => Err(invalid_tool()),
+    }
+}
+fn network_openapi_paths() -> Value {
+    let mut paths = serde_json::Map::new();
+    for (path, operations) in [
+        (
+            "/api/v1/printer-network/policy",
+            vec![("get", "get_printer_network_policy")],
+        ),
+        (
+            "/api/v1/printer-network/discovery-plans",
+            vec![("post", "plan_printer_discovery")],
+        ),
+        (
+            "/api/v1/printer-network/discovery-jobs",
+            vec![("post", "start_printer_discovery")],
+        ),
+        (
+            "/api/v1/printer-network/discovery-jobs/{jobId}",
+            vec![
+                ("get", "get_printer_discovery"),
+                ("delete", "cancel_printer_discovery"),
+            ],
+        ),
+        (
+            "/api/v1/printers/{id}/endpoint-approval",
+            vec![("put", "set_printer_endpoint_approval")],
+        ),
+        (
+            "/api/v1/printers/{id}/status-checks",
+            vec![("post", "test_printer_connection")],
+        ),
+    ] {
+        let mut methods = serde_json::Map::new();
+        for (method, tool) in operations {
+            let mut schema = network_tool_schema(tool).unwrap();
+            let mut operation = serde_json::json!({"operationId":tool,"description":"Explicit read-only printer LAN operation. Host policy and current printerNetwork/catalogRead permission are mandatory; endpoint approval and saved status also require catalogWrite. No credentials, raw identifiers, arbitrary URL, or control commands.","responses":{"200":{"description":"Sanitized bounded result; versions are decimal strings"},"400":{"description":"Invalid request or missing explicit confirmation"},"401":{"description":"Authentication required"},"403":{"description":"Current permission or operator policy missing"},"404":{"description":"Plan or job is missing, expired, already consumed, or not owned by this principal"},"409":{"description":"Stale printer version, changed policy generation, or cancelled work"},"422":{"description":"Malformed JSON shape or unsupported fields"},"503":{"description":"Maintenance or capacity limit"}}});
+            if tool == "get_printer_network_policy" {
+                operation["description"] = serde_json::json!("Read host-configured printer LAN availability and bounds with catalogRead permission. This performs no network I/O and remains available when printerNetwork permission or host policy is absent; clients cannot enable or expand policy.");
+            }
+            if path.contains('{') {
+                let (parameter, key) = if path.contains("{jobId}") {
+                    ("jobId", "jobId")
+                } else {
+                    ("id", "printerId")
+                };
+                operation["parameters"] = serde_json::json!([{"name":parameter,"in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":128}}]);
+                schema["properties"].as_object_mut().unwrap().remove(key);
+                schema["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|value| value != key);
+            }
+            if !matches!(method, "get" | "delete") {
+                operation["requestBody"] = serde_json::json!({"required":true,"content":{"application/json":{"schema":schema}}});
+            }
+            let response = match tool {
+                "get_printer_network_policy" => "PrinterNetworkPolicySummary",
+                "plan_printer_discovery" => "PrinterDiscoveryPlan",
+                "set_printer_endpoint_approval" => "Printer",
+                "test_printer_connection" => "PrinterConnectionResponse",
+                _ => "PrinterDiscoveryJob",
+            };
+            operation["responses"]["200"]["content"] = serde_json::json!({"application/json":{"schema":{"$ref":format!("#/components/schemas/{response}")}}});
+            methods.insert(method.into(), operation);
+        }
+        paths.insert(path.into(), Value::Object(methods));
+    }
+    Value::Object(paths)
+}
+
+fn network_output_schemas() -> Value {
+    let boolean = serde_json::json!({"type":"boolean"});
+    let text = serde_json::json!({"type":"string"});
+    let optional_text = serde_json::json!({"type":["string","null"]});
+    let count = serde_json::json!({"type":"integer","minimum":0,"maximum":4294967295_u64});
+    serde_json::json!({
+      "PrinterNetworkPolicySummary":{"type":"object","additionalProperties":false,"required":["enabled","discoveryAvailable","statusChecksAvailable","multicastDiscoveryAllowed","carbonBroadcastAllowed","maxDiscoveryAddresses","maxSuggestions","maximumDurationMs"],"properties":{"enabled":boolean,"discoveryAvailable":boolean,"statusChecksAvailable":boolean,"multicastDiscoveryAllowed":boolean,"carbonBroadcastAllowed":boolean,"maxDiscoveryAddresses":count,"maxSuggestions":count,"maximumDurationMs":count}},
+      "PrinterDiscoveryPlan":{"type":"object","additionalProperties":false,"required":["planToken","normalizedRange","addressCount","includeBambuDiscovery","multicastDisclosure","expiresAt"],"properties":{"planToken":text,"normalizedRange":text,"addressCount":count,"includeBambuDiscovery":boolean,"multicastDisclosure":optional_text,"expiresAt":{"type":"string","format":"date-time"}}},
+      "PrinterNetworkSuggestion":{"type":"object","additionalProperties":false,"required":["key","name","model","bedMm","connection","source","printerType"],"properties":{"key":text,"name":text,"model":optional_text,"bedMm":{"oneOf":[{"type":"null"},{"type":"array","minItems":3,"maxItems":3,"items":count}]},"connection":{"type":"object","additionalProperties":false,"required":["kind","address"],"properties":{"kind":{"type":"string","const":"network"},"address":text}},"source":{"type":"string","enum":["moonraker","prusalink","bambu_mqtt_tls"]},"printerType":text}},
+      "PrinterDiscoveryJob":{"type":"object","additionalProperties":false,"required":["jobId","status","suggestions","normalizedRange","errorCode"],"properties":{"jobId":text,"status":{"type":"string","enum":["running","completed","cancelled","failed"]},"suggestions":{"type":"array","maxItems":33,"items":{"$ref":"#/components/schemas/PrinterNetworkSuggestion"}},"normalizedRange":text,"errorCode":optional_text}},
+      "PrinterConnectionResponse":{"type":"object","additionalProperties":false,"required":["result","printer","statusEventObserved"],"properties":{"result":{"type":"string","enum":["connected","unreachable","unsupported","authRequired","failed","cancelled"]},"printer":{"$ref":"#/components/schemas/Printer"},"statusEventObserved":boolean}}
+    })
+}

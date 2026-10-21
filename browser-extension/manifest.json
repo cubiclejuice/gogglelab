@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "GoggleLab Capture",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "description": "Queue supported 3D-model pages and downloads for explicit GoggleLab import.",
+  "permissions": ["storage", "activeTab", "downloads", "offscreen"],
+  "host_permissions": [
+    "https://makerworld.com/*",
+    "https://thangs.com/*",
+    "https://printables.com/*",
+    "https://thingiverse.com/*",
+    "https://cults3d.com/*",
+    "https://myminifactory.com/*",
+    "https://*.makerworld.com/*",
+    "https://*.thangs.com/*",
+    "https://*.printables.com/*",
+    "https://*.thingiverse.com/*",
+    "https://*.cults3d.com/*",
+    "https://*.myminifactory.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://api.printables.com/*",
+    "https://api.bambulab.com/*"
+  ],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Capture for GoggleLab", "default_popup": "popup.html" },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://makerworld.com/*",
+        "https://thangs.com/*",
+        "https://printables.com/*",
+        "https://thingiverse.com/*",
+        "https://cults3d.com/*",
+        "https://myminifactory.com/*",
+        "https://*.makerworld.com/*",
+        "https://*.thangs.com/*",
+        "https://*.printables.com/*",
+        "https://*.thingiverse.com/*",
+        "https://*.cults3d.com/*",
+        "https://*.myminifactory.com/*"
+      ],
+      "js": ["shared.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

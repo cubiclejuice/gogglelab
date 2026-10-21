@@ -1,0 +1,1761 @@
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::{ffi::OsStr, ffi::OsString};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use library_core::CatalogSettings;
+use sha2::{Digest, Sha256};
+use stl_core::package_bounds::{collect_verified_model_source, PackageProcessingContext};
+use stl_core::zip_bounds::ZipResourceObserver;
+use stl_core::{ParsedStl, ResourceStop};
+
+use crate::png_output::BoundedPngOutput;
+use crate::secure_fs::Directory;
+use crate::ProcessingError;
+
+const RENDER_VERSION: u32 = 1;
+const MAX_RENDER_TRIANGLES: usize = 200_000;
+const BASE_MAX_RASTER_SAMPLES: usize = 8_000_000;
+pub(crate) const MAX_CACHED_PNG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PNG_DIMENSION: u32 = 1024;
+const MAX_DECODED_PNG_BYTES: usize = 4 * 1024 * 1024;
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub struct ThumbnailArtifact {
+    pub relative_path: PathBuf,
+    pub png_hash: String,
+}
+
+/// A supported recipe parsed from a complete canonical cache filename. Names
+/// supply lookup hints only: neither source nor PNG digests establish ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThumbnailRecipe {
+    source_hash: String,
+    size: u32,
+    background: String,
+    png_hash_hint: Option<String>,
+}
+impl ThumbnailRecipe {
+    pub(crate) fn parse_filename(name: &OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        let (source_hash, suffix) = name.strip_suffix(".png")?.split_once("-isometric-v1-")?;
+        let mut fields = suffix.split('-');
+        let size = match fields.next()? {
+            "128" => 128,
+            "256" => 256,
+            "512" => 512,
+            _ => return None,
+        };
+        let background = fields.next()?;
+        let png_hash_hint = fields.next();
+        let canonical_hex = |value: &str, length| {
+            value.len() == length
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        };
+        if !canonical_hex(source_hash, 64)
+            || !canonical_hex(background, 6)
+            || png_hash_hint.is_some_and(|hash| !canonical_hex(hash, 64))
+            || fields.next().is_some()
+        {
+            return None;
+        }
+        Some(Self {
+            source_hash: source_hash.to_owned(),
+            size,
+            background: background.to_owned(),
+            png_hash_hint: png_hash_hint.map(str::to_owned),
+        })
+    }
+    pub(crate) fn matches_catalog(
+        &self,
+        source_hash: &str,
+        settings: &CatalogSettings,
+        png_hash: &str,
+    ) -> bool {
+        self.source_hash.eq_ignore_ascii_case(source_hash)
+            && self.size == settings.thumbnail_size
+            && self.background.eq_ignore_ascii_case(
+                settings
+                    .thumbnail_background
+                    .strip_prefix('#')
+                    .unwrap_or(""),
+            )
+            && self
+                .png_hash_hint
+                .as_ref()
+                .is_none_or(|hint| hint.eq_ignore_ascii_case(png_hash))
+    }
+    pub(crate) fn raster_sample_budget(&self) -> u64 {
+        BASE_MAX_RASTER_SAMPLES as u64 * u64::from(self.size) * u64::from(self.size) / (256 * 256)
+    }
+    pub(crate) fn source_hash(&self) -> &str {
+        &self.source_hash
+    }
+    fn settings(&self) -> CatalogSettings {
+        CatalogSettings {
+            thumbnail_size: self.size,
+            thumbnail_background: format!("#{}", self.background),
+            thumbnail_concurrency: 1,
+            scan_batch_size: 128,
+        }
+    }
+}
+
+/// Constructible only by the deterministic raster renderer, never by admitting
+/// an existing cache file or copying an embedded archive preview.
+#[derive(Debug)]
+pub(crate) struct RasterGeneratedPng {
+    bytes: Vec<u8>,
+    recipe: ThumbnailRecipe,
+    source_bytes: u64,
+    png_hash: String,
+}
+impl RasterGeneratedPng {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    // Read-only bindings for the subsequent, separately gated PNG admission.
+    #[allow(dead_code)]
+    pub(crate) fn recipe(&self) -> &ThumbnailRecipe {
+        &self.recipe
+    }
+    #[allow(dead_code)]
+    pub(crate) fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+    pub(crate) fn png_hash(&self) -> &str {
+        &self.png_hash
+    }
+    /// Match a canonical cache selector to this independently rendered output.
+    /// The optional filename digest selects bytes; it never creates proof.
+    pub(crate) fn matches_filename(&self, name: &OsStr) -> bool {
+        let Some(candidate) = ThumbnailRecipe::parse_filename(name) else {
+            return false;
+        };
+        candidate.source_hash == self.recipe.source_hash
+            && candidate.size == self.recipe.size
+            && candidate.background == self.recipe.background
+            && candidate
+                .png_hash_hint
+                .as_deref()
+                .is_none_or(|hint| hint == self.png_hash.as_str())
+    }
+}
+#[derive(Debug)]
+struct EmbeddedPreviewPng {
+    bytes: Vec<u8>,
+}
+#[derive(Debug)]
+enum SourceThumbnail {
+    RasterGenerated(RasterGeneratedPng),
+    EmbeddedPreviewCopy(EmbeddedPreviewPng),
+}
+impl SourceThumbnail {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::RasterGenerated(png) => png.bytes,
+            Self::EmbeddedPreviewCopy(png) => png.bytes,
+        }
+    }
+}
+
+/// Pure bounded source rendering shared with normal generation. Callers still
+/// admit the source through catalog/root/epoch checks; a digest alone is not
+/// permission to read a source. This function accepts no cache path or catalog.
+#[cfg(test)]
+fn render_source_thumbnail(
+    source: &[u8],
+    source_hash: &str,
+    expected_bytes: u64,
+    settings: &CatalogSettings,
+) -> Result<SourceThumbnail, ProcessingError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    render_source_thumbnail_in_context(source, source_hash, expected_bytes, settings, &mut context)
+}
+
+fn render_source_thumbnail_in_context(
+    source: &[u8],
+    source_hash: &str,
+    expected_bytes: u64,
+    settings: &CatalogSettings,
+    context: &mut PackageProcessingContext,
+) -> Result<SourceThumbnail, ProcessingError> {
+    render_source_with_preview(
+        source,
+        source_hash,
+        expected_bytes,
+        settings,
+        context,
+        crate::images::embedded_3mf_thumbnail_in_context_typed,
+        render_png_typed,
+    )
+}
+
+fn render_source_with_preview(
+    source: &[u8],
+    source_hash: &str,
+    expected_bytes: u64,
+    settings: &CatalogSettings,
+    context: &mut PackageProcessingContext,
+    preview: impl FnOnce(
+        &[u8],
+        &mut PackageProcessingContext,
+    ) -> Result<Option<Vec<u8>>, ProcessingError>,
+    raster: impl FnOnce(&ParsedStl, &CatalogSettings) -> Result<Vec<u8>, ProcessingError>,
+) -> Result<SourceThumbnail, ProcessingError> {
+    let observer = context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    let result = (|| {
+        if expected_bytes > stl_core::limits::MAX_FILE_BYTES {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::InputLimitExceeded),
+            ));
+        }
+        if source.len() as u64 != expected_bytes || hex_digest(source) != source_hash {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
+            ));
+        }
+        let relative = thumbnail_relative_path(source_hash, settings);
+        let recipe = relative
+            .file_name()
+            .and_then(ThumbnailRecipe::parse_filename)
+            .ok_or_else(|| "Unsupported thumbnail recipe".to_owned())?;
+        if recipe.source_hash() != source_hash {
+            return Err("Thumbnail recipe source mismatch".into());
+        }
+        // Keep the existing parser/embedded-selection order and raster algorithm.
+        // Their existing expansion, triangle-stride and raster-sample limits apply.
+        let parsed =
+            stl_core::parse_model_in_context(source, context).map_err(ProcessingError::from)?;
+        observer.check().map_err(ProcessingError::from)?;
+        let rendered = match preview(source, context) {
+            Ok(Some(bytes)) => SourceThumbnail::EmbeddedPreviewCopy(EmbeddedPreviewPng { bytes }),
+            Err(error) if error.is_terminal() => return Err(error),
+            Ok(None) | Err(_) => {
+                observer.check().map_err(ProcessingError::from)?;
+                let bytes = raster(&parsed, settings)?;
+                let png_hash = hex_digest(&bytes);
+                SourceThumbnail::RasterGenerated(RasterGeneratedPng {
+                    bytes,
+                    recipe,
+                    source_bytes: expected_bytes,
+                    png_hash,
+                })
+            }
+        };
+        observer.check().map_err(ProcessingError::from)?;
+        let bytes = match &rendered {
+            SourceThumbnail::RasterGenerated(png) => png.bytes(),
+            SourceThumbnail::EmbeddedPreviewCopy(png) => &png.bytes,
+        };
+        if bytes.len() as u64 > MAX_CACHED_PNG_BYTES {
+            return Err("Generated thumbnail exceeds its cache size limit".into());
+        }
+        Ok(rendered)
+    })();
+    observer.finish(result)
+}
+
+/// Independent raster reproduction only. Embedded previews and a mismatched
+/// content-address hint remain unproven regardless of any cache equality.
+/// Each standalone call creates one operation; composed callers supply their context.
+#[cfg(test)]
+pub(crate) fn reproduce_thumbnail(
+    recipe: &ThumbnailRecipe,
+    source: &[u8],
+    expected_bytes: u64,
+) -> Result<Option<RasterGeneratedPng>, ProcessingError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    reproduce_thumbnail_in_context(recipe, source, expected_bytes, &mut context)
+}
+
+pub(crate) fn reproduce_thumbnail_in_context(
+    recipe: &ThumbnailRecipe,
+    source: &[u8],
+    expected_bytes: u64,
+    context: &mut PackageProcessingContext,
+) -> Result<Option<RasterGeneratedPng>, ProcessingError> {
+    match render_source_thumbnail_in_context(
+        source,
+        recipe.source_hash(),
+        expected_bytes,
+        &recipe.settings(),
+        context,
+    )? {
+        SourceThumbnail::EmbeddedPreviewCopy(_) => Ok(None),
+        SourceThumbnail::RasterGenerated(mut png) => {
+            if recipe
+                .png_hash_hint
+                .as_ref()
+                .is_some_and(|hint| hint != png.png_hash())
+            {
+                Ok(None)
+            } else {
+                // Bind the exact parsed legacy/CA selector to the independently
+                // rendered bytes; callers cannot substitute a different recipe.
+                png.recipe = recipe.clone();
+                Ok(Some(png))
+            }
+        }
+    }
+}
+
+pub fn thumbnail_relative_path(content_hash: &str, settings: &CatalogSettings) -> PathBuf {
+    let background = settings
+        .thumbnail_background
+        .trim_start_matches('#')
+        .to_ascii_lowercase();
+    PathBuf::from("thumbnails").join(format!(
+        "{content_hash}-isometric-v{RENDER_VERSION}-{}-{background}.png",
+        settings.thumbnail_size
+    ))
+}
+
+pub fn ensure_thumbnail(
+    library_root: &Path,
+    source_path: &Path,
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+) -> Result<ThumbnailArtifact, String> {
+    ensure_thumbnail_typed(
+        library_root,
+        source_path,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Typed generation for native callers; terminal processing errors precede staging.
+#[doc(hidden)]
+pub fn ensure_thumbnail_typed(
+    library_root: &Path,
+    source_path: &Path,
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    ensure_thumbnail_in_context_typed(
+        library_root,
+        source_path,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+        &mut context,
+    )
+}
+
+/// Generate within an existing source-validation/package operation.
+#[doc(hidden)]
+pub fn ensure_thumbnail_in_context_typed(
+    library_root: &Path,
+    source_path: &Path,
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+    context: &mut PackageProcessingContext,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    let observer = context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    let result = (|| {
+        let relative = thumbnail_relative_path(content_hash, settings);
+        if let Some(cached) = cached_thumbnail(library_root, &relative, regenerate)? {
+            return Ok(cached);
+        }
+        if expected_source_bytes > stl_core::limits::MAX_FILE_BYTES {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::InputLimitExceeded),
+            ));
+        }
+        let metadata = fs::symlink_metadata(source_path).map_err(ProcessingError::from_io)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != expected_source_bytes
+        {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
+            ));
+        }
+        let file = File::open(source_path).map_err(ProcessingError::from_io)?;
+        let bytes = collect_verified_model_source(file, expected_source_bytes, &observer)
+            .map_err(ProcessingError::from)?;
+        if hex_digest(&bytes) != content_hash {
+            return Err(ProcessingError::from_io(
+                observer.stop_io(ResourceStop::EnvelopeChanged),
+            ));
+        }
+        ensure_thumbnail_from_bytes_in_context_typed(
+            library_root,
+            &bytes,
+            content_hash,
+            expected_source_bytes,
+            settings,
+            regenerate,
+            context,
+        )
+    })();
+    observer.finish(result)
+}
+
+fn cached_thumbnail(
+    library_root: &Path,
+    relative: &Path,
+    regenerate: bool,
+) -> Result<Option<ThumbnailArtifact>, String> {
+    if regenerate {
+        return Ok(None);
+    }
+    let output = library_root.join(relative);
+    let parent = output
+        .parent()
+        .ok_or_else(|| "Thumbnail output has no parent directory".to_string())?;
+    let directory = thumbnail_directory(library_root, parent)?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| "Thumbnail output filename is invalid".to_string())?;
+    let file = match open_thumbnail_file(&directory, name)? {
+        Some(file) => file,
+        None => return Ok(None),
+    };
+    if file.metadata().map_err(|error| error.to_string())?.len() > MAX_CACHED_PNG_BYTES {
+        return Err("Thumbnail cache entry exceeds the size limit".into());
+    }
+    let bytes = read_bounded_file(file, MAX_CACHED_PNG_BYTES)?;
+    if validate_png_bytes(&bytes).is_ok() {
+        Ok(Some(ThumbnailArtifact {
+            relative_path: relative.to_path_buf(),
+            png_hash: hex_digest(&bytes),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_thumbnail_from_bytes(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+) -> Result<ThumbnailArtifact, String> {
+    ensure_thumbnail_from_bytes_typed(
+        library_root,
+        source_bytes,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_thumbnail_from_bytes_typed(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    let mut context = PackageProcessingContext::new(ZipResourceObserver::new());
+    ensure_thumbnail_from_bytes_in_context_typed(
+        library_root,
+        source_bytes,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+        &mut context,
+    )
+}
+
+pub(crate) fn ensure_thumbnail_from_bytes_in_context_typed(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+    context: &mut PackageProcessingContext,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    let observer = context.observer();
+    observer.check().map_err(ProcessingError::from)?;
+    if expected_source_bytes > stl_core::limits::MAX_FILE_BYTES {
+        return Err(ProcessingError::from_io(
+            observer.stop_io(ResourceStop::InputLimitExceeded),
+        ));
+    }
+    if source_bytes.len() as u64 != expected_source_bytes
+        || hex_digest(source_bytes) != content_hash
+    {
+        return Err(ProcessingError::from_io(
+            observer.stop_io(ResourceStop::EnvelopeChanged),
+        ));
+    }
+    let result = ensure_from_bytes_with_render(
+        library_root,
+        source_bytes,
+        content_hash,
+        expected_source_bytes,
+        settings,
+        regenerate,
+        || {
+            render_source_thumbnail_in_context(
+                source_bytes,
+                content_hash,
+                expected_source_bytes,
+                settings,
+                context,
+            )
+            .map(SourceThumbnail::into_bytes)
+        },
+    );
+    observer.finish(result)
+}
+
+fn ensure_from_bytes_with_render(
+    library_root: &Path,
+    source_bytes: &[u8],
+    content_hash: &str,
+    expected_source_bytes: u64,
+    settings: &CatalogSettings,
+    regenerate: bool,
+    render: impl FnOnce() -> Result<Vec<u8>, ProcessingError>,
+) -> Result<ThumbnailArtifact, ProcessingError> {
+    if source_bytes.len() as u64 != expected_source_bytes
+        || source_bytes.len() as u64 > stl_core::limits::MAX_FILE_BYTES
+        || hex_digest(source_bytes) != content_hash
+    {
+        return Err("Model source changed since it was indexed".into());
+    }
+    let relative = thumbnail_relative_path(content_hash, settings);
+    let output = library_root.join(&relative);
+    let parent = output
+        .parent()
+        .ok_or_else(|| "Thumbnail output has no parent directory".to_string())?;
+    let directory = thumbnail_directory(library_root, parent)?;
+    let output_name = output
+        .file_name()
+        .ok_or_else(|| "Thumbnail output filename is invalid".to_string())?;
+    if !regenerate {
+        match open_thumbnail_file(&directory, output_name)? {
+            Some(file) => {
+                let bytes = read_bounded_file(file, MAX_CACHED_PNG_BYTES)?;
+                if validate_png_bytes(&bytes).is_ok() {
+                    return Ok(ThumbnailArtifact {
+                        relative_path: relative,
+                        png_hash: hex_digest(&bytes),
+                    });
+                }
+            }
+            None => {}
+        }
+    }
+    // All typed parser/selection completion gates run before a new stage exists.
+    let png = render()?;
+    let png_hash = hex_digest(&png);
+    // Regeneration can reproduce the exact cache entry. Reuse those verified
+    // bytes rather than displacing them into a permanent recovery hold.
+    if let Some(existing) = open_thumbnail_file(&directory, output_name)? {
+        if existing
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len()
+            == png.len() as u64
+        {
+            let existing_bytes = read_bounded_file(existing, MAX_CACHED_PNG_BYTES)?;
+            if existing_bytes == png {
+                return Ok(ThumbnailArtifact {
+                    relative_path: relative,
+                    png_hash,
+                });
+            }
+        }
+    }
+    let staging_name = OsString::from(format!(
+        ".thumbnail-{}-{}.part",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = directory
+        .create_new_file(&staging_name)
+        .map_err(|error| error.to_string())?;
+    let write_result = file.write_all(&png).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = directory.hold_entry(&staging_name);
+        return Err(error.to_string().into());
+    }
+    if let Err(error) = directory.replace_child(&staging_name, output_name) {
+        let _ = directory.hold_entry(&staging_name);
+        return Err(error.to_string().into());
+    }
+    let published = directory
+        .open_file(output_name)
+        .map_err(|error| error.to_string())?;
+    let published_bytes = read_bounded_file(published, MAX_CACHED_PNG_BYTES)?;
+    if validate_png_bytes(&published_bytes).is_err() || hex_digest(&published_bytes) != png_hash {
+        let _ = directory.hold_verified_file(
+            output_name,
+            &(published_bytes.len() as u64, hex_digest(&published_bytes)),
+            MAX_CACHED_PNG_BYTES,
+        );
+        return Err("Published thumbnail failed its content hash check".into());
+    }
+    Ok(ThumbnailArtifact {
+        relative_path: relative,
+        png_hash,
+    })
+}
+
+pub fn png_data_uri(path: &Path) -> Result<String, String> {
+    png_data_uri_validated(path, None)
+}
+
+pub fn png_data_uri_with_hash(path: &Path, expected_hash: &str) -> Result<String, String> {
+    png_data_uri_validated(path, Some(expected_hash))
+}
+
+fn png_data_uri_validated(path: &Path, expected_hash: Option<&str>) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("Cached thumbnail is not a regular file".into());
+    }
+    if metadata.len() > MAX_CACHED_PNG_BYTES {
+        return Err("Cached thumbnail exceeds the size limit".into());
+    }
+    let bytes = read_bounded(path, MAX_CACHED_PNG_BYTES)?;
+    validate_png_bytes(&bytes)?;
+    if expected_hash.is_some_and(|expected| hex_digest(&bytes) != expected) {
+        return Err("Cached thumbnail hash does not match the catalog".into());
+    }
+    Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)))
+}
+
+pub(crate) fn validate_png_bytes(bytes: &[u8]) -> Result<(), String> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("Cached thumbnail is not a PNG".into());
+    }
+    let limits = png::Limits {
+        bytes: MAX_DECODED_PNG_BYTES,
+    };
+    let decoder = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), limits);
+    let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
+    let info = reader.info();
+    if info.width == 0
+        || info.height == 0
+        || info.width > MAX_PNG_DIMENSION
+        || info.height > MAX_PNG_DIMENSION
+    {
+        return Err("Cached thumbnail dimensions exceed the limit".into());
+    }
+    let output_size = reader
+        .output_buffer_size()
+        .ok_or_else(|| "Cached thumbnail output size overflowed".to_string())?;
+    if output_size > MAX_DECODED_PNG_BYTES {
+        return Err("Cached thumbnail decoded output exceeds the limit".into());
+    }
+    let mut decoded = vec![0_u8; output_size];
+    reader
+        .next_frame(&mut decoded)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn thumbnail_directory(library_root: &Path, parent: &Path) -> Result<Directory, String> {
+    let metadata = fs::symlink_metadata(library_root).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Library root is not a real directory".into());
+    }
+    if parent != library_root.join("thumbnails") {
+        return Err("Thumbnail cache path is outside its owned directory".into());
+    }
+    // Resolve aliases in ancestor components such as macOS's /var and /tmp,
+    // then use only the canonical path for the pinned directory operations.
+    let canonical_root = library_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let root = Directory::open(&canonical_root).map_err(|error| error.to_string())?;
+    if !root
+        .matches_path(&canonical_root)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("Library root identity changed".into());
+    }
+    let thumbnails_name = OsStr::new("thumbnails");
+    match root.open_child(thumbnails_name) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            root.create_child_directory(thumbnails_name)
+                .map_err(|error| error.to_string())?;
+            root.sync().map_err(|error| error.to_string())?;
+            root.open_child(thumbnails_name)
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn open_thumbnail_file(directory: &Directory, name: &OsStr) -> Result<Option<File>, String> {
+    match directory.open_file(name) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if is_symlink_error(&error) => Err("Thumbnail cache entry is a symlink".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn is_symlink_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_symlink_error(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn read_bounded_file(file: File, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err("File grew beyond the allowed size while being read".into());
+    }
+    Ok(bytes)
+}
+
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    read_bounded_file(file, limit)
+}
+
+#[cfg(test)]
+fn render_png(model: &ParsedStl, settings: &CatalogSettings) -> Result<Vec<u8>, String> {
+    render_png_typed(model, settings).map_err(|error| error.to_string())
+}
+
+fn render_png_typed(
+    model: &ParsedStl,
+    settings: &CatalogSettings,
+) -> Result<Vec<u8>, ProcessingError> {
+    render_png_with_output(
+        model,
+        settings,
+        BoundedPngOutput::new(MAX_CACHED_PNG_BYTES as usize),
+    )
+}
+
+#[cfg(test)]
+fn render_png_with_output_limit(
+    model: &ParsedStl,
+    settings: &CatalogSettings,
+    output_limit: usize,
+) -> Result<Vec<u8>, String> {
+    render_png_with_output(model, settings, BoundedPngOutput::new(output_limit))
+        .map_err(|error| error.to_string())
+}
+
+fn render_png_with_output(
+    model: &ParsedStl,
+    settings: &CatalogSettings,
+    mut output: BoundedPngOutput,
+) -> Result<Vec<u8>, ProcessingError> {
+    let size = usize::try_from(settings.thumbnail_size)
+        .map_err(|_| "Thumbnail size is invalid".to_string())?;
+    if !matches!(size, 128 | 256 | 512) {
+        return Err("Thumbnail size is invalid".into());
+    }
+    let background = parse_background(&settings.thumbnail_background)?;
+    let mut rgba = vec![0_u8; size * size * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[background[0], background[1], background[2], 255]);
+    }
+    let mut depth = vec![f32::NEG_INFINITY; size * size];
+
+    if model.positions.len() >= 9 {
+        let (min_x, max_x, min_y, max_y) = bounds(
+            model
+                .positions
+                .chunks_exact(3)
+                .map(|point| project([point[0], point[1], point[2]])),
+        );
+        let width = (max_x - min_x).max(f32::EPSILON);
+        let height = (max_y - min_y).max(f32::EPSILON);
+        let margin = (size as f32 * 0.055).max(7.0);
+        let scale =
+            ((size as f32 - margin * 2.0) / width).min((size as f32 - margin * 2.0) / height);
+        let offset_x = (size as f32 - width * scale) * 0.5 - min_x * scale;
+        let offset_y = (size as f32 - height * scale) * 0.5 + max_y * scale;
+        let triangle_count = model.positions.len() / 9;
+        let stride = triangle_count.div_ceil(MAX_RENDER_TRIANGLES).max(1);
+        let mut raster_budget = BASE_MAX_RASTER_SAMPLES
+            .saturating_mul(size * size)
+            .checked_div(256 * 256)
+            .unwrap_or(BASE_MAX_RASTER_SAMPLES);
+
+        for triangle in (0..triangle_count).step_by(stride) {
+            let first = triangle * 9;
+            let vertices = [
+                screen(
+                    project(&model.positions[first..first + 3]),
+                    scale,
+                    offset_x,
+                    offset_y,
+                ),
+                screen(
+                    project(&model.positions[first + 3..first + 6]),
+                    scale,
+                    offset_x,
+                    offset_y,
+                ),
+                screen(
+                    project(&model.positions[first + 6..first + 9]),
+                    scale,
+                    offset_x,
+                    offset_y,
+                ),
+            ];
+            let source = &model.positions[first..first + 9];
+            let shade = triangle_shade(source);
+            if !rasterize(
+                vertices,
+                shade,
+                size,
+                &mut depth,
+                &mut rgba,
+                &mut raster_budget,
+            ) {
+                break;
+            }
+        }
+    }
+
+    let encoded = (|| {
+        let mut encoder = png::Encoder::new(&mut output, size as u32, size as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&rgba)?;
+        writer.finish()
+    })();
+    if output.allocation_failed() {
+        return Err(ProcessingError::AllocationFailed);
+    }
+    if output.limit_exceeded() {
+        return Err("Generated thumbnail exceeds its cache size limit".into());
+    }
+    encoded.map_err(|error| error.to_string())?;
+    output.into_bytes().map_err(ProcessingError::from_io)
+}
+
+fn project(point: impl AsRef<[f32]>) -> [f32; 3] {
+    let point = point.as_ref();
+    let x = (point[0] - point[2]) * 0.707_106_77;
+    let y = point[1] * 0.816_496_6 - (point[0] + point[2]) * 0.408_248_3;
+    let depth = (point[0] + point[1] + point[2]) * 0.577_350_26;
+    [x, y, depth]
+}
+
+fn bounds(points: impl Iterator<Item = [f32; 3]>) -> (f32, f32, f32, f32) {
+    points.fold(
+        (
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ),
+        |(min_x, max_x, min_y, max_y), point| {
+            (
+                min_x.min(point[0]),
+                max_x.max(point[0]),
+                min_y.min(point[1]),
+                max_y.max(point[1]),
+            )
+        },
+    )
+}
+
+fn screen(point: [f32; 3], scale: f32, offset_x: f32, offset_y: f32) -> [f32; 3] {
+    [
+        point[0] * scale + offset_x,
+        offset_y - point[1] * scale,
+        point[2],
+    ]
+}
+
+fn triangle_shade(p: &[f32]) -> u8 {
+    let a = [p[3] - p[0], p[4] - p[1], p[5] - p[2]];
+    let b = [p[6] - p[0], p[7] - p[1], p[8] - p[2]];
+    let normal = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+        .sqrt()
+        .max(f32::EPSILON);
+    let light = [0.35_f32, 0.75, 0.56];
+    let dot = ((normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]) / length).abs();
+    (105.0 + 130.0 * dot) as u8
+}
+
+fn rasterize(
+    vertices: [[f32; 3]; 3],
+    shade: u8,
+    size: usize,
+    depth: &mut [f32],
+    rgba: &mut [u8],
+    budget: &mut usize,
+) -> bool {
+    let min_x = vertices
+        .iter()
+        .map(|point| point[0].floor() as i32)
+        .min()
+        .unwrap_or(0)
+        .clamp(0, size as i32 - 1);
+    let max_x = vertices
+        .iter()
+        .map(|point| point[0].ceil() as i32)
+        .max()
+        .unwrap_or(0)
+        .clamp(0, size as i32 - 1);
+    let min_y = vertices
+        .iter()
+        .map(|point| point[1].floor() as i32)
+        .min()
+        .unwrap_or(0)
+        .clamp(0, size as i32 - 1);
+    let max_y = vertices
+        .iter()
+        .map(|point| point[1].ceil() as i32)
+        .max()
+        .unwrap_or(0)
+        .clamp(0, size as i32 - 1);
+    let area = edge(vertices[0], vertices[1], vertices[2][0], vertices[2][1]);
+    if area.abs() < f32::EPSILON {
+        return true;
+    }
+    let samples = (max_x - min_x + 1) as usize * (max_y - min_y + 1) as usize;
+    if samples > *budget {
+        return false;
+    }
+    *budget -= samples;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let w0 = edge(vertices[1], vertices[2], px, py) / area;
+            let w1 = edge(vertices[2], vertices[0], px, py) / area;
+            let w2 = 1.0 - w0 - w1;
+            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                let z = w0 * vertices[0][2] + w1 * vertices[1][2] + w2 * vertices[2][2];
+                let index = y as usize * size + x as usize;
+                if z > depth[index] {
+                    depth[index] = z;
+                    let pixel = &mut rgba[index * 4..index * 4 + 4];
+                    pixel.copy_from_slice(&[shade / 2, shade, shade.saturating_add(18), 255]);
+                }
+            }
+        }
+    }
+    true
+}
+
+fn parse_background(value: &str) -> Result<[u8; 3], String> {
+    if value.len() != 7 || !value.starts_with('#') {
+        return Err("Thumbnail background must be #RRGGBB".into());
+    }
+    let parse = |range| {
+        u8::from_str_radix(&value[range], 16)
+            .map_err(|_| "Thumbnail background must be #RRGGBB".to_string())
+    };
+    Ok([parse(1..3)?, parse(3..5)?, parse(5..7)?])
+}
+
+fn edge(a: [f32; 3], b: [f32; 3], x: f32, y: f32) -> f32 {
+    (x - a[0]) * (b[1] - a[1]) - (y - a[1]) * (b[0] - a[0])
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use stl_core::{ParsedStl, StlFormat};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn settings() -> CatalogSettings {
+        CatalogSettings {
+            thumbnail_size: 256,
+            thumbnail_background: "#12171F".into(),
+            thumbnail_concurrency: 2,
+            scan_batch_size: 128,
+        }
+    }
+
+    fn one_triangle() -> ParsedStl {
+        ParsedStl {
+            format: StlFormat::Binary,
+            triangle_count: 1,
+            positions: vec![0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 20.0, 0.0],
+            stored_normals: vec![0.0, 0.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn raster_bounded_output_preserves_legacy_encoding_and_requires_complete_iend() {
+        let model = ParsedStl {
+            format: StlFormat::Binary,
+            triangle_count: 0,
+            positions: Vec::new(),
+            stored_normals: Vec::new(),
+        };
+        let settings = settings();
+        let rgba = [0x12, 0x17, 0x1f, 255].repeat(256 * 256);
+        let mut baseline = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut baseline, 256, 256);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgba).unwrap();
+            // Match the previous production encoder's successful Drop footer.
+        }
+        let output = render_png_with_output_limit(&model, &settings, baseline.len()).unwrap();
+        assert_eq!(output, baseline);
+        assert_eq!(render_png(&model, &settings).unwrap(), baseline);
+        assert_eq!(
+            render_png_with_output_limit(&model, &settings, baseline.len() - 1).unwrap_err(),
+            "Generated thumbnail exceeds its cache size limit"
+        );
+        assert_eq!(
+            &output[output.len() - 12..],
+            b"\0\0\0\0IEND\xae\x42\x60\x82"
+        );
+        let mut reader = png::Decoder::new(Cursor::new(&output)).read_info().unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut decoded).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(decoded, rgba);
+        drop(reader);
+
+        let mut bad_crc = output;
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let mut reader = png::Decoder::new(Cursor::new(&bad_crc))
+            .read_info()
+            .unwrap();
+        reader.next_frame(&mut decoded).unwrap();
+        assert!(reader.finish().is_err());
+    }
+
+    fn proof_recipe(source: &[u8]) -> ThumbnailRecipe {
+        let name = thumbnail_relative_path(&hex_digest(source), &settings());
+        ThumbnailRecipe::parse_filename(name.file_name().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn proof_recipe_parser_accepts_only_complete_canonical_supported_names() {
+        let hash = "a".repeat(64);
+        let png = "b".repeat(64);
+        for size in [128, 256, 512] {
+            let legacy = format!("{hash}-isometric-v1-{size}-12171f.png");
+            let recipe = ThumbnailRecipe::parse_filename(OsStr::new(&legacy)).unwrap();
+            assert_eq!(recipe.source_hash, hash);
+            assert_eq!(recipe.size, size);
+            assert_eq!(recipe.background, "12171f");
+            assert_eq!(recipe.png_hash_hint, None);
+            let ca = format!("{hash}-isometric-v1-{size}-12171f-{png}.png");
+            assert_eq!(
+                ThumbnailRecipe::parse_filename(OsStr::new(&ca))
+                    .unwrap()
+                    .png_hash_hint,
+                Some(png.clone())
+            );
+        }
+        for name in [
+            format!("../{hash}-isometric-v1-256-12171f.png"),
+            format!("thumbnails/{hash}-isometric-v1-256-12171f.png"),
+            format!("x\\{hash}-isometric-v1-256-12171f.png"),
+            format!("{hash}-isometric-v2-256-12171f.png"),
+            format!("{hash}-isometric-v01-256-12171f.png"),
+            format!("{hash}-isometric-v1-0256-12171f.png"),
+            format!("{hash}-isometric-v1-1024-12171f.png"),
+            format!("{}-isometric-v1-256-12171f.png", hash.to_uppercase()),
+            format!("{hash}-isometric-v1-256-12171F.png"),
+            format!("{hash}-isometric-v1-256-12171f-{png}.png.extra"),
+            format!("{hash}-isometric-v1-256-12171f-{}.png", "B".repeat(64)),
+            format!("{hash}-isometric-v1-256-12171f.png\0"),
+        ] {
+            assert!(
+                ThumbnailRecipe::parse_filename(OsStr::new(&name)).is_none(),
+                "accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_bypasses_adopted_cache_and_exactly_reproduces_only_raster_output() {
+        let source = binary_triangle();
+        let recipe = proof_recipe(&source);
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("thumbnails")).unwrap();
+        let mut changed = settings();
+        changed.thumbnail_background = "#ff0000".into();
+        let foreign = render_png(&one_triangle(), &changed).unwrap();
+        let relative = thumbnail_relative_path(&hex_digest(&source), &settings());
+        fs::write(root.path().join(&relative), &foreign).unwrap();
+        let adopted = ensure_thumbnail_from_bytes(
+            root.path(),
+            &source,
+            &hex_digest(&source),
+            source.len() as u64,
+            &settings(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(adopted.png_hash, hex_digest(&foreign));
+        let proof = reproduce_thumbnail(&recipe, &source, source.len() as u64)
+            .unwrap()
+            .unwrap();
+        let expected = render_png(&one_triangle(), &settings()).unwrap();
+        assert_eq!(proof.recipe(), &recipe);
+        assert_eq!(proof.source_bytes(), source.len() as u64);
+        assert_eq!(proof.png_hash(), hex_digest(&expected));
+        assert_eq!(proof.bytes, expected);
+        assert_ne!(proof.bytes, foreign);
+        assert_eq!(fs::read(root.path().join(relative)).unwrap(), foreign);
+        let mut addressed = recipe.clone();
+        addressed.png_hash_hint = Some(hex_digest(&expected));
+        assert_eq!(
+            reproduce_thumbnail(&addressed, &source, source.len() as u64)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            expected
+        );
+        addressed.png_hash_hint = Some("0".repeat(64));
+        assert!(
+            reproduce_thumbnail(&addressed, &source, source.len() as u64)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn proof_rejects_changed_source_hash_size_and_source_limit_before_rendering() {
+        let source = binary_triangle();
+        let recipe = proof_recipe(&source);
+        assert!(reproduce_thumbnail(&recipe, &source, source.len() as u64 + 1).is_err());
+        assert!(
+            reproduce_thumbnail(&recipe, &source, stl_core::limits::MAX_FILE_BYTES + 1).is_err()
+        );
+        let mut changed = source.clone();
+        changed[0] ^= 1;
+        assert!(reproduce_thumbnail(&recipe, &changed, changed.len() as u64).is_err());
+    }
+
+    #[test]
+    fn proof_never_qualifies_embedded_preview_copies_even_when_pixels_match_raster() {
+        let source = three_mf_cube();
+        let parsed = stl_core::parse_model(&source).unwrap();
+        let preview = render_png(&parsed, &settings()).unwrap();
+        let mut archive = zip::ZipWriter::new_append(Cursor::new(source)).unwrap();
+        archive
+            .start_file(
+                "Metadata/thumbnail.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&preview).unwrap();
+        let embedded_source = archive.finish().unwrap().into_inner();
+        let recipe = proof_recipe(&embedded_source);
+        let rendered = render_source_thumbnail(
+            &embedded_source,
+            &recipe.source_hash,
+            embedded_source.len() as u64,
+            &settings(),
+        )
+        .unwrap();
+        assert!(matches!(rendered, SourceThumbnail::EmbeddedPreviewCopy(_)));
+        assert!(
+            reproduce_thumbnail(&recipe, &embedded_source, embedded_source.len() as u64)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn renders_real_png_with_non_background_pixels() {
+        let png = render_png(&one_triangle(), &settings()).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() > 500);
+        let decoder = png::Decoder::new(Cursor::new(&png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (256, 256));
+        assert!(pixels[..info.buffer_size()]
+            .chunks_exact(4)
+            .any(|pixel| pixel != [18, 23, 31, 255]));
+    }
+
+    fn binary_triangle() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 84];
+        bytes[80..84].copy_from_slice(&1_u32.to_le_bytes());
+        for value in [
+            0.0_f32, 0.0, 1.0, 0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 20.0, 0.0,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0]);
+        bytes
+    }
+
+    fn three_mf_cube() -> Vec<u8> {
+        let model = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+<resources><object id="1" type="model"><mesh><vertices>
+<vertex x="0" y="0" z="0"/><vertex x="20" y="0" z="0"/>
+<vertex x="20" y="20" z="0"/><vertex x="0" y="20" z="0"/>
+<vertex x="0" y="0" z="20"/><vertex x="20" y="0" z="20"/>
+<vertex x="20" y="20" z="20"/><vertex x="0" y="20" z="20"/>
+</vertices><triangles>
+<triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+<triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+<triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+<triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+<triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+<triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+</triangles></mesh></object></resources><build><item objectid="1"/></build></model>"#;
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("3D/3dmodel.model", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(model.as_bytes()).unwrap();
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "gogglelab-thumbnail-{label}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("thumbnails")).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn generated_thumbnail_is_reused_across_calls() {
+        let root = temp_root("cache");
+        let source = root.join("source.stl");
+        let source_bytes = binary_triangle();
+        fs::write(&source, &source_bytes).unwrap();
+        let source_hash = hex_digest(&source_bytes);
+        let first = ensure_thumbnail(
+            &root,
+            &source,
+            &source_hash,
+            source_bytes.len() as u64,
+            &settings(),
+            false,
+        )
+        .unwrap();
+        let first_bytes = fs::read(root.join(&first.relative_path)).unwrap();
+        let second = ensure_thumbnail(
+            &root,
+            &source,
+            &source_hash,
+            source_bytes.len() as u64,
+            &settings(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(first.relative_path, second.relative_path);
+        assert_eq!(first.png_hash, second.png_hash);
+        assert_eq!(
+            first_bytes,
+            fs::read(root.join(second.relative_path)).unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn truncated_cached_png_is_rejected_and_regenerated_from_source() {
+        let root = temp_root("truncated");
+        let source = root.join("source.stl");
+        let source_bytes = binary_triangle();
+        fs::write(&source, &source_bytes).unwrap();
+        let source_hash = hex_digest(&source_bytes);
+        let cached = root.join(thumbnail_relative_path(&source_hash, &settings()));
+        fs::write(&cached, b"\x89PNG\r\n\x1a\ntruncated").unwrap();
+        assert!(png_data_uri(&cached).is_err());
+
+        let regenerated = ensure_thumbnail(
+            &root,
+            &source,
+            &source_hash,
+            source_bytes.len() as u64,
+            &settings(),
+            false,
+        )
+        .unwrap();
+        assert!(png_data_uri(&root.join(regenerated.relative_path)).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_identical_regeneration_does_not_grow_thumbnail_storage() {
+        let root = temp_root("identical-regeneration");
+        let source_bytes = binary_triangle();
+        let source_hash = hex_digest(&source_bytes);
+        let generate = || {
+            ensure_thumbnail_from_bytes(
+                &root,
+                &source_bytes,
+                &source_hash,
+                source_bytes.len() as u64,
+                &settings(),
+                true,
+            )
+            .unwrap()
+        };
+        let first = generate();
+        let expected_bytes = fs::read(root.join(&first.relative_path)).unwrap();
+        for _ in 0..3 {
+            let regenerated = generate();
+            assert_eq!(regenerated.relative_path, first.relative_path);
+            assert_eq!(regenerated.png_hash, first.png_hash);
+            assert_eq!(
+                fs::read(root.join(&regenerated.relative_path)).unwrap(),
+                expected_bytes
+            );
+            let entries = fs::read_dir(root.join("thumbnails"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(entries, vec![first.relative_path.file_name().unwrap()]);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regeneration_retains_displaced_thumbnail_in_recoverable_hold() {
+        let root = temp_root("displaced-thumbnail");
+        let source = root.join("source.stl");
+        let source_bytes = binary_triangle();
+        fs::write(&source, &source_bytes).unwrap();
+        let source_hash = hex_digest(&source_bytes);
+        let output = root.join(thumbnail_relative_path(&source_hash, &settings()));
+        let displaced = b"preexisting thumbnail bytes";
+        fs::write(&output, displaced).unwrap();
+
+        ensure_thumbnail(
+            &root,
+            &source,
+            &source_hash,
+            source_bytes.len() as u64,
+            &settings(),
+            true,
+        )
+        .unwrap();
+
+        let held = fs::read_dir(root.join("thumbnails"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gogglelab-held-")
+                    && entry.file_name().to_string_lossy().ends_with(".data")
+            })
+            .find(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == displaced));
+        assert!(
+            held.is_some(),
+            "regeneration must preserve displaced bytes in a recoverable hold"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_png_dimensions_are_rejected_before_data_uri_encoding() {
+        let root = temp_root("dimensions");
+        let path = root.join("thumbnails/oversized.png");
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, MAX_PNG_DIMENSION + 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&vec![0_u8; (MAX_PNG_DIMENSION as usize + 1) * 4])
+                .unwrap();
+        }
+        fs::write(&path, encoded).unwrap();
+        let error = png_data_uri(&path).unwrap_err();
+        assert!(error.contains("dimensions"), "unexpected error: {error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_reader_refuses_content_beyond_limit() {
+        let root = temp_root("bounded-read");
+        let path = root.join("growing.bin");
+        fs::write(&path, b"12345").unwrap();
+        assert!(read_bounded(&path, 4).unwrap_err().contains("grew"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_key_and_pixels_include_thumbnail_configuration() {
+        let default = settings();
+        let mut configured = default.clone();
+        configured.thumbnail_size = 128;
+        configured.thumbnail_background = "#FF0000".into();
+        assert_ne!(
+            thumbnail_relative_path("abc", &default),
+            thumbnail_relative_path("abc", &configured)
+        );
+
+        let png = render_png(
+            &ParsedStl {
+                format: StlFormat::Binary,
+                triangle_count: 0,
+                positions: Vec::new(),
+                stored_normals: Vec::new(),
+            },
+            &configured,
+        )
+        .unwrap();
+        let decoder = png::Decoder::new(Cursor::new(png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (128, 128));
+        assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_thumbnail_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("symlink");
+        let source = root.join("source.stl");
+        let source_bytes = binary_triangle();
+        fs::write(&source, &source_bytes).unwrap();
+        let source_hash = hex_digest(&source_bytes);
+        let cached = root.join(thumbnail_relative_path(&source_hash, &settings()));
+        symlink(&source, cached).unwrap();
+        assert!(ensure_thumbnail(
+            &root,
+            &source,
+            &source_hash,
+            source_bytes.len() as u64,
+            &settings(),
+            false,
+        )
+        .unwrap_err()
+        .contains("symlink"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renders_3mf_geometry_and_optionally_writes_qa_artifact() {
+        let parsed = stl_core::parse_model(&three_mf_cube()).unwrap();
+        assert_eq!(parsed.format, StlFormat::ThreeMf);
+        assert_eq!(parsed.triangle_count, 12);
+        let png = render_png(&parsed, &settings()).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        if let Some(path) = std::env::var_os("GOGGLELAB_THUMBNAIL_QA_OUTPUT") {
+            let path = PathBuf::from(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, png).unwrap();
+        }
+    }
+    fn terminal_errors() -> Vec<ProcessingError> {
+        vec![
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::InputLimitExceeded),
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::ReadWorkExceeded),
+            ProcessingError::ResourceStopped(stl_core::ResourceStop::EnvelopeChanged),
+            ProcessingError::AllocationFailed,
+            ProcessingError::FundingBusy,
+        ]
+    }
+    #[test]
+    fn typed_preview_stop_never_starts_raster_but_ordinary_preview_failure_does() {
+        let source = binary_triangle();
+        let hash = hex_digest(&source);
+        for error in terminal_errors() {
+            let expected = error.to_string();
+            let calls = std::cell::Cell::new(0);
+            let result = render_source_with_preview(
+                &source,
+                &hash,
+                source.len() as u64,
+                &settings(),
+                &mut PackageProcessingContext::new(ZipResourceObserver::new()),
+                |_, _| Err(error),
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(Vec::new())
+                },
+            );
+            let error = result.unwrap_err();
+            assert!(error.is_terminal());
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(calls.get(), 0);
+        }
+        let calls = std::cell::Cell::new(0);
+        let result = render_source_with_preview(
+            &source,
+            &hash,
+            source.len() as u64,
+            &settings(),
+            &mut PackageProcessingContext::new(ZipResourceObserver::new()),
+            |_, _| Err("ordinary invalid preview".into()),
+            |model, settings| {
+                calls.set(calls.get() + 1);
+                render_png_typed(model, settings)
+            },
+        );
+        assert!(matches!(
+            result.unwrap(),
+            SourceThumbnail::RasterGenerated(_)
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+    #[test]
+    fn typed_render_stop_creates_no_stage_and_preserves_existing_thumbnail() {
+        for error in terminal_errors() {
+            let root = temp_root("typed-stop");
+            let source = binary_triangle();
+            let hash = hex_digest(&source);
+            let relative = thumbnail_relative_path(&hash, &settings());
+            let output = root.join(&relative);
+            fs::write(&output, b"unknown existing thumbnail").unwrap();
+            let before = fs::read_dir(root.join("thumbnails"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            let expected = error.to_string();
+            let result = ensure_from_bytes_with_render(
+                &root,
+                &source,
+                &hash,
+                source.len() as u64,
+                &settings(),
+                true,
+                || Err(error),
+            );
+            let error = result.unwrap_err();
+            assert!(error.is_terminal());
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(fs::read(&output).unwrap(), b"unknown existing thumbnail");
+            let after = fs::read_dir(root.join("thumbnails"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(before, after);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn typed_raster_sink_allocation_does_not_become_an_ordinary_render_failure() {
+        let error = render_png_with_output(
+            &one_triangle(),
+            &settings(),
+            BoundedPngOutput::allocation_failure_for_test(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessingError::AllocationFailed));
+    }
+    #[test]
+    fn context_thumbnail_keeps_validation_geometry_and_preview_usage_and_plain_read_is_free() {
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let base = three_mf_cube();
+            let mut original = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+            let mut model = Vec::new();
+            original
+                .by_name("3D/3dmodel.model")
+                .unwrap()
+                .read_to_end(&mut model)
+                .unwrap();
+            let preview = render_png(&one_triangle(), &settings()).unwrap();
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, bytes) in [
+                ("3D/3dmodel.model", model.as_slice()),
+                ("Metadata/thumbnail.png", preview.as_slice()),
+            ] {
+                archive.start_file(name, options).unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            let source = archive.finish().unwrap().into_inner();
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            fs::create_dir(root.join("thumbnails")).unwrap();
+            let path = root.join("part.3mf");
+            fs::write(&path, &source).unwrap();
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer);
+            stl_core::parse_model_in_context(&source, &mut context).unwrap();
+            assert_eq!(context.usage().inflation_bytes, model.len() as u64);
+            assert_eq!(context.usage().retained_input_bytes, 0);
+            let before = context.usage();
+            let artifact = ensure_thumbnail_in_context_typed(
+                &root,
+                &path,
+                &hex_digest(&source),
+                source.len() as u64,
+                &settings(),
+                true,
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(
+                context.usage().inflation_bytes,
+                2 * model.len() as u64 + preview.len() as u64
+            );
+            assert_eq!(context.usage().retained_input_bytes, 0);
+            assert!(context.usage().inflation_bytes > before.inflation_bytes);
+            assert!(
+                validate_png_bytes(&fs::read(root.join(artifact.relative_path)).unwrap()).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn swallowed_preview_stop_rejects_both_optional_successes_before_raster_or_output() {
+        let source = binary_triangle();
+        let hash = hex_digest(&source);
+        for optional in [None, Some(Vec::new())] {
+            let observer = ZipResourceObserver::new();
+            let mut context = PackageProcessingContext::new(observer.clone());
+            let raster_called = std::cell::Cell::new(false);
+            let result = render_source_with_preview(
+                &source,
+                &hash,
+                source.len() as u64,
+                &settings(),
+                &mut context,
+                |_, _| {
+                    let _ = observer.stop_io(ResourceStop::ReadWorkExceeded);
+                    Ok(optional)
+                },
+                |_, _| {
+                    raster_called.set(true);
+                    Ok(Vec::new())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(ProcessingError::ResourceStopped(
+                    ResourceStop::ReadWorkExceeded
+                ))
+            ));
+            assert!(!raster_called.get());
+        }
+    }
+
+    #[test]
+    fn existing_cache_cannot_hide_a_prior_operation_stop() {
+        let root = temp_root("context-stop-cache");
+        let source = binary_triangle();
+        let hash = hex_digest(&source);
+        let artifact = ensure_thumbnail_from_bytes_typed(
+            &root,
+            &source,
+            &hash,
+            source.len() as u64,
+            &settings(),
+            true,
+        )
+        .unwrap();
+        let bytes = fs::read(root.join(&artifact.relative_path)).unwrap();
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        let _ = observer.stop_io(ResourceStop::EnvelopeChanged);
+        let result = ensure_thumbnail_in_context_typed(
+            &root,
+            &root.join("missing.stl"),
+            &hash,
+            source.len() as u64,
+            &settings(),
+            false,
+            &mut context,
+        );
+        assert!(matches!(
+            result,
+            Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged
+            ))
+        ));
+        assert_eq!(fs::read(root.join(artifact.relative_path)).unwrap(), bytes);
+        assert_eq!(fs::read_dir(root.join("thumbnails")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn context_reproduction_keeps_raster_only_authority_and_source_envelope() {
+        let source = binary_triangle();
+        let recipe = proof_recipe(&source);
+        let observer = ZipResourceObserver::new();
+        let mut context = PackageProcessingContext::new(observer.clone());
+        assert!(reproduce_thumbnail_in_context(
+            &recipe,
+            &source,
+            source.len() as u64,
+            &mut context
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(context.usage().inflation_bytes, 0);
+        assert_eq!(context.usage().retained_input_bytes, 0);
+        let mut changed = source.clone();
+        changed[0] ^= 1;
+        assert!(matches!(
+            reproduce_thumbnail_in_context(&recipe, &changed, changed.len() as u64, &mut context),
+            Err(ProcessingError::ResourceStopped(
+                ResourceStop::EnvelopeChanged
+            ))
+        ));
+        assert!(observer.check().is_err());
+    }
+}

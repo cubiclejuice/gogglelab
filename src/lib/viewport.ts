@@ -5,7 +5,8 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { ColorTarget, ColorwayMode, ResolveColor } from "./color-types";
-import type { DecodedGeometry, GeometryStats, PartSummary } from "./ipc";
+import type { DecodedGeometry } from "./geometry-wire";
+import type { GeometryStats, PartSummary } from "./ipc";
 import { layoutPlates, plateCameraDistance } from "./plate-layout";
 import { planGroups } from "./viewport-groups";
 import { getEffectiveTheme } from "./theme";
